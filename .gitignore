@@ -11,18 +11,20 @@ node_modules/
 .pnp
 .pnp.js
 
-# Runtimes & State Stores
-runtime/
-.runtime/
-state/
+# Local Runtimes & Ephemeral State Stores (Anchored to root only)
+/.agent-hub-runtime/
+/.runtime/
+/runtime/
+/state/
+credentials.json
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
 
 # Logs & Diagnostics
-logs/
 *.log
+/logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -42,9 +44,9 @@ Thumbs.db
 *.swo
 
 # Build & Test Caches
-dist/
-build/
-coverage/
+/dist/
+/build/
+/coverage/
 .cache/
 .tmp/
-tmp/
+/tmp/
