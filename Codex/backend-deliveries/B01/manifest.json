@@ -1,0 +1,14 @@
+{
+  "task": "B-01",
+  "status": "verified",
+  "files": {
+    "changes.patch": "0a3616f4fb88d31560fc6d69c0aa336619c8f549d9466a4157910061cdd89276",
+    "README.md": "9c940bf255d77cfff2336365d6d2426e45ef6a0ac8e4d65a78c5b5076dfb9899",
+    "tests.log": "9e96b7f431a641519a92f7e6902266cf09543f9a6f0ef7e453b7a49ecf4ad8c7",
+    "source/src/bun/harness-auto-enable.ts": "b72fb10e3b19e450a99691a310ae478ae317593a4afa45dd01ba06b2a1596a30",
+    "source/src/bun/agents.test.ts": "afc4660d2c4e68cb1c68bbb17cc276f2904854881b25bb08d446c6ca5f7ad2eb",
+    "source/src/bun/agents.ts": "38d8862370e12e81337933dcaeebebae826cbea59dd82489d3e757f26921a6f4",
+    "source/src/bun/worktree.test.ts": "00d211d560e09572c805b2dac99f1139a3b13d5c3eaca0299f0ca07a5c362d29",
+    "source/src/bun/harness-auto-enable.test.ts": "46678215a07c1dd45f2fbbad61f545a0a3d394b0d378236bbee226a1e9decbff"
+  }
+}

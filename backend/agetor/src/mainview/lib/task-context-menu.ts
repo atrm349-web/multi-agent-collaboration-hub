@@ -1,0 +1,166 @@
+import type { Task } from "../../shared/types.ts";
+import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
+import { importedSessionOf } from "../../shared/imported-session.ts";
+
+/** Every action the task context menu can offer. A subset of App.tsx's
+ *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
+ *  `unarchive`/`del`), plus the details-panel actions the menu additionally
+ *  surfaces as quick actions. T3 maps each id to its App.tsx handler.
+ *  `resume-recovery`/`cancel-auto-resume` map to `api.resumeFxRecovery`/
+ *  `api.cancelFxAutoResume` — see `docs/plans/fx-recovery-follow-ups.md`. */
+export type TaskMenuAction =
+  | "open"
+  | "open-pipeline"
+  | "start"
+  | "stop"
+  | "resume-recovery"
+  | "cancel-auto-resume"
+  | "mark-done"
+  | "archive"
+  | "unarchive"
+  | "diff"
+  | "open-in-finder"
+  | "view-pr"
+  | "view-issue"
+  | "mark-read"
+  | "mark-unread"
+  | "copy-branch"
+  | "copy-worktree-path"
+  | "delete";
+
+/** Visual/semantic grouping — T3 inserts a separator between consecutive
+ *  entries whose `group` differs, so the order below also defines where the
+ *  dividers land. Per the plan's §1 table, the read/unread pair and the copy
+ *  entries form a single visual block (three separators total: after
+ *  `primary`, after `inspect`, and before `danger`) — they share the
+ *  `utility` group rather than being split into two groups that would each
+ *  draw their own divider. */
+export type TaskMenuGroup = "primary" | "inspect" | "utility" | "danger";
+
+export interface TaskMenuEntry {
+  action: TaskMenuAction;
+  label: string;
+  group: TaskMenuGroup;
+  /** Danger-styled entry (destructive text color). Only `delete` sets this. */
+  danger?: boolean;
+}
+
+/**
+ * Builds the task card's right-click quick-action list, in display order,
+ * per the §1 table in `docs/plans/task-context-menu.md`. Pure and
+ * side-effect-free: no React, no `api` calls — App.tsx resolves each
+ * returned `action` to its real handler and renders the entries.
+ *
+ * Gating mirrors `TaskCard`'s own button precedence exactly (see the
+ * "Button precedence: Answer > Stop > Open > Run" comment in TaskCard.tsx)
+ * so the menu never offers an action the card's own hover buttons wouldn't:
+ * `awaiting`/`active`/`openable` are computed the same way, and "Run" is
+ * hidden whenever the card would instead show "Answer"/"Review"/"Stop"/
+ * "Open" — re-running from the menu while a turn is live or unread output
+ * is waiting would be surprising, not a shortcut.
+ *
+ * `ctx.isOpen` mirrors `TaskCard`'s `isOpen` prop (`task.id ===
+ * selected?.id`): the read/unread entries are suppressed while the run
+ * panel for this task is already open, matching the card's own dot
+ * suppression (messages streamed while open are marked seen on close, not
+ * mid-session).
+ */
+export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): TaskMenuEntry[] {
+  const archived = task.archivedAt != null;
+  const active = task.column === "running" || task.column === "blocked";
+  const awaiting = task.pendingInteractionCount > 0 || task.column === "blocked";
+  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
+  // step tasks do (see `isPipelineParent` below) — so `hasOpenableRun` alone
+  // would forever gate the "Run" entry open even once the pipeline has
+  // actually executed. `hasOpenablePipelineRun` is the parent-shaped
+  // equivalent: once any step execution has landed in history, there's
+  // something worth opening the run view for, and Retry/Restart live there
+  // instead of the card (M15, docs/plans/pipelines.md review).
+  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  // A pipeline PARENT task (`pipelineId` set) opens the full-page run view
+  // instead of the run panel — "Open pipeline" replaces "Open details" as
+  // the first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP
+  // task (`pipelineParentId` set) can't be deleted/archived/unarchived
+  // individually — the parent owns its lifecycle (409 server-side, D9) — so
+  // those entries never appear for one, even though the board never
+  // renders a menu for a step row today (D11 hides them from the board).
+  const isPipelineParent = task.pipelineId != null;
+  const isStepTask = task.pipelineParentId != null;
+  // Stop is only honoured server-side for a pipeline PARENT while its run
+  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
+  // otherwise — e.g. a `blocked` run with nothing live), so the entry gates
+  // on `pipelineRun.status`, not the column (L-A1). Mirrors `TaskCard`.
+  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" : active;
+
+  const entries: TaskMenuEntry[] = [];
+
+  // primary
+  if (isPipelineParent) {
+    entries.push({ action: "open-pipeline", label: "Open pipeline", group: "primary" });
+  } else {
+    entries.push({ action: "open", label: "Open details", group: "primary" });
+  }
+  if (!archived && !awaiting && !active && !openable && !importedSessionOf(task)) {
+    entries.push({ action: "start", label: "Run", group: "primary" });
+  }
+  if (stoppable && !archived) {
+    entries.push({ action: "stop", label: "Stop", group: "primary" });
+  }
+  // A resumable fx pause (see TaskFxRecovery) offers its own quick actions
+  // right after Stop — "Resume paused response" whenever the task is
+  // sitting on one, and "Cancel auto-resume" additionally whenever the
+  // orchestrator has a pending timer armed for it (`fxRecovery.autoResume`
+  // non-null). Both are hidden once archived — archiving clears the row.
+  if (isTaskFxPaused(task) && !archived) {
+    entries.push({ action: "resume-recovery", label: "Resume paused response", group: "primary" });
+    if (task.fxRecovery?.autoResume) {
+      entries.push({ action: "cancel-auto-resume", label: "Cancel auto-resume", group: "primary" });
+    }
+  }
+  if (task.column === "review" && !archived) {
+    entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
+  }
+  if (!archived && !isStepTask && (task.column === "done" || active)) {
+    entries.push({ action: "archive", label: active ? "Stop & archive…" : "Archive", group: "primary" });
+  }
+  if (archived && !isStepTask) {
+    entries.push({ action: "unarchive", label: "Unarchive", group: "primary" });
+  }
+
+  // inspect
+  entries.push({ action: "diff", label: "View changes", group: "inspect" });
+  entries.push({ action: "open-in-finder", label: "Open in Finder", group: "inspect" });
+  if (task.prUrl) {
+    entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
+  }
+  if (task.issueUrl) {
+    entries.push({ action: "view-issue", label: "View issue", group: "inspect" });
+  }
+
+  // utility — read/unread + copy entries share one group so they render as a
+  // single block (see the `TaskMenuGroup` doc comment). "unread" is only
+  // ever honest to flip when the task has actually produced an assistant
+  // message; `hasAssistantMessages` is what lets "Mark as unread" avoid
+  // re-flagging a task that never said anything.
+  if (task.unread === true && !ctx.isOpen) {
+    entries.push({ action: "mark-read", label: "Mark as read", group: "utility" });
+  }
+  if (!task.unread && !ctx.isOpen && task.hasAssistantMessages === true) {
+    entries.push({ action: "mark-unread", label: "Mark as unread", group: "utility" });
+  }
+  if (task.branch) {
+    entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
+  }
+  if (task.worktreePath) {
+    entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
+  }
+
+  // danger — always last. A step task can't be deleted individually — the
+  // parent pipeline task owns its lifecycle (409 server-side, D9).
+  if (!isStepTask) {
+    entries.push({ action: "delete", label: "Delete…", group: "danger", danger: true });
+  }
+
+  return entries;
+}

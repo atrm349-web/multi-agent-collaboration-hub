@@ -1,0 +1,891 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import * as p from "@clack/prompts";
+import { getClient, type Flags } from "../context.ts";
+import { c, out, printJson, isTTY } from "../output.ts";
+import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
+import { flagValue } from "../args.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag } from "../usage.ts";
+import { resolveRefs, warnMissingRefs } from "../refs.ts";
+import {
+  discoveredExtensionNames,
+  existsInLiveScope,
+  filterUnresolvedRefs,
+  unresolvedWarningLine,
+  verifyTokensViaSearch,
+  warnUnresolvedRefs,
+} from "../at-warn.ts";
+import { fileScopeForTask } from "../tui/at-complete.ts";
+import {
+  parseIssueUrl,
+  sameIssueUrl,
+  issueTaskTitle,
+  renderIssueThreadMarkdown,
+  buildIssueTaskPrompt,
+  inferTaskTypeFromLabels,
+} from "../../shared/issue-task.ts";
+import {
+  AGENT_OPTIONS,
+  DEFAULT_MODEL,
+  DEFAULT_EFFORT,
+  CATALOG_SCOPED_KINDS,
+  supportedEfforts,
+  cursorModelIdCoveredByCatalog,
+  defaultModeFor,
+  type AgentKind,
+  type AgentOption,
+  type AgentProfile,
+  type Harness,
+  type OpencodeServerMode,
+  type Pipeline,
+  type Speed,
+} from "../../shared/types.ts";
+import { opencodeMajor } from "../../shared/opencode.ts";
+import { isSpeed, supportedSpeeds, SPEED_OPTIONS } from "../../shared/speed.ts";
+import {
+  mergeModelOptions,
+  discoveredEffortsFor,
+  type DiscoveredModel,
+  type ModelOption,
+} from "../../shared/model-options.ts";
+import { buildFileEntries } from "../../shared/at-file-filter.ts";
+import { unresolvedAtTokens } from "../../shared/at-refs.ts";
+import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
+import { matchPipelineRef } from "../../shared/pipeline.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+
+interface AddOpts {
+  title?: string;
+  prompt?: string;
+  promptFile?: string;
+  agent?: string;
+  model?: string;
+  mode?: string;
+  effort?: string;
+  /** `--speed <tier>`, or its `--fast` (`fast`) / `--no-fast` (`off`)
+   *  aliases — whichever came last on the command line. */
+  speed?: Speed;
+  maxMode?: boolean;
+  /** `--opencode-server shared|standalone` — OpenCode 2's server option
+   *  (validated by `parseOpencodeServerFlag`). A launch flag like the six
+   *  above, so `--profile`/`--pipeline` refuse it too. */
+  opencodeServer?: OpencodeServerMode;
+  workdir?: string;
+  isolation?: "worktree" | "none";
+  baseRef?: string;
+  type?: string;
+  start?: boolean;
+  refs: string[];
+  /** Seed title/prompt from a GitHub/GitLab/Bitbucket issue + its comment
+   *  thread — resolved against `--workdir` (or cwd) in `cmdAdd`. */
+  issue?: string;
+  /** `--profile <id|name>` — launch from a saved {@link AgentProfile} instead
+   *  of picking harness/model/mode/effort by hand. Mutually exclusive with
+   *  those four flags (plus --speed/--fast/--max-mode) — enforced by
+   *  `assertProfileFlagCombo` before either the non-interactive or wizard
+   *  path runs. Resolved to an id via `matchAgentProfileRef` in `cmdAdd`. */
+  profile?: string;
+  /** `--pipeline <id|name>` — launch a {@link Pipeline} instead of a single
+   *  agent. The created task becomes the pipeline's parent (board) task; the
+   *  pipeline itself defines every step's harness/model/mode/effort, so this
+   *  is mutually exclusive with `--profile` and the six manual-launch flags
+   *  — enforced by `assertPipelineFlagCombo`. Resolved to an id via
+   *  `matchPipelineRef` in `cmdAdd`. */
+  pipeline?: string;
+}
+
+export function parseAdd(args: string[]): AddOpts {
+  const o: AddOpts = { refs: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
+    switch (a) {
+      case "--title": o.title = val(); break;
+      case "--prompt": o.prompt = val(); break;
+      case "--prompt-file": o.promptFile = val(true); break;
+      case "--agent": o.agent = val(); break;
+      case "--model": o.model = val(); break;
+      case "--mode": o.mode = val(); break;
+      case "--effort": o.effort = val(); break;
+      case "--speed": o.speed = parseSpeedFlag(val()); break;
+      case "--fast": o.speed = "fast"; break;
+      case "--no-fast": o.speed = "off"; break;
+      case "--max-mode": o.maxMode = true; break;
+      case "--no-max-mode": o.maxMode = false; break;
+      case "--opencode-server": o.opencodeServer = parseOpencodeServerFlag(val()); break;
+      case "--workdir": o.workdir = val(); break;
+      case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
+      case "--base-ref": o.baseRef = val(); break;
+      case "--type": o.type = val(); break;
+      case "--ref": o.refs.push(val()); break;
+      case "--start": o.start = true; break;
+      case "--issue": o.issue = val(); break;
+      case "--profile": o.profile = val(); break;
+      case "--pipeline": o.pipeline = val(); break;
+      default: break;
+    }
+  }
+  return o;
+}
+
+/** Whether any of the manual harness/model/mode/effort/speed/maxMode/
+ *  opencode-server flags were given — the block `--profile`/`--pipeline` each replace
+ *  wholesale. Shared by `assertProfileFlagCombo`/`assertPipelineFlagCombo`
+ *  (flag-vs-flag conflicts) and the wizard's Pipeline-step gating below (m20
+ *  review fix) so the two can't drift. */
+function hasManualLaunchFlags(o: AddOpts): boolean {
+  return (
+    o.agent !== undefined ||
+    o.model !== undefined ||
+    o.mode !== undefined ||
+    o.effort !== undefined ||
+    o.speed !== undefined ||
+    o.maxMode !== undefined ||
+    o.opencodeServer !== undefined
+  );
+}
+
+/** `--profile` replaces the whole harness/model/mode/effort/speed/maxMode
+ *  block — the profile defines those — so combining it with any of the six
+ *  flags that set them by hand is a usage error, in both the non-interactive
+ *  and wizard paths (checked once, up front, before either runs). */
+function assertProfileFlagCombo(o: AddOpts): void {
+  if (!o.profile) return;
+  if (hasManualLaunchFlags(o)) {
+    throw new Error(
+      "--profile cannot be combined with --agent/--model/--mode/--effort/--speed/--fast/--max-mode/--opencode-server (the agent defines them)",
+    );
+  }
+}
+
+/** `--pipeline` replaces the whole harness/model/mode/effort/speed/maxMode
+ *  block too — a pipeline's steps carry their own agent profiles — AND
+ *  `--profile` (a task is either a pipeline's parent or launched from a
+ *  single agent profile, never both). Checked once, up front, mirroring
+ *  `assertProfileFlagCombo`. */
+function assertPipelineFlagCombo(o: AddOpts): void {
+  if (!o.pipeline) return;
+  if (o.profile !== undefined || hasManualLaunchFlags(o)) {
+    throw new Error(
+      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--speed/--fast/--max-mode/--opencode-server (the pipeline defines the launch)",
+    );
+  }
+}
+
+export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
+  const o = parseAdd(args);
+  assertProfileFlagCombo(o);
+  assertPipelineFlagCombo(o);
+  let prompt = o.prompt;
+  if (o.promptFile) {
+    prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
+  }
+
+  // The user-typed prompt, if any, exactly as supplied via `--prompt` or
+  // `--prompt-file` — snapshotted here, BEFORE the `--issue` block below may
+  // compose the thread body into `prompt` via `??=`, so it's provably
+  // pre-composition regardless of which path runs next. This is what
+  // `restrictTo` filters against for an `--issue` add (below): the wizard
+  // never independently solicits additional prompt text for an issue task —
+  // `wizard()`'s `prefilledPrompt` param is always already non-null by the
+  // time it's called (either this snapshot, when the user passed
+  // `--prompt`/`--prompt-file`, or the composed thread body otherwise), so
+  // its own `p.text` prompt question never fires — meaning nothing after
+  // this point can add more genuinely user-typed content for an issue task,
+  // in either the TTY (wizard) or non-interactive (flag) path.
+  const userTypedPrompt = prompt ?? null;
+
+  // Captured BEFORE the `--issue` block below fills in title/prompt
+  // fallbacks — otherwise every `--issue` invocation would look "explicit"
+  // and `chooseAddPath` would always skip the wizard (see fix #3).
+  const explicit = Boolean(o.title) && Boolean(prompt);
+
+  const client = await getClient(flags);
+
+  // `--issue <url>` seeds title/prompt from the issue + its comment thread
+  // (same route the app's issue dialogs and New Task form use) and stamps
+  // `issueUrl`/`issueSnapshot` onto the created task. Resolved against
+  // `--workdir` (or cwd) since the thread fetch needs a repo to match against.
+  let issueUrl: string | undefined;
+  let issueSnapshot: string | undefined;
+  // Set from `thread.commentsError` when the issue loaded but its comment
+  // thread couldn't be fetched (e.g. GitLab's 401-to-anonymous `/notes` even
+  // on a public project) — surfaced as a terminal warning below, and folded
+  // into the `--json` result's `warnings` array instead of the plain-text
+  // print, matching the dialog/form's non-blocking treatment of the same
+  // signal.
+  let issueWarning: string | undefined;
+  if (o.issue) {
+    const parsed = parseIssueUrl(o.issue);
+    if (!parsed) throw new Error("--issue: not a recognized GitHub/GitLab/Bitbucket issue URL");
+    // Resolve relative to the CLI's cwd (not the daemon's — see `baseInput`'s
+    // comment) so the thread fetch and the eventual task both land on the
+    // same absolute path the user meant.
+    const workdir = path.resolve(o.workdir ?? process.cwd());
+    o.workdir = workdir;
+    const thread = await client.getIssueThread(workdir, parsed.number);
+    if (!sameIssueUrl(thread.item.htmlUrl, o.issue)) {
+      throw new Error("--issue: that issue belongs to a different repository than --workdir");
+    }
+    o.title ??= issueTaskTitle(thread.item);
+    prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
+    // An explicit `--type` stays authoritative; only fill it from the
+    // issue's own labels (e.g. `bug`, `kind/defect`, `spike`) when the user
+    // didn't pass one — mirrors the "Work on this with Agetor" dialog's
+    // Type-picker seeding (`CreateTaskFromIssueDialog`). Checked with
+    // `?.trim()` rather than `??=`: `flagValue` returns `""` for a bare
+    // `--type ""`, which `??=` would leave alone, silently falling through
+    // to the server's default type instead of the issue's labels.
+    if (!o.type?.trim()) o.type = inferTaskTypeFromLabels(thread.item.labels);
+    issueUrl = thread.item.htmlUrl;
+    issueSnapshot = renderIssueThreadMarkdown(thread);
+    if (thread.commentsError) {
+      issueWarning = thread.commentsError;
+      if (!flags.json) out(c.yellow("⚠ comments not fetched — " + thread.commentsError));
+    }
+  }
+
+  let input: CreateTaskInput | null;
+  if (chooseAddPath({ explicit, isTTY, json: flags.json }) === "non-interactive") {
+    if (!(o.title && prompt)) {
+      throw new Error(
+        "agetor add needs --title and --prompt (or --prompt-file), or --issue <url>, when not run interactively",
+      );
+    }
+    // An explicit `--mode` is never touched; only fill the gap a scripted
+    // add would otherwise leave (see `defaultNonInteractiveMode`'s doc). A
+    // `--profile`/`--pipeline` add ignores mode entirely (the profile/
+    // pipeline supplies it), so skip the fill rather than compute a default
+    // `baseInput` will discard.
+    if (!o.mode && !o.profile && !o.pipeline) o.mode = defaultNonInteractiveMode(o.agent);
+    let profileId: string | undefined;
+    if (o.profile) {
+      const result = matchAgentProfileRef(await client.listAgentProfiles(), o.profile);
+      if ("error" in result) throw new Error(asProfileError(result.error));
+      profileId = result.profile.id;
+    }
+    let pipelineId: string | undefined;
+    if (o.pipeline) {
+      const result = matchPipelineRef(await client.listPipelines(), o.pipeline);
+      if (!result.ok) throw new Error(result.error);
+      pipelineId = result.pipeline.id;
+    }
+    input = baseInput(o, o.title, prompt, profileId, pipelineId);
+  } else {
+    input = await wizard(client, o, prompt);
+  }
+  if (!input) {
+    out("cancelled");
+    return;
+  }
+  if (issueUrl) {
+    input.issueUrl = issueUrl;
+    input.issueSnapshot = issueSnapshot;
+  }
+  if (input.references?.length) warnMissingRefs(input.references);
+
+  // Match the app's "Run task": create in "ready" when starting immediately.
+  if (o.start) input.column = "ready";
+
+  const task = await client.createTask(input);
+
+  // `restrictTo` matches the `--start`/pre-check paths below: an `--issue`
+  // task's composed prompt quotes issue text full of `@octocat`-style
+  // mentions that must not trigger the warning — only tokens the user
+  // themselves typed (into `--prompt`, `--prompt-file`, or the wizard's
+  // interactive prompt — captured above as `userTypedPrompt`, never
+  // `--title`) count. A plain add's whole prompt is user-typed, so no
+  // restriction is needed.
+  // An `--issue` add with no user-typed prompt has NO user-typed tokens at
+  // all — restrict to the empty string (warn on nothing) rather than null
+  // (warn on everything), or the composed thread body's quoted third-party
+  // `@mentions` would all read as "won't resolve".
+  const restrictTo = o.issue ? (userTypedPrompt ?? "") : null;
+  let unresolvedRefsWarning: string[] = [];
+
+  let started = false;
+  // A failed start (e.g. a pipeline whose step profile was deleted, a
+  // logged-out harness, a missing binary) used to be swallowed into a bare
+  // `started: false` — the task exists, so the add itself isn't a failure,
+  // but the reason must reach the user (L-CLI9): a plain `! start failed:`
+  // line, or a `warnings` entry under --json.
+  let startError: string | null = null;
+  if (o.start) {
+    try {
+      const startRes = await client.startTask(task.id);
+      started = true;
+      if (startRes.unresolvedRefs?.length) {
+        const extensionNames = await discoveredExtensionNames(client, task);
+        unresolvedRefsWarning = filterUnresolvedRefs(startRes.unresolvedRefs, { extensionNames, restrictTo });
+      }
+    } catch (e) {
+      started = false;
+      startError = `start failed: ${(e as Error)?.message ?? String(e)}`;
+    }
+  } else if (restrictTo !== "" && input.prompt.includes("@")) {
+    // Task wasn't started, so there's no server-side send-time expansion to
+    // ask — advisory client-side pre-check instead: list the scope the task
+    // will actually run in (the same `fileScopeForTask` table `RunPanel` /
+    // the TUI composer use, CLAUDE.md §12) and flag any `@`-token the user
+    // typed that won't resolve there. Never blocks or fails the add; a
+    // listing that errored or came back empty can't prove a token
+    // unresolved, so it's skipped silently rather than false-warning.
+    // `restrictTo === ""` (an `--issue` add with no user-typed prompt) is
+    // checked above before this branch even runs: every candidate token
+    // would be filtered out anyway, so there's no reason to pay for the
+    // listing fetch.
+    try {
+      const scope = fileScopeForTask(task);
+      const listing = await client.listProjectFiles(scope);
+      if (listing.files.length > 0) {
+        const validPaths = new Set(buildFileEntries(listing.files).map((e) => e.path));
+        let unresolvedTokens = unresolvedAtTokens(input.prompt, validPaths);
+        if (scope.ref == null) {
+          // A LIVE scope (`--isolation none`) runs on this same machine, so
+          // mirror the server's real oracle directly: a gitignored-but-
+          // present path (e.g. `@.env`) isn't in the listing but DOES exist
+          // on disk, and send-time expansion will resolve it — must not warn.
+          unresolvedTokens = unresolvedTokens.filter((t) => !existsInLiveScope(scope.dir, t.path));
+        }
+        if (listing.truncated) {
+          // A TRUNCATED listing (the 20k `MAX_PROJECT_FILES` cap — a
+          // monorepo) can't tell "not present" from "present but past the
+          // cap" apart, so a token missing from it isn't provably
+          // unresolved — unlike the untruncated branch below, which can
+          // warn on `unresolvedTokens` directly. Shrink to the candidates
+          // that would otherwise warn (extension mentions and non-user-typed
+          // tokens are exempt regardless of what a search would find, so
+          // there's no reason to spend a round-trip on them) and verify each
+          // one via the server's full-depth search before trusting it as
+          // missing (`verifyTokensViaSearch`, CLAUDE.md §12's webview
+          // parity). Only PROVEN-missing tokens warn.
+          const extensionNames = await discoveredExtensionNames(client, task);
+          const candidateRaws = new Set(
+            filterUnresolvedRefs(
+              unresolvedTokens.map((t) => t.raw),
+              { extensionNames, restrictTo },
+            ),
+          );
+          const candidates = unresolvedTokens.filter((t) => candidateRaws.has(t.raw));
+          if (candidates.length) {
+            const missing = await verifyTokensViaSearch(client, scope, candidates);
+            unresolvedRefsWarning = missing.map((t) => t.raw);
+          }
+        } else {
+          const rawUnresolved = unresolvedTokens.map((t) => t.raw);
+          if (rawUnresolved.length) {
+            const extensionNames = await discoveredExtensionNames(client, task);
+            unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
+          }
+        }
+      }
+    } catch {
+      // listing failed — skip silently, see comment above.
+    }
+  }
+
+  if (flags.json) {
+    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning), startError].filter(
+      (w): w is string => Boolean(w),
+    );
+    return printJson(warnings.length ? { task, started, warnings } : { task, started });
+  }
+  out(
+    `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${escapeFreeText(task.title)}` +
+      (started ? c.cyan("  ▸ started") : ""),
+  );
+  if (startError) out(c.yellow(`  ! ${escapeFreeText(startError)}`));
+  warnUnresolvedRefs(unresolvedRefsWarning);
+  if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
+}
+
+/** Pure decision of whether `agetor add` should run non-interactively (a
+ *  ready-made title+prompt already in hand) or launch the interactive
+ *  wizard — factored out of `cmdAdd` so the branching (fix for `--issue`
+ *  wrongly bypassing the wizard) is testable without driving `@clack/prompts`.
+ *
+ *  Non-interactive whenever: the user explicitly supplied both `--title` and
+ *  a prompt (`--prompt`/`--prompt-file`) themselves — `explicit` must be
+ *  computed BEFORE any `--issue`-derived fallback fills those in, otherwise
+ *  every `--issue` invocation would look "explicit" — or this isn't a real
+ *  terminal (`!isTTY`), or `--json` output was requested (the wizard has no
+ *  JSON rendering). Otherwise (a TTY, no `--json`, and the user didn't fully
+ *  spell it out — e.g. `--issue` alone) the wizard runs, prefilled with
+ *  whatever the caller already resolved (issue-derived title/prompt, etc). */
+export function chooseAddPath(input: {
+  explicit: boolean;
+  isTTY: boolean;
+  json: boolean;
+}): "non-interactive" | "wizard" {
+  return input.explicit || !input.isTTY || input.json ? "non-interactive" : "wizard";
+}
+
+/**
+ * The `mode` a non-interactive `agetor add` should store when `--mode`
+ * wasn't passed. Before this, the non-interactive path (`baseInput`)
+ * forwarded `o.mode` verbatim, so a scripted add with no `--mode` stored
+ * `null` and the task spawned on whatever bare fallback the driver picks at
+ * launch time rather than the picker's own default — for fx specifically
+ * that meant `auto` (its interactive-review mode, which stalls without a
+ * Gateway reviewer on most accounts) instead of `yolo` ("Full access"), even
+ * though `AGENT_OPTIONS.fx.modes[0]` is `yolo` and every picker (webview,
+ * the wizard below) defaults to it.
+ *
+ * Delegates to the shared `defaultModeFor(kind)` (`src/shared/types.ts`,
+ * `AGENT_OPTIONS[kind].modes[0]?.id ?? "auto"`) — the one place "what does
+ * an unset mode mean" lives, per `docs/plans/fx-recovery-follow-ups.md` §3.6
+ * (also used by `reconcileTaskSession`, the webview's `nullModeFallback` and
+ * `onAgentChange` reset, and every `buildCommand`/`spawnAgent` fallback).
+ * Mirrors the exact expression the interactive wizard's own Mode picker
+ * seeds from (see the `pickOption` call in `wizard()` below) so a scripted
+ * add matches what a human would get from pressing Enter on that step.
+ * `agent` is a harness id — the raw `--agent` flag, or `undefined` when
+ * omitted. For every BUILT-IN harness (the normal `--agent fx` / `--agent
+ * codex` / … usage) the id equals its `AgentKind` verbatim (seeded that way
+ * by migrations 032/037/046), so no async harness lookup is needed here the
+ * way the wizard needs one; an unrecognized custom-account harness id, or an
+ * omitted `--agent`, falls back to `claude-code`'s modes — the same `??
+ * "claude-code"` fallback the wizard uses when a harness can't be found by
+ * id. The declared return type stays `string | undefined` (matching the
+ * pre-`defaultModeFor` version of this function) even though the actual
+ * value is never `undefined` in practice — `defaultModeFor` itself falls
+ * back to `"auto"` for a hypothetical future kind with no modes configured,
+ * so this only ever widens, never narrows, what callers can rely on.
+ */
+export function defaultNonInteractiveMode(agent: string | undefined): string | undefined {
+  const kind: AgentKind = (agent && agent in AGENT_OPTIONS ? agent : "claude-code") as AgentKind;
+  return defaultModeFor(kind);
+}
+
+/** `profileId`/`pipelineId`, when given, replace the whole agent/model/mode/
+ *  effort/speed/maxMode block with `agentProfileId`/`pipelineId` — the server
+ *  resolves it and overrides (agent profile) or entirely owns (pipeline)
+ *  those fields (plan §3 D5/routes table, `docs/plans/pipelines.md`'s routes
+ *  table), so sending them here too would be dead weight at best and
+ *  misleading at worst. `pipelineId` wins over `profileId` when somehow both
+ *  are passed (unreachable in practice — `assertPipelineFlagCombo` already
+ *  rejects `--pipeline` + `--profile` together before either resolves). */
+function baseInput(
+  o: AddOpts,
+  title: string,
+  prompt: string,
+  profileId?: string,
+  pipelineId?: string,
+): CreateTaskInput {
+  const input: CreateTaskInput = {
+    title,
+    prompt,
+    // Resolve relative to the CLI's cwd (not the daemon's — it may be a
+    // long-lived detached process with a stale/unrelated cwd) so a typed or
+    // `--workdir`-flagged relative path lands on disk where the user meant,
+    // matching `projects add`'s path.resolve(target).
+    workdir: o.workdir ? path.resolve(o.workdir) : o.workdir,
+    isolation: o.isolation,
+    baseRef: o.baseRef,
+    taskType: o.type,
+    references: resolveRefs(o.refs),
+  };
+  if (pipelineId) {
+    input.pipelineId = pipelineId;
+  } else if (profileId) {
+    input.agentProfileId = profileId;
+  } else {
+    input.agent = o.agent;
+    input.model = o.model;
+    input.mode = o.mode;
+    input.effort = o.effort;
+    input.speed = o.speed;
+    input.maxMode = o.maxMode;
+    input.opencodeServer = o.opencodeServer;
+  }
+  return input;
+}
+
+/** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
+ *  when it is still offerable — a curated row for the kind, or an id the
+ *  harness's discovered catalog actually lists (fx accounts can carry
+ *  discovered-only ids) — else the kind's default. Mirrors the two webview
+ *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
+ *  2026-03-09 and cleared by migration 049) can't be re-offered as the
+ *  pre-selected default via mergeModelOptions' unlisted-row rule. `loggedIn`
+ *  mirrors mergeModelOptions rule 7: a logged-out harness's discovered
+ *  catalog is untrustworthy (an expired login reads back the unauthenticated
+ *  catalog), so it is not consulted — only curated rows can keep the pref. */
+export function resolveInitialModel(
+  kind: AgentKind,
+  stored: string | undefined | null,
+  discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null = null,
+): string {
+  const offerable = loggedIn === false ? [] : discovered;
+  if (
+    stored &&
+    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || offerable.some((m) => m.id === stored))
+  ) {
+    return stored;
+  }
+  return DEFAULT_MODEL[kind];
+}
+
+async function wizard(
+  client: AgetorClient,
+  o: AddOpts,
+  prefilledPrompt: string | undefined,
+): Promise<CreateTaskInput | null> {
+  p.intro(c.cyan("New Agetor task"));
+
+  const title =
+    o.title ??
+    (await p.text({
+      message: "Title",
+      validate: (v) => (v && v.trim() ? undefined : "required"),
+    }));
+  if (p.isCancel(title)) return cancelled();
+
+  const prompt =
+    prefilledPrompt ??
+    (await p.text({
+      message: "Prompt",
+      validate: (v) => (v && v.trim() ? undefined : "required"),
+    }));
+  if (p.isCancel(prompt)) return cancelled();
+
+  // Load harnesses + saved preferences once, for the agent / model / mode /
+  // effort defaults — so the common picks are a single Enter.
+  const { harnesses, statuses } = await client
+    .listHarnesses()
+    .catch(() => ({ harnesses: [], statuses: [] }));
+  const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
+  // Kind-level catalog (older-daemon-safe fallback) and per-harness catalog
+  // (what the app's pickers actually use — a second fx harness with its own
+  // account sees its own list). Each is independently `.catch`-guarded so a
+  // daemon that hasn't landed `/agent-models/harnesses` yet (or either probe
+  // failing outright) degrades to the kind map instead of crashing the
+  // wizard — see plan §3 D6.
+  const discovered = await client
+    .agentModels()
+    .catch(() => ({}) as Record<string, DiscoveredModel[]>);
+  const harnessModels = await client
+    .harnessModels()
+    .catch(() => ({ ready: true, byHarness: {} as Record<string, DiscoveredModel[]> }));
+
+  // Pipeline step: a first "Pipeline" pick over saved pipelines (plus a
+  // "None — launch a single agent" escape hatch), shown only when at least
+  // one pipeline exists, `--pipeline` wasn't already given on the command
+  // line, AND neither `--profile` nor any manual harness/model/mode/effort/
+  // speed/max-mode flag was given (m20 review fix) — mirroring
+  // `assertPipelineFlagCombo`'s exclusivity: those flags already commit the
+  // task to a single-agent launch, so offering a Pipeline pick here would
+  // let a wizard answer silently override (or conflict with) a flag the
+  // user already set on the command line. Picking a pipeline skips the
+  // Profile step and the harness/model/mode/effort steps below entirely —
+  // the pipeline's steps supply all of it, the created task is just the
+  // pipeline's parent (board) task.
+  let pipelineId: string | undefined;
+  if (o.pipeline) {
+    const result = matchPipelineRef(await client.listPipelines().catch(() => [] as Pipeline[]), o.pipeline);
+    if (!result.ok) throw new Error(result.error);
+    pipelineId = result.pipeline.id;
+  } else if (!o.profile && !hasManualLaunchFlags(o)) {
+    const pipelines = await client.listPipelines().catch(() => [] as Pipeline[]);
+    if (pipelines.length > 0) {
+      const NONE = "__none__";
+      const pick = await p.select({
+        message: "Pipeline",
+        options: [
+          { value: NONE, label: "None — launch a single agent" },
+          ...pipelines.map((pl) => ({
+            value: pl.id,
+            label: escapeControlChars(pl.name),
+            hint: `${pl.graph.steps.length} step${pl.graph.steps.length === 1 ? "" : "s"}`,
+          })),
+        ],
+      });
+      if (p.isCancel(pick)) return cancelled();
+      if (pick !== NONE) pipelineId = pick;
+    }
+  }
+
+  // Agent-profile step: a first "Profile" pick over saved profiles (plus a
+  // "Pick harness manually" escape hatch), shown only when at least one
+  // profile exists, `--profile` wasn't already given on the command line,
+  // and no pipeline was picked above. Picking a profile skips the harness/
+  // model/mode/effort steps below entirely (and their pref writes) — the
+  // profile supplies all of it.
+  let profileId: string | undefined;
+  if (!pipelineId) {
+    if (o.profile) {
+      const result = matchAgentProfileRef(
+        await client.listAgentProfiles().catch(() => [] as AgentProfile[]),
+        o.profile,
+      );
+      if ("error" in result) throw new Error(asProfileError(result.error));
+      profileId = result.profile.id;
+    } else {
+      const profiles = await client.listAgentProfiles().catch(() => [] as AgentProfile[]);
+      if (profiles.length > 0) {
+        const MANUAL = "__manual__";
+        const pick = await p.select({
+          message: "Profile",
+          options: [
+            ...profiles.map((pr) => ({
+              value: pr.id,
+              label: escapeControlChars(pr.name),
+              hint: escapeControlChars(
+                agentProfileSummary({
+                  harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
+                  model: pr.model,
+                  effort: pr.effort,
+                  mode: pr.mode,
+                }),
+              ),
+            })),
+            { value: MANUAL, label: "Pick harness manually" },
+          ],
+        });
+        if (p.isCancel(pick)) return cancelled();
+        if (pick !== MANUAL) profileId = pick;
+      }
+    }
+  }
+
+  let agent = o.agent;
+  let model = o.model;
+  let mode = o.mode;
+  let effort = o.effort;
+  let speed = o.speed;
+  // Only a speed the user actually picked is remembered — a kind/model with
+  // nothing beyond "off" must not overwrite `lastSpeed:<kind>`.
+  let speedPicked = false;
+  let opencodeServer = o.opencodeServer;
+  let kind: AgentKind | undefined;
+
+  if (!profileId && !pipelineId) {
+    if (!agent) {
+      const enabled = harnesses.filter((h) => h.enabled !== false);
+      if (enabled.length > 0) {
+        const def = prefs.defaultHarness;
+        const pick = await p.select({
+          message: "Agent",
+          options: enabled.map((h) => ({ value: h.id, label: h.label, hint: h.kind })),
+          initialValue: enabled.some((h) => h.id === def) ? def : undefined,
+        });
+        if (p.isCancel(pick)) return cancelled();
+        agent = pick;
+      }
+    }
+
+    kind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
+
+    // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
+    // an additional `fx-2` account from the built-in `fx`); fall back to the
+    // kind-level map for an older daemon without `/agent-models/harnesses`.
+    // Computed once agent/kind are known so the model picker and the effort
+    // prompt below read the same discovered list.
+    // Spec'd cursor models show as one base row + effort dropdown, not N
+    // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
+    const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
+      (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
+    );
+    const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
+
+    // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
+    // through — house convention); otherwise the stored `lastModel:<kind>`
+    // pref only while it is still offerable (`resolveInitialModel`, which
+    // mirrors the webview pickers' validation and rule 7's logged-out
+    // distrust), else the kind's default.
+    const initial = o.model ?? resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
+
+    // Hoisted so both the model picker and the effort prompt below read the
+    // same merged rows — computed unconditionally (not just inside the
+    // `!model` branch) since `--model` can be passed without `--effort`, and
+    // the effort prompt still needs rule-7/8-honoring `efforts` per model.
+    const modelOptions = mergeModelOptions({
+      curated: AGENT_OPTIONS[kind].models,
+      discovered: catalog,
+      selected: initial,
+      scoped: CATALOG_SCOPED_KINDS.has(kind),
+      loggedIn,
+    });
+
+    if (!model) {
+      const picked = await pickOption("Model", modelOptions, initial);
+      if (picked === null) return cancelled();
+      model = picked;
+    }
+    if (!mode) {
+      const picked = await pickOption("Mode", AGENT_OPTIONS[kind].modes, prefs[`lastMode:${kind}`] ?? AGENT_OPTIONS[kind].modes[0]?.id);
+      if (picked === null) return cancelled();
+      mode = picked;
+    }
+    if (!effort) {
+      // Efforts must come from the merged rows, never the raw discovered
+      // catalog — `modelOptions` already honours rule 7 (a logged-out
+      // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
+      // computed per merged row), so reading `catalog` directly here would
+      // bypass both.
+      const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
+      if (efforts.length > 0) {
+        const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
+        if (picked === null) return cancelled();
+        effort = picked;
+      }
+    }
+    if (speed === undefined) {
+      // Only offered when the model has a tier beyond "off": cursor's Fast
+      // variants, or the fx speed options discovery reported for this model
+      // (the merged row carries rule 8's `fast`/`ultrafast` flags). Anything
+      // else launches at "off" without a prompt.
+      const choices = wizardSpeedChoices(kind, model ?? null, effort ?? null, modelOptions);
+      if (choices.length > 0) {
+        const stored = prefs[`lastSpeed:${kind}`];
+        const picked = await pickOption(
+          "Speed",
+          choices,
+          isSpeed(stored) && choices.some((opt) => opt.id === stored) ? stored : "off",
+        );
+        if (picked === null) return cancelled();
+        speed = picked as Speed;
+        speedPicked = true;
+      } else {
+        speed = "off";
+      }
+    }
+    if (opencodeServer === undefined) {
+      // OpenCode 2 (or an unknown version) only, and not for a harness with
+      // its own home, which always runs standalone — the same rule as the
+      // app's OpenCode server picker. Otherwise nothing is sent and the core
+      // stores its default ("shared").
+      const harness = harnesses.find((h) => h.id === agent);
+      const version = statuses.find((s) => s.harnessId === agent)?.version ?? null;
+      const choices = wizardOpencodeServerChoices(kind, harness, version);
+      if (choices.length > 0) {
+        const picked = await pickOption("OpenCode server", choices, "shared");
+        if (picked === null) return cancelled();
+        opencodeServer = picked as OpencodeServerMode;
+      }
+    }
+  }
+
+  let workdir = o.workdir;
+  if (!workdir) {
+    const projects = (await client.listProjects().catch(() => [])) as Array<{
+      path: string;
+      name?: string;
+    }>;
+    const pick = await p.select({
+      message: "Working directory",
+      options: [
+        ...projects.map((pr) => ({ value: pr.path, label: pr.name ?? pr.path, hint: pr.path })),
+        { value: "__other__", label: "Other (type a path)…" },
+      ],
+    });
+    if (p.isCancel(pick)) return cancelled();
+    if (pick === "__other__") {
+      const typed = await p.text({ message: "Path", placeholder: process.cwd() });
+      if (p.isCancel(typed)) return cancelled();
+      workdir = typed.trim() || process.cwd();
+    } else {
+      workdir = pick;
+    }
+  }
+
+  const start = await p.confirm({ message: "Start it now?", initialValue: false });
+  if (p.isCancel(start)) return cancelled();
+  o.start = start;
+
+  // Remember the picks so the next `add` defaults to them — skipped entirely
+  // for a profile- or pipeline-launched task (D12: no "last used profile"
+  // preference, and the profile's/pipeline's own values shouldn't leak into
+  // the manual defaults).
+  if (!profileId && !pipelineId && kind) {
+    await persistPrefs(client, kind, { model, mode, effort, speed: speedPicked ? speed : undefined });
+  }
+
+  p.outro(c.green("creating…"));
+  return baseInput(
+    { ...o, agent, model, mode, effort, speed, opencodeServer, workdir },
+    title,
+    prompt,
+    profileId,
+    pipelineId,
+  );
+}
+
+/** The wizard's OpenCode server step rows (Shared / Standalone, same copy as
+ *  the app's picker), or `[]` when the step doesn't apply: a kind other than
+ *  opencode, OpenCode 1 (no `--standalone`, no background service — a
+ *  missing or unparseable version counts as 2, per `opencodeMajor`), or a
+ *  harness with its own home (Standalone is forced, so there's no choice). */
+export function wizardOpencodeServerChoices(
+  kind: AgentKind,
+  harness: Pick<Harness, "home"> | null | undefined,
+  version: string | null | undefined,
+): AgentOption[] {
+  if (kind !== "opencode") return [];
+  if (opencodeMajor(version) !== 2) return [];
+  if (harness?.home && harness.home.trim() !== "") return [];
+  return [
+    {
+      id: "shared",
+      label: "Shared",
+      hint: "Runs through OpenCode's background service (faster start, shared with your other OpenCode clients)",
+    },
+    { id: "standalone", label: "Standalone", hint: "Starts a private OpenCode server for each turn" },
+  ];
+}
+
+/** The Speed step's rows for the wizard: the tiers `supportedSpeeds` offers
+ *  for this kind/model/effort — fed the selected merged model row's
+ *  `fast`/`ultrafast` flags (rule 8 copies them from discovery; fx only
+ *  knows its speed options that way) — or `[]` when only `off` is on offer,
+ *  in which case the wizard skips the step and launches at `off`. */
+export function wizardSpeedChoices(
+  kind: AgentKind,
+  model: string | null,
+  effort: string | null,
+  modelOptions: readonly ModelOption[],
+): AgentOption[] {
+  const speeds = supportedSpeeds(kind, model, effort, modelOptions.find((m) => m.id === model));
+  if (speeds.length <= 1) return [];
+  return SPEED_OPTIONS.filter((opt) => speeds.includes(opt.id as Speed));
+}
+
+/** A select that returns the chosen value (or null on cancel), pre-selecting
+ *  `initial` when it's a valid option. Structurally typed (`id`/`label`/
+ *  optional `hint`) rather than `AgentOption[]` so it accepts both plain
+ *  curated rows (modes, efforts) and `mergeModelOptions`'s `ModelOption[]`
+ *  (models) without a cast — both shapes carry the fields this cares about
+ *  and nothing else is read. */
+async function pickOption(
+  message: string,
+  opts: ReadonlyArray<{ id: string; label: string; hint?: string }>,
+  initial: string | undefined,
+): Promise<string | null> {
+  const pick = await p.select({
+    message,
+    options: opts.map((opt) => ({ value: opt.id, label: opt.label, hint: opt.hint })),
+    initialValue: opts.some((opt) => opt.id === initial) ? initial : opts[0]?.id,
+  });
+  return p.isCancel(pick) ? null : (pick as string);
+}
+
+/** Persist the chosen model/mode/effort/speed as the per-kind last-used
+ *  defaults (`lastSpeed:<kind>` is the key the New Task form reads too). */
+export async function persistPrefs(
+  client: AgetorClient,
+  kind: AgentKind,
+  picks: { model?: string; mode?: string; effort?: string; speed?: Speed },
+): Promise<void> {
+  const writes: Array<Promise<unknown>> = [];
+  if (picks.model) writes.push(client.setPreference(`lastModel:${kind}`, picks.model));
+  if (picks.mode) writes.push(client.setPreference(`lastMode:${kind}`, picks.mode));
+  if (picks.effort) writes.push(client.setPreference(`lastEffort:${kind}`, picks.effort));
+  if (picks.speed) writes.push(client.setPreference(`lastSpeed:${kind}`, picks.speed));
+  await Promise.allSettled(writes);
+}
+
+function cancelled(): null {
+  p.cancel("cancelled");
+  return null;
+}

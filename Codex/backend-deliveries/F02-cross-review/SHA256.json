@@ -1,0 +1,18 @@
+{
+  "README.md": "0a0bb69c157e4b3ec03b33c2703431c10877ff55ea4af463c8e331d1b76d7e93",
+  "bridge-tests.log": "b4445596c9d8c95f17a3e91b7dc32b7122fd12f5c5c5311e5fe43d0bfcf39231",
+  "chrome-rerun.log": "189376d0e36ca87c4221e8d3e2c74abe2094af4a6a503ecafec85fb15563e3ef",
+  "frontend-source-lock.json": "c2ecd3d5030660296646a4e35ea0f344475c8eb7335214226fc5c0b659505c16",
+  "inputs/live-f02-i01.json": "83a303d3611bb3e8c827a9ec13a7e851f9ee01a210fac279bf462a2a15dabe76",
+  "inputs/manifest.json": "cc866e669d8a27c4c9ce4732d673c7f706a5e75d1b5154f3e7bdd413cd01a044",
+  "inputs/verify-live-f02-i01.ts": "6d9d807900dbf6a3add43248d46473c9f96361221b8a0908c02e32e089c661f1",
+  "rerun/live-f02-i01.json": "e7217b3b43d87c3775a6f8cbef51d2ccd596c25eaadaae5bec1bbb43860656cb",
+  "rerun/screenshots/live_01_dashboard.png": "b2f2d11f312bca59514bc1db7408696d4571329639050e1ff89f981e2eabdcb4",
+  "rerun/screenshots/live_02_task_center.png": "804f0a72c72b06e5cc6be96a4116b326438f4af6ef096a7149a9b3cde1e29111",
+  "rerun/screenshots/live_03_review_center.png": "6672095020c869fe3dcc201fbccf2ba096c007a36742d47b41e1d0f18fb5b77f",
+  "rerun/screenshots/live_04_artifact_center.png": "8112aa9dbda62672149f883ef3203a42c3a9477e52d084bf6d94f6505d93ab87",
+  "source-check.log": "d582de15f7673f2eca860a7560cd72a414718c18d5db1115737607c1ea3d0a2e",
+  "source-sync.json": "61d5caaf4e875fa787f80073335d87e3808b64da1a0daf4aa866e39bfd93de4b",
+  "verify-controlled-chrome.ts": "4bd4e2136caf6cf333fbbaa899e1145b7e2391146966aa7c5577b0cf18e5e039",
+  "verify-source-sync.ts": "f9b0881cb196846f91520256c0a3f4972db929a435beb7104cb3cfc5c10c2c88"
+}

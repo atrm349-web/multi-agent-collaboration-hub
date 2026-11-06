@@ -1,0 +1,3029 @@
+import { test, expect, describe } from "bun:test";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+// Set data dir before db.ts is loaded transitively (claude-tmux.ts imports
+// it now that the scraper looks up the task's runId).
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-"));
+
+import { __forTest } from "./claude-tmux.ts";
+import { detectAskModal } from "./claude-questions.ts";
+
+const {
+  matchNumberedModal,
+  matchYesNoModal,
+  matchStartupConsentDialog,
+  clearedStabilityGate,
+  matchUnparsableModal,
+  stuckTurnFallbackArmed,
+  MODAL_FOOTER_RE,
+  STUCK_TURN_FALLBACK_MS,
+  WORKING_LINE_RE,
+  MODAL_NOTICE_RE,
+  paneShowsClaudeWorking,
+  WORKING_CHROME_WINDOW_LINES,
+  UNPARSABLE_STABILITY_TICKS,
+  nextUnparsableStreak,
+  unparsableStreakCleared,
+  matchSliderModal,
+  SLIDER_TRACK_RE,
+  SLIDER_TRACK_MIN_CHARS,
+  SLIDER_FOOTER_RE,
+  matchSlashConfirmModal,
+  paneShowsIdleInputBox,
+  STATUS_BAR_RE,
+  IDLE_PROMPT_SEARCH_LINES,
+  pickScrapeMatch,
+  paneShowsBlockingPrompt,
+  idleSettleTick,
+  paneShowsComposerText,
+  SESSION_ONLY_CONFIRM_RE,
+  pickerRowFamily,
+  pickerChoiceIndexForFamily,
+  stripVolatileStatusBarHint,
+  EFFORT_HINT_SUFFIX_RE,
+  TURN_DONE_SUMMARY_RE,
+} = __forTest;
+
+/** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
+ *  same fixture directory claude-questions.test.ts reads from. */
+const fx = (name: string): string =>
+  readFileSync(path.join(import.meta.dir, "fixtures", "askuserquestion", `${name}.txt`), "utf8");
+
+test("matchNumberedModal — claude plan-mode dialog (cursor on choice 1)", () => {
+  const pane = `
+  Edit file
+    src/foo.ts
+    1 line changed
+  Do you want to make this edit to foo.ts?
+  ❯ 1. Yes
+    2. Yes, allow all
+    3. No
+`;
+  const m = matchNumberedModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["1", "2", "3"]);
+  expect(m!.choices[0]!.label).toBe("Yes");
+  expect(m!.choices[1]!.label).toBe("Yes, allow all");
+  expect(m!.choices[2]!.label).toBe("No");
+  expect(m!.cursorIndex).toBe(0);
+});
+
+test("matchNumberedModal — alt cursor glyph (›)", () => {
+  const pane = `Question?
+› 1. Pick A
+  2. Pick B`;
+  const m = matchNumberedModal(pane);
+  expect(m?.choices.length).toBe(2);
+  expect(m?.cursorIndex).toBe(0);
+});
+
+test("matchNumberedModal — cursor on non-first choice (model picker shape)", () => {
+  // Regression for the "Allow all edits silently picks Yes" class of
+  // bug: selection modals (model picker, /login) open with the cursor
+  // on the *current* value, not option 1. The cursor index must
+  // reflect that so the dismissal path can navigate from the right
+  // starting position.
+  const pane = `Pick a model
+  1. Opus 4.7
+❯ 2. Sonnet 4.6
+  3. Haiku 4.5`;
+  const m = matchNumberedModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(1);
+});
+
+test("matchNumberedModal — same labels with different cursor position yield different fingerprints", () => {
+  // Cursor position is part of the fingerprint so that an in-progress
+  // modal whose selection changed (e.g., user arrowed via real tmux
+  // attach) re-registers with the new starting position. Without
+  // this, the second-tick stability check would silently match the old
+  // fingerprint and the dismissal path would navigate from a stale
+  // cursor index.
+  const a = matchNumberedModal(`❯ 1. A\n  2. B\n  3. C`)!;
+  const b = matchNumberedModal(`  1. A\n❯ 2. B\n  3. C`)!;
+  expect(a.cursorIndex).toBe(0);
+  expect(b.cursorIndex).toBe(1);
+  expect(a.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchNumberedModal — no cursor anywhere means it's a printed list, not a modal", () => {
+  const pane = `Here are the next steps:
+  1. Install
+  2. Configure
+  3. Run`;
+  expect(matchNumberedModal(pane)).toBeNull();
+});
+
+test("matchNumberedModal — only one numbered line → not a choice set", () => {
+  const pane = `Foo
+❯ 1. Just one`;
+  expect(matchNumberedModal(pane)).toBeNull();
+});
+
+test("matchNumberedModal — same content yields a stable fingerprint", () => {
+  const pane = `Q?
+❯ 1. A
+  2. B`;
+  const a = matchNumberedModal(pane)!;
+  const b = matchNumberedModal(pane + "\n   "); // trailing whitespace shouldn't change fp
+  expect(a.fingerprint).toBe(b!.fingerprint);
+});
+
+test("matchNumberedModal — changing labels changes the fingerprint", () => {
+  const a = matchNumberedModal(`❯ 1. A\n  2. B`)!;
+  const b = matchNumberedModal(`❯ 1. A\n  2. C`)!;
+  expect(a.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchNumberedModal — tool-use permission prompt: wrapped description's '0.' line is not a choice", () => {
+  // Regression: an MCP tool-use permission prompt wraps the tool description
+  // across pane lines. When a line happens to break right before a number —
+  // here "… remaining >" / "0. Use the offset …" — the phantom "0." row is
+  // numerically contiguous with the real "1." option and used to be swallowed
+  // as choice 0 (shifting the cursor index too). The choice set must be exactly
+  // the 1/2/3 options below "Do you want to proceed?".
+  const pane = `  Tool use
+
+    example MCP server – Fetch Records(scope: "demo") (MCP)
+    Fetch records in pages. Keep fetching while remaining >
+    0. Use the offset arg to paginate.
+
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. Yes, and don't ask again for example MCP server – Fetch Records commands in
+       /Users/me/.agetor/worktrees/demo
+    3. No
+
+  Esc to cancel · Tab to amend`;
+  const m = matchNumberedModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["1", "2", "3"]);
+  expect(m!.choices[0]!.label).toBe("Yes");
+  expect(m!.cursorIndex).toBe(0);
+  // The wrapped continuation row (the worktree path) is folded into option 2's
+  // label rather than dropped, so the "don't ask again" scope stays legible.
+  expect(m!.choices[1]!.label).toBe(
+    "Yes, and don't ask again for example MCP server – Fetch Records commands in /Users/me/.agetor/worktrees/demo",
+  );
+  expect(m!.choices[2]!.label).toBe("No");
+  // A permission prompt's footer (`Esc to cancel · Tab to amend`) never
+  // mentions a session-only confirm — `confirmKey` must stay undefined so
+  // this modal is still dismissed with a plain Enter.
+  expect(m!.confirmKey).toBeUndefined();
+});
+
+test("matchNumberedModal — a same-indent line under the last option is not folded into its label", () => {
+  // The last option isn't capped by a following numbered row, so it relies on
+  // the indentation rule: only rows indented PAST the option marker are wraps.
+  // A standalone hint at the option's own indent must stay out of the label.
+  const pane = `Do you want to proceed?
+❯ 1. Yes
+  2. No
+  This runs immediately.
+
+Esc to cancel`;
+  const m = matchNumberedModal(pane);
+  expect(m!.choices.map((c) => c.label)).toEqual(["Yes", "No"]);
+});
+
+test("matchNumberedModal — modal footer marks the match high-confidence (skips the two-tick gate)", () => {
+  // A real interactive modal carries an `Esc to cancel …` footer; streamed
+  // numbered output never does. scrapeOnce registers high-confidence matches on
+  // the first sighting so tool-use asks surface promptly instead of ~2s late.
+  const withFooter = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend`);
+  expect(withFooter!.highConfidence).toBe(true);
+
+  const withoutFooter = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No`);
+  expect(withoutFooter!.highConfidence).toBeFalsy();
+});
+
+test("matchNumberedModal — footer is found past trailing blank rows (tmux pads the capture)", () => {
+  // `tmux capture-pane` can emit trailing blank rows. The footer detection must
+  // look at the last non-blank lines, not a fixed window of raw lines, or the
+  // fast path silently never engages and the delay fix is a no-op in practice.
+  const m = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend
+
+
+`);
+  expect(m!.highConfidence).toBe(true);
+});
+
+test("matchNumberedModal — AskUserQuestion review/submit screen ('Ready to submit your answers?') matches as a numbered modal", () => {
+  // scrapeOnce now narrows the ask-modal suppression to detectAskModal ===
+  // "question" only (claude-tmux.ts), so a lingering "review" screen falls
+  // through to this matcher instead of being structurally invisible. Slice
+  // the fixture down to the review block itself — tab bar through the
+  // "2. Cancel" line — the way a real 40-line pane tail would present it.
+  const lines = fx("review_submit").split("\n");
+  const tabBarIdx = lines.findIndex((l) => l.includes("✔ Submit"));
+  const cancelIdx = lines.findIndex((l) => /2\.\s+Cancel/.test(l));
+  expect(tabBarIdx).toBeGreaterThan(-1);
+  expect(cancelIdx).toBeGreaterThan(tabBarIdx);
+  const tail = lines.slice(tabBarIdx, cancelIdx + 1).join("\n");
+
+  const m = matchNumberedModal(tail);
+  expect(m).not.toBeNull();
+  expect(m!.choices).toEqual([
+    { key: "1", label: "Submit answers" },
+    { key: "2", label: "Cancel" },
+  ]);
+  expect(m!.cursorIndex).toBe(0);
+  // No "Esc to cancel" footer on the review screen → not high-confidence,
+  // so the two-tick stability gate applies before scrapeOnce registers it
+  // (guards against a mid-drive transient sighting registering a ghost card).
+  expect(m!.highConfidence).toBeFalsy();
+});
+
+test("clearedStabilityGate — high-confidence registers on first sighting; others need two ticks", () => {
+  const hi = { fingerprint: "fp", highConfidence: true } as any;
+  const lo = { fingerprint: "fp", highConfidence: false } as any;
+  // High-confidence clears even when the previous tick saw nothing.
+  expect(clearedStabilityGate(hi, null)).toBe(true);
+  // Low-confidence needs the previous tick to have seen the same fingerprint.
+  expect(clearedStabilityGate(lo, null)).toBe(false);
+  expect(clearedStabilityGate(lo, "different")).toBe(false);
+  expect(clearedStabilityGate(lo, "fp")).toBe(true);
+});
+
+test("matchYesNoModal — (y/N) prompt on last line", () => {
+  const pane = `Continue with the operation? (y/N)`;
+  const m = matchYesNoModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["y", "n"]);
+});
+
+test("matchYesNoModal — bracket variant [Y/n] with trailing colon", () => {
+  const pane = `Proceed [Y/n]:`;
+  const m = matchYesNoModal(pane);
+  expect(m).not.toBeNull();
+});
+
+test("matchYesNoModal — ignores numbered modal pane (different signature)", () => {
+  const pane = `❯ 1. Yes
+  2. No`;
+  expect(matchYesNoModal(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — bypass-permissions warning, accept is option 2", () => {
+  // The exact shape claude draws on the first `--dangerously-skip-permissions`
+  // launch of a version that re-prompts. The cursor defaults to "No, exit"
+  // (option 1); we must navigate to the affirmative.
+  const pane = `
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  By proceeding, you accept all responsibility for actions taken while running
+  in Bypass Permissions mode.
+
+  https://code.claude.com/docs/en/security
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("bypass-permissions");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(1); // must move off the default "No, exit"
+});
+
+test("matchStartupConsentDialog — workspace-trust dialog (real observed text), accept is the cursor default", () => {
+  // The real first-run workspace-trust prompt (claude 2.1.x). NOT suppressed by
+  // --dangerously-skip-permissions, so agetor's fresh worktrees hit it; left
+  // unanswered it blocks JSONL creation until the 30s boot timeout kills the run.
+  const pane = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /Users/me/.agetor/worktrees/00000000-0000-0000-0000-000000000000
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("trust-folder");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(0); // already on "Yes, I trust this folder" → Enter alone
+});
+
+test("matchStartupConsentDialog — 2.1.284 unnumbered workspace-trust dialog, cursor defaults to \"No, exit\"", () => {
+  // Real capture (claude 2.1.284): options carry no `N.` prefix and the cursor
+  // starts on "No, exit". accept must land on the "Yes" row, never the default.
+  const pane = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-501/-Users-me--agetor-worktrees-cb38d00e/scratchpad/smoke/pr
+ oj
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("trust-folder");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(1);
+  expect(m!.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, I trust this folder"]);
+  // Fingerprint is stable per rendered dialog and moves with the cursor.
+  expect(matchStartupConsentDialog(pane)!.fingerprint).toBe(m!.fingerprint);
+  const moved = pane.replace(" ❯ No, exit\n   Yes, I trust this folder", "   No, exit\n ❯ Yes, I trust this folder");
+  const m2 = matchStartupConsentDialog(moved);
+  expect(m2!.cursorIndex).toBe(1);
+  expect(m2!.fingerprint).not.toBe(m!.fingerprint);
+});
+
+test("matchStartupConsentDialog — unnumbered dialog with no affirmative choice → null", () => {
+  const pane = ` Quick safety check: Is this a project you created or one you trust?
+
+ ❯ No, exit
+   Cancel
+
+ Enter to confirm · Esc to cancel`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — unrelated unnumbered list without the marker → null", () => {
+  const pane = ` Pick one
+
+ ❯ No, exit
+   Yes, proceed
+
+ Enter to confirm · Esc to cancel`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — a normal per-tool permission modal is NOT auto-confirmed", () => {
+  // Runtime permission prompts carry no startup marker → must stay null so
+  // they route through the interactive scraper for the user to decide.
+  const pane = `Do you want to make this edit to foo.ts?
+  ❯ 1. Yes
+    2. Yes, allow all
+    3. No`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — bypass marker without a parseable choice list → null", () => {
+  // A half-drawn frame (marker present, choices not yet rendered) must not
+  // trigger a stray Enter.
+  const pane = `WARNING: Claude Code running in Bypass Permissions mode`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — distinct dialogs get distinct fingerprints", () => {
+  const bypass = matchStartupConsentDialog(`Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept`)!;
+  const trust = matchStartupConsentDialog(`Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit`)!;
+  expect(bypass).not.toBeNull();
+  expect(trust).not.toBeNull();
+  expect(bypass.fingerprint).not.toBe(trust.fingerprint);
+});
+
+// The "Claude in Chrome extension detected" startup prompt (introduced by a
+// claude version bump) blocks JSONL creation just like the consent dialogs —
+// but enabling/disabling browser tools is NOT a choice agetor can make for the
+// user. It must therefore route through the interactive scraper path (surfaced
+// as a tmux_prompt card the user answers), never the boot auto-confirmer.
+const CHROME_EXTENSION_PANE = `  Claude in Chrome extension detected
+
+  Claude will use your Chrome browser by default — navigating sites, filling
+  forms, and capturing screenshots in your existing session.
+
+  Site-level permissions come from the Chrome extension. Turn browser tools
+  off for future sessions with /chrome.
+
+❯ 1. Yes, use my browser
+  2. No, keep browser tools off
+
+Enter to confirm · Esc to keep browser tools off`;
+
+test("matchStartupConsentDialog — Chrome-extension startup prompt is NOT auto-confirmed", () => {
+  // No startup-consent marker → null, so boot leaves it for the user instead
+  // of guessing whether to grant browser access.
+  expect(matchStartupConsentDialog(CHROME_EXTENSION_PANE)).toBeNull();
+});
+
+test("matchNumberedModal — Chrome-extension startup prompt surfaces as an interactive modal", () => {
+  // The boot poller falls back to this matcher for non-consent startup
+  // questions; a hit is what gets registered as a tmux_prompt card.
+  const m = matchNumberedModal(CHROME_EXTENSION_PANE)!;
+  expect(m).not.toBeNull();
+  expect(m.cursorIndex).toBe(0);
+  expect(m.choices.map((c) => c.label)).toEqual([
+    "Yes, use my browser",
+    "No, keep browser tools off",
+  ]);
+});
+
+test("dispatchLine updates permissionMode BEFORE the dedup guard (reattach safety)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir: t } = await import("node:os");
+  const path2 = await import("node:path");
+  const dir = mkdtempSync(path2.default.join(t(), "agetor-pm-"));
+  const jsonl = path2.default.join(dir, "session.jsonl");
+  writeFileSync(jsonl, "");
+  const state = __forTest.installSession("t-pm-reattach", jsonl);
+  // Simulate the reattach situation: the uuid is already in the dedup
+  // set (the previous process persisted it to run_events), so any
+  // SSE-emitting work would be skipped. The permission-mode update
+  // must still apply because it lives ABOVE the dedup return.
+  const uuid = "11111111-1111-1111-1111-111111111111";
+  state.seenLineUuids.add(uuid);
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode", uuid, permissionMode: "plan",
+  }));
+  expect(state.permissionMode).toBe("plan");
+  __forTest.uninstallSession("t-pm-reattach");
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Idle scrape throttle — regression for "a question raised after the task went
+// to review never appears in the stream (user has to answer it in tmux)".
+//
+// A native AskUserQuestion / permission modal appears with NO JSONL write
+// (claude doesn't persist the tool_use until it's answered), so once a session
+// is JSONL-idle past SCRAPE_IDLE_AFTER_MS the old hard `return` stopped the
+// scraper forever — `lastJsonlAppendAt` never advanced again, so a modal raised
+// after the turn resolved was never captured. The throttle must keep scraping.
+
+const {
+  decideScrapeTick,
+  SCRAPE_IDLE_AFTER_MS,
+  SCRAPE_IDLE_POLL_MS,
+  SCRAPE_DEEP_IDLE_AFTER_MS,
+  SCRAPE_DEEP_IDLE_POLL_MS,
+} = __forTest;
+
+const NOW = 1_000_000;
+// A session that's been JSONL-quiet long enough to be idle, but not yet
+// "deeply" idle — the common "just resolved to review" window (2s cadence).
+const NEAR_IDLE_APPEND = NOW - (SCRAPE_IDLE_AFTER_MS + 1_000);
+// A session quiet past SCRAPE_DEEP_IDLE_AFTER_MS — the slow 10s cadence.
+const DEEP_IDLE_APPEND = NOW - (SCRAPE_DEEP_IDLE_AFTER_MS + 5_000);
+
+test("decideScrapeTick — busy session (turn in flight) always scrapes at full rate", () => {
+  const d = decideScrapeTick({
+    turnInFlight: true,
+    lastJsonlAppendAt: 0,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — recently-active session (within idle window) scrapes, no idle stamp", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NOW - (SCRAPE_IDLE_AFTER_MS - 1), // still 'recent'
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — near-idle session STILL scrapes once past the 2s throttle (the bug)", () => {
+  // No turn in flight, JSONL silent past SCRAPE_IDLE_AFTER_MS, last idle
+  // capture > SCRAPE_IDLE_POLL_MS ago. The old code returned here and never
+  // looked at the pane again — stranding a modal raised after `review`.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NEAR_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - SCRAPE_IDLE_POLL_MS - 1,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: true });
+});
+
+test("decideScrapeTick — near-idle but within the 2s throttle skips (keeps idle cost low)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NEAR_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - (SCRAPE_IDLE_POLL_MS - 1), // just scraped
+    now: NOW,
+  });
+  expect(d).toEqual({ run: false, stampIdle: false });
+});
+
+test("decideScrapeTick — deeply-idle session backs off to the 10s cadence", () => {
+  // Quiet > SCRAPE_DEEP_IDLE_AFTER_MS, and the last capture was 3s ago. At the
+  // near-idle 2s rate this would scrape; the deep tier must skip it so long-
+  // dead sessions don't fork tmux every 2s forever.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - 3_000, // > SCRAPE_IDLE_POLL_MS but < SCRAPE_DEEP_IDLE_POLL_MS
+    now: NOW,
+  });
+  expect(d).toEqual({ run: false, stampIdle: false });
+});
+
+test("decideScrapeTick — deeply-idle session still scrapes once past the 10s cadence (very-late modal)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - SCRAPE_DEEP_IDLE_POLL_MS - 1,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: true });
+});
+
+test("decideScrapeTick — a live ask-card forces full-rate scraping (modal-gone backstop)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: true, // card up → never idle-gated
+    lastIdleScrapeAt: NOW, // would otherwise be inside the throttle window
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — a pending prompt forces full-rate scraping (auto-cancel backstop)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 1,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — a session that never appended (lastJsonlAppendAt === 0) is not idle-gated", () => {
+  // Guards the `lastJsonlAppendAt !== 0` clause: a brand-new session shouldn't
+  // be treated as idle before it has produced any output.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: 0,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// matchUnparsableModal / stuckTurnFallbackArmed — the unknown/unparsable
+// Claude Code prompt fallback (docs/plans/unknown-claude-prompts-fallback.md
+// §5). Last-resort matcher for a pane no real matcher parsed: fires on a
+// recognised modal footer (`MODAL_FOOTER_RE`) over the last 3 non-blank tail
+// lines, or on the stuck-turn watchdog. Always `unparsable: true`, empty
+// `choices`, never `highConfidence` — so it always needs the two-tick
+// stability gate.
+
+// The claude 2.1.234 "Set up auto mode for your environment?" startup wizard
+// — a real tmux pane capture (from a screenshot). Unnumbered arrow-key
+// widget (`◂ Mixed ▸` value selector, `[ ]` checkbox rows) that
+// matchNumberedModal/matchYesNoModal/detectAskModal all reject, bounded by a
+// real Ink footer. This is the canonical fixture the fallback exists for.
+const AUTO_MODE_WIZARD_PANE = `Set up auto mode for your environment?
+
+Claude Code reads this project, your recent Claude sessions, and optionally your shell history and other
+repositories. Claude analyzes this data and customizes auto mode to make better decisions.
+
+  How you use Claude here    ◂ Mixed ▸
+❯ Also scan shell history    [ ]
+  Also scan your other repos [ ]
+
+  Continue
+
+←/→ to change usage · Enter to continue · Esc to cancel`;
+
+test("matchUnparsableModal — auto-mode wizard: no real matcher parses it, fallback fires via the footer arm", () => {
+  expect(matchNumberedModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+  expect(matchYesNoModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+  expect(detectAskModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false);
+  expect(m).not.toBeNull();
+  expect(m!.unparsable).toBe(true);
+  expect(m!.choices).toEqual([]);
+  expect(m!.cursorIndex).toBe(0);
+  // Deliberately never high-confidence — footer presence IS the trigger, not
+  // extra confidence on top of an already-parsed choice set, so a single-tick
+  // sighting must still clear the two-tick stability gate.
+  expect(m!.highConfidence).toBeFalsy();
+});
+
+test("MODAL_FOOTER_RE — matches the three evidence-backed footer phrasings, case-insensitively", () => {
+  expect(MODAL_FOOTER_RE.test("Esc to cancel · Tab to amend")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("Enter to confirm · Esc to cancel")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("←/→ to change usage · Enter to continue · Esc to cancel")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("ENTER TO CONTINUE")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("? for shortcuts")).toBe(false);
+});
+
+test("SESSION_ONLY_CONFIRM_RE — matches the bare /model picker's session-only confirm phrasing", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to set as default · s to use this session only · Esc to cancel")).toBe(
+    true,
+  );
+});
+
+test("SESSION_ONLY_CONFIRM_RE — does not match ordinary modal footers (permission prompts, the effort slider, plain Esc-to-cancel)", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Esc to cancel · Tab to amend")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to continue · Esc to cancel")).toBe(false);
+});
+
+// ── Fingerprint stability ────────────────────────────────────────────────
+//
+// `matchUnparsableModal`'s fingerprint is sha1 of the same last-12-raw-line
+// window used for `paneText`, with blank + volatile lines stripped before
+// hashing. That's only tick-to-tick stable when the meaningful content has
+// slack inside the 12-line window — i.e. fewer than 12 raw lines total, so a
+// trailing blank row or a transient volatile line (the spinner, the "Tip:"
+// banner) lands in the slack instead of evicting real content from the
+// FRONT of the window (`lines.slice(-12)` is a raw positional slice, not a
+// last-N-non-blank slice the way the footer-arm check and paneText's own
+// "12 lines" comment imply).
+//
+// The canonical wizard fixture above is exactly 12 raw lines (8 meaningful +
+// 4 blank) with the footer as its true last line — zero slack — so it is
+// the worst case, not the representative one. Use a shorter footer-bearing
+// pane (well under 12 lines, as a fuller real capture with scrollback above
+// the modal would leave slack in this window) to pin the intended
+// tolerance; see the fixture below for the canonical pane's actual
+// (fragile) behavior at zero slack, which is a discovered gap, not
+// something this suite asserts as "working".
+const SHORT_UNPARSABLE_PANE = `Do a thing?
+
+Enter to continue · Esc to cancel`;
+
+test("matchUnparsableModal — fingerprint is stable across trailing blank-row padding (with window slack)", () => {
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withTrailingBlanks = matchUnparsableModal(`${SHORT_UNPARSABLE_PANE}\n\n\n`, false)!;
+  expect(clean).not.toBeNull();
+  expect(withTrailingBlanks.fingerprint).toBe(clean.fingerprint);
+});
+
+test("matchUnparsableModal — fingerprint is stable across an inserted volatile line (with window slack)", () => {
+  // A spinner/"Tip:" line appearing between ticks (VOLATILE_PANE_LINE_RE)
+  // must not change the fingerprint — it's stripped before hashing.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withVolatile = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\n✳ Compacting… (esc to interrupt)"),
+    false,
+  )!;
+  expect(withVolatile.fingerprint).toBe(clean.fingerprint);
+
+  const withTip = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\nTip: press Shift+Tab to cycle modes"),
+    false,
+  )!;
+  expect(withTip.fingerprint).toBe(clean.fingerprint);
+});
+
+test("matchUnparsableModal — fingerprint is stable across an inserted completed-turn 'done' summary line (still volatile, per VOLATILE_PANE_LINE_RE's un-negated SPINNER_ELAPSED_LINE)", () => {
+  // TURN_DONE_SUMMARY_RE's own doc: the elapsed-summary row keeps carrying
+  // its `· done <time>` suffix on an idle pane forever after a turn
+  // completes. It's no longer "working" (WORKING_LINE_RE negates this form),
+  // but it must stay VOLATILE — a card's fingerprint or the reaper's
+  // activity diff must not jitter on the tick where this suffix appears.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withDoneRow = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\n✻ Churned for 1s · done 5:35 PM"),
+    false,
+  )!;
+  expect(withDoneRow.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── stripVolatileStatusBarHint / EFFORT_HINT_SUFFIX_RE (wave-5 finding #8) ──
+//
+// Smoke evidence, claude 2.1.246: on a genuinely idle session the status
+// bar's right-hand hint FLICKERS on its own — one capture read
+//   ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort
+// and the identical row WITHOUT the trailing `● high · /effort` segment a
+// second later. An EARLIER fix stripped the WHOLE status-bar row via
+// VOLATILE_PANE_LINE_RE whenever it carried this hint — but that also erased
+// the mode name itself from the activity diff and the unparsable card's
+// paneText, hiding a genuine terminal-side mode flip. The current fix is
+// narrower: `stripVolatileStatusBarHint` strips ONLY the self-flickering
+// suffix off a matched `STATUS_BAR_RE` row (via `EFFORT_HINT_SUFFIX_RE`),
+// leaving the mode glyph / name / cycle hint / agent count intact — this is
+// what `normalizePaneForActivity` (not itself exposed via __forTest, since
+// its only call site is the private `scrapeOnce`) applies to every line
+// before its own VOLATILE_PANE_LINE_RE filter, so the activity-diff yields
+// the SAME normalized value for the idle pane with and without the suffix.
+
+test("stripVolatileStatusBarHint — strips the self-flickering '● <effort> · /effort' suffix off a status-bar row, yielding the SAME value as the row without it", () => {
+  const withSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort";
+  const withoutSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent";
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(withoutSuffix);
+  // The already-bare row (no suffix to strip) round-trips unchanged — proof
+  // this is the SAME normalized value on both sides of the flicker, not just
+  // "produces something".
+  expect(stripVolatileStatusBarHint(withoutSuffix)).toBe(withoutSuffix);
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(stripVolatileStatusBarHint(withoutSuffix));
+});
+
+test("stripVolatileStatusBarHint — a no-op on any line that ISN'T a recognized status bar, even one shaped exactly like the hint suffix", () => {
+  // The gate is `STATUS_BAR_RE.test(line)` first — narrower than the whole
+  // row being blindly regex-replaced regardless of context (finding #8).
+  const notAStatusBar = "some transcript line · ← 1 agent            ● high · /effort";
+  expect(stripVolatileStatusBarHint(notAStatusBar)).toBe(notAStatusBar);
+});
+
+test("EFFORT_HINT_SUFFIX_RE — matches only the trailing '● <word> · /effort' segment, anchored to end of line", () => {
+  expect(EFFORT_HINT_SUFFIX_RE.test("· ← 1 agent            ● high · /effort")).toBe(true);
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort")).toBe(true);
+  // Not anchored at end-of-line — must not match trailing prose past it.
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort trailing text")).toBe(false);
+  // No leading whitespace before the glyph — the regex requires `\s+` first.
+  expect(EFFORT_HINT_SUFFIX_RE.test("● high · /effort")).toBe(false);
+});
+
+test("matchUnparsableModal — a genuinely different modal gets a different fingerprint", () => {
+  const a = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const b = matchUnparsableModal(`Do a DIFFERENT thing?\n\nEnter to continue · Esc to cancel`, false)!;
+  expect(a.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchUnparsableModal — the canonical (zero-slack) wizard fixture's fingerprint IS stable across trailing padding", () => {
+  // Regression guard for a window-saturation bug: an earlier implementation
+  // took a raw `lines.slice(-12)` BEFORE filtering blank/volatile lines, so
+  // when the meaningful content already filled all 12 lines (as the real
+  // wizard pane does — 8 meaningful + 4 blank, footer as the true last
+  // line), a fluctuating trailing blank row or a transient spinner line
+  // evicted real content from the FRONT of the window and jittered the
+  // hash — the two-tick stability gate could never converge on exactly the
+  // tall modal this feature was built for. The filter must run first.
+  const clean = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false)!;
+  const withTrailingBlanks = matchUnparsableModal(`${AUTO_MODE_WIZARD_PANE}\n\n`, false)!;
+  const withTrailingSpinner = matchUnparsableModal(
+    `${AUTO_MODE_WIZARD_PANE}\n✳ Compacting… (esc to interrupt)`,
+    false,
+  )!;
+  expect(clean).not.toBeNull();
+  expect(withTrailingBlanks).not.toBeNull();
+  expect(withTrailingBlanks.fingerprint).toBe(clean.fingerprint);
+  expect(withTrailingSpinner.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── Negative panes (footer arm must stay silent) ─────────────────────────
+
+test("matchUnparsableModal — normal idle input-box pane does not fire", () => {
+  const pane = `╭──────────────────────────────────────────────────────────────────────────╮
+│ >                                                                            │
+╰──────────────────────────────────────────────────────────────────────────╯
+  ? for shortcuts · ← for agents`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — working pane with the 'esc to interrupt' spinner but no footer does not fire", () => {
+  const pane = `● Running Bash(npm test)…
+
+✳ Working… (esc to interrupt · 12s · 1.2k tokens)`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — plain transcript pane does not fire", () => {
+  const pane = `● I've updated the file to fix the bug.
+
+Let me run the tests now to confirm the fix works as expected.`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — a footer phrase quoted in transcript prose ABOVE the last 3 non-blank lines does not fire", () => {
+  const pane = `The dialog said "Esc to cancel · Tab to amend" when I saw it earlier.
+
+Here's what I found after digging further:
+Line A
+Line B
+Line C
+Line D`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+// ── Precedence sanity ─────────────────────────────────────────────────────
+
+test("matchUnparsableModal — precedence: a numbered tool-permission modal is caught by matchNumberedModal first, but WOULD also match the fallback alone", () => {
+  // scrapeOnce's real dispatch is `matchNumberedModal(tail) ?? matchYesNoModal(tail)
+  // ?? matchUnparsableModal(...)` — the fallback is the final `??` arm, so a
+  // parseable numbered modal never reaches it in practice. This test documents
+  // that ordering is load-bearing: in isolation, matchUnparsableModal WOULD
+  // also fire on the same pane (it carries a recognised footer), so if the
+  // `??` chain were ever reordered, a real numbered modal would silently
+  // downgrade to the "read it in the terminal" fallback card instead of
+  // rendering real clickable choices.
+  const pane = `Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend`;
+
+  const numbered = matchNumberedModal(pane);
+  expect(numbered).not.toBeNull();
+  expect(numbered!.choices.map((c) => c.key)).toEqual(["1", "2"]);
+  expect(numbered!.highConfidence).toBe(true);
+
+  const fallbackAlone = matchUnparsableModal(pane, false);
+  expect(fallbackAlone).not.toBeNull();
+  expect(fallbackAlone!.unparsable).toBe(true);
+
+  // scrapeOnce's actual `??` chain: numbered wins.
+  const dispatched = matchNumberedModal(pane) ?? matchYesNoModal(pane) ?? matchUnparsableModal(pane, false);
+  expect(dispatched).toEqual(numbered);
+});
+
+// ── stuckTurnFallbackArmed truth table ────────────────────────────────────
+
+const WATCHDOG_NOW = 2_000_000;
+const ALL_ARMED = {
+  turnInFlight: true,
+  lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS - 1,
+  now: WATCHDOG_NOW,
+  paneWorking: false,
+  askCardLive: false,
+  paneIdle: false,
+};
+
+test("stuckTurnFallbackArmed — all conditions true → armed", () => {
+  expect(stuckTurnFallbackArmed(ALL_ARMED)).toBe(true);
+});
+
+test("stuckTurnFallbackArmed — no turn in flight → not armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, turnInFlight: false })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — lastJsonlAppendAt === 0 (never appended) → not armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, lastJsonlAppendAt: 0 })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — quiet exactly AT the threshold (not strictly over) → not armed", () => {
+  expect(stuckTurnFallbackArmed({
+    ...ALL_ARMED,
+    lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS, // quiet === threshold, not >
+  })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — quiet one ms past the threshold → armed", () => {
+  expect(stuckTurnFallbackArmed({
+    ...ALL_ARMED,
+    lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS - 1,
+  })).toBe(true);
+});
+
+test("stuckTurnFallbackArmed — pane shows claude working → not armed (busy, not stuck)", () => {
+  // No longer spinner-specific: `paneWorking` is `paneShowsClaudeWorking(tail)`,
+  // which stays true across a working turn's quiet-JSONL windows (background
+  // agent waits, long tool calls, elapsed-summary spinners) — not just while
+  // the 1 Hz-blinking "esc to interrupt" text happens to be on-screen.
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: true })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — an ask card/collection is already live → not armed (owns its own give-up ladder)", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, askCardLive: true })).toBe(false);
+});
+
+// ── Watchdog arm on matchUnparsableModal ──────────────────────────────────
+
+test("matchUnparsableModal — watchdog arm fires on a footerless stuck pane when watchdogArmed is true, stays silent when false", () => {
+  const stuckPane = `● Running Bash(a very long build)…
+
+Still going, no visible progress, nothing that looks like a modal or a
+footer — just a wedged TUI.`;
+  expect(matchUnparsableModal(stuckPane, false)).toBeNull();
+  const armed = matchUnparsableModal(stuckPane, true);
+  expect(armed).not.toBeNull();
+  expect(armed!.unparsable).toBe(true);
+  expect(armed!.choices).toEqual([]);
+});
+
+// ── Two-tick stability gate applies to unparsable matches ─────────────────
+
+test("clearedStabilityGate — an unparsable match never has highConfidence, so it needs two ticks like any other low-confidence match", () => {
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false)!;
+  expect(m.unparsable).toBe(true);
+  expect(m.highConfidence).toBeFalsy();
+  // First sighting: no previous fingerprint recorded yet → does not clear.
+  expect(clearedStabilityGate(m, null)).toBe(false);
+  // A different prior fingerprint (a different modal was on screen last
+  // tick) → still does not clear.
+  expect(clearedStabilityGate(m, "some-other-fingerprint")).toBe(false);
+  // Same fingerprint on the second consecutive tick → clears.
+  expect(clearedStabilityGate(m, m.fingerprint)).toBe(true);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2.1.239 hardening — docs/plans/unknown-tui-detection-flicker.md §5.
+//
+// The #185 fallback card was flickering during NORMAL claude-code 2.1.239
+// activity (streaming, tool calls, background-agent waits): the working
+// indicators the old `SPINNER_RE=/esc to interrupt/i` guard relied on moved
+// (status-bar `esc to interrupt` now blinks at ~1 Hz and is absent for whole
+// quiet-JSONL windows during a bg-agent wait or long tool call) or changed
+// shape (a ticking spinner glyph + elapsed/token-counter line). This section
+// covers: (A) `paneShowsClaudeWorking`'s truth table against real captured
+// 2.1.239 panes, (B) `MODAL_NOTICE_RE`'s usage-limit auto-continue veto on
+// BOTH matchUnparsableModal arms, (C) that the veto/gate doesn't over-
+// suppress genuinely actionable notices or the existing wizard fixture, (D)
+// that the working-gate — not the matcher itself — is what suppresses a
+// footer-bearing pane that also shows working chrome (mirrors scrapeOnce's
+// real `paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(...)`
+// dispatch), (E) fingerprint stability across the new volatile forms, and
+// (F) the raised 3-tick stability constant.
+
+// ── A. paneShowsClaudeWorking truth table ──────────────────────────────────
+
+const WORKING_PANE_LINES = [
+  // Present-participle spinner (glyph + word + ellipsis).
+  "✽ Frosting… (2m 52s · ↓ 12.1k tokens)",
+  // Dot-glyph spinner — `·` doubles as the spinner glyph here, not just a
+  // mid-line separator; the leading-anchor is what makes this safe (see the
+  // prose-bullet false case below).
+  "· Prestidigitating… (1h 21m 31s · ↓ 259.0k tokens)",
+  // Elapsed summary — no ellipsis, just "<Word> for <n><unit>".
+  "✻ Cooked for 2m 18s",
+  // Elapsed + a live shell.
+  "✻ Brewed for 9s · 1 shell still running",
+  // Background-agent wait — the only normal-work window with NO ticking
+  // spinner line at all; this phrase is what covers it.
+  "✻ Waiting for 1 background agent to finish",
+  // Status-bar interrupt (auto mode) — the legacy signal, now 1 Hz-blinking,
+  // kept as one input among several rather than the sole gate.
+  "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent",
+  // Background-agent roster row — ticking token counter, no spinner glyph.
+  "  ◯ general-purpose  W2-A launch-path persistence  10s · ↓ 46.2k tokens",
+  // Status-bar shell count (no "esc to interrupt" on this particular frame).
+  "  ⏵⏵ auto mode on · 1 shell · ← 1 agent · ↓ to manage",
+];
+
+for (const line of WORKING_PANE_LINES) {
+  test(`paneShowsClaudeWorking — true for 2.1.239 working chrome: ${JSON.stringify(line)}`, () => {
+    expect(paneShowsClaudeWorking(line)).toBe(true);
+    // Also true when the line sits inside a fuller pane tail.
+    expect(paneShowsClaudeWorking(`some prior line\n${line}\nsome later line`)).toBe(true);
+  });
+}
+
+const IDLE_INPUT_BOX_PANE = `╭────╮
+│ >  │
+╰────╯
+  ? for shortcuts · ← for agents`;
+
+test("paneShowsClaudeWorking — false for the idle input-box pane", () => {
+  expect(paneShowsClaudeWorking(IDLE_INPUT_BOX_PANE)).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for the auto-mode wizard fixture (fallback must still fire for it)", () => {
+  // This is the safety property the whole gate rests on: a real prompt/wizard
+  // REPLACES the working chrome rather than co-rendering with it, so gating
+  // the fallback on `!paneShowsClaudeWorking` can never hide this fixture.
+  expect(paneShowsClaudeWorking(AUTO_MODE_WIZARD_PANE)).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for a prose bullet that merely starts with the '·' glyph", () => {
+  // Regression for the over-match the review caught: the dot-glyph spinner
+  // form requires an ellipsis (`…`) right after the leading word, and the
+  // elapsed form requires `\d+` immediately followed by `s`/`m`/`h` (no
+  // space). "for 3 reasons" has neither — the digit is followed by a space,
+  // not a unit letter — so ordinary prose starting with "· " must not read
+  // as a spinner.
+  expect(paneShowsClaudeWorking("  · Something worth noting for 3 reasons below")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for prose that merely mentions tokens", () => {
+  // Regression for the over-match the review caught: TOKEN_COUNTER_LINE is
+  // anchored to a `·`/arrow separator immediately before the count, so plain
+  // prose mentioning "tokens" (no `·↓`/`·↑` glyph) must not match.
+  expect(paneShowsClaudeWorking("The response used about 5 tokens total, roughly.")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for the idle manual-mode status bar", () => {
+  expect(paneShowsClaudeWorking("  ⏸ manual mode on · ? for shortcuts · ← 1 agent")).toBe(false);
+});
+
+test("WORKING_LINE_RE — sanity: still matches the legacy 'esc to interrupt' status-bar phrase directly", () => {
+  expect(WORKING_LINE_RE.test("esc to interrupt")).toBe(true);
+  expect(WORKING_LINE_RE.test("nothing to see here")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — transcript prose that merely RESEMBLES working chrome stays false", () => {
+  // Regression for the review finding: every arm is anchored to the chrome
+  // shape it came from, so look-alike prose in the transcript can't read as
+  // working (and thereby hide a genuine prompt rendered below it).
+  expect(paneShowsClaudeWorking("  · 3 shell scripts were updated")).toBe(false); // status-bar arm needs `· N shell ·`/EOL
+  expect(paneShowsClaudeWorking("Waiting for 2 background agents to report back.")).toBe(false); // needs the leading spinner glyph
+  expect(paneShowsClaudeWorking("· Loading… more text follows")).toBe(false); // spinner arm needs `(` or EOL after `…`
+  // …while the real chrome shapes those guards protect still read as working.
+  expect(paneShowsClaudeWorking("✻ Waiting for 1 background agent to finish")).toBe(true);
+  expect(paneShowsClaudeWorking("  ⏵⏵ auto mode on · 1 shell · ← 1 agent · ↓ to manage")).toBe(true);
+  expect(paneShowsClaudeWorking("✻ Determining…")).toBe(true); // bare spinner, no parenthetical yet
+  expect(paneShowsClaudeWorking("✳ Compacting… (esc to interrupt)")).toBe(true);
+});
+
+test("paneShowsClaudeWorking — only inspects the bottom widget area (last WORKING_CHROME_WINDOW_LINES non-blank lines), not the scrollback transcript", () => {
+  expect(WORKING_CHROME_WINDOW_LINES).toBe(16);
+  // A tool result that echoes claude chrome (an agent inspecting tmux panes —
+  // agetor dogfooding) sits in the TRANSCRIPT, well above a real wizard that
+  // then renders below it. Before the window was bounded, that echo gated the
+  // fallback off for as long as it stayed inside the 40-line scrape tail.
+  const echoedChromeAboveWizard =
+    "  ⎿  status: ⏵⏵ auto mode on · esc to interrupt · ← 1 agent\n"
+    + Array.from({ length: 20 }, (_, i) => `transcript line ${i + 1}`).join("\n")
+    + "\n" + AUTO_MODE_WIZARD_PANE;
+  expect(paneShowsClaudeWorking(echoedChromeAboveWizard)).toBe(false);
+  // …and the real scrapeOnce dispatch therefore still cards the wizard.
+  const dispatched = paneShowsClaudeWorking(echoedChromeAboveWizard)
+    ? null
+    : matchUnparsableModal(echoedChromeAboveWizard, false);
+  expect(dispatched).not.toBeNull();
+  expect(dispatched!.unparsable).toBe(true);
+  // Boundary: a working line exactly WORKING_CHROME_WINDOW_LINES non-blank
+  // lines from the bottom is still seen; one line further up is not. The
+  // deepest live widget area captured (4 background agents) was 13 rows, so
+  // 16 keeps every real form inside the window.
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => `row ${i + 1}`).join("\n");
+  const working = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent";
+  expect(paneShowsClaudeWorking(`${working}\n${filler(WORKING_CHROME_WINDOW_LINES - 1)}`)).toBe(true);
+  expect(paneShowsClaudeWorking(`${working}\n${filler(WORKING_CHROME_WINDOW_LINES)}`)).toBe(false);
+  // Blank rows don't count toward the window (tmux pads the capture).
+  expect(paneShowsClaudeWorking(`${working}\n\n\n\n${filler(WORKING_CHROME_WINDOW_LINES - 1)}`)).toBe(true);
+});
+
+// ── B. MODAL_NOTICE_RE veto — both matchUnparsableModal arms ───────────────
+
+test("matchUnparsableModal — usage-limit auto-continue notice is vetoed on the footer arm", () => {
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing automatically at 8am · esc to cancel",
+    false,
+  );
+  expect(m).toBeNull();
+});
+
+test("matchUnparsableModal — usage-limit auto-continue notice is ALSO vetoed on the watchdog arm (the must-fix from review)", () => {
+  // A mid-turn limit pause keeps the turn in flight and the pane quiet, which
+  // would otherwise arm the stuck-turn watchdog — so the notice veto has to
+  // apply regardless of which arm would have fired.
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing automatically at 8am · esc to cancel",
+    true,
+  );
+  expect(m).toBeNull();
+});
+
+test("matchUnparsableModal — 'continuing shortly' variant is also vetoed on the watchdog arm", () => {
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing shortly · esc to cancel",
+    true,
+  );
+  expect(m).toBeNull();
+});
+
+test("MODAL_NOTICE_RE — matches both auto-continue phrasings, not the actionable reset notice", () => {
+  expect(MODAL_NOTICE_RE.test("continuing automatically")).toBe(true);
+  expect(MODAL_NOTICE_RE.test("continuing shortly")).toBe(true);
+  expect(MODAL_NOTICE_RE.test("press enter to continue")).toBe(false);
+});
+
+// ── C. Still-cards cases (veto/gate must not over-suppress) ────────────────
+
+test("matchUnparsableModal — 'Usage limit has reset · press enter to continue' is never vetoed (genuinely actionable)", () => {
+  // Carries a MODAL_FOOTER_RE phrase ("enter to continue") and no
+  // MODAL_NOTICE_RE phrase ("has reset" is not an auto-continue notice) — the
+  // veto must not sweep this one up along with the auto-continue variants.
+  // Drawn as the bottom line it fires the footer arm outright …
+  const bottom = matchUnparsableModal("Usage limit has reset · press enter to continue", false);
+  expect(bottom).not.toBeNull();
+  expect(bottom!.unparsable).toBe(true);
+  // … but claude draws notice-class lines in the HINT SLOT above the input
+  // box (observed 5 non-blank lines from the bottom for the weekly-limit
+  // hint), which is outside the footer arm's last-3 window. There it reaches
+  // the user via the watchdog arm instead — the turn is still in flight, the
+  // pane is quiet, nothing shows working — so assert exactly that split, not
+  // an instant footer-arm card the real rendering can't deliver.
+  const hintSlot = `⏺ Working on it.
+
+          Usage limit has reset · press enter to continue
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsClaudeWorking(hintSlot)).toBe(false);
+  expect(matchUnparsableModal(hintSlot, false)).toBeNull(); // footer arm can't see it
+  const viaWatchdog = matchUnparsableModal(hintSlot, true);
+  expect(viaWatchdog).not.toBeNull(); // watchdog arm: NOT vetoed
+  expect(viaWatchdog!.unparsable).toBe(true);
+});
+
+test("matchUnparsableModal — the auto-continue veto covers the card's 12-line window, not just the last 3 lines (hint-slot notice + watchdog → null)", () => {
+  // Regression for the review finding: with the veto scoped to the last 3
+  // non-blank lines, a notice drawn in the hint slot (5th from the bottom)
+  // was invisible to the veto while the watchdog arm — turn in flight, JSONL
+  // quiet for hours during the limit pause, no working chrome — still built
+  // the card. The veto must scan the same window the card is built from.
+  const hintSlot = `⏺ Working on it.
+
+          Usage limit reached · continuing automatically at 8am · esc to cancel
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsClaudeWorking(hintSlot)).toBe(false); // so the watchdog WOULD arm
+  expect(matchUnparsableModal(hintSlot, true)).toBeNull();
+  expect(matchUnparsableModal(hintSlot, false)).toBeNull();
+});
+
+test("matchUnparsableModal — the auto-mode wizard fixture still cards (unchanged; see the existing footer-arm test above)", () => {
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false);
+  expect(m).not.toBeNull();
+  expect(m!.unparsable).toBe(true);
+});
+
+// ── D. Working-gate composition (mirrors scrapeOnce's real dispatch) ───────
+
+test("matchUnparsableModal + paneShowsClaudeWorking — a footer-bearing pane that ALSO shows working chrome is only suppressed by the gate, not the matcher", () => {
+  const pane = `Some prompt?
+
+✻ Waiting for 1 background agent to finish
+
+Enter to continue · Esc to cancel`;
+
+  // The matcher alone doesn't know about working chrome — it still matches.
+  const alone = matchUnparsableModal(pane, false);
+  expect(alone).not.toBeNull();
+  expect(alone!.unparsable).toBe(true);
+
+  // scrapeOnce's real call site gates on `!paneShowsClaudeWorking` first —
+  // this is what actually suppresses it. Documents the gate is load-bearing:
+  // if it were ever dropped at the call site, this exact pane would flicker
+  // a card during a normal background-agent wait.
+  const gated = paneShowsClaudeWorking(pane) ? null : matchUnparsableModal(pane, false);
+  expect(gated).toBeNull();
+});
+
+// ── E. Fingerprint stability across the new volatile forms ─────────────────
+
+test("matchUnparsableModal — fingerprint is stable across an inserted elapsed-spinner/shell line (widened VOLATILE_PANE_LINE_RE)", () => {
+  // Analogous to the existing "inserted volatile line" test above, but for
+  // the new 2.1.239 forms specifically: a `✻ Brewed for 9s · 1 shell still
+  // running` line landing between ticks must not jitter the fingerprint, or
+  // the __external__ auto-cancel sweep would resolve a card that never
+  // stopped being the same real modal.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withElapsedSpinner = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace(
+      "Do a thing?",
+      "Do a thing?\n✻ Brewed for 9s · 1 shell still running",
+    ),
+    false,
+  )!;
+  expect(clean).not.toBeNull();
+  expect(withElapsedSpinner).not.toBeNull();
+  expect(withElapsedSpinner.fingerprint).toBe(clean.fingerprint);
+
+  const withTokenCounterRoster = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace(
+      "Do a thing?",
+      "Do a thing?\n  ◯ general-purpose  some task  10s · ↓ 46.2k tokens",
+    ),
+    false,
+  )!;
+  expect(withTokenCounterRoster.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── F. Constant sanity ──────────────────────────────────────────────────────
+
+test("UNPARSABLE_STABILITY_TICKS is 3 (raised from the generic 2-tick gate)", () => {
+  expect(UNPARSABLE_STABILITY_TICKS).toBe(3);
+});
+
+// Drive the pure streak step exactly the way scrapeOnce does: per tick,
+// `streak = nextUnparsableStreak(streak, sameFingerprintAsLastTick)` when the
+// tick produced an unparsable match, `streak = 0` on any tick that didn't
+// (null match, parseable match, answered prompt). Registration happens on the
+// first tick where `unparsableStreakCleared(streak)`.
+function driveStreak(ticks: Array<string | null>): number | null {
+  let streak = 0;
+  let last: string | null = null;
+  for (const [i, fp] of ticks.entries()) {
+    if (fp === null) { streak = 0; last = null; continue; }
+    streak = nextUnparsableStreak(streak, last === fp);
+    last = fp;
+    if (unparsableStreakCleared(streak)) return i; // 0-based tick index of registration
+  }
+  return null;
+}
+
+test("unparsable streak — the same fingerprint on 3 consecutive ticks registers on the 3rd, never earlier", () => {
+  expect(driveStreak(["A", "A"])).toBeNull();
+  expect(driveStreak(["A", "A", "A"])).toBe(2);
+});
+
+test("unparsable streak — a different fingerprint in between restarts the count (A,B,A never registers)", () => {
+  expect(driveStreak(["A", "B", "A"])).toBeNull();
+  expect(driveStreak(["A", "B", "A", "A"])).toBeNull();
+  expect(driveStreak(["A", "B", "B", "B"])).toBe(3);
+});
+
+test("unparsable streak — a null-match tick (claude wrote JSONL / working chrome appeared) resets it (A,A,∅,A,A never registers)", () => {
+  expect(driveStreak(["A", "A", null, "A", "A"])).toBeNull();
+  expect(driveStreak(["A", "A", null, "A", "A", "A"])).toBe(5);
+});
+
+test("unparsable streak — a 1–2 tick blip (the old flicker) never registers", () => {
+  // The exact shape the fix exists for: a transient match that survives one
+  // or two ticks before the pane moves on must never become a card.
+  expect(driveStreak(["A", null, "A", null, "A", null])).toBeNull();
+  expect(driveStreak(["A", "A", null, "A", "A", null])).toBeNull();
+});
+
+// ── idleSettleTick — pure per-tick streak step for scrapeOnce's idle-settle
+// net, the settle-side mirror of nextUnparsableStreak/unparsableStreakCleared
+// above: `eligible` is the caller's own idleSettleEligible decision for THIS
+// tick (already folded in the `lastActivityAt` recency requirement — see the
+// function's own doc); `streak` is the running count going in. Not eligible
+// ⇒ reset to 0, never fire. Eligible ⇒ increment, firing (and resetting back
+// to 0) once the streak reaches UNPARSABLE_STABILITY_TICKS — the SAME
+// stability bar the unparsable fallback itself uses. ─────────────────────────
+
+test("idleSettleTick — not eligible resets the streak to 0 and never fires, regardless of the incoming streak", () => {
+  expect(idleSettleTick({ eligible: false, streak: 0 })).toEqual({ streak: 0, fire: false });
+  expect(idleSettleTick({ eligible: false, streak: 2 })).toEqual({ streak: 0, fire: false });
+  expect(idleSettleTick({ eligible: false, streak: 5 })).toEqual({ streak: 0, fire: false });
+});
+
+test("idleSettleTick — eligible ticks increment the streak without firing until it reaches UNPARSABLE_STABILITY_TICKS", () => {
+  expect(UNPARSABLE_STABILITY_TICKS).toBe(3);
+  expect(idleSettleTick({ eligible: true, streak: 0 })).toEqual({ streak: 1, fire: false });
+  expect(idleSettleTick({ eligible: true, streak: 1 })).toEqual({ streak: 2, fire: false });
+});
+
+test("idleSettleTick — the 3rd consecutive eligible tick fires and resets the streak back to 0", () => {
+  expect(idleSettleTick({ eligible: true, streak: 2 })).toEqual({ streak: 0, fire: true });
+});
+
+test("idleSettleTick — fires (and resets) from a streak already at or past the threshold too, not just exactly one below it", () => {
+  expect(idleSettleTick({ eligible: true, streak: 3 })).toEqual({ streak: 0, fire: true });
+  expect(idleSettleTick({ eligible: true, streak: 5 })).toEqual({ streak: 0, fire: true });
+});
+
+// Drive it the way scrapeOnce does: `streak = idleSettleTick({eligible, streak}).streak`
+// on every tick; settles on the first tick where `.fire` is true.
+function driveIdleSettle(eligibleTicks: boolean[]): number | null {
+  let streak = 0;
+  for (const [i, eligible] of eligibleTicks.entries()) {
+    const step = idleSettleTick({ eligible, streak });
+    streak = step.streak;
+    if (step.fire) return i;
+  }
+  return null;
+}
+
+test("idleSettleTick driven over a sequence — fires on the 3rd consecutive eligible tick, never earlier", () => {
+  expect(driveIdleSettle([true, true])).toBeNull();
+  expect(driveIdleSettle([true, true, true])).toBe(2);
+});
+
+test("idleSettleTick driven over a sequence — an ineligible tick in between restarts the count", () => {
+  expect(driveIdleSettle([true, true, false, true, true])).toBeNull();
+  expect(driveIdleSettle([true, true, false, true, true, true])).toBe(5);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Claude Code 2.1.245 — `/model` and `/effort` in-TUI widgets
+// (docs/plans/model-effort-local-command-turns.md §2, §5 T4). Real pane
+// captures from the spike: the bare `/model` numbered picker, the bare
+// `/effort` slider (two cursor positions), the mid-conversation "Switch
+// model?" / "Change effort level?" confirms, and the idle input box across
+// every observed status-bar variant.
+
+/** 120 × U+2500 — the exact border width the 2.1.245 idle input box draws
+ *  (plan §2). Shared by every idle-pane fixture below. */
+const IDLE_BORDER = "─".repeat(120);
+
+/** Idle input box immediately after an inline local command (`/model sonnet`)
+ *  resolved with no assistant turn — verbatim shape from the spike, only the
+ *  status-bar line varies across the five observed mode variants. */
+function idlePane(statusBar: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯ 
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+/**
+ * Same idle pane as `idlePane`, but with claude's completed-turn elapsed
+ * summary (`✻ Churned for 1s · done 5:35 PM`, `TURN_DONE_SUMMARY_RE`'s own
+ * doc) inserted where the smoke evidence found it — sitting exactly 5
+ * non-blank rows from the bottom of the pane (counting up: status bar,
+ * border, bare `❯ ` prompt, border, this line), i.e. still comfortably inside
+ * `WORKING_CHROME_WINDOW_LINES`.
+ */
+function idlePaneWithDoneRow(statusBar: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+✻ Churned for 1s · done 5:35 PM
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+// ── TURN_DONE_SUMMARY_RE / the completed-turn 'done' marker ─────────────────
+// (docs/plans/model-effort-local-command-turns.md §10) — the one token that
+// tells a FINISHED elapsed-summary row (`✻ Churned for 1s · done 5:35 PM`)
+// apart from a still-RUNNING one (`✻ Cooked for 2m 18s`). See
+// SPINNER_ELAPSED_WORKING_LINE / SPINNER_ELAPSED_LINE's doc comments for the
+// two different questions ("is it working?" vs "is it volatile?") that ride
+// on this split.
+
+test("TURN_DONE_SUMMARY_RE — matches the completed-turn marker, not a still-running elapsed summary", () => {
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Churned for 1s · done 5:35 PM")).toBe(true);
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Cooked for 2m 18s")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false on an idle tail carrying a completed turn's 'done' summary 5 rows above the input box, even though the live ticking forms of the SAME elapsed shape still read as working", () => {
+  // The negation in SPINNER_ELAPSED_WORKING_LINE is what makes this false —
+  // without it, ANY session that ever finished a turn would read as
+  // permanently working (see that constant's own doc for the four real
+  // consumers that broke: mirrorModelViaPicker's busy bail, the idle-settle
+  // net, the unparsable footer arm, and paneShowsComposerText).
+  const idleWithDoneRow = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(idleWithDoneRow)).toBe(false);
+
+  // The same elapsed-summary SHAPE, minus the "· done" suffix, is still
+  // genuinely working — a long non-shell tool call whose only pane signal is
+  // the ticking elapsed timer.
+  expect(paneShowsClaudeWorking("✻ Cooked for 2m 18s")).toBe(true);
+  expect(paneShowsClaudeWorking("✽ Frosting… (2m 52s · ↓ 12.1k tokens)")).toBe(true);
+});
+
+test("idle+done tail (a completed turn's summary row still on screen 3 minutes later) reads as idle across the whole chain: paneShowsIdleInputBox true, pickScrapeMatch null, paneShowsBlockingPrompt false", () => {
+  const pane = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(pane)).toBe(false);
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+  expect(pickScrapeMatch(pane, { paneWorking: paneShowsClaudeWorking(pane), watchdogArmed: false })).toBeNull();
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
+// ── Model picker (bare `/model`) ─────────────────────────────────────────────
+
+const MODEL_PICKER_PANE = `   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names,
+   specify with --model.
+
+     1. Default (recommended)  Opus 5 with 1M context · Best for everyday, complex tasks
+     2. Opus (1M context)      Opus 5 with 1M context · Best for everyday, complex tasks
+     3. Fable                  Fable 5 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+   ❯ 6. Opus 4.8 ✔             Newer version available · select Opus for Opus 5
+
+   ◉ xHigh effort ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel`;
+
+test("matchNumberedModal — 2.1.245 bare /model picker: 6 choices, cursor on the current model (Opus 4.8), high-confidence", () => {
+  const m = matchNumberedModal(MODEL_PICKER_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.choices.length).toBe(6);
+  expect(m!.cursorIndex).toBe(5);
+  expect(m!.highConfidence).toBe(true);
+  expect(m!.nav).toBeUndefined();
+});
+
+test("matchSliderModal — the /model picker has no ▲ track line, so it never looks like the effort slider", () => {
+  expect(matchSliderModal(MODEL_PICKER_PANE)).toBeNull();
+});
+
+test("matchSlashConfirmModal — the /model picker is not a Switch model?/Change effort level? confirm, for either kind", () => {
+  expect(matchSlashConfirmModal(MODEL_PICKER_PANE, "model")).toBeNull();
+  expect(matchSlashConfirmModal(MODEL_PICKER_PANE, "effort")).toBeNull();
+});
+
+test("matchNumberedModal — 2.1.245 bare /model picker: confirmKey is 's' (footer offers 's to use this session only')", () => {
+  // Owner decision (plan §8 Q6, 2026-08-26): a card click through agetor
+  // must confirm with 's' (session-only), never plain Enter (which would
+  // rewrite the user's global claude default model).
+  const m = matchNumberedModal(MODEL_PICKER_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.confirmKey).toBe("s");
+});
+
+test("pickScrapeMatch — the /model picker's confirmKey rides along through the shared chain", () => {
+  const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
+  expect(direct.confirmKey).toBe("s");
+  const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false });
+  expect(dispatched!.confirmKey).toBe("s");
+});
+
+// ── pickerRowFamily / pickerChoiceIndexForFamily — the 2.1.246 bare /model
+// picker's row-name parse (mirrorModelViaPicker's pure half). Verbatim rows
+// from that function's own doc comment in claude-tmux.ts:
+//   1. Default (recommended)  Opus 5 with 1M context, best for complex work
+//   2. Opus (1M context)      Opus 5 with 1M context …
+//   3. Fable                  Fable 5 …
+//   4. Sonnet ✔               Sonnet 5 …
+//   5. Haiku                  Haiku 4.5 …
+// (labels below omit the leading "N. " — matchNumberedModal already strips
+// that before a row reaches `choices[].label`.)
+
+test("pickerRowFamily — 2.1.246 bare /model picker row labels", () => {
+  expect(pickerRowFamily("Default (recommended)  Opus 5 with 1M context, best for complex work")).toBe("Default");
+  expect(pickerRowFamily("Opus (1M context)      Opus 5 with 1M context, best for complex work")).toBe("Opus");
+  expect(pickerRowFamily("Fable                  Fable 5, most capable for your hardest and longest-running tasks"))
+    .toBe("Fable");
+  expect(pickerRowFamily("Sonnet ✔               Sonnet 5, efficient for routine tasks")).toBe("Sonnet");
+  expect(pickerRowFamily("Haiku                  Haiku 4.5, fastest for quick answers")).toBe("Haiku");
+});
+
+test("pickerRowFamily — no leading word at all yields null", () => {
+  expect(pickerRowFamily("")).toBeNull();
+  expect(pickerRowFamily("   ")).toBeNull();
+});
+
+test("pickerChoiceIndexForFamily — 2.1.246 bare /model picker: Default is never selectable (from either direction), known families resolve by index, unknown family is -1", () => {
+  const choices = [
+    { key: "1", label: "Default (recommended)  Opus 5 with 1M context, best for complex work" },
+    { key: "2", label: "Opus (1M context)      Opus 5 with 1M context, best for complex work" },
+    { key: "3", label: "Fable                  Fable 5, most capable for your hardest and longest-running tasks" },
+    { key: "4", label: "Sonnet ✔               Sonnet 5, efficient for routine tasks" },
+    { key: "5", label: "Haiku                  Haiku 4.5, fastest for quick answers" },
+  ];
+  expect(pickerChoiceIndexForFamily(choices, "Opus")).toBe(1);
+  expect(pickerChoiceIndexForFamily(choices, "Sonnet")).toBe(3);
+  expect(pickerChoiceIndexForFamily(choices, "Fable")).toBe(2);
+  expect(pickerChoiceIndexForFamily(choices, "Haiku")).toBe(4);
+  expect(pickerChoiceIndexForFamily(choices, "Mythos")).toBe(-1);
+  // Never-pick-Default, from both directions.
+  expect(pickerChoiceIndexForFamily(choices, "Default")).toBe(-1);
+  expect(pickerChoiceIndexForFamily(choices, "default")).toBe(-1);
+  // Case-insensitive match on a real family.
+  expect(pickerChoiceIndexForFamily(choices, "opus")).toBe(1);
+});
+
+// ── Effort slider (bare `/effort`) ───────────────────────────────────────────
+
+const EFFORT_SLIDER_XHIGH_PANE = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+
+const EFFORT_SLIDER_HIGH_PANE = `   Effort
+
+                             Faster                                                 Smarter
+                             ────────────────────▲──────────────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+
+test("matchSliderModal — ▲ at column 59 is nearest-centre to xhigh (cursorIndex 3), nav horizontal, high-confidence", () => {
+  const m = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["1", "2", "3", "4", "5", "6"]);
+  expect(m!.choices.map((c) => c.label)).toEqual(["low", "medium", "high", "xhigh", "max", "ultracode"]);
+  expect(m!.cursorIndex).toBe(3);
+  expect(m!.nav).toBe("horizontal");
+  expect(m!.highConfidence).toBe(true);
+});
+
+test("matchSliderModal — ▲ at column 49 is nearest-centre to high (cursorIndex 2)", () => {
+  const m = matchSliderModal(EFFORT_SLIDER_HIGH_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(2);
+});
+
+test("matchSliderModal — fingerprints differ between the two cursor captures and are stable across repeated calls on the same pane", () => {
+  const a1 = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const a2 = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const b = matchSliderModal(EFFORT_SLIDER_HIGH_PANE)!;
+  expect(a1.fingerprint).toBe(a2.fingerprint);
+  expect(a1.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchNumberedModal / matchYesNoModal — the effort slider has no digits or (y/N) shape, so neither generic matcher fires", () => {
+  expect(matchNumberedModal(EFFORT_SLIDER_XHIGH_PANE)).toBeNull();
+  expect(matchYesNoModal(EFFORT_SLIDER_XHIGH_PANE)).toBeNull();
+  expect(matchNumberedModal(EFFORT_SLIDER_HIGH_PANE)).toBeNull();
+  expect(matchYesNoModal(EFFORT_SLIDER_HIGH_PANE)).toBeNull();
+});
+
+// ── pickScrapeMatch — the shared numbered > yes-no > slider > unparsable
+// chain used by BOTH scrapeOnce and the boot poller (docs/plans/model-
+// effort-local-command-turns.md §10 review finding #9) — tests exercise the
+// production function directly rather than re-implementing the `??` chain
+// in the test body, so a future reorder of the real chain would fail here
+// too.
+
+test("pickScrapeMatch — a slider pane resolves to the slider match, never unparsable, even with the watchdog armed", () => {
+  const direct = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
+  const dispatched = pickScrapeMatch(EFFORT_SLIDER_XHIGH_PANE, { paneWorking: false, watchdogArmed: true });
+  expect(dispatched).not.toBeNull();
+  expect(dispatched).toEqual(direct);
+  expect((dispatched as any).unparsable).toBeUndefined();
+});
+
+test("pickScrapeMatch — the /model picker resolves to the numbered match", () => {
+  const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
+  expect(pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+});
+
+test("pickScrapeMatch — a (y/N) pane resolves to the yes-no match", () => {
+  const pane = `Continue with the operation? (y/N)`;
+  const direct = matchYesNoModal(pane)!;
+  expect(pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+});
+
+test("pickScrapeMatch — an idle input box with watchdogArmed:true (paneWorking:false) resolves to the unparsable watchdog match", () => {
+  // pickScrapeMatch itself has no independent notion of "idle" — it trusts
+  // whatever paneWorking/watchdogArmed the caller computed. Production never
+  // actually calls it this way for a real idle pane (stuckTurnFallbackArmed's
+  // own paneIdle term keeps watchdogArmed false there — see the paired
+  // assertion further below), but this pins the shared chain's own dispatch
+  // logic in isolation from that caller-side guard.
+  const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  const dispatched = pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: true });
+  expect(dispatched).not.toBeNull();
+  expect(dispatched!.unparsable).toBe(true);
+});
+
+test("pickScrapeMatch — the same idle pane with paneWorking:true resolves to null (the paneWorking gate skips the unparsable arm outright)", () => {
+  const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true })).toBeNull();
+});
+
+test("pickScrapeMatch — a footer-bearing unknown modal resolves to the unparsable footer match even with the watchdog NOT armed", () => {
+  const direct = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const dispatched = pickScrapeMatch(SHORT_UNPARSABLE_PANE, { paneWorking: false, watchdogArmed: false });
+  expect(dispatched).toEqual(direct);
+  expect(dispatched!.unparsable).toBe(true);
+});
+
+test("pickScrapeMatch — boot semantics: the boot poller always passes watchdogArmed:false, so a footerless stuck pane never cards there (only the footer arm can ever fire at boot)", () => {
+  const stuckPane = `● Running Bash(a very long build)…
+
+Still going, no visible progress, nothing that looks like a modal or a
+footer — just a wedged TUI.`;
+  expect(pickScrapeMatch(stuckPane, { paneWorking: false, watchdogArmed: false })).toBeNull();
+});
+
+// ── Effort slider negatives (one of the three required signals missing) ────
+
+test("matchSliderModal — label row missing (track line directly followed by the footer) → null", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — track + label present but no ←/→ to adjust footer within the last 3 non-blank lines → null", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+// ── Signal (b)/(c) distance boundaries ──────────────────────────────────────
+
+test("matchSliderModal — signal (b) boundary: a label-shaped row 3+ non-blank lines below the track (past LABEL_ROW_SEARCH_NONBLANK=2) → null", () => {
+  // Two non-label filler lines separate the track from the label row, so the
+  // label search (bounded to 2 non-blank lines below the track) runs out
+  // before ever reaching it — labelIdx stays unset regardless of what a
+  // footer further down might say.
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+filler one
+filler two
+                             low     medium     high     xhigh      max       ultracode
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — signal (c) boundary: the footer 4+ non-blank lines below the label row (past FOOTER_SEARCH_NONBLANK=3) → null even though the footer text exists in the pane", () => {
+  const pane = `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+filler one
+filler two
+filler three
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("matchSliderModal — signal (c): an old echo's stale track/label ABOVE a live slider whose own track has scrolled off the top of the tail → null, and the fallback still cards via matchUnparsableModal's footer arm", () => {
+  // The bottom-up track search in (a) has only ONE track line to find in the
+  // whole tail — the OLD echo's — so it wins by default (the live slider's
+  // track is gone, off-screen). Signal (b) then finds the label row
+  // immediately below THAT stale track (the echo's own label row, adjacent
+  // as always). Signal (c) is what rejects the pane: searching from the
+  // ECHO's label row, the real (live) footer down at the true bottom sits
+  // far more than FOOTER_SEARCH_NONBLANK (3) non-blank lines away — buried
+  // behind the echo's own sub-row plus several lines of intervening
+  // transcript — so footerIdx is never found and matchSliderModal returns
+  // null before signal (d) (which the live footer legitimately WOULD pass,
+  // being among the tail's last 3 non-blank lines) is ever reached. That's
+  // the asymmetric partner to the "OLD echo above an idle box" case below,
+  // where (d) is what rejects instead of (c).
+  const pane = `❯ /effort
+   Effort
+
+                             Faster                                                 Smarter
+                             ────────────────────▲──────────────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+❯ /effort xhigh
+
+some later transcript line one
+some later transcript line two
+some later transcript line three
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+  expect(matchSliderModal(pane)).toBeNull();
+  // The real footer at the true bottom is exactly what drives the fallback
+  // card instead — confirming "falls through to matchUnparsableModal" isn't
+  // just a doc claim but the actual outcome for this pane.
+  const fallback = matchUnparsableModal(pane, false);
+  expect(fallback).not.toBeNull();
+  expect(fallback!.unparsable).toBe(true);
+});
+
+/** Same slider shape as `EFFORT_SLIDER_XHIGH_PANE` (real label row + real
+ *  footer), but with a caller-supplied track line — lets the
+ *  SLIDER_TRACK_MIN_CHARS tests isolate signal (a) without also having to
+ *  reconstruct the label/footer rows. */
+function sliderPaneWithTrack(track: string): string {
+  return `   Effort
+
+                             Faster                                                 Smarter
+                             ${track}
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+}
+
+test("matchSliderModal — a lone ▲ (no real track) never looks like the slider, even with a real label row and footer", () => {
+  expect(matchSliderModal(sliderPaneWithTrack("▲"))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 9-char track (one short of the minimum) still fails to parse", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS - 1) + "▲";
+  expect(track.length).toBe(SLIDER_TRACK_MIN_CHARS); // sanity: 9 dashes + the ▲ itself
+  expect(matchSliderModal(sliderPaneWithTrack(track))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 10-char track (meets the minimum) parses normally", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS) + "▲";
+  expect(matchSliderModal(sliderPaneWithTrack(track))).not.toBeNull();
+});
+
+test("matchSliderModal / pickScrapeMatch / paneShowsBlockingPrompt — a real slider at the bottom is still recognised with genuine working chrome (a spinner line) above it", () => {
+  // matchSliderModal is a pure pane-SHAPE matcher — it never consults
+  // paneShowsClaudeWorking at all, unlike the unparsable fallback's gate —
+  // so a real slider track/labels/footer at the bottom parses regardless of
+  // what's rendered above it. (The vacuous predecessor of this test merely
+  // fed a bare spinner line with no slider shape in it at all, which
+  // trivially returns null without exercising anything about "working".)
+  const pane = `✳ Working… (esc to interrupt · 12s · 1.2k tokens)
+${EFFORT_SLIDER_XHIGH_PANE}`;
+  const direct = matchSliderModal(pane);
+  expect(direct).not.toBeNull();
+  expect(direct!.nav).toBe("horizontal");
+
+  // pickScrapeMatch's own paneWorking gate (see its doc) only ever wraps the
+  // TRAILING unparsable arm — a real slider match still wins outright, even
+  // with paneWorking AND the watchdog both true.
+  const dispatched = pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true });
+  expect(dispatched).toEqual(direct);
+  expect((dispatched as any).unparsable).toBeUndefined();
+
+  // And the paste-guard predicate agrees for the same reason: a live slider
+  // blocks a pending paste regardless of the spinner text also on the pane.
+  expect(paneShowsBlockingPrompt(pane)).toBe(true);
+});
+
+test("matchSliderModal — a transcript that merely contains an OLD slider echo, followed by the idle input box, does not re-fire", () => {
+  // Signal (d): the footer requirement is checked against the CURRENT bottom
+  // of the pane, not near the stale track line. Signals (a)-(c) all pass for
+  // the echo in isolation — it's a complete, self-contained slider capture
+  // (its own track, its own adjacent label row, its own footer right below
+  // that) — so (c) alone would still match. (d) is what rejects it: that
+  // footer is buried under the idle box that now follows, so it is NOT among
+  // the tail's last 3 non-blank lines. See the (c)-fails case (an old echo
+  // above a LIVE slider whose track has scrolled off) in the boundary tests
+  // above for the asymmetric partner this signal split exists to cover.
+  const pane = `❯ /effort
+${EFFORT_SLIDER_HIGH_PANE}
+❯ /effort high
+
+${idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent")}`;
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS is 10", () => {
+  expect(SLIDER_TRACK_MIN_CHARS).toBe(10);
+});
+
+test("SLIDER_TRACK_RE — matches a track line with exactly one ▲, not a bare border or a two-marker line", () => {
+  expect(SLIDER_TRACK_RE.test(
+    "                             ──────────────────────────────▲────────────┆──────────────────",
+  )).toBe(true);
+  expect(SLIDER_TRACK_RE.test("─".repeat(30))).toBe(false); // no ▲ at all
+  expect(SLIDER_TRACK_RE.test("▲──▲")).toBe(false); // two markers — not "exactly one"
+});
+
+test("SLIDER_FOOTER_RE — matches the captured slider footer phrase specifically", () => {
+  expect(SLIDER_FOOTER_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(true);
+  expect(SLIDER_FOOTER_RE.test("Enter to confirm · Esc to cancel")).toBe(false);
+});
+
+// ── Signal (d) boundary: rows drawn AFTER the (otherwise correctly-anchored)
+// footer, between it and the pane's true bottom ─────────────────────────────
+
+/** A real, correctly-anchored slider (signals a/b/c all satisfied) with N
+ *  extra rows appended after the footer — e.g. the "Tip: …" hint banner
+ *  claude sometimes draws below its own footer. Isolates signal (d) — "the
+ *  footer must ALSO be among the tail's last 3 non-blank lines" — from (a)/
+ *  (b)/(c), which this shape always satisfies regardless of `trailingRows`. */
+function sliderPaneWithTrailingRows(trailingRows: string[]): string {
+  const trailer = trailingRows.map((r) => `\n${r}`).join("");
+  return `   Effort
+
+                             Faster                                                 Smarter
+                             ──────────────────────────────▲────────────┆──────────────────
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel${trailer}`;
+}
+
+test("matchSliderModal — signal (d): a single Tip: hint row between the footer and the pane bottom still parses (footer remains within the last 3 non-blank lines)", () => {
+  const pane = sliderPaneWithTrailingRows(["Tip: Ask Claude to make a plan before coding"]);
+  expect(matchSliderModal(pane)).not.toBeNull();
+});
+
+test("matchSliderModal — signal (d) boundary: footer exactly 3rd-from-bottom (two trailing rows) still parses", () => {
+  const pane = sliderPaneWithTrailingRows(["Tip: row one", "Tip: row two"]);
+  expect(matchSliderModal(pane)).not.toBeNull();
+});
+
+test("matchSliderModal — signal (d) boundary: footer pushed to 4th-from-bottom (three trailing rows) → null", () => {
+  // Documents the exact boundary: 3 non-blank lines drawn after the footer
+  // is the point signal (d) stops treating the widget as still live at the
+  // bottom of the pane.
+  const pane = sliderPaneWithTrailingRows(["Tip: row one", "Tip: row two", "Tip: row three"]);
+  expect(matchSliderModal(pane)).toBeNull();
+});
+
+// ── Slash confirms (2.1.245 "Switch model?" / "Change effort level?") ──────
+
+const EFFORT_CONFIRM_PANE = `   Change effort level?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current effort level. Switching to low means the full history gets re-read on
+   your next message.
+
+   ❯ 1. Yes, switch to low
+     2. No, go back`;
+
+const MODEL_CONFIRM_PANE = `   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Opus 5 means the full history gets re-read on your
+   next message.
+
+   ❯ 1. Yes, switch to Opus 5
+     2. No, go back`;
+
+test("matchSlashConfirmModal — effort confirm matches kind 'effort', cursor on 'Yes, switch to low'", () => {
+  const m = matchSlashConfirmModal(EFFORT_CONFIRM_PANE, "effort");
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(0);
+});
+
+test("matchSlashConfirmModal — effort confirm does NOT match kind 'model'", () => {
+  expect(matchSlashConfirmModal(EFFORT_CONFIRM_PANE, "model")).toBeNull();
+});
+
+test("matchSlashConfirmModal — model confirm matches kind 'model', cursor on 'Yes, switch to Opus 5'", () => {
+  const m = matchSlashConfirmModal(MODEL_CONFIRM_PANE, "model");
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(0);
+});
+
+test("matchSlashConfirmModal — model confirm does NOT match kind 'effort'", () => {
+  expect(matchSlashConfirmModal(MODEL_CONFIRM_PANE, "effort")).toBeNull();
+});
+
+test("matchSlashConfirmModal — cursor moved to 'No, go back' never matches, for either kind", () => {
+  const noSelected = EFFORT_CONFIRM_PANE
+    .replace("   ❯ 1. Yes, switch to low", "     1. Yes, switch to low")
+    .replace("     2. No, go back", "   ❯ 2. No, go back");
+  expect(matchNumberedModal(noSelected)!.cursorIndex).toBe(1); // sanity: cursor really moved
+  expect(matchSlashConfirmModal(noSelected, "effort")).toBeNull();
+  expect(matchSlashConfirmModal(noSelected, "model")).toBeNull();
+});
+
+test("matchNumberedModal — both confirms parse as a plain 2-choice modal, not high-confidence (no Esc-to-cancel footer)", () => {
+  const effort = matchNumberedModal(EFFORT_CONFIRM_PANE);
+  const model = matchNumberedModal(MODEL_CONFIRM_PANE);
+  expect(effort!.choices.length).toBe(2);
+  expect(effort!.highConfidence).toBeFalsy();
+  expect(model!.choices.length).toBe(2);
+  expect(model!.highConfidence).toBeFalsy();
+});
+
+test("matchNumberedModal — neither 'Switch model?' nor 'Change effort level?' confirm carries a session-only confirmKey", () => {
+  // These confirms have no footer at all (see the test above), let alone the
+  // /model picker's session-only phrasing — they must always dismiss with
+  // the default Enter.
+  expect(matchNumberedModal(EFFORT_CONFIRM_PANE)!.confirmKey).toBeUndefined();
+  expect(matchNumberedModal(MODEL_CONFIRM_PANE)!.confirmKey).toBeUndefined();
+});
+
+// ── Idle input box (`paneShowsIdleInputBox`) ────────────────────────────────
+
+const IDLE_STATUS_BAR_VARIANTS: Array<[string, string]> = [
+  ["bypass permissions", "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent"],
+  ["auto mode", "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent"],
+  ["manual mode (no shift+tab hint, uses '? for shortcuts' instead)", "⏸ manual mode on · ? for shortcuts · ← 1 agent"],
+  ["accept edits", "⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent"],
+  ["plan mode", "⏸ plan mode on (shift+tab to cycle) · ← 1 agent"],
+  ["bypass permissions, no '· ← N agent' suffix", "⏵⏵ bypass permissions on (shift+tab to cycle)"],
+  ["auto mode with a '⧉ index' segment (2.1.29x)", "⏵⏵ auto mode on (shift+tab to cycle) · ⧉ index · ← 1 agent"],
+  [
+    "auto mode with the right-hand '◉ xhigh · /effort' hint (2.1.296)",
+    "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent                               ◉ xhigh · /effort",
+  ],
+];
+
+for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+  test(`paneShowsIdleInputBox — true for the idle pane with the "${label}" status bar`, () => {
+    expect(STATUS_BAR_RE.test(bar)).toBe(true);
+    expect(paneShowsIdleInputBox(idlePane(bar))).toBe(true);
+  });
+}
+
+test("STATUS_BAR_RE — does not match '⏵⏵ auto mode on' without either cycle hint (status-bar-shaped but incomplete)", () => {
+  expect(STATUS_BAR_RE.test("⏵⏵ auto mode on · ← 1 agent")).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for the /model picker (a modal replaces the input box, not a status bar)", () => {
+  expect(paneShowsIdleInputBox(MODEL_PICKER_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for both effort slider captures", () => {
+  expect(paneShowsIdleInputBox(EFFORT_SLIDER_XHIGH_PANE)).toBe(false);
+  expect(paneShowsIdleInputBox(EFFORT_SLIDER_HIGH_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for both slash confirms", () => {
+  expect(paneShowsIdleInputBox(EFFORT_CONFIRM_PANE)).toBe(false);
+  expect(paneShowsIdleInputBox(MODEL_CONFIRM_PANE)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false for a working pane (spinner above the status bar, whose bar carries 'esc to interrupt')", () => {
+  // A working pane's OWN status bar carries the same "(shift+tab to cycle)"
+  // hint STATUS_BAR_RE matches, with "esc to interrupt" spliced in (see
+  // STATUS_BAR_RE's doc comment) — that's rejected directly (check b), so
+  // this reads false regardless of whether a bare "❯" happens to sit above it.
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false when idle-box rows sit in scrollback ABOVE a modal (idle rows, a ▔ divider, then the confirm as the last lines)", () => {
+  const pane = `${idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")}
+${"▔".repeat(120)}
+${EFFORT_CONFIRM_PANE}`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — false when the status bar is NOT in the last two non-blank lines (two ordinary transcript rows follow it)", () => {
+  const pane = `${idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")}
+some later transcript line one
+some later transcript line two`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true with a 'Tip: …' row and an '✔ Update installed' row sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  Tip: Ask Claude to make a plan before coding
+  ✔ Update installed · restart to apply
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — true with a 2-row background-agent roster (⏺ main / ◯ explorer) sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+⏺ main
+◯ explorer
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — false when the bare ❯ prompt sits 9+ non-blank rows above the bar (outside IDLE_PROMPT_SEARCH_LINES)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES + 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true when the bare ❯ prompt sits exactly IDLE_PROMPT_SEARCH_LINES non-blank rows above the bar (boundary)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES - 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("IDLE_PROMPT_SEARCH_LINES is 8", () => {
+  expect(IDLE_PROMPT_SEARCH_LINES).toBe(8);
+});
+
+// ── stuckTurnFallbackArmed / matchUnparsableModal — idle interplay ──────────
+
+test("stuckTurnFallbackArmed — idle at the input box disarms the watchdog even when everything else is armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneIdle: true })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — a working pane on the esc-to-interrupt blink-OFF tick (paneIdle reads true) still never arms", () => {
+  // paneShowsIdleInputBox's "esc to interrupt" text blinks at ~1 Hz in
+  // claude's real TUI, so paneIdle can legitimately read true on the
+  // blink-off tick of an otherwise-busy pane (see that function's doc).
+  // paneShowsClaudeWorking (the spinner line) is what actually protects the
+  // settle path — stuckTurnFallbackArmed's own `!paneWorking` term holds
+  // regardless of what paneIdle says.
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: true, paneIdle: true })).toBe(false);
+});
+
+test("matchUnparsableModal — the idle input box never trips the footer arm (idle is proof the turn ended, not an unparsable modal); the actual protection against the WATCHDOG arm lives one level up, in stuckTurnFallbackArmed's paneIdle term", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+  // matchUnparsableModal itself has no notion of "idle" at all — passed
+  // watchdogArmed directly (as if some caller had already decided to arm
+  // it), it fires on this same idle pane same as any other footerless,
+  // notice-free pane. The reason a real idle pane never actually reaches
+  // here with watchdogArmed:true in production is stuckTurnFallbackArmed's
+  // own `!p.paneIdle` term below — that's where the real protection lives.
+  expect(matchUnparsableModal(pane, true)).not.toBeNull();
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneIdle: true })).toBe(false);
+});
+
+// ── Composer text (`paneShowsComposerText`) ─────────────────────────────────
+// (docs/plans/model-effort-local-command-turns.md §10 review finding #2) —
+// this predicate is `paneShowsIdleInputBox`'s complement on the SAME
+// `livePromptRow`: bare vs. non-bare live row. Used by `queuePaste`'s
+// composer-dirty check before pasting a new message over a stranded one.
+
+test("paneShowsComposerText — false on the verbatim idlePane() fixture (bare live row), even with a '❯ /model sonnet' transcript ECHO above it; paneShowsIdleInputBox is true for the same pane", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+  expect(paneShowsComposerText(pane)).toBe(false);
+});
+
+/** Same shape as `idlePane`, but with arbitrary text sitting in the LIVE
+ *  (bottom) composer row instead of the bare `❯ ` prompt — lets a test drive
+ *  `paneShowsComposerText`'s non-bare branch without reconstructing the
+ *  echo/border chrome by hand each time. */
+function idlePaneWithComposerText(statusBar: string, composerText: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯ ${composerText}
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+test("paneShowsComposerText — true when the live row holds unsent text ('hello from agetor'); paneShowsIdleInputBox is false for the same pane", () => {
+  const pane = idlePaneWithComposerText(
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    "hello from agetor",
+  );
+  expect(paneShowsComposerText(pane)).toBe(true);
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsComposerText — true for the multi-line paste placeholder ('[Pasted text #1 +12 lines]')", () => {
+  const pane = idlePaneWithComposerText(
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent",
+    "[Pasted text #1 +12 lines]",
+  );
+  expect(paneShowsComposerText(pane)).toBe(true);
+});
+
+test("paneShowsComposerText — false for the /model picker, both effort slider captures, and both slash confirms (no anchored status bar, so livePromptRow finds nothing)", () => {
+  expect(paneShowsComposerText(MODEL_PICKER_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_SLIDER_XHIGH_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_SLIDER_HIGH_PANE)).toBe(false);
+  expect(paneShowsComposerText(EFFORT_CONFIRM_PANE)).toBe(false);
+  expect(paneShowsComposerText(MODEL_CONFIRM_PANE)).toBe(false);
+});
+
+test("paneShowsComposerText / paneShowsIdleInputBox — both false on a working pane (spinner + 'esc to interrupt' bar), even with a non-bare live row", () => {
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+❯ still typing
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsComposerText(pane)).toBe(false);
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+// ── paneShowsBlockingPrompt spot-checks — picker / idle / working (the
+// slider case is already pinned above, alongside pickScrapeMatch) ──────────
+
+test("paneShowsBlockingPrompt — true for the /model picker (a numbered modal)", () => {
+  expect(paneShowsBlockingPrompt(MODEL_PICKER_PANE)).toBe(true);
+});
+
+test("paneShowsBlockingPrompt — false for the idle input box", () => {
+  const pane = idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
+test("paneShowsBlockingPrompt — false for a working pane with no modal on screen (spinner chrome alone never blocks a pending paste)", () => {
+  const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
+
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// F-B: startup consent-dialog confirm — verify-and-retry (live smoke on 2.1.284:
+// Down+Enter accepted by tmux, no effect, run died at the 30 s boot timeout).
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("startupConfirmDecision — pure attempt/retry decision", () => {
+  const { startupConfirmDecision, STARTUP_CONFIRM_RETRY_MS, STARTUP_CONFIRM_MAX_ATTEMPTS } = __forTest;
+
+  test("first sighting waits; a second consecutive sighting attempts", () => {
+    expect(startupConfirmDecision({ seenTwice: false, attempts: 0, lastAttemptAt: 0, now: 1000 })).toBe("wait");
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 0, lastAttemptAt: 0, now: 1000 })).toBe("attempt");
+  });
+
+  test("the retry window is at least 1.5 s", () => {
+    expect(STARTUP_CONFIRM_RETRY_MS).toBeGreaterThanOrEqual(1500);
+  });
+
+  test("after an attempt: waits until STARTUP_CONFIRM_RETRY_MS, then retries only when the fingerprint was stable", () => {
+    const at = 5000;
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + 1 })).toBe("wait");
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS - 1 })).toBe("wait");
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 1, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("attempt");
+    // A retry now DOES need the identical fingerprint on two consecutive polls.
+    expect(startupConfirmDecision({ seenTwice: false, attempts: 2, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("wait");
+  });
+
+  test("at the attempt cap: waits out the window, then gives up (once stable)", () => {
+    const at = 9000;
+    expect(STARTUP_CONFIRM_MAX_ATTEMPTS).toBe(4);
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 4, lastAttemptAt: at, now: at + 10 })).toBe("wait");
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 4, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("give-up");
+    expect(startupConfirmDecision({ seenTwice: false, attempts: 4, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("wait");
+    expect(startupConfirmDecision({ seenTwice: true, attempts: 3, lastAttemptAt: at, now: at + STARTUP_CONFIRM_RETRY_MS })).toBe("attempt");
+  });
+});
+
+describe("createStartupConfirmTracker — the boot poller's per-dialog state machine", () => {
+  const { createStartupConfirmTracker, STARTUP_CONFIRM_RETRY_MS } = __forTest;
+  const POLL = 350;
+  const TRUST = (cursorFirst: boolean): string =>
+    ` Quick safety check: Is this a project you created or one you trust?\n\n` +
+    (cursorFirst ? ` ❯ No, exit\n   Yes, I trust this folder\n` : `   No, exit\n ❯ Yes, I trust this folder\n`) +
+    `\n Enter to confirm · Esc to cancel\n`;
+  const match = (cursorFirst: boolean) => matchStartupConsentDialog(TRUST(cursorFirst))!;
+
+  test("confirms only on the 2nd consecutive sighting; auto-confirmed is emitted only after the dialog is absent on two polls", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    expect(t.observe(m, 0)).toEqual({ attempt: null, statuses: [] });
+    const second = t.observe(m, POLL);
+    expect(second.attempt).toBe(m);
+    expect(second.statuses).toEqual([]);
+    // Still on the pane 350 ms later: too early to retry, and NOT reported confirmed.
+    expect(t.observe(m, 2 * POLL)).toEqual({ attempt: null, statuses: [] });
+    // One blank frame is not enough...
+    expect(t.observe(null, 3 * POLL)).toEqual({ attempt: null, statuses: [] });
+    // ...the second consecutive one reports it.
+    expect(t.observe(null, 4 * POLL)).toEqual({
+      attempt: null,
+      statuses: ["claude startup dialog auto-confirmed (trust-folder)"],
+    });
+    // Reported once.
+    expect(t.observe(null, 5 * POLL).statuses).toEqual([]);
+  });
+
+  test("N3: m,m,m,null,m,m,null,null emits exactly one auto-confirmed (at the 2nd consecutive null) and no extra attempt", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    const seq: Array<typeof m | null> = [m, m, m, null, m, m, null, null];
+    const attempts: number[] = [];
+    const statuses: Array<{ i: number; s: string }> = [];
+    seq.forEach((obs, i) => {
+      const step = t.observe(obs, i * POLL);
+      if (step.attempt) attempts.push(i);
+      for (const s of step.statuses) statuses.push({ i, s });
+    });
+    expect(attempts).toEqual([1]);
+    expect(statuses).toEqual([{ i: 7, s: "claude startup dialog auto-confirmed (trust-folder)" }]);
+  });
+
+  test("N3: a single null frame keeps the entry and its attempt count (no fresh first attempt afterwards)", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    t.observe(m, 0);
+    expect(t.observe(m, POLL).attempt).toBe(m);
+    expect(t.observe(null, 2 * POLL).statuses).toEqual([]);
+    // Back again, within the retry window: waits (attempts is still 1, not reset to 0
+    // — a reset would let the very next stable pair fire another attempt immediately).
+    expect(t.observe(m, 3 * POLL).attempt).toBeNull();
+    expect(t.observe(m, 4 * POLL).attempt).toBeNull();
+  });
+
+  test("N2: a retry needs an identical fingerprint on two consecutive post-window polls", () => {
+    const t = createStartupConfirmTracker();
+    const before = match(true);
+    t.observe(before, 0);
+    expect(t.observe(before, POLL).attempt).toBe(before); // attempt #1 at t=350
+    const after = match(false); // Down landed, Enter did not: cursor now on the accept row
+    expect(after.fingerprint).not.toBe(before.fingerprint);
+    const t0 = POLL;
+    // Inside the window: never.
+    for (let now = t0 + POLL; now < t0 + STARTUP_CONFIRM_RETRY_MS; now += POLL) {
+      expect(t.observe(after, now).attempt).toBeNull();
+    }
+    // First post-window poll: only ONE stable sighting → still waits.
+    const first = t0 + Math.ceil(STARTUP_CONFIRM_RETRY_MS / POLL) * POLL;
+    expect(t.observe(after, first).attempt).toBeNull();
+    // Second consecutive post-window poll with the same fingerprint → retry, Enter alone.
+    const retry = t.observe(after, first + POLL);
+    expect(retry.attempt).toBe(after);
+    expect(retry.attempt!.cursorIndex).toBe(retry.attempt!.acceptIndex);
+  });
+
+  test("N2: a fingerprint that changes between the two post-window polls restarts the stability count", () => {
+    const t = createStartupConfirmTracker();
+    const a = match(true);
+    const b = match(false);
+    t.observe(a, 0);
+    expect(t.observe(a, POLL).attempt).toBe(a);
+    const first = POLL + 5 * POLL; // 1750 ms after the attempt: past the window
+    expect(t.observe(a, first).attempt).toBeNull();
+    expect(t.observe(b, first + POLL).attempt).toBeNull(); // changed mid-repaint
+    expect(t.observe(b, first + 2 * POLL).attempt).toBe(b); // now two identical in a row
+  });
+
+  test("gives up after 4 attempts with ONE status line, then stops retrying", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    let now = 0;
+    t.observe(m, now);
+    let attempts = 0;
+    const statuses: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      now += POLL;
+      const step = t.observe(m, now);
+      if (step.attempt) attempts++;
+      statuses.push(...step.statuses);
+    }
+    expect(attempts).toBe(4);
+    expect(statuses).toEqual([
+      "claude startup dialog could not be confirmed after 4 attempts (trust-folder) — answer it in the terminal",
+    ]);
+    // N4: the poller asks the tracker whether to fall through to the generic card path.
+    expect(t.hasGivenUp("trust-folder")).toBe(true);
+    expect(t.hasGivenUp("bypass-permissions")).toBe(false);
+    // Leaving after a give-up never claims an auto-confirm (even after 2 absent polls).
+    expect(t.observe(null, now + POLL).statuses).toEqual([]);
+    expect(t.observe(null, now + 2 * POLL).statuses).toEqual([]);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+  });
+
+  test("N4: before give-up hasGivenUp is false, so the poller keeps auto-confirming instead of carding", () => {
+    const t = createStartupConfirmTracker();
+    const m = match(true);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+    t.observe(m, 0);
+    t.observe(m, POLL);
+    expect(t.hasGivenUp("trust-folder")).toBe(false);
+  });
+
+  test("N4: the dialog that survived give-up is still cardable by the generic path (pickScrapeMatch), so the fall-through registers a tmux_prompt", () => {
+    const generic = __forTest.pickScrapeMatch(TRUST(true), { paneWorking: false, watchdogArmed: false });
+    expect(generic).not.toBeNull();
+    expect(generic!.unparsable).toBe(true);
+    expect(generic!.paneText).toContain("Yes, I trust this folder");
+  });
+
+  test("flushAbsent (bootSettled early return) reports only dialogs NOT matched on the last poll", () => {
+    // Still matched on the last poll (boot window timed out with the dialog up): nothing.
+    const stuck = createStartupConfirmTracker();
+    const m = match(true);
+    stuck.observe(m, 0);
+    expect(stuck.observe(m, POLL).attempt).toBe(m);
+    stuck.observe(m, 2 * POLL);
+    expect(stuck.flushAbsent()).toEqual([]);
+    expect(stuck.flushConfirmed()).toEqual([]); // entries were cleared by the flush
+
+    // Absent on the last poll after an attempt (one blank frame is enough here): reported once.
+    const gone = createStartupConfirmTracker();
+    gone.observe(m, 0);
+    gone.observe(m, POLL);
+    gone.observe(null, 2 * POLL); // single null: entry kept, statuses empty
+    expect(gone.flushAbsent()).toEqual(["claude startup dialog auto-confirmed (trust-folder)"]);
+    expect(gone.flushAbsent()).toEqual([]);
+
+    // Matched again after a blank frame: the absence counter reset, so nothing.
+    const flicker = createStartupConfirmTracker();
+    flicker.observe(m, 0);
+    flicker.observe(m, POLL);
+    flicker.observe(null, 2 * POLL);
+    flicker.observe(m, 3 * POLL);
+    expect(flicker.flushAbsent()).toEqual([]);
+
+    // Never attempted (only ever one sighting) and gave-up entries emit nothing either.
+    const fresh = createStartupConfirmTracker();
+    fresh.observe(m, 0);
+    fresh.observe(null, POLL);
+    expect(fresh.flushAbsent()).toEqual([]);
+  });
+
+  test("a different dialog is tracked under its own name; flushConfirmed reports attempted-but-unreported ones", () => {
+    const t = createStartupConfirmTracker();
+    const bypass = matchStartupConsentDialog(`Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept`)!;
+    t.observe(bypass, 0);
+    expect(t.observe(bypass, POLL).attempt).toBe(bypass);
+    const trust = match(true);
+    // Bypass replaced by trust (positive evidence it is gone): reported immediately, trust waits a poll.
+    const step = t.observe(trust, 2 * POLL);
+    expect(step.statuses).toEqual(["claude startup dialog auto-confirmed (bypass-permissions)"]);
+    expect(step.attempt).toBeNull();
+    expect(t.observe(trust, 3 * POLL).attempt).toBe(trust);
+    // JSONL appeared while the trust dialog was still "pending": flush reports it.
+    expect(t.flushConfirmed()).toEqual(["claude startup dialog auto-confirmed (trust-folder)"]);
+    expect(t.flushConfirmed()).toEqual([]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// F-B: sliceModalRegion — footer wrapped across two rows (#11)
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("sliceModalRegion", () => {
+  const { sliceModalRegion } = __forTest;
+
+  test("ends at the literal `Esc to cancel` footer and drops scrollback above the header", () => {
+    const pane = ["  1. old numbered list in scrollback", "", " ☐ Pick", "", "Which?", "❯ 1. A", "  2. B", "", "Enter to select · Esc to cancel", "", ""].join("\n");
+    const region = sliceModalRegion(pane);
+    expect(region.split("\n")[0]).toBe("");
+    expect(region).toContain("☐ Pick");
+    expect(region).not.toContain("old numbered list");
+    expect(region.endsWith("Esc to cancel")).toBe(true);
+  });
+
+  test("a footer wrapped as `… Esc to` / `cancel` ends on the successor row", () => {
+    const pane = ["scrollback 1. x", "", " ☐ Pick", "Which?", "❯ 1. A", "  2. B", "", "Enter to select · ↑/↓ to navigate · Esc to", "cancel", "", "❯ prompt"].join("\n");
+    const region = sliceModalRegion(pane);
+    expect(region.endsWith("Esc to\ncancel")).toBe(true);
+    expect(region).not.toContain("prompt");
+    expect(region).not.toContain("scrollback");
+  });
+
+  test("no footer at all → the full text, unchanged", () => {
+    expect(sliceModalRegion("a\nb\nc")).toBe("a\nb\nc");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Composer placeholder (docs/plans/claude-code-placeholder.md, TT1): a dim
+// prompt suggestion / startup `Try "…"` sample / `Message @<agent>…` hint on
+// the live `❯` row is an EMPTY composer, not text in the box. Plain
+// `capture-pane -p` cannot tell it from typed text; the styled
+// (`capture-pane -p -e`) tail can — the placeholder is SGR-dim.
+// ────────────────────────────────────────────────────────────────────────────
+
+const {
+  stripSgr,
+  isPlaceholderRow,
+  placeholderRowShowing,
+  livePromptRow,
+  livePromptRowIndex,
+} = __forTest;
+
+const PLACEHOLDER_STATUS_BAR = "⏵⏵ auto mode on (shift+tab to cycle) · ⧉ index · ← 1 agent";
+
+/** The live `❯` row as claude 2.1.296 renders it: a default-colour SGR lead,
+ *  the glyph, then a NBSP (U+00A0, not an ASCII space) before any text. */
+const livePrefix = "\x1b[39m❯\xa0";
+
+/** SGR-only projection (the fixtures below use nothing but `ESC[…m`). */
+const sgrPlain = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+/**
+ * A full synthetic `{ plain, styled }` tail pair for one live row. Both
+ * captures have the SAME line count and the live row at the same raw index
+ * (a transcript echo, a blank row, a separator, the live `❯` row, a
+ * separator, then the status bar); the styled one just carries SGR escapes
+ * on its chrome rows too, like the real `capture-pane -e` does. Pass the
+ * styled live row WITHOUT the `\x1b[39m❯\xa0` lead (it is prepended) — or a
+ * full `liveRow` override to build a deliberately mismatched styled tail.
+ */
+function placeholderPanes(
+  rowSuffix: string,
+  opts: { statusBar?: string; liveRow?: string } = {},
+): { plain: string; styled: string; rowIndex: number } {
+  const statusBar = opts.statusBar ?? PLACEHOLDER_STATUS_BAR;
+  const styledLive = opts.liveRow ?? `${livePrefix}${rowSuffix}`;
+  const styledLines = [
+    "\x1b[39m❯\xa0/model sonnet\x1b[0m",
+    "  ⎿  Set model to Sonnet 5 and saved as your default for new sessions",
+    "",
+    `\x1b[2m${IDLE_BORDER}\x1b[0m`,
+    styledLive,
+    `\x1b[2m${IDLE_BORDER}\x1b[0m`,
+    `  \x1b[2m${statusBar}\x1b[0m`,
+  ];
+  const plainLines = styledLines.map(sgrPlain);
+  return { plain: plainLines.join("\n"), styled: styledLines.join("\n"), rowIndex: 4 };
+}
+
+/** Live-row suffixes (after the `\x1b[39m❯\xa0` lead) that ARE placeholders. */
+const placeholderCases: Array<[string, string]> = [
+  ["a contiguous dim suggestion", "\x1b[2mmake a vertical version too\x1b[0m"],
+  [
+    "the per-word dim startup sample (resets at every space)",
+    '\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m \x1b[2ma\x1b[0m \x1b[2mfile\x1b[0m \x1b[2mcalled\x1b[0m \x1b[2mhello.txt"\x1b[0m',
+  ],
+  [
+    "an inverted first char closed with SGR 27 (7…27…2)",
+    "\x1b[7mm\x1b[27m\x1b[2make a vertical version too\x1b[0m",
+  ],
+  [
+    "an inverted first char closed with a full reset (7…0…2)",
+    "\x1b[7mm\x1b[0m\x1b[2make a vertical version too\x1b[0m",
+  ],
+  ["a 'Message @<agent>…' dim hint", "\x1b[2mMessage @reviewer…\x1b[0m"],
+  ["a two-char placeholder: inverted first char + one dim char", "\x1b[7mo\x1b[27m\x1b[2mk\x1b[0m"],
+  ["dim set alongside an extended colour in one sequence ('2;38;5;7')", "\x1b[2;38;5;7mmake a vertical version too\x1b[0m"],
+  ["dim set through a compound param ('0;2')", "\x1b[0;2mmake a vertical version too\x1b[0m"],
+  ["dim set after an empty-param reset ('ESC[m')", "\x1b[m\x1b[2mmake a vertical version too\x1b[0m"],
+  [
+    "dim survives an unrelated colour change mid-row",
+    "\x1b[2mmake a \x1b[38;5;244mvertical\x1b[39m version too\x1b[0m",
+  ],
+];
+
+/** Live-row suffixes that are NOT placeholders (text, chips, mixed or coloured rows). */
+const nonPlaceholderCases: Array<[string, string]> = [
+  ["typed text (plain)", "hello from agetor"],
+  ["a plain paste chip", "[Pasted text #1 +25 lines]"],
+  ["a plain image chip", "[Image #2]"],
+  ["an image chip followed by typed text", "[Image #2] hello"],
+  ["a dim run followed by plain text", "\x1b[2mmake a\x1b[0m vertical version too"],
+  ["plain text followed by a dim run", "make a \x1b[2mvertical version too\x1b[0m"],
+  ["dim cleared mid-row by SGR 22", "\x1b[2mmake a \x1b[22mvertical version too\x1b[0m"],
+  ["text coloured with the 256-colour index 2 (green, NOT dim)", "\x1b[38;5;2mhello from agetor\x1b[0m"],
+  ["a single char in the 256-colour index 7 (NOT inverse)", "\x1b[38;5;7mx\x1b[0m"],
+  ["text coloured with truecolour 2;2;2 (NOT dim)", "\x1b[38;2;2;2;2mhello from agetor\x1b[0m"],
+  ["a single char in truecolour 7;7;7 (NOT inverse)", "\x1b[38;2;7;7;7mx\x1b[0m"],
+  ["a 256-colour background index 2 (NOT dim)", "\x1b[48;5;2mhello from agetor\x1b[0m"],
+  ["a dim paste chip (explicit exclusion)", "\x1b[2m[Pasted text #1 +3 lines]\x1b[0m"],
+  ["a dim image chip (explicit exclusion)", "\x1b[2m[Image #2]\x1b[0m"],
+  ["an inverted run longer than the first char", "\x1b[7mhello\x1b[0m"],
+  // Claude's cursor block sits on the LAST typed character, so a one-letter
+  // draft renders as one inverted char with nothing dim — typed text, not a
+  // placeholder (code review, low finding 1).
+  ["a one-char typed draft under the cursor block (7…27)", "\x1b[7mh\x1b[27m"],
+  ["a one-char typed draft under the cursor block (7…0)", "\x1b[7mh\x1b[0m"],
+  ["a one-char typed draft under an unclosed cursor block", "\x1b[7mh"],
+  ["a one-char inverted draft followed by trailing spaces", "\x1b[7mh\x1b[0m   "],
+  ["a row with no visible text after the glyph", ""],
+];
+
+describe("stripSgr", () => {
+  test("removes SGR sequences, leaving the plain text", () => {
+    expect(stripSgr("\x1b[39m❯\xa0\x1b[2mmake a\x1b[0m version")).toBe("❯\xa0make a version");
+    expect(stripSgr("\x1b[1;38;5;12mbold\x1b[m")).toBe("bold");
+  });
+
+  test("removes non-'m' CSI sequences too (erase / cursor movement)", () => {
+    expect(stripSgr("a\x1b[Kb\x1b[2Kc\x1b[3;4Hd")).toBe("abcd");
+  });
+
+  test("removes an OSC 8 hyperlink terminated by BEL, keeping the link text", () => {
+    expect(stripSgr("\x1b]8;;https://example.invalid/x\x07link\x1b]8;;\x07 after")).toBe("link after");
+  });
+
+  test("removes an OSC 8 hyperlink terminated by ST (ESC \\), keeping the link text", () => {
+    expect(stripSgr("\x1b]8;;https://example.invalid/x\x1b\\link\x1b]8;;\x1b\\ after")).toBe("link after");
+  });
+
+  test("removes a charset designation", () => {
+    expect(stripSgr("\x1b(Bplain")).toBe("plain");
+  });
+
+  test("drops a stray lone ESC that starts no recognised sequence", () => {
+    expect(stripSgr("abc\x1b")).toBe("abc");
+    expect(stripSgr("a\x1b\x01b")).toBe("a\x01b");
+  });
+
+  test("is the identity on text without escapes", () => {
+    expect(stripSgr("❯\xa0hello — plain")).toBe("❯\xa0hello — plain");
+  });
+});
+
+describe("isPlaceholderRow — the SGR dim rule", () => {
+  for (const [label, suffix] of placeholderCases) {
+    test(`true for ${label}`, () => {
+      const row = `${livePrefix}${suffix}`;
+      expect(isPlaceholderRow(row)).toBe(true);
+    });
+  }
+
+  for (const [label, suffix] of nonPlaceholderCases) {
+    test(`false for ${label}`, () => {
+      const row = `${livePrefix}${suffix}`;
+      expect(isPlaceholderRow(row)).toBe(false);
+    });
+  }
+
+  test("false for a bare row (no text after the glyph) and for a row with no glyph at all", () => {
+    expect(isPlaceholderRow(livePrefix)).toBe(false);
+    expect(isPlaceholderRow("\x1b[2mjust dim text, no prompt glyph\x1b[0m")).toBe(false);
+  });
+
+  test("an ASCII space after the glyph reads the same as the NBSP", () => {
+    expect(isPlaceholderRow("\x1b[39m❯ \x1b[2mmake a vertical version too\x1b[0m")).toBe(true);
+    expect(isPlaceholderRow("\x1b[39m❯ hello from agetor")).toBe(false);
+  });
+});
+
+describe("placeholderRowShowing — escape-only rows in the styled capture", () => {
+  test("blank rows that carry only escapes in the styled capture keep the index alignment (still a placeholder)", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    // `capture-pane -e` can emit a bare reset on a row that is blank in the
+    // plain capture; the line count is unchanged, so the live row's index
+    // still lines up.
+    const styledLines = styled.split("\n");
+    expect(styledLines[2]).toBe("");
+    styledLines[2] = "\x1b[0m";
+    const withEscapeRow = ["\x1b[0m\x1b[39m", ...styledLines].join("\n");
+    const plainWithBlank = ["", ...plain.split("\n")].join("\n");
+    expect(placeholderRowShowing(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsIdleInputBox(plainWithBlank, withEscapeRow)).toBe(true);
+    expect(paneShowsComposerText(plainWithBlank, withEscapeRow)).toBe(false);
+  });
+
+  test("an extra escape-only row at the TOP of the styled capture only (counts differ) shifts the index and is not trusted", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    const shifted = ["\x1b[0m", ...styled.split("\n")].join("\n");
+    expect(placeholderRowShowing(plain, shifted)).toBe(false);
+    expect(paneShowsIdleInputBox(plain, shifted)).toBe(false);
+  });
+});
+
+describe("livePromptRow / livePromptRowIndex — raw line index", () => {
+  test("livePromptRowIndex is the index into tail.split('\\n') and livePromptRow is that very line", () => {
+    const { plain, rowIndex } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    expect(livePromptRowIndex(plain)).toBe(rowIndex);
+    expect(livePromptRow(plain)).toBe(plain.split("\n")[rowIndex]!);
+    expect(livePromptRow(plain)).toBe("❯\xa0make a vertical version too");
+  });
+
+  test("blank rows (leading, between chrome rows) count toward the raw index; a trailing artifact row after the bar is tolerated", () => {
+    const lines = [
+      "",
+      "",
+      "  ⎿  an earlier transcript row",
+      "",
+      "❯ /model sonnet",
+      "",
+      IDLE_BORDER,
+      "",
+      "❯\xa0make a vertical version too",
+      IDLE_BORDER,
+      `  ${PLACEHOLDER_STATUS_BAR}`,
+      "  a stray artifact row",
+    ];
+    const tail = lines.join("\n");
+    // The bottom-most `❯` row wins over the transcript echo further up, and
+    // the index counts every blank row.
+    expect(livePromptRowIndex(tail)).toBe(8);
+    expect(livePromptRow(tail)).toBe(lines[8]!);
+  });
+
+  test("null when no status bar is anchored in the last two non-blank rows", () => {
+    expect(livePromptRowIndex("❯\xa0hello\nsome transcript\nmore transcript")).toBeNull();
+    expect(livePromptRow("❯\xa0hello\nsome transcript\nmore transcript")).toBeNull();
+  });
+});
+
+describe("placeholderRowShowing / paneShowsIdleInputBox / paneShowsComposerText with a styled tail", () => {
+  for (const [label, suffix] of placeholderCases) {
+    test(`placeholder (${label}) reads idle, not composer text`, () => {
+      const { plain, styled } = placeholderPanes(suffix);
+      expect(placeholderRowShowing(plain, styled)).toBe(true);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+    });
+  }
+
+  for (const [label, suffix] of nonPlaceholderCases) {
+    if (suffix === "") continue; // covered by the bare-row tests below
+    test(`non-placeholder (${label}) reads as composer text, not idle`, () => {
+      const { plain, styled } = placeholderPanes(suffix);
+      expect(placeholderRowShowing(plain, styled)).toBe(false);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    });
+  }
+
+  test("a bare row is idle with or without a styled tail, and is never composer text", () => {
+    const { plain, styled } = placeholderPanes("");
+    expect(plain.split("\n")[4]).toBe("❯\xa0");
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+    expect(paneShowsComposerText(plain)).toBe(false);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+
+  test("without a styled tail (omitted, undefined or null) a placeholder-text row reads exactly as today: composer text, not idle", () => {
+    const { plain } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    for (const styled of [undefined, null] as const) {
+      expect(placeholderRowShowing(plain, styled)).toBe(false);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    }
+    expect(paneShowsIdleInputBox(plain)).toBe(false);
+    expect(paneShowsComposerText(plain)).toBe(true);
+  });
+
+  test("a styled row whose plain projection differs from the plain capture (the pane moved between the two reads) is NOT trusted as a placeholder", () => {
+    const { plain } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    // The styled read caught a later frame: a different dim suggestion.
+    const moved = placeholderPanes("", {
+      liveRow: `${livePrefix}\x1b[2msomething else entirely\x1b[0m`,
+    }).styled;
+    expect(placeholderRowShowing(plain, moved)).toBe(false);
+    expect(paneShowsIdleInputBox(plain, moved)).toBe(false);
+    expect(paneShowsComposerText(plain, moved)).toBe(true);
+  });
+
+  test("a styled tail that is offset by a row (its index names a different line) is NOT trusted either", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m");
+    const shifted = `\n${styled}`;
+    expect(placeholderRowShowing(plain, shifted)).toBe(false);
+    // And one too short to hold the live row's index at all.
+    expect(placeholderRowShowing(plain, "\x1b[2mmake a vertical version too\x1b[0m")).toBe(false);
+  });
+
+  test("trailing whitespace differences between the two captures are tolerated (right-trimmed compare)", () => {
+    const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m   ");
+    expect(placeholderRowShowing(plain.replace(/ +$/gm, ""), styled)).toBe(true);
+  });
+
+  test("a working pane (spinner + 'esc to interrupt' bar) never reads idle or composer text, placeholder or not", () => {
+    const styledLines = [
+      "✽ Frosting… (2m 52s · ↓ 12.1k tokens)",
+      "",
+      `${livePrefix}\x1b[2mmake a vertical version too\x1b[0m`,
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent",
+    ];
+    const styled = styledLines.join("\n");
+    const plain = sgrPlain(styled);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+});
+
+describe("idle status-bar variants read as idle with a bare NBSP row, styled or not", () => {
+  for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+    test(`"${label}"`, () => {
+      const { plain, styled } = placeholderPanes("", { statusBar: bar });
+      expect(STATUS_BAR_RE.test(bar)).toBe(true);
+      expect(paneShowsIdleInputBox(plain)).toBe(true);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+    });
+  }
+
+  for (const [label, bar] of IDLE_STATUS_BAR_VARIANTS) {
+    test(`"${label}" — a dim placeholder above it reads idle only given the styled tail`, () => {
+      const { plain, styled } = placeholderPanes("\x1b[2mmake a vertical version too\x1b[0m", { statusBar: bar });
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsIdleInputBox(plain)).toBe(false);
+    });
+  }
+});
+
+describe("placeholder keeps the unknown-prompt watchdog chain quiet", () => {
+  const SUGGESTION = "\x1b[2mmake a vertical version too\x1b[0m";
+
+  test("paneIdle computed from a placeholder (styled) disarms stuckTurnFallbackArmed and pickScrapeMatch / matchUnparsableModal yield nothing", () => {
+    const { plain, styled } = placeholderPanes(SUGGESTION);
+    const paneWorking = paneShowsClaudeWorking(plain);
+    const paneIdle = paneShowsIdleInputBox(plain, styled);
+    expect(paneWorking).toBe(false);
+    expect(paneIdle).toBe(true);
+
+    const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
+    expect(watchdogArmed).toBe(false);
+    expect(matchUnparsableModal(plain, watchdogArmed)).toBeNull();
+    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).toBeNull();
+    expect(paneShowsBlockingPrompt(plain)).toBe(false);
+  });
+
+  test("contrast: with NO styled evidence the same quiet turn arms the watchdog and the placeholder row registers as an unparsable card (the prod bug this guards against)", () => {
+    const { plain } = placeholderPanes(SUGGESTION);
+    const paneWorking = paneShowsClaudeWorking(plain);
+    const paneIdle = paneShowsIdleInputBox(plain);
+    expect(paneIdle).toBe(false);
+
+    const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
+    expect(watchdogArmed).toBe(true);
+    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).not.toBeNull();
+  });
+
+  test("typed text in the composer is NOT idle even with a styled tail, so the watchdog still arms (genuinely stranded text keeps today's behaviour)", () => {
+    const { plain, styled } = placeholderPanes("hello from agetor");
+    const paneIdle = paneShowsIdleInputBox(plain, styled);
+    expect(paneIdle).toBe(false);
+    expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: false, paneIdle })).toBe(true);
+  });
+
+  test("the injectable styled reader round-trips through setCaptureStyledTail (restores the previous reader)", async () => {
+    const { styled } = placeholderPanes(SUGGESTION);
+    const prev = __forTest.setCaptureStyledTail(async () => styled);
+    try {
+      const swapped = __forTest.setCaptureStyledTail(async () => null);
+      expect(await swapped({} as never)).toBe(styled);
+      __forTest.setCaptureStyledTail(swapped);
+    } finally {
+      __forTest.setCaptureStyledTail(prev);
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Live captures (claude 2.1.296 / tmux 3.6a, 2026-10-13): the rows below are
+// verbatim `capture-pane -p -e` bytes from a real session, not hand-built.
+// They pin the three placeholder families seen live, both cursor styles, the
+// background-agent roster that 2.1.296 draws BELOW the status bar, and the
+// comma-joined `1 shell, 1 monitor` status item.
+// ────────────────────────────────────────────────────────────────────────────
+
+const LIVE_BORDER = `\x1b[38;5;244m${"─".repeat(80)}`;
+const LIVE_IDLE_BAR = "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent\x1b[39m";
+const LIVE_ROSTER_BAR =
+  "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← 1 agent · ↓ to manage\x1b[39m";
+/** Roster as drawn in the MAIN view (`⏺` on main) — the agent had finished;
+ *  its row keeps the frozen elapsed time and token counter. */
+const LIVE_ROSTER_MAIN = [
+  "\x1b[1m  ⏺ main\x1b[0m",
+  "\x1b[38;5;246m  \x1b[38;5;211m◯ \x1b[38;5;246mgeneral-purpose\x1b[39m  \x1b[38;5;246msleeper\x1b[39m                           \x1b[38;5;246m1m 40s · ↓ 37.4k tokens\x1b[39m",
+];
+/** Same roster while viewing the subagent's transcript (`⏺` on the agent). */
+const LIVE_ROSTER_AGENT_VIEW = [
+  "\x1b[38;5;246m  ◯ main\x1b[39m",
+  "\x1b[1m  \x1b[38;5;211m⏺ \x1b[39mgeneral-purpose\x1b[0m  \x1b[1msleeper\x1b[0m                           \x1b[1m1m 40s · ↓ 37.4k tokens\x1b[0m",
+];
+
+/** A live pane tail pair: transcript, border, the live row, border, bar,
+ *  then any rows below the bar (one blank row before them, as captured). */
+function livePanes(liveRow: string, belowBar: string[] = [], bar = LIVE_IDLE_BAR): { plain: string; styled: string } {
+  const styledLines = [
+    "\x1b[38;5;231m⏺\x1b[39m I added a docstring to add() in util.py.",
+    "",
+    "\x1b[38;5;246m✻ Brewed for 4s · done 6:39 PM\x1b[39m",
+    LIVE_BORDER,
+    liveRow,
+    LIVE_BORDER,
+    bar,
+    ...(belowBar.length > 0 ? ["", ...belowBar] : []),
+  ];
+  return { plain: styledLines.map(stripSgr).join("\n"), styled: styledLines.join("\n") };
+}
+
+const LIVE_PLACEHOLDER_ROWS: Array<[string, string]> = [
+  ["a post-turn prompt suggestion", "\x1b[39m❯\xa0\x1b[2mcommit this\x1b[0m"],
+  ["the startup sample, one dim span (after the box was cleared)", '\x1b[39m❯\xa0\x1b[2mTry "fix typecheck errors"\x1b[0m'],
+  [
+    "the startup sample, dim per word (fresh session)",
+    '\x1b[39m❯\xa0\x1b[2mTry\x1b[0m \x1b[2m"create\x1b[0m \x1b[2ma\x1b[0m \x1b[2mutil\x1b[0m \x1b[2mlogging.py\x1b[0m \x1b[2mthat..."',
+  ],
+  [
+    "the startup sample with Claude's own cursor cell inverting the first char (native cursor off)",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry\x1b[0m \x1b[2m"edit\x1b[0m \x1b[2m<filepath>\x1b[0m \x1b[2mto..."\x1b[0m',
+  ],
+  [
+    "the cleared startup sample with the inverted first char, one dim span",
+    '\x1b[39m❯\xa0\x1b[7mT\x1b[0;2mry "edit <filepath> to..."\x1b[0m',
+  ],
+  ["the 'Message @<agent>…' hint while viewing a background subagent", "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m"],
+];
+
+/** Typed drafts with Claude's own cursor cell (native cursor off): the
+ *  inverted cell is AFTER or INSIDE the text, never a placeholder. */
+const LIVE_TYPED_ROWS: Array<[string, string]> = [
+  ["one typed char, cursor cell after it", "\x1b[39m❯\xa0h\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell after it", "\x1b[39m❯\xa0hello\x1b[7m \x1b[0m"],
+  ["a typed word, cursor cell inside it", "\x1b[39m❯\xa0hel\x1b[7ml\x1b[0mo"],
+];
+
+describe("live 2.1.296 captures — placeholder rows read idle, typed rows don't", () => {
+  for (const [label, row] of LIVE_PLACEHOLDER_ROWS) {
+    test(`${label}: a placeholder, idle with the styled tail, text without it`, () => {
+      expect(isPlaceholderRow(row)).toBe(true);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+      expect(paneShowsComposerText(plain, styled)).toBe(false);
+      // Plain `capture-pane -p` alone can't tell: today's reading.
+      expect(paneShowsIdleInputBox(plain)).toBe(false);
+    });
+  }
+  for (const [label, row] of LIVE_TYPED_ROWS) {
+    test(`${label}: composer text even with the styled tail`, () => {
+      expect(isPlaceholderRow(row)).toBe(false);
+      const { plain, styled } = livePanes(row);
+      expect(paneShowsIdleInputBox(plain, styled)).toBe(false);
+      expect(paneShowsComposerText(plain, styled)).toBe(true);
+    });
+  }
+  test("the empty composer with Claude's own cursor cell (an inverted space) is a bare ❯", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0\x1b[7m \x1b[0m");
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+  });
+});
+
+describe("live 2.1.296 captures — the background-agent roster below the status bar", () => {
+  test("main view: the suggestion row above the bar is still the live prompt row", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mcheck on the sleeper agent\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(plain)).toBe("❯\xa0check on the sleeper agent");
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+  });
+
+  test("subagent view: the 'Message @<agent>…' row reads idle", () => {
+    const row = "\x1b[39m❯\xa0\x1b[2mMessage @general-purpose…\x1b[0m";
+    const { plain, styled } = livePanes(row, LIVE_ROSTER_AGENT_VIEW, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(plain, styled)).toBe(true);
+    expect(paneShowsComposerText(plain, styled)).toBe(false);
+  });
+
+  test("a bare ❯ above a roster reads idle; typed text above one reads as composer text", () => {
+    const bare = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsIdleInputBox(bare.plain)).toBe(true);
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(livePromptRow(typed.plain)).toBe("❯\xa0hello");
+    expect(paneShowsIdleInputBox(typed.plain, typed.styled)).toBe(false);
+  });
+
+  test("without a session, the roster's token counter still reads as working chrome (one frame can't tell a finished agent from a running one)", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain)).toBe(true);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: true })).toBe(true);
+  });
+
+  test("a frozen roster (rosterLive: false) is not working chrome; other working chrome still is", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsClaudeWorking(plain, { rosterLive: false })).toBe(false);
+    const busy = livePanes(
+      "\x1b[39m❯\xa0",
+      LIVE_ROSTER_MAIN,
+      "  ⏵⏵ auto mode on · ← 1 agent · esc to interrupt · ↓ to manage",
+    );
+    expect(paneShowsClaudeWorking(busy.plain, { rosterLive: false })).toBe(true);
+  });
+});
+
+describe("background-agent roster liveness (noteAgentRoster)", () => {
+  const ROSTER_ROW = "  ◯ general-purpose  sleeper                           1m 40s · ↓ 37.4k tokens";
+  const pane = (row: string | null): string =>
+    [
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent · ↓ to manage",
+      "",
+      "  ⏺ main",
+      ...(row === null ? [] : [row]),
+    ].join("\n");
+  const freshState = () => ({ agentRosterSignature: null, agentRosterChangedAt: 0 }) as never;
+
+  test("the signature holds only the agent rows, not the main row", () => {
+    expect(__forTest.agentRosterSignature(pane(ROSTER_ROW))).toBe(ROSTER_ROW.trim());
+    expect(__forTest.agentRosterSignature(pane(null))).toBeNull();
+  });
+
+  test("a roster is live when first seen, frozen once it hasn't changed for AGENT_ROSTER_LIVE_MS, live again when it ticks", () => {
+    const state = freshState();
+    const t0 = 1_000_000;
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS - 1)).toBe(true);
+    expect(__forTest.noteAgentRoster(state, pane(ROSTER_ROW), t0 + __forTest.AGENT_ROSTER_LIVE_MS)).toBe(false);
+    const ticked = ROSTER_ROW.replace("1m 40s", "1m 41s");
+    expect(__forTest.noteAgentRoster(state, pane(ticked), t0 + __forTest.AGENT_ROSTER_LIVE_MS + 1)).toBe(true);
+  });
+
+  test("no roster on the pane is not live and clears the remembered rows", () => {
+    const state = freshState() as unknown as { agentRosterSignature: string | null };
+    __forTest.noteAgentRoster(state as never, pane(ROSTER_ROW), 5);
+    expect(__forTest.noteAgentRoster(state as never, pane(null), 6)).toBe(false);
+    expect(state.agentRosterSignature).toBeNull();
+  });
+
+  test("a frozen roster no longer blocks the idle-settle net: idle at the box, not working", () => {
+    const state = freshState();
+    const { plain } = livePanes("\x1b[39m❯\xa0", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    const t0 = 2_000_000;
+    __forTest.noteAgentRoster(state, plain, t0);
+    const rosterLive = __forTest.noteAgentRoster(state, plain, t0 + __forTest.AGENT_ROSTER_LIVE_MS);
+    const paneWorking = paneShowsClaudeWorking(plain, { rosterLive });
+    expect(paneWorking).toBe(false);
+    expect(paneShowsIdleInputBox(plain)).toBe(true);
+    expect(stuckTurnFallbackArmed({
+      turnInFlight: true,
+      lastJsonlAppendAt: 1,
+      now: 1 + __forTest.STUCK_TURN_FALLBACK_MS + 1,
+      paneWorking,
+      askCardLive: false,
+      paneIdle: false,
+    })).toBe(true);
+  });
+
+  test("a frozen roster no longer hides typed composer text", () => {
+    const typed = livePanes("\x1b[39m❯\xa0hello", LIVE_ROSTER_MAIN, LIVE_ROSTER_BAR);
+    expect(paneShowsComposerText(typed.plain, typed.styled)).toBe(false);
+    expect(paneShowsComposerText(typed.plain, typed.styled, { rosterLive: false })).toBe(true);
+  });
+
+  test("the selector-focused roster (the bar replaced by '↑/↓ to select') has no live prompt row", () => {
+    const tail = [
+      "❯\xa0Message @general-purpose…",
+      "─".repeat(80),
+      "  ↑/↓ to select · Enter to view",
+      "❯ ◯ main",
+      "  ⏺ general-purpose  sleeper                               7s · ↓ 37.4k tokens",
+    ].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("transcript-shaped ⏺ rows at the bottom are not a roster (no bar above them → no live row)", () => {
+    const tail = ["❯\xa0", "─".repeat(80), "⏺ The sleep 120 is running in the background.", "⏺ I'll wait for it."].join("\n");
+    expect(livePromptRowIndex(tail)).toBeNull();
+  });
+
+  test("a roster longer than the skip cap is left alone (reads as no bar)", () => {
+    const rows = Array.from({ length: 13 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    expect(livePromptRowIndex(plain)).toBeNull();
+  });
+
+  test("readPaneMode finds the bar above a roster of four agents", async () => {
+    const rows = Array.from({ length: 4 }, (_, i) => `  ◯ general-purpose  agent${i}   2s · ↓ 1.0k tokens`);
+    const { plain } = livePanes("\x1b[39m❯\xa0", ["  ⏺ main", ...rows], LIVE_ROSTER_BAR);
+    const prev = __forTest.setCaptureModePane(async () => plain);
+    try {
+      expect(await __forTest.readPaneMode({} as never)).toBe("auto");
+    } finally {
+      __forTest.setCaptureModePane(prev);
+    }
+  });
+});
+
+describe("live 2.1.296 captures — comma-joined status-bar items", () => {
+  for (const bar of [
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · ↓ to manage",
+    "  ⏵⏵ auto mode on · ← 1 agent · 1 shell, 1 monitor · esc to interrupt · ↓ to …",
+    "  ⏵⏵ auto mode on · 2 monitors, 1 shell · ← 1 agent",
+  ]) {
+    test(`working: ${JSON.stringify(bar)}`, () => {
+      expect(paneShowsClaudeWorking(`❯\xa0\n${"─".repeat(80)}\n${bar}`)).toBe(true);
+    });
+  }
+  test("prose that merely mentions shells after a list is not working chrome", () => {
+    expect(paneShowsClaudeWorking("· 3 shell scripts were updated, 2 tests added")).toBe(false);
+  });
+});
+
+/** Claude's background-sessions view as captured live (2.1.299, 80x24,
+ *  2026-10-13; directory and session names replaced). */
+const BACKGROUND_VIEW_PANE = [
+  "",
+  " ▐▛███▛█   Claude Code v2.1.299",
+  "▝▜██████▀  New sessions: Opus 5.5 · high effort",
+  " ▝▝   ▝▝   ~/projects/example-repo",
+  "           2 awaiting input · 0 working · 1 completed",
+  "",
+  "Your conversation moved to the background — enter opens it · esc returns to it ·",
+  "ctrl+c twice quits",
+  "",
+  "~/projects/example-repo",
+  "∙ Example task one              Failed · waiting on helper subagent's sle…   5m",
+  "✻ current session               Needs input · repo                            0s",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "❯ describe a task for a new session",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for sh…",
+  "",
+  "",
+].join("\n");
+
+describe("Claude's background-sessions view", () => {
+  test("the live view is detected", () => {
+    expect(__forTest.paneShowsBackgroundSessionsView(BACKGROUND_VIEW_PANE)).toBe(true);
+  });
+
+  test("the view is neither an idle input box nor composer text, and no matcher cards it", () => {
+    expect(paneShowsIdleInputBox(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(paneShowsComposerText(BACKGROUND_VIEW_PANE)).toBe(false);
+    expect(__forTest.paneShowsBlockingPrompt(BACKGROUND_VIEW_PANE)).toBe(false);
+  });
+
+  test("an ordinary idle pane, and the redraw frame after Escape, are not the view", () => {
+    const { plain } = livePanes("\x1b[39m❯\xa0");
+    expect(__forTest.paneShowsBackgroundSessionsView(plain)).toBe(false);
+    expect(__forTest.paneShowsBackgroundSessionsView("\n  Waiting for session to redraw… Ctrl+Z to detach\n")).toBe(false);
+  });
+
+  test("the bar's wording in the transcript, above a real input box, is not the view", () => {
+    const tail = [
+      "⏺ The bar reads `· enter to return · space to reply · ctrl+x to delete`.",
+      "Your conversation moved to the background — enter opens it · esc returns to it ·",
+      "─".repeat(80),
+      "❯\xa0",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(__forTest.paneShowsBackgroundSessionsView(tail)).toBe(false);
+  });
+});

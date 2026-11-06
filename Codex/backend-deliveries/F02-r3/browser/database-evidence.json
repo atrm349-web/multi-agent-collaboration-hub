@@ -1,0 +1,283 @@
+{
+  "mode": "controlled-provider-injected-testRunner",
+  "entities": [
+    {
+      "kind": "task",
+      "data": {
+        "id": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "version": 7,
+        "createdAt": "2026-11-03T07:43:09.910Z",
+        "updatedAt": "2026-11-03T07:43:26.893Z",
+        "executionMode": "live",
+        "provenance": "current",
+        "title": "R3 \u53d7\u63a7\u9a8c\u8bc1",
+        "goal": "R3-CHAIN",
+        "repositoryId": "9a01ca5e-8530-448e-baba-39aa2dd436a3",
+        "baseCommit": "920a6e45dc28b182d6cc9e4f2ac11aff6ddaa1b3",
+        "status": "succeeded",
+        "priority": "high",
+        "progressPct": 100,
+        "pendingApprovalCount": 0,
+        "artifactCount": 12,
+        "acceptanceCriteria": [
+          {
+            "id": "ac-1",
+            "description": "All planned subtasks pass independent validation (exitCode=0)",
+            "testProfileId": "clamp"
+          }
+        ],
+        "error": null,
+        "startedAt": "2026-11-03T07:43:10.255Z",
+        "endedAt": "2026-11-03T07:43:26.893Z",
+        "deadlineAt": null
+      }
+    },
+    {
+      "kind": "subtask",
+      "data": {
+        "id": "f22a8ab8-04ee-493e-8afa-878e7e96cd7d",
+        "version": 6,
+        "createdAt": "2026-11-03T07:43:09.911Z",
+        "updatedAt": "2026-11-03T07:43:10.642Z",
+        "executionMode": "live",
+        "code": "A",
+        "title": "A",
+        "description": "A",
+        "stage": "implementation",
+        "dependsOn": [],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-A",
+            "description": "A",
+            "testProfileId": "clamp"
+          }
+        ],
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "status": "succeeded",
+        "assignedAgentId": "11111111-1111-4111-8111-111111111111",
+        "workspaceId": "096bbfae-ab5a-47ce-b6e2-e31390607897",
+        "branchName": null,
+        "progressPct": 100,
+        "attempt": 1,
+        "maxAttempts": 2,
+        "timeoutMs": 120000,
+        "outputArtifactIds": [
+          "1e573bf7-8409-43dd-801b-dd2cb5c33f0b",
+          "9c42a41c-de15-41cd-8ad2-0783e6856c56",
+          "1c47a18b-7a77-45e0-b7e4-155ed4c45b6d",
+          "b70f62c9-3ea6-4b6c-a6df-eb055b5af7d4",
+          "aade3d3c-164e-4eca-8d17-436579eb9acf",
+          "32308ea4-a7ac-47bf-befb-149510679cc9",
+          "821eca2c-2077-4494-9745-50baf1966871"
+        ],
+        "error": null
+      }
+    },
+    {
+      "kind": "subtask",
+      "data": {
+        "id": "e705e2b2-970c-4f57-90e2-0418ce09a696",
+        "version": 7,
+        "createdAt": "2026-11-03T07:43:09.912Z",
+        "updatedAt": "2026-11-03T07:43:10.966Z",
+        "executionMode": "live",
+        "code": "C",
+        "title": "C",
+        "description": "C",
+        "stage": "implementation",
+        "dependsOn": [
+          "f22a8ab8-04ee-493e-8afa-878e7e96cd7d"
+        ],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-C",
+            "description": "C",
+            "testProfileId": "clamp"
+          },
+          {
+            "id": "ac-B",
+            "description": "B",
+            "testProfileId": "clamp"
+          }
+        ],
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "status": "succeeded",
+        "assignedAgentId": "11111111-1111-4111-8111-111111111111",
+        "workspaceId": "26c59e84-d9c4-4ad0-ba3c-27322cd80b27",
+        "branchName": null,
+        "progressPct": 100,
+        "attempt": 1,
+        "maxAttempts": 2,
+        "timeoutMs": 120000,
+        "outputArtifactIds": [
+          "2a887d80-677f-4d12-aaa1-819256498cb9",
+          "b88f15e2-7291-4639-be12-9da3b2506303",
+          "d54a2aa0-99f2-4c9d-a43d-5e5988465dbe"
+        ],
+        "error": null
+      }
+    },
+    {
+      "kind": "subtask",
+      "data": {
+        "id": "081ef0b9-4055-43c2-9cc1-02da56fd9aa6",
+        "version": 8,
+        "createdAt": "2026-11-03T07:43:09.912Z",
+        "updatedAt": "2026-11-03T07:43:26.892Z",
+        "executionMode": "live",
+        "code": "FINAL-REVIEW",
+        "title": "Independent final review",
+        "description": "Review the integrated result against the user goal without modifying files",
+        "stage": "review",
+        "dependsOn": [
+          "e705e2b2-970c-4f57-90e2-0418ce09a696"
+        ],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-1",
+            "description": "All planned subtasks pass independent validation (exitCode=0)",
+            "testProfileId": "clamp"
+          }
+        ],
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "status": "succeeded",
+        "assignedAgentId": "22222222-2222-4222-8222-222222222222",
+        "workspaceId": "212a346c-2198-4631-af85-61e488156577",
+        "branchName": null,
+        "progressPct": 100,
+        "attempt": 1,
+        "maxAttempts": 2,
+        "timeoutMs": 120000,
+        "outputArtifactIds": [
+          "f6d7c84d-76b9-4268-bf24-cba07e353d0a",
+          "9d7117f1-056c-4a3c-bbdb-3b3d83508ccb"
+        ],
+        "error": null
+      }
+    },
+    {
+      "kind": "validation",
+      "data": {
+        "id": "04a37007-57ac-4374-93ce-0c6c998609b4",
+        "version": 1,
+        "createdAt": "2026-11-03T07:43:10.641Z",
+        "updatedAt": "2026-11-03T07:43:10.641Z",
+        "executionMode": "live",
+        "provenance": "current",
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "subtaskId": "f22a8ab8-04ee-493e-8afa-878e7e96cd7d",
+        "runId": "8547c87d-6d1a-46c7-bf60-adf96717ec69",
+        "criterionId": "ac-A",
+        "status": "passed",
+        "exitCode": 0,
+        "evidenceArtifactIds": [
+          "821eca2c-2077-4494-9745-50baf1966871"
+        ]
+      }
+    },
+    {
+      "kind": "validation",
+      "data": {
+        "id": "c1216a57-0e3b-40e2-9c54-4e3ee0525efd",
+        "version": 1,
+        "createdAt": "2026-11-03T07:43:10.966Z",
+        "updatedAt": "2026-11-03T07:43:10.966Z",
+        "executionMode": "live",
+        "provenance": "current",
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "subtaskId": "e705e2b2-970c-4f57-90e2-0418ce09a696",
+        "runId": "58b794f9-68f2-4779-91b1-c4ba6854b196",
+        "criterionId": "ac-C",
+        "status": "passed",
+        "exitCode": 0,
+        "evidenceArtifactIds": [
+          "d54a2aa0-99f2-4c9d-a43d-5e5988465dbe"
+        ]
+      }
+    },
+    {
+      "kind": "validation",
+      "data": {
+        "id": "4d459bde-b242-432b-8acc-7fede12a1457",
+        "version": 1,
+        "createdAt": "2026-11-03T07:43:10.966Z",
+        "updatedAt": "2026-11-03T07:43:10.966Z",
+        "executionMode": "live",
+        "provenance": "current",
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "subtaskId": "e705e2b2-970c-4f57-90e2-0418ce09a696",
+        "runId": "58b794f9-68f2-4779-91b1-c4ba6854b196",
+        "criterionId": "ac-B",
+        "status": "passed",
+        "exitCode": 0,
+        "evidenceArtifactIds": [
+          "d54a2aa0-99f2-4c9d-a43d-5e5988465dbe"
+        ]
+      }
+    },
+    {
+      "kind": "validation",
+      "data": {
+        "id": "b5518ebb-0f33-4a96-871f-023289730deb",
+        "version": 1,
+        "createdAt": "2026-11-03T07:43:11.360Z",
+        "updatedAt": "2026-11-03T07:43:11.360Z",
+        "executionMode": "live",
+        "provenance": "current",
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "subtaskId": "081ef0b9-4055-43c2-9cc1-02da56fd9aa6",
+        "runId": "49931d58-11dd-414f-8b37-2748fc85b550",
+        "criterionId": "ac-1",
+        "status": "passed",
+        "exitCode": 0,
+        "evidenceArtifactIds": [
+          "9d7117f1-056c-4a3c-bbdb-3b3d83508ccb"
+        ]
+      }
+    },
+    {
+      "kind": "approval",
+      "data": {
+        "id": "32bba507-5821-464e-a1cd-ce3b6788ac7a",
+        "version": 2,
+        "createdAt": "2026-11-03T07:43:11.364Z",
+        "updatedAt": "2026-11-03T07:43:26.891Z",
+        "executionMode": "live",
+        "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+        "subtaskId": "081ef0b9-4055-43c2-9cc1-02da56fd9aa6",
+        "runId": "49931d58-11dd-414f-8b37-2748fc85b550",
+        "actionType": "final_delivery",
+        "actionDigest": "ed3a5189b5d32d87831fdb58e299e5eea2fe83d07302d061e58b08bb1b858907",
+        "summary": "Final delivery: R3 \u53d7\u63a7\u9a8c\u8bc1",
+        "status": "approved",
+        "expiresAt": "2026-11-03T08:13:11.364Z",
+        "artifactRefs": [
+          "1c47a18b-7a77-45e0-b7e4-155ed4c45b6d",
+          "1e573bf7-8409-43dd-801b-dd2cb5c33f0b",
+          "2a887d80-677f-4d12-aaa1-819256498cb9",
+          "32308ea4-a7ac-47bf-befb-149510679cc9",
+          "821eca2c-2077-4494-9745-50baf1966871",
+          "9c42a41c-de15-41cd-8ad2-0783e6856c56",
+          "9d7117f1-056c-4a3c-bbdb-3b3d83508ccb",
+          "aade3d3c-164e-4eca-8d17-436579eb9acf",
+          "b70f62c9-3ea6-4b6c-a6df-eb055b5af7d4",
+          "b88f15e2-7291-4639-be12-9da3b2506303",
+          "d54a2aa0-99f2-4c9d-a43d-5e5988465dbe",
+          "f6d7c84d-76b9-4268-bf24-cba07e353d0a"
+        ],
+        "diffArtifactId": "1e573bf7-8409-43dd-801b-dd2cb5c33f0b",
+        "decidedAt": "2026-11-03T07:43:26.891Z",
+        "decidedBy": "user:local"
+      }
+    }
+  ]
+}

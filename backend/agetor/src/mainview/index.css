@@ -1,0 +1,270 @@
+/* React Flow's own stylesheet. TRIED first: placing this `@import` right
+   after `@tailwind base` (so Preflight's resets apply before React Flow's
+   own layout/positioning rules, letting `.react-flow__node`/`.react-flow__
+   pane`'s `box-sizing`/absolute-positioning win the cascade) — but built
+   output (`bunx vite build --mode development`, then grepped the emitted
+   CSS for `.react-flow__handle`/`.react-flow__pane`/`.react-flow__minimap`)
+   showed PostCSS silently DROPPED the `@import` and emitted only a
+   "@import statements must precede all other statements" warning: Vite's
+   built-in postcss-import pass enforces real CSS `@import`-ordering rules
+   against the raw source (it runs before Tailwind's own PostCSS plugin
+   consumes the `@tailwind` at-rules, so `@tailwind base` still counts as a
+   preceding statement at that point), so React Flow's canvas would have
+   shipped with NO base styling at all. Falling back to the CSS-spec
+   position — the very top of the file, before `@tailwind base` itself —
+   fixed it: re-running the same build + grep confirmed `.react-flow__node`/
+   `.react-flow__pane`/`.react-flow__handle`/`.react-flow__minimap` are now
+   present in the emitted CSS. This does mean Preflight's resets are applied
+   AFTER React Flow's own rules in cascade order, but that's harmless here:
+   React Flow's rules target its own `.react-flow*` classes with fairly
+   specific selectors, Preflight only resets bare element selectors (not
+   classes), and Tailwind utility classes (from `@tailwind
+   components`/`utilities`, both still after this import) retain their
+   usual higher-specificity/later-in-cascade win over React Flow's own
+   defaults — so a utility class on a custom node still applies correctly.
+   The scoped `.react-flow` variable/override block further down this file
+   (see bottom) is what actually themes the canvas either way. */
+@import "@xyflow/react/dist/style.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 240 5.9% 10%;
+    --radius: 0.5rem;
+    /* Semantic status tokens (theme feature). Used primarily as text/icon
+       color (text-success) and low-alpha backgrounds (bg-success/10), so
+       these must independently clear ~4.5:1 contrast on --background above.
+       Tailwind's *-600 shades were the plan's starting point, but emerald-600
+       (3.76:1), amber-600 (3.19:1), and sky-600 (4.10:1) on white all fall
+       short of AA for normal text — bumped those three to *-700 (5.0-5.9:1).
+       rose-600 already clears (4.70:1) so danger stays at *-600. See the
+       .dark block below for the *-400 shades these replace as literals. */
+    --success: 162.9 93.5% 24.3%; /* emerald-700 */
+    --success-foreground: 0 0% 98%;
+    /* amber-700 (26 90.5% 37.1%, 5.01:1 on white) still failed AA when
+       composited under the low-alpha "experimental" pill tint (bg-warning/15
+       → effective bg ~#f4e5da → only 4.07:1). Bumped one step darker to
+       amber-800, which clears both the plain-text case (7.09:1) and the
+       tinted-pill case (5.77:1). Dark mode's --warning below is untouched. */
+    --warning: 22.7 82.5% 31.4%; /* amber-800 */
+    --warning-foreground: 0 0% 98%;
+    --info: 201.3 96.3% 32.2%; /* sky-700 */
+    --info-foreground: 0 0% 98%;
+    --danger: 346.8 77.2% 49.8%; /* rose-600 */
+    --danger-foreground: 0 0% 98%;
+    /* GitHub's own convention for a merged PR — purple, deliberately distinct
+       from success/info so "merged" never reads as "open" or "passing". */
+    --merged: 263.4 69.3% 42.2%; /* violet-800 */
+    --merged-foreground: 0 0% 98%;
+    /* Task-type category color (TASK_TYPES "spike") — not a status, so it
+       lives alongside --merged rather than stretching success/warning/info/
+       danger onto a meaning they don't carry. Mirrors violet-500's hue
+       family (same as --merged) but is a distinct token because "merged" is
+       a GitHub PR-state concept, not a task category. Bumped to violet-700
+       for light-mode text contrast (7.10:1 on white vs violet-500's 4.23:1);
+       dark keeps the original violet-500 literal (4.70:1) unchanged. */
+    --spike: 263.4 70% 50.4%; /* violet-700 */
+    --spike-foreground: 0 0% 98%;
+    /* Solid, saturated indicator-dot tokens (agent-availability dot etc.).
+       Unlike the four status tokens above, these are NOT text/icon colors —
+       they're small filled circles that must read correctly on both a
+       near-black and a near-white surface, so (unusually) they carry the
+       *same* value in :root and .dark: Tailwind's own emerald-500 / red-500 /
+       amber-500, reproducing today's dark-mode dot exactly instead of
+       drifting onto the *-400 status-token shades (which would turn the red
+       dot salmon-pink). --warning-solid is the third state (harness
+       available but logged out) alongside success/danger. */
+    --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
+    --danger-solid: 0 84.2% 60.2%; /* red-500 */
+    --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 6% 10%;
+    --card-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+    /* Mirror the literal Tailwind *-400 colors these tokens are replacing
+       throughout the app (text-rose-400, text-emerald-400, text-amber-400,
+       text-sky-400) so the conversion is visually a no-op in dark mode. */
+    --success: 158.1 64.4% 51.6%; /* emerald-400 */
+    --success-foreground: 240 5.9% 10%;
+    --warning: 43.3 96.4% 56.3%; /* amber-400 */
+    --warning-foreground: 240 5.9% 10%;
+    --info: 198.4 93.2% 59.6%; /* sky-400 */
+    --info-foreground: 240 5.9% 10%;
+    --danger: 351.3 94.5% 71.4%; /* rose-400 */
+    --danger-foreground: 240 5.9% 10%;
+    --merged: 255.1 91.7% 76.3%; /* violet-400 */
+    --merged-foreground: 240 5.9% 10%;
+    /* Reproduces TASK_TYPES' original literal (text-violet-500) exactly —
+       see the :root block above for why this is a separate token from
+       --merged. */
+    --spike: 258.3 89.5% 66.3%; /* violet-500 */
+    --spike-foreground: 240 5.9% 10%;
+    /* Same value as :root — see the :root comment for why these two are
+       theme-invariant. */
+    --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
+    --danger-solid: 0 84.2% 60.2%; /* red-500 */
+    --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
+  }
+
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; }
+}
+
+/* WKWebView hides overlay scrollbars when idle. Force a persistent horizontal
+   scrollbar on the kanban so users always have a hit target to drag. */
+.kanban-scroll::-webkit-scrollbar {
+  height: 10px;
+  -webkit-appearance: none;
+}
+.kanban-scroll::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+.kanban-scroll::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 9999px;
+  border: 2px solid hsl(var(--background));
+}
+.kanban-scroll::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.6);
+}
+
+/* Markdown rendering for assistant messages in the run panel. Sized to sit
+   well next to the surrounding 12px event rows; still compact by design, but
+   headings get clear space above and snug space below (margin-top-only, so
+   a heading binds to the content that follows it) while paragraph-to-
+   paragraph rhythm loosens modestly via the owl selector below — Tailwind
+   Preflight already zeroes p/ul/ol margins, so no redundant reset here would
+   just fight the owl at equal-or-higher specificity. */
+.agetor-md { line-height: 1.6; }
+.agetor-md > * + * { margin-top: 0.625rem; }
+.agetor-md h1, .agetor-md h2, .agetor-md h3, .agetor-md h4, .agetor-md h5, .agetor-md h6 {
+  font-weight: 600;
+  line-height: 1.3;
+  color: hsl(var(--foreground));
+  margin-top: 1.125rem;
+}
+.agetor-md h1 { font-size: 1.125rem; }
+.agetor-md h2 { font-size: 1.0625rem; }
+.agetor-md h3 { font-size: 1rem; }
+.agetor-md h4, .agetor-md h5, .agetor-md h6 { font-size: 0.875rem; }
+.agetor-md h1 + *, .agetor-md h2 + *, .agetor-md h3 + *, .agetor-md h4 + *, .agetor-md h5 + *, .agetor-md h6 + * {
+  margin-top: 0.375rem;
+}
+.agetor-md > :first-child,
+.agetor-md blockquote > :first-child,
+.agetor-md li > :first-child { margin-top: 0; }
+.agetor-md strong { font-weight: 600; color: hsl(var(--foreground)); }
+.agetor-md em { font-style: italic; }
+.agetor-md del { text-decoration: line-through; opacity: 0.7; }
+.agetor-md ul, .agetor-md ol { padding-left: 1.25rem; }
+.agetor-md ul { list-style: disc; }
+.agetor-md ol { list-style: decimal; }
+.agetor-md li { margin: 0.1875rem 0; }
+.agetor-md li > ul, .agetor-md li > ol { margin-top: 0.125rem; }
+.agetor-md li > p { display: inline; }
+.agetor-md blockquote {
+  border-left: 2px solid hsl(var(--border));
+  padding-left: 0.625rem;
+  color: hsl(var(--muted-foreground));
+  font-style: italic;
+}
+.agetor-md hr {
+  border: 0;
+  border-top: 1px solid hsl(var(--border));
+  margin: 0.75rem 0;
+}
+.agetor-md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.6875rem;
+}
+.agetor-md th, .agetor-md td {
+  border: 1px solid hsl(var(--border) / 0.6);
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+.agetor-md th { background: hsl(var(--muted) / 0.4); font-weight: 600; }
+.agetor-md input[type="checkbox"] {
+  margin-right: 0.375rem;
+  vertical-align: middle;
+}
+
+/* React Flow (pipelines canvas) theming — maps our existing shadcn/ui HSL
+   tokens onto React Flow 12's own `--xy-*` custom properties instead of
+   overriding its class selectors directly, so both `.dark` and `:root`
+   automatically stay in sync the same way every other themed surface in
+   this app does. Every variable below is a real `--xy-*` name emitted by
+   `node_modules/@xyflow/react/dist/style.css` (verified via
+   `grep -o -- '--xy-[a-z-]*' node_modules/@xyflow/react/dist/style.css`) —
+   none invented. Scoped to `.react-flow` (the library's own root class)
+   rather than `:root`/`.dark` so it never leaks CSS variables onto
+   unrelated parts of the app. */
+.react-flow {
+  --xy-background-color: hsl(var(--background));
+  --xy-node-background-color-default: hsl(var(--card));
+  --xy-node-border-default: 1px solid hsl(var(--border));
+  --xy-edge-stroke-default: hsl(var(--muted-foreground));
+  --xy-edge-stroke-selected-default: hsl(var(--info));
+  --xy-handle-background-color-default: hsl(var(--info));
+  --xy-minimap-background-color: hsl(var(--card));
+  --xy-controls-button-background-color: hsl(var(--card));
+  --xy-controls-button-color: hsl(var(--foreground));
+  --xy-controls-button-border-color: hsl(var(--border));
+}
+
+/* Scoped overrides restoring/adjusting React Flow defaults under Tailwind
+   Preflight. `.react-flow svg { display: block }` ships correctly in React
+   Flow's own stylesheet already (no override needed); the two below are
+   the ones Preflight/our own resets actually affect. */
+.react-flow__edges {
+  overflow: visible;
+}
+.react-flow__edge-path {
+  fill: none;
+}
+/* React Flow's MIT license permits removing the on-canvas attribution as
+   long as attribution is retained elsewhere; this is a desktop app, not a
+   public web deployment, so the corner watermark is suppressed here.
+   Attribution is retained via `package.json`'s dependency list
+   (`@xyflow/react`) rather than the README, which doesn't name the
+   library. Attribution: React Flow / @xyflow, MIT License,
+   https://github.com/xyflow/xyflow. */
+.react-flow__attribution {
+  display: none;
+}

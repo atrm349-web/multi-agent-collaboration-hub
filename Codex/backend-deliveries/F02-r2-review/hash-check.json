@@ -1,0 +1,50 @@
+[
+  {
+    "path": "apps/web/public/index.html",
+    "expected": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "matches": true
+  },
+  {
+    "path": "Antigravity/frontend-deliveries/F02-r2/index.html",
+    "expected": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "matches": true
+  },
+  {
+    "path": "apps/web/public/app.js",
+    "expected": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "actual": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "matches": true
+  },
+  {
+    "path": "Antigravity/frontend-deliveries/F02-r2/app.js",
+    "expected": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "actual": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "matches": true
+  },
+  {
+    "path": "apps/web/public/styles.css",
+    "expected": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+    "actual": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+    "matches": true
+  },
+  {
+    "path": "Antigravity/frontend-deliveries/F02-r2/styles.css",
+    "expected": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+    "actual": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+    "matches": true
+  },
+  {
+    "path": "Antigravity/frontend-deliveries/F02-r2/app.live-native.js",
+    "expected": "818fcb3ac8fb44ea103d8f293b9e64f95ca3e5de6981fa41f06f4e75060eb2ea",
+    "actual": "818fcb3ac8fb44ea103d8f293b9e64f95ca3e5de6981fa41f06f4e75060eb2ea",
+    "matches": true
+  },
+  {
+    "path": "Antigravity/frontend-deliveries/F02-r2/index.live-native.html",
+    "expected": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317",
+    "actual": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317",
+    "matches": true
+  }
+]

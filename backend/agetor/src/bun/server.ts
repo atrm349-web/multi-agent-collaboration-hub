@@ -1,0 +1,8694 @@
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import path from "node:path";
+import type { WebSocketHandler } from "bun";
+import pkg from "../../package.json" with { type: "json" };
+import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
+import { removeCoreCreds } from "./core-creds.ts";
+import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
+import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
+import { readTextNoFollow } from "./no-follow.ts";
+import { openFileBytes, settleFileBytes } from "./core-file-read.ts";
+import { PROJECT_CAPABILITY_PATHSPECS } from "./ref-tree.ts";
+import { taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
+import { DISCLAIM_PREF_KEY, isDisclaimOffValue } from "./disclaim.ts";
+import { applyDisclaimPreferenceWrite } from "./disclaim-switch.ts";
+import { childEnv } from "./core-spawn.ts";
+import {
+  tasks,
+  backlog,
+  drafts,
+  runs,
+  subagents,
+  projects,
+  preferences,
+  harnesses,
+  harnessUsage,
+  HarnessBuiltinError,
+  HarnessInUseError,
+  savedPrompts,
+  agentProfiles,
+  AgentProfileNameError,
+  pipelines,
+  PipelineNameError,
+  dataDir,
+  clampWindowByBytes,
+  resolveAnchoredMinId,
+} from "./db.ts";
+import { refreshOne } from "./usage/poller.ts";
+import { beginLagLabel } from "./event-loop-lag.ts";
+import { resolveResumeCursor } from "./event-resume.ts";
+import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
+import { notificationTargetTaskId } from "./notification-hooks.ts";
+import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
+import { scanOpencodeSessions } from "./opencode-session-scan.ts";
+import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
+import { claudeConfigDirsToScan, claudeSessionLivenessCheckedAt, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
+import { claudeSessionScanOptions, flushPendingClaudeSessionsNotice } from "./claude-session-launch.ts";
+import {
+  compactDatabase,
+  configuredRetentionDays,
+  dbStats,
+  isRetentionRunning,
+  requestRetentionPass,
+  runArchivedHistoryRetentionPass,
+} from "./retention.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
+import { checkAllHarnesses } from "./agent-status.ts";
+import {
+  applyHarnessAutoEnable,
+  flushPendingHarnessAutoEnableNotice,
+  setHarnessAutoEnableBroadcaster,
+} from "./harness-auto-enable.ts";
+import { accountUsageDays } from "./account-usage.ts";
+import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
+import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
+import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
+import { stalledSince } from "./stall-registry.ts";
+import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
+import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
+import {
+  buildHarnessTerminalCommand,
+  harnessEnv,
+  isValidEnvKey,
+  resolveBin,
+  toTerminalAppleScript,
+} from "./agents.ts";
+import type { UpdaterSnapshot } from "./updater.ts";
+import {
+  bundledTmuxAvailable,
+  bundledTmuxPath,
+  getTmuxSource,
+  resolveTmuxBin,
+  setTmuxSource,
+  TMUX_SOURCE_KEY,
+  tmuxSocketArgs,
+  type TmuxSource,
+} from "./tmux-resolution.ts";
+import {
+  dismissAskModalForMessage,
+  dismissTmuxPrompt,
+  driveAskAnswers,
+  healWindowSize,
+  jsonlPathFor,
+  rebuildEventsFromJsonl,
+  markTmuxPromptAnswered,
+  resolveAskCard,
+  sendModalKeys,
+  sessionExists,
+  sessionNameFor,
+} from "./claude-tmux.ts";
+import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
+import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
+import {
+  getAheadCount,
+  getTaskDiff,
+  getTaskDiffBlob,
+  gitFetch,
+  gitPull,
+  gitPush,
+  hasUncommittedChanges,
+  headBranchState,
+  listBranches,
+  remoteSyncState,
+} from "./worktree.ts";
+import {
+  attachSocket,
+  closeTerminal,
+  createTerminal,
+  detachSocket,
+  getTerminal,
+  listTerminals,
+  writeTerminal,
+  resizeTerminal,
+  type TerminalSocketData,
+} from "./terminals.ts";
+import { listAgentCapabilities } from "./commands.ts";
+import { listProjectFiles } from "./project-files.ts";
+import {
+  addGitHubDiscussionComment,
+  addGitHubProjectItem,
+  addGitHubReaction,
+  addGitHubSubIssue,
+  applyGitHubSuggestion,
+  cancelGitHubWorkflowRun,
+  createGitHubDiscussion,
+  createGitHubLabel,
+  createGitHubMilestone,
+  createGitHubRelease,
+  deleteGitHubComment,
+  deleteGitHubDiscussion,
+  deleteGitHubDiscussionComment,
+  deleteGitHubLabel,
+  deleteGitHubMilestone,
+  deleteGitHubRelease,
+  dispatchGitHubWorkflow,
+  getGitHubCommitStatus,
+  getGitHubDiscussion,
+  getGitHubIssuePinned,
+  getGitHubProjectItems,
+  getGitHubPullLinkedIssues,
+  getGitHubRepoPermissions,
+  getGitHubThreadSubscription,
+  getGitHubPullReviewThreads,
+  listGitHubAssignees,
+  listGitHubDiscussions,
+  listGitHubMilestones,
+  listGitHubNotifications,
+  listGitHubProjectsV2,
+  listGitHubPullCommits,
+  listGitHubReactions,
+  listGitHubReleases,
+  listGitHubSubIssues,
+  listGitHubTags,
+  listGitHubWorkflowRuns,
+  listGitHubWorkflows,
+  markAllGitHubNotificationsRead,
+  markGitHubNotificationRead,
+  removeGitHubProjectItem,
+  removeGitHubReaction,
+  removeGitHubSubIssue,
+  requestGitHubPullReviewers,
+  rerunGitHubWorkflowRun,
+  setGitHubDiscussionAnswer,
+  setGitHubIssueLock,
+  setGitHubIssuePinned,
+  setGitHubProjectItemStatus,
+  setGitHubPullAutoMerge,
+  setGitHubPullDraft,
+  setGitHubReviewThreadResolved,
+  setGitHubThreadSubscription,
+  transferGitHubIssue,
+  unsubscribeGitHubThread,
+  updateGitHubComment,
+  updateGitHubLabel,
+  updateGitHubMilestone,
+  updateGitHubPullBranch,
+  updateGitHubRelease,
+} from "./github.ts";
+import { remoteHostsForDirs } from "./git-provider.ts";
+import * as gitHost from "./git-host.ts";
+import { getDiscoveredEfforts, getDiscoveredModels } from "./agent-discovery.ts";
+import {
+  refreshAllModels,
+  refreshHarnessModels,
+  noteHarnessRemoved,
+  getHarnessModelMap,
+  noteHarnessStatuses,
+} from "./model-discovery.ts";
+import { getMainWindow } from "./window.ts";
+import {
+  answerCursorAsk,
+  answerFxPermission,
+  recordCursorAskToolResult,
+  answerTmuxPrompt,
+  findFxPermissionById,
+  findTmuxPromptById,
+  getAskQuestionsById,
+  listPendingForTask,
+  type AskQuestionsAnswer,
+} from "./interactions.ts";
+import {
+  ARCHIVED_HISTORY_RETENTION_INVALID_ERROR,
+  ARCHIVED_HISTORY_RETENTION_PREF,
+  DEFAULT_BRANCH_CONFIG,
+  DEFAULT_MODEL,
+  EVENTS_PAGE_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
+  EVENTS_REPLAY_LIMIT,
+  EVENTS_REPLAY_MAX_BYTES,
+  MIN_REPLAY_EVENTS,
+  PIPELINE_LIMITS,
+  TASK_EVENTS_REPLAY_META_EVENT,
+  TASK_TYPES,
+  normalizeArchivedHistoryRetentionValue,
+  parseArchivedHistoryRetentionDays,
+  supportedEfforts,
+  validateBranchConfig,
+} from "../shared/types.ts";
+import type {
+  AgentKind,
+  AgentProfile,
+  AppEvent,
+  BranchNamingConfig,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubPullMergeMethod,
+  GitHubPullReviewEvent,
+  GitHubReactionContent,
+  GitHubReactionSubject,
+  GlobalEvent,
+  Handoff,
+  Pipeline,
+  PipelineInput,
+  PipelineRunState,
+  RunEvent,
+  OpencodeServerMode,
+  OpencodeSessionList,
+  Speed,
+  Task,
+  TaskEventsReplayMeta,
+  TaskGitStatus,
+  TaskTeardownPreview,
+  TaskReference,
+} from "../shared/types.ts";
+import { REMOTE_ACCESS_PREF_KEY } from "../shared/types.ts";
+import { armForceQuit, broadcastAppEvent, hasAppEventListeners, requestQuitCompletely, subscribeAppEvents } from "./quit-guard.ts";
+import { BOOT_GATE_EXEMPT_ALWAYS, BOOT_GATE_EXEMPT_HEADLESS, gateRoutesUntilReady } from "./boot-gate.ts";
+import {
+  BackgroundStartError,
+  getBackgroundStatus,
+  getRemoteAccess,
+  openLoginItems,
+  setRemoteAccessOff,
+  startBackgroundNow,
+  subscribeBackgroundChanges,
+  turnOffBackground,
+  turnOnBackground,
+} from "./background.ts";
+import { consumePendingOpenTask } from "./pending-open.ts";
+import {
+  binaryPreviewKind,
+  contentTypeForPreviewPath,
+  isImagePath,
+  MAX_FILE_PREVIEW_BYTES,
+} from "../shared/attachments.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
+import type { BundleImportOptions } from "../shared/bundle-import.ts";
+import {
+  BUNDLE_MAX_REQUEST_BYTES,
+  bundleDownloadsDir,
+  bundleSaveErrorMessage,
+  commitBundleImport,
+  exportBundleFor,
+  fakePickDir,
+  fakePickedFolder,
+  fakePickedJsonFile,
+  parseBundleImportOptions,
+  parseBundleSelection,
+  previewBundleImport,
+  readPickedBundleFile,
+  writeBundleFile,
+  type BundleImportError,
+} from "./bundle.ts";
+import { pickedPaths, singlePickedPath } from "./native-pick.ts";
+import type { AgentProfilePatch } from "./db.ts";
+import { duplicateAgentName } from "../shared/duplicate-name.ts";
+import { resolveSpeedInput } from "../shared/speed.ts";
+import { parseOpencodeServerInput } from "../shared/opencode.ts";
+import { duplicateAgentProfile } from "./duplicate-agent-profile.ts";
+
+// Re-export so existing call sites (index.ts → webview URL) keep working.
+// `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
+// The actual `Bun.serve` bind reads the env again inside `startApiServer`,
+// so tests that share a process but set `AGETOR_API_PORT` between file
+// imports (notifications.test.ts + server-auth.test.ts) each bind their
+// own port — the cached module state doesn't trap them on one value.
+export { API_TOKEN };
+export const API_PORT = getApiPort();
+
+// Origins allowed on responses. Re-populated inside `startApiServer` once
+// the runtime port is known. Kept as a mutable Set so handlers can close
+// over the binding at module load and still see the correct values.
+const ALLOWED_ORIGINS = new Set<string>();
+
+// Count of attached SSE clients across /events, /runs/:id/events,
+// /tasks/:id/events and /app/events. The headless CLI daemon reads this to
+// decide when it's safe to idle-shutdown: a connected CLI keeps the core alive
+// even with no running task. Best-effort — incremented when a stream opens,
+// decremented on the request abort.
+let attachedClients = 0;
+export function attachedClientCount(): number {
+  return attachedClients;
+}
+
+const json = (data: unknown, init?: ResponseInit) =>
+  new Response(JSON.stringify(data), {
+    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+    status: init?.status,
+  });
+
+// Content-type for the /tasks/:id/diff/blob response, from the shared
+// canonical extension→MIME map (`../shared/attachments.ts`, also used by
+// /files/preview below and by github.ts's pull-blob path — one map, no more
+// drift between the three). `relPath` has already passed `binaryPreviewKind`
+// by the time this is called, so the shared map always matches; the
+// fallback is defense-in-depth only.
+function blobContentType(relPath: string, kind: "image" | "pdf"): string {
+  return contentTypeForPreviewPath(relPath) ?? (kind === "pdf" ? "application/pdf" : "application/octet-stream");
+}
+
+// Derived, never-persisted count of this task's still-`running` subagent
+// rows — drives the kanban card's "N background agents" badge. Single-task
+// routes are called far less often than the 2s `/tasks` poll, so a one-off
+// filter over `listForTask` (already exported, already indexed by task_id)
+// is fine here; `/tasks` itself uses the grouped `runningCountsByTask()`
+// query instead of calling this per row.
+function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
+  const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
+  // `stalledSince` rides the same decoration: transient in-memory server
+  // state (the turn-stall watchdog's mark) that the DB-derived Task can't
+  // carry — see stall-registry.ts.
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
+}
+
+// Turn raw path strings into references: keep only existing absolute paths,
+// dedupe, and read directory-ness from the filesystem (authoritative — more
+// reliable than the webview's view). A path is never trimmed: a file name may
+// end in a space. `/refs/pick` re-joins the native panel's comma-split answer
+// first (`pickedPaths`, ./native-pick.ts); any piece that still doesn't exist
+// on disk falls out here rather than reaching the prompt as a broken ref.
+function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
+  const refs: TaskReference[] = [];
+  const seen = new Set<string>();
+  for (const abs of rawPaths) {
+    if (typeof abs !== "string") continue;
+    if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      continue; // gone / unreadable / comma-split fragment — skip rather than 500
+    }
+    seen.add(abs);
+    refs.push({ path: abs, isDirectory: st.isDirectory() });
+  }
+  return refs;
+}
+
+// `refsFromPaths` for `POST /refs/resolve`, the one reference route the CLI
+// token may call (D24): for a CLI caller the stat of each caller-named path runs
+// in a disclaimed child (`probePaths`), never in the core process, so naming a
+// path can't borrow Agetor's macOS grants. Same result shape and same rules as
+// the sync form — only existing absolute paths survive, deduped, with
+// `isDirectory` read from the filesystem. Mapping from probe kinds: `dir` /
+// `file` / `other` are kept (`other` — a socket or device — has isDirectory
+// false, exactly what statSync gives it); `missing` and `denied` are dropped,
+// which is what the in-process form does when statSync throws ENOENT or
+// EPERM/EACCES. The app caller keeps the in-process form untouched.
+async function refsFromPathsForCaller(rawPaths: unknown[], caller: ApiCaller | null): Promise<TaskReference[]> {
+  if (caller !== "cli") return refsFromPaths(rawPaths);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const abs of rawPaths) {
+    if (typeof abs !== "string") continue;
+    if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
+    seen.add(abs);
+    candidates.push(abs);
+  }
+  const kinds = await probePaths(candidates, "cli");
+  const refs: TaskReference[] = [];
+  candidates.forEach((abs, i) => {
+    const kind = kinds[i];
+    if (kind === "dir") refs.push({ path: abs, isDirectory: true });
+    else if (kind === "file" || kind === "other") refs.push({ path: abs, isDirectory: false });
+  });
+  return refs;
+}
+
+// Turn the caller-supplied `?name=` for /attachments into a safe basename
+// that can't escape `${dataDir}/attachments/`. Stripping null bytes and path
+// separators before `path.basename` is defense in depth (`path.basename`
+// alone already drops any `/`-delimited directory component); trimming
+// leading dots keeps the result from landing as a hidden dotfile-looking
+// name. The stem is capped at 120 UTF-8 bytes — `?name=` is caller-supplied
+// and macOS caps filenames at 255 bytes — trimmed a character at a time
+// (never mid-byte-sequence) so multi-byte UTF-8 names don't come out
+// mangled. Uniquification against what's already on disk happens at write
+// time (see `writeAttachmentAtomic` below), not here — an existsSync probe
+// here would leave a TOCTOU gap for concurrent same-name uploads.
+function sanitizeAttachmentBasename(rawName: string): { stem: string; ext: string } {
+  const cleaned = rawName
+    .replace(/\0/g, "")
+    .replace(/[/\\]/g, "-");
+  let safe = path.basename(cleaned).replace(/^\.+/, "");
+  if (!safe) safe = "attachment";
+  const ext = path.extname(safe);
+  let stem = ext ? safe.slice(0, -ext.length) : safe;
+  if (!stem) stem = "attachment";
+  const MAX_STEM_BYTES = 120;
+  while (Buffer.byteLength(stem, "utf8") > MAX_STEM_BYTES) {
+    stem = stem.slice(0, -1);
+  }
+  if (!stem) stem = "attachment";
+  return { stem, ext };
+}
+
+// Write `buf` under `dir` as `${stem}${ext}`, using an atomic exclusive
+// create (`wx`) so two concurrent uploads that sanitize to the same
+// basename (the client fires same-basename uploads via `Promise.all`)
+// can't race an existsSync-then-write check-then-act gap and silently
+// clobber each other. On EEXIST, fall back once to a unique-by-construction
+// name; if even that collides, the error propagates to the route's catch.
+function writeAttachmentAtomic(
+  dir: string,
+  stem: string,
+  ext: string,
+  buf: ArrayBuffer,
+): { abs: string; basename: string } {
+  const createExclusive = (basename: string): string => {
+    const abs = path.join(dir, basename);
+    const fd = openSync(abs, "wx");
+    try {
+      writeSync(fd, Buffer.from(buf));
+    } finally {
+      closeSync(fd);
+    }
+    return abs;
+  };
+  const primary = `${stem}${ext}`;
+  try {
+    return { abs: createExclusive(primary), basename: primary };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const fallback = `${stem}-${crypto.randomUUID().slice(0, 8)}${ext}`;
+    return { abs: createExclusive(fallback), basename: fallback };
+  }
+}
+
+// We bind to 127.0.0.1 by default (the headless core can widen it via
+// AGETOR_API_HOST for container use), so CORS is mostly belt-and-suspenders.
+// We still echo the calling origin so the Vite HMR webview
+// (http://localhost:5173) can call us during dev — but never `*`. Foreign
+// origins are also blocked by the token gate (both tokens travel in an
+// `authorization` header, which makes every webview request a preflighted
+// cross-origin one), so this is defense-in-depth.
+// Populated inside `startApiServer` once the runtime port is known.
+
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin") ?? "";
+  const allowed = ALLOWED_ORIGINS.has(origin) ? origin : "null";
+  return {
+    "access-control-allow-origin": allowed,
+    "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    // `last-event-id`: the task event stream's reconnects send it (SSE resume
+    // cursor); without it in the allow list the browser fails that
+    // preflight and the stream could never reconnect.
+    "access-control-allow-headers": "content-type,authorization,last-event-id",
+    "access-control-allow-credentials": "true",
+    // The Authorization header makes every webview request preflight; let the
+    // browser cache each answer (WebKit caps this at 600 s) so a transcript's
+    // images and the 2 s polls don't pay a second round trip each time.
+    "access-control-max-age": "600",
+  };
+}
+
+function unauthorized(req: Request): Response {
+  return json(
+    { error: "unauthorized" },
+    { status: 401, headers: corsHeaders(req) },
+  );
+}
+
+// Who may call what is decided ONCE, before any handler runs, by the route
+// policy walker (`applyRoutePolicy` over `ROUTE_POLICY`, route-policy.ts): it
+// resolves the caller from the Authorization header (master → "app", CLI token
+// → "cli"; `?token=` only for the CLI token on the three legacy SSE GETs),
+// refuses the CLI token on desktop-only routes and gates CLI-supplied paths
+// (D24). `authed` is what each handler adds on top: "a caller the walker
+// authorized". It stays on every handler so a route that somehow bypassed the
+// walker (or a handler reused outside it) still fails closed with a 401.
+//
+// We type the wrapper loosely so Bun's per-route param typing (it infers
+// `params.id` as `string` for the pattern `/:id`) flows through unchanged.
+// Under `noUncheckedIndexedAccess`, a generic `Record<string,string>` would
+// otherwise become `string | undefined` and force needless guards.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F {
+  // A CORS preflight never carries the token, and Bun hands OPTIONS to a
+  // function-valued route's handler too. The webview sends its token in an
+  // `authorization` header (never `?token=`, D13), which makes every
+  // cross-origin request preflight, so answer it here like the fetch()
+  // fallback does instead of 401-ing it.
+  return ((req: Request) => {
+    if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
+    return callerOf(req) !== null ? fn(req) : unauthorized(req);
+  }) as F;
+}
+
+// Terminal WebSocket tickets (P7). A WebSocket can't carry an Authorization
+// header and the master token must never appear in a URL (D13), so the webview
+// first POSTs `/terminals/:id/ws-ticket` (desktop-only, header-authenticated)
+// and opens `GET /terminals/:id/ws?ticket=…`. A ticket is 32 random bytes (hex),
+// bound to one terminal id, valid for 30 s and consumed by its first use — it
+// is a lookup key, not a derivation of any credential, so a URL that leaks into
+// a log or history is dead before anyone can replay it.
+const WS_TICKET_TTL_MS = 30_000;
+const wsTickets = new Map<string, { terminalId: string; expiresAt: number }>();
+
+function pruneWsTickets(now: number): void {
+  for (const [ticket, entry] of wsTickets) {
+    if (entry.expiresAt <= now) wsTickets.delete(ticket);
+  }
+}
+
+function mintWsTicket(terminalId: string): { ticket: string; expiresAt: number } {
+  const now = Date.now();
+  pruneWsTickets(now);
+  const ticket = randomBytes(32).toString("hex");
+  const expiresAt = now + WS_TICKET_TTL_MS;
+  wsTickets.set(ticket, { terminalId, expiresAt });
+  return { ticket, expiresAt };
+}
+
+/** Consume `ticket` for `terminalId`: true only for a live, unused ticket minted for that same terminal. */
+function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
+  if (!ticket) return false;
+  const entry = wsTickets.get(ticket);
+  if (!entry) return false;
+  // Single use even on a mismatch: a ticket presented for the wrong terminal is dead too.
+  wsTickets.delete(ticket);
+  return entry.expiresAt > Date.now() && entry.terminalId === terminalId;
+}
+
+/**
+ * Fields callers may patch on a task. Everything else is server-managed —
+ * including, additively, `agentProfileId`/`agentProfile` (docs/plans/
+ * agent-profiles.md D1): they're create-only (via `POST /tasks`'s
+ * `agentProfileId`) or targeted-UPDATE-only (`tasks.setAgentProfile`, called
+ * from `startTask`'s live-profile refresh and the detach route below),
+ * never through this generic PATCH. See the bound-agent 409 guard in
+ * `PATCH /tasks/:id` for the other half of that lock: even a listed field
+ * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`/`opencodeServer`) is refused once a
+ * task is bound to a profile, until it's detached.
+ *
+ * `fast` is the legacy boolean alias of `speed` (D13): `filterPatch` maps it
+ * through `resolveSpeedInput` (`true` → `"fast"`, `false` → `"off"`; an
+ * explicit `speed` wins) and never forwards `fast` itself to the db layer.
+ *
+ * `opencodeServer` (OpenCode's per-task server option, D-4) is validated by
+ * `filterPatch` through `parseOpencodeServerInput` — anything but `shared`/
+ * `standalone` is a 400. A non-OpenCode task stores it and ignores it, like
+ * `maxMode`. It is one of the profile-bound fields below.
+ *
+ * `checkoutBranch` (the last-seen worktree checkout, migration 063) is
+ * server-managed the same way: only `tasks.setCheckoutBranch` writes it, at
+ * run start/settle, terminal open and archive — a PATCH carrying it is
+ * silently ignored like every other unlisted field.
+ */
+const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "speed", "fast", "maxMode", "taskType",
+  "opencodeServer",
+]);
+
+/** The 8 reaction contents GitHub's API accepts — validated here before the
+ *  request ever reaches `addGitHubReaction` (which re-validates independently,
+ *  same defense-in-depth as the other GitHub POST routes). */
+const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+
+function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string } {
+  if (!raw || typeof raw !== "object") return { patch: {} };
+  const body = raw as Record<string, unknown>;
+  const patch: Partial<Task> = {};
+  for (const [k, v] of Object.entries(body)) {
+    // `speed`/`fast` are resolved together below — `fast` never reaches the db.
+    if (k === "speed" || k === "fast") continue;
+    if (k === "maxMode") {
+      patch.maxMode = v === true;
+      continue;
+    }
+    if (k === "opencodeServer") {
+      const server = parseOpencodeServerInput(v);
+      if (typeof server === "object") return { error: server.error };
+      if (server !== undefined) patch.opencodeServer = server;
+      continue;
+    }
+    if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
+  }
+  const speed = resolveSpeedInput(body);
+  if ("error" in speed) return { error: speed.error };
+  if (speed.speed !== undefined) patch.speed = speed.speed;
+  return { patch };
+}
+
+/** Shared precondition for the backlog-mutation routes: the task must exist
+ *  and not be archived. Returns an error Response to short-circuit with, or
+ *  null when the caller may proceed. Mirrors the archived-freeze that the
+ *  task PATCH route enforces so a direct API caller can't stash/edit drafts on
+ *  a frozen task the UI has already made read-only. */
+function backlogGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing the backlog" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Shared precondition for the cursor-plan-mutation routes (PATCH edit,
+ *  approve): the task must exist and not be archived. Mirrors `backlogGuard`
+ *  — same archived-freeze policy applied to the `plans` JSON column. */
+function planGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing plans" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Shared precondition for both plan-mutation routes: plan approval/editing
+ *  only makes sense for a cursor task (keyed on cursor's `createPlanToolCall`)
+ *  or a GitHub Copilot task (keyed on the driver's synthetic `copilot_plan`
+ *  tool_use). Identical check, identical 400 shape, in both the PATCH edit
+ *  route and the approve route — factored out so they can't drift. Returns
+ *  the harness kind alongside so the approve route can branch on it. */
+function planKindGuard(req: Request, task: Task): Response | null {
+  const kind = harnesses.getByIdOrKind(task.agent)?.kind;
+  if (kind !== "cursor" && kind !== "copilot") {
+    return json(
+      { error: "plan approval is only supported for cursor or GitHub Copilot tasks" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Concurrent-approve guard for `/tasks/:id/plans/:planId/approve`: claimed
+ *  synchronously (no `await` between the `.has` check and the `.add`) before
+ *  any async work, so two POSTs racing in on the same plan can't both pass
+ *  the `status === "pending"` check and both send the approval message —
+ *  the second is rejected with 409 before it does anything. Keyed on
+ *  `taskId:planId` (not just `planId`, though plan ids are already unique)
+ *  to read unambiguously in isolation. */
+const approvalsInFlight = new Set<string>();
+
+/** Concurrent-answer guard for `/ask-questions/:id/answer`: a card stays
+ *  pending until `resolveAskCard` runs AFTER the delivery awaits, so a second
+ *  POST for the same card (a double submit, or the CLI racing the webview)
+ *  would otherwise plan and drive the same keystrokes into the live modal a
+ *  second time. Claimed synchronously — no `await` between the pending lookup,
+ *  the `.has` check and the `.add` — and released in a `finally` once delivery
+ *  has finished. The second request is rejected with 409 before it does
+ *  anything. Keyed on the card id. */
+const askAnswersInFlight = new Set<string>();
+
+/**
+ * Coerce an untrusted request body into a well-formed BranchNamingConfig,
+ * dropping unknown fields and filling every task-type rule (missing ones fall
+ * back to the built-in default). Returns `{ error }` when the shape is
+ * unusable or a prefix wouldn't produce a legal branch.
+ */
+/** Wire shape for a stored GitHub PAT: the raw token never leaves the Bun
+ *  process — only a last-4-chars preview, and even that is withheld when the
+ *  token is so short the suffix would be the entire secret. */
+function sanitizedTokenInfo(t: { host: string; label: string | null; token: string }) {
+  return {
+    host: t.host,
+    label: t.label,
+    tokenPreview: t.token.length > 4 ? `…${t.token.slice(-4)}` : "…",
+  };
+}
+
+function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { error: string } {
+  if (!raw || typeof raw !== "object") return { error: "config (object) required" };
+  const src = raw as { rules?: unknown; includeSlug?: unknown };
+  const rulesSrc = (src.rules && typeof src.rules === "object" ? src.rules : {}) as Record<string, unknown>;
+  const rules = {} as BranchNamingConfig["rules"];
+  for (const t of TASK_TYPES) {
+    const r = rulesSrc[t.id] as { prefix?: unknown } | undefined;
+    const prefix = r && typeof r.prefix === "string" ? r.prefix : DEFAULT_BRANCH_CONFIG.rules[t.id].prefix;
+    rules[t.id] = { prefix };
+  }
+  const config: BranchNamingConfig = {
+    rules,
+    includeSlug: typeof src.includeSlug === "boolean" ? src.includeSlug : true,
+  };
+  const v = validateBranchConfig(config);
+  if (!v.ok) return { error: v.reason };
+  return { config };
+}
+
+/** "`<what>` must not contain a lone surrogate" when `value` holds one, else
+ *  null. JSON can spell an unpaired surrogate (`"\ud800"`); SQLite stores
+ *  text as UTF-8 and pairs it with the next code unit, so the stored value
+ *  would differ from the one sent, and no bundle could carry it. */
+function loneSurrogateError(value: string, what: string): string | null {
+  return LONE_SURROGATE_RE.test(value) ? `${what} must not contain a lone surrogate` : null;
+}
+
+/** The `name` body check shared by `POST`/`PATCH /agent-profiles`, run on
+ *  the trimmed value: required, within its cap, and free of control
+ *  characters and lone surrogates. Returns the error, or null. */
+function agentProfileNameError(name: string): string | null {
+  if (!name) return "name required";
+  if (name.length > AGENT_PROFILE_LIMITS.name) {
+    return `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer`;
+  }
+  // Same rule as a pipeline name: a terminal escape in a name would reach
+  // every CLI listing that prints it.
+  if (PIPELINE_CONTROL_CHAR_RE.test(name)) return "agent name must not contain control characters";
+  return loneSurrogateError(name, "agent name");
+}
+
+/** The `instructions` body check shared by `POST`/`PATCH /agent-profiles`.
+ *  Returns the error, or null. */
+function agentProfileInstructionsError(instructions: string): string | null {
+  if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+    return `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`;
+  }
+  return loneSurrogateError(instructions, "agent instructions");
+}
+
+/** The `effort`/`mode` body check shared by `POST`/`PATCH /agent-profiles`:
+ *  a string within its cap, or null. Returns the error, or null when valid. */
+function agentProfileOptionalFieldError(value: unknown, field: "effort" | "mode"): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return `${field} must be a string or null`;
+  const max = AGENT_PROFILE_LIMITS[field];
+  if (value.trim().length > max) return `agent ${field} must be ${max} characters or fewer`;
+  if (PIPELINE_CONTROL_CHAR_RE.test(value.trim())) return `agent ${field} must not contain control characters`;
+  return loneSurrogateError(value, `agent ${field}`);
+}
+
+/** The `model` body check shared by `POST`/`PATCH /agent-profiles`, run on
+ *  the trimmed value: required, within its cap, and free of control and
+ *  invisible characters — a model made only of those would export as an
+ *  empty string, which no bundle could carry. Returns the error, or null. */
+function agentProfileModelError(model: string): string | null {
+  if (!model) return "model required";
+  if (model.length > AGENT_PROFILE_LIMITS.model) {
+    return `agent model must be ${AGENT_PROFILE_LIMITS.model} characters or fewer`;
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(model)) return "agent model must not contain control characters";
+  const lone = loneSurrogateError(model, "agent model");
+  if (lone) return lone;
+  const invisible = findInvisibleChar(model);
+  if (invisible) return `agent model must not contain invisible characters (${invisible})`;
+  return null;
+}
+
+/** The stored form of a valid `effort`/`mode` body value: trimmed, and an
+ *  empty one reads as null (the kind default) — the length check above runs
+ *  on the trimmed value, and the bundle parser reads these fields the same
+ *  way, so what is stored is exactly what was checked and what exports. */
+function agentProfileOptionalField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.trim() || null;
+}
+
+/**
+ * Validate + normalize an agent profile's `skills` field for the
+ * `POST`/`PATCH /agent-profiles` routes (docs/plans/agent-profiles.md). Unlike
+ * `sanitizeSkillsList` in db.ts (a defensive parse-path normalizer that
+ * silently drops/truncates malformed input from the DB), this is the wire
+ * validator — it must be HONEST about what it does: a non-array, or an array
+ * containing anything that isn't a string, 400s rather than silently
+ * filtering; the array is normalized via `normalizeSkillName` (trim,
+ * strip-leading-slash, collapse whitespace, drop-if-empty) and deduplicated
+ * (first occurrence wins) BEFORE the length is checked against
+ * `AGENT_PROFILE_LIMITS.skills`, so a caller that sends 60 raw entries which
+ * normalize/dedupe down to 40 unique names is accepted, while one that still
+ * has 51 after normalization is rejected instead of silently truncated.
+ */
+function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.some((s) => typeof s !== "string")) {
+    return { error: "skills must be an array of strings" };
+  }
+  if ((raw as string[]).some((s) => LONE_SURROGATE_RE.test(s))) {
+    return { error: "skills must not contain a lone surrogate" };
+  }
+  const seen = new Set<string>();
+  const skills: string[] = [];
+  for (const entry of raw as string[]) {
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    skills.push(name);
+  }
+  if (skills.length > AGENT_PROFILE_LIMITS.skills) {
+    return { error: `at most ${AGENT_PROFILE_LIMITS.skills} skills` };
+  }
+  return { skills };
+}
+
+/**
+ * Stamp an {@link AgentProfile}'s server-derived `taskCount` (docs/plans/
+ * agent-profiles.md — "used by N tasks"). `withTaskCount` does a single
+ * targeted `agentProfiles.taskCount` query, for the single-resource
+ * GET/POST/PATCH `/agent-profiles/:id` responses; `withTaskCounts` uses one
+ * grouped `agentProfiles.taskCounts()` map so the `GET /agent-profiles` list
+ * route never issues N queries for N profiles. A profile with no bound tasks
+ * simply isn't a key in the map, hence the `?? 0` default.
+ */
+function withTaskCount(p: AgentProfile): AgentProfile {
+  return { ...p, taskCount: agentProfiles.taskCount(p.id) };
+}
+function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
+  const counts = agentProfiles.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/** Validates both a client-minted `cloneId` on `POST /projects/clone`'s body
+ *  and the `:cloneId` path param on `DELETE /projects/clone/:cloneId` — see
+ *  those routes' own doc comments (docs/plans/clone-repository-all-providers.md
+ *  Addendum A). Matches `crypto.randomUUID()`'s own shape, case-insensitively
+ *  (a client could reasonably uppercase one). */
+const CLONE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Route-level bookkeeping for `POST /projects/clone`'s own duplicate-id
+ *  guard — distinct from clone.ts's `activeClones` registry (which keys off
+ *  the actual running `git clone` child process, one attempt at a time).
+ *  This set spans the whole request, from just before `cloneRepo` is called
+ *  through every exit path after it, so a second POST reusing the same
+ *  client-minted `cloneId` while the first is still in flight can't overwrite
+ *  the first's registry handle (which would make a cancel kill the wrong
+ *  clone, or interleave two clones' progress events under one id). Entries
+ *  are removed in a `finally`, so the id is free to reuse on any later POST
+ *  once the earlier request has settled — success, failure, or cancel. */
+const inFlightCloneIds = new Set<string>();
+
+/**
+ * Stamp a {@link Pipeline}'s server-derived `taskCount` (docs/plans/
+ * pipelines.md §3 routes table) — number of parent pipeline tasks currently
+ * bound to it (`tasks.pipeline_id = this.id`, every column including
+ * archived). Exact analog of `withTaskCount`/`withTaskCounts` above:
+ * `withPipelineTaskCount` does a single targeted `pipelines.taskCount` query
+ * for the single-resource GET/POST/PATCH `/pipelines/:id` responses;
+ * `withPipelineTaskCounts` uses one grouped `pipelines.taskCounts()` map so
+ * `GET /pipelines` never issues N queries for N pipelines.
+ */
+function withPipelineTaskCount(p: Pipeline): Pipeline {
+  return { ...p, taskCount: pipelines.taskCount(p.id) };
+}
+function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
+  const counts = pipelines.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/** Most bytes of a refused request body read and thrown away before the
+ *  reader gives up and cancels. Also the server's `maxRequestBodySize`: Bun
+ *  refuses a larger Content-Length itself (413, before any handler runs) and
+ *  leaves the keep-alive socket clean, so the cancel below is only ever
+ *  reached by a chunked body — Bun 1.3.10 doesn't apply `maxRequestBodySize`
+ *  to one (spike-verified) — or a stalled one. The largest legitimate body
+ *  (`POST /screenshots`) is 25 MB. */
+export const REFUSED_BODY_DRAIN_MAX_BYTES = 64 * 1024 * 1024;
+/** Longest a refused body is drained before the reader gives up and cancels:
+ *  a client that sends slowly (or stalls) mid-upload must not hold the 413
+ *  back, and the request open, indefinitely. */
+const REFUSED_BODY_DRAIN_MAX_MS = 5_000;
+
+/**
+ * Read and discard the rest of a request body that is being refused, up to
+ * {@link REFUSED_BODY_DRAIN_MAX_BYTES} or {@link REFUSED_BODY_DRAIN_MAX_MS},
+ * then cancel. A client that keeps its connection alive (Bun's fetch does;
+ * verified on 1.3.10) otherwise wedges its next request on that socket
+ * behind the unread upload — a `Connection: close` response header does not
+ * help. Nothing is held: each chunk is dropped as it arrives.
+ *
+ * The give-up paths sacrifice that socket: after `reader.cancel()` the
+ * client's next request on it waits until `idleTimeout` closes it. That only
+ * happens to a chunked body over 64 MB (a Content-Length one that size never
+ * reaches a handler — see `maxRequestBodySize`) or a client that stops
+ * sending for 5 s mid-upload, neither of which the webview or CLI does; the
+ * 413 itself is still answered at once.
+ */
+export async function drainRefusedBody(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxMs = REFUSED_BODY_DRAIN_MAX_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), maxMs);
+  });
+  const drain = async (): Promise<"done" | "cap"> => {
+    let drained = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return "done";
+      drained += value.byteLength;
+      if (drained > REFUSED_BODY_DRAIN_MAX_BYTES) return "cap";
+    }
+  };
+  const drained = drain();
+  // Lost the race and cancelled below: a late rejection must not surface as
+  // an unhandled one.
+  drained.catch(() => {});
+  try {
+    const outcome = await Promise.race([drained, deadline]);
+    if (outcome === "done") return;
+  } catch {
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  // Past the byte cap or the deadline: cancelling also settles a read still
+  // pending in `drain`, so nothing is left waiting on the stream.
+  await reader.cancel().catch(() => {});
+}
+
+/**
+ * The request body as text, or null once it passes `maxBytes` — from there
+ * the rest is drained and thrown away instead of buffered. A body that can't
+ * be read reads as "" (the JSON parse then 400s).
+ */
+async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await drainRefusedBody(reader);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return "";
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/**
+ * Read and validate a `POST /bundle/import[/preview]` body — `{ text,
+ * options?, planFingerprint? }` (docs/plans/agents-pipelines-import-export.md
+ * K4; `planFingerprint`, the previewed plan's, only matters to the commit,
+ * which 409s when its own re-plan differs). A body over
+ * `BUNDLE_MAX_REQUEST_BYTES` is refused with 413 by `Content-Length` before
+ * it is parsed (like `/screenshots`), and — when chunked, with no length — as
+ * soon as the read passes it; either way the rest is drained, never held. Returns
+ * the error `Response` to send, or the parsed body.
+ */
+async function readBundleImportBody(
+  req: Request,
+): Promise<{ text: string; options: BundleImportOptions; planFingerprint?: string } | Response> {
+  const tooLarge = () =>
+    json(
+      {
+        error:
+          `request is too large to import — a bundle file holds at most ${BUNDLE_MAX_BYTES / (1024 * 1024)} MB, ` +
+          "and text with many control characters takes more room once sent",
+        code: "too-large",
+      },
+      { status: 413, headers: corsHeaders(req) },
+    );
+  const claimed = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(claimed) && claimed > BUNDLE_MAX_REQUEST_BYTES) {
+    // Refused before parsing, but read off the socket so a keep-alive client
+    // can send its next request on it.
+    if (req.body) await drainRefusedBody(req.body.getReader());
+    return tooLarge();
+  }
+  // A chunked body carries no Content-Length: read it with a byte cap, so an
+  // oversized one is refused without ever being held in memory whole.
+  const raw = await readBodyCapped(req, BUNDLE_MAX_REQUEST_BYTES);
+  if (raw === null) return tooLarge();
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "invalid body", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const { text, options, planFingerprint } = body as { text?: unknown; options?: unknown; planFingerprint?: unknown };
+  if (typeof text !== "string") {
+    return json({ error: "text (string) required", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  const parsedOptions = parseBundleImportOptions(options);
+  if ("error" in parsedOptions) {
+    return json({ error: parsedOptions.error, code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (planFingerprint !== undefined && planFingerprint !== null && typeof planFingerprint !== "string") {
+    return json({ error: "planFingerprint must be a string", code: "invalid" }, { status: 400, headers: corsHeaders(req) });
+  }
+  return {
+    text,
+    options: parsedOptions.options,
+    ...(typeof planFingerprint === "string" ? { planFingerprint } : {}),
+  };
+}
+
+/** 400 `{ error, code }` for a file that didn't parse; 409 `{ error, plan }`
+ *  for a plan with blocking issues. */
+function bundleImportErrorResponse(req: Request, r: BundleImportError): Response {
+  if (r.status === 400) {
+    return json({ error: r.error, code: r.code }, { status: 400, headers: corsHeaders(req) });
+  }
+  return json({ error: r.error, plan: r.plan }, { status: 409, headers: corsHeaders(req) });
+}
+
+/**
+ * Validate the `POST /pipelines` / `PATCH /pipelines/:id` body's `name`:
+ * trimmed, required, `PIPELINE_LIMITS.name` cap, and (L-S1) no C0/DEL
+ * control characters — the same rule `validatePipelineGraph` applies to
+ * step names, since both are quoted verbatim into prompts and the run view.
+ */
+function parsePipelineName(body: Record<string, unknown>): { value: string } | { error: string } {
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return { error: "name required" };
+  if (name.length > PIPELINE_LIMITS.name) {
+    return { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` };
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(name)) return { error: "pipeline name must not contain control characters" };
+  const lone = loneSurrogateError(name, "pipeline name");
+  if (lone) return { error: lone };
+  return { value: name };
+}
+
+/**
+ * Validate the `description` field when the body carries it: it must be a
+ * string (L-S6 — a non-string used to be silently read as `""`, so a PATCH
+ * with `description: 42` wiped the real description) within
+ * `PIPELINE_LIMITS.description`. Returns `undefined` when the key is absent.
+ */
+function parsePipelineDescription(body: Record<string, unknown>): { value: string | undefined } | { error: string } {
+  if (!("description" in body) || body.description === undefined) return { value: undefined };
+  if (typeof body.description !== "string") return { error: "description must be a string" };
+  if (body.description.length > PIPELINE_LIMITS.description) {
+    return { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` };
+  }
+  const lone = loneSurrogateError(body.description, "pipeline description");
+  if (lone) return { error: lone };
+  return { value: body.description };
+}
+
+/**
+ * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
+ * field's doc in `shared/types.ts`): every persisted handoff (history and
+ * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
+ * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
+ * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
+ * was otherwise shipping every handoff of every pipeline task on every
+ * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
+ * full state; the server's own `tasks.list()`/`get()` reads are untouched.
+ */
+function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
+  const joins: PipelineRunState["joins"] = {};
+  for (const [stepId, join] of Object.entries(run.joins)) {
+    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
+  }
+  return {
+    ...run,
+    snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
+    history: run.history.map((h) => ({ ...h, handoff: null })),
+    joins,
+  };
+}
+
+/**
+ * Validate + normalize the `POST /pipelines` / `PATCH /pipelines/:id` body's
+ * `maxSteps` field: omitted is fine (the db layer defaults it via
+ * `PIPELINE_LIMITS.maxStepsDefault`), otherwise it must be an integer in
+ * `1..PIPELINE_LIMITS.maxStepsMax`. Returns `undefined` (meaning "omit the
+ * key") when the field wasn't present at all, so a PATCH that doesn't
+ * mention `maxSteps` leaves it untouched.
+ */
+function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number | undefined } | { error: string } {
+  if (body.maxSteps === undefined) return { value: undefined };
+  const m = body.maxSteps;
+  if (typeof m !== "number" || !Number.isInteger(m) || m < 1 || m > PIPELINE_LIMITS.maxStepsMax) {
+    return { error: `maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}` };
+  }
+  return { value: m };
+}
+
+/**
+ * Validate the optional launch-picker fields on `POST /projects/clone`
+ * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
+ * so a bad profile/harness id 400s with nothing cloned to disk instead of
+ * cloning and then reporting `eli5Error`. Mirrors `createTask`'s own
+ * precedence: a resolvable `agentProfileId` wins and the seven manual fields
+ * (`opencodeServer` included) are not forwarded to it.
+ */
+function validateCloneLaunch(
+  body: Record<string, unknown>,
+): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } | { error: string } {
+  let agentProfileId: string | undefined;
+  if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
+    if (typeof body.agentProfileId !== "string") {
+      return { error: "agentProfileId must be a string" };
+    }
+    const trimmed = body.agentProfileId.trim();
+    if (trimmed) {
+      const profile = agentProfiles.get(trimmed);
+      if (!profile) {
+        return { error: `unknown agent profile "${trimmed}"` };
+      }
+      // `createTask` resolves the profile's own harness and fails on a
+      // dangling one — catch that here too, before anything is cloned.
+      if (!harnesses.getByIdOrKind(profile.harness)) {
+        return { error: `unknown harness "${profile.harness}"` };
+      }
+      agentProfileId = trimmed;
+    }
+  }
+
+  if (body.agent !== undefined && typeof body.agent !== "string") {
+    return { error: "agent must be a string" };
+  }
+  if (body.mode !== undefined && typeof body.mode !== "string") {
+    return { error: "mode must be a string" };
+  }
+  if (body.model !== undefined && typeof body.model !== "string") {
+    return { error: "model must be a string" };
+  }
+  if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
+    return { error: "effort must be a string or null" };
+  }
+  // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+  const speedInput = resolveSpeedInput(body);
+  if ("error" in speedInput) return { error: speedInput.error };
+  if (body.maxMode !== undefined && typeof body.maxMode !== "boolean") {
+    return { error: "maxMode must be a boolean" };
+  }
+  const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+  if (typeof opencodeServer === "object") return { error: opencodeServer.error };
+
+  if (agentProfileId) return { agentProfileId };
+
+  if (typeof body.agent === "string" && !harnesses.getByIdOrKind(body.agent)) {
+    return { error: `unknown harness "${body.agent}"` };
+  }
+
+  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } = {};
+  if (typeof body.agent === "string") out.agent = body.agent;
+  if (typeof body.mode === "string") out.mode = body.mode;
+  if (typeof body.model === "string") out.model = body.model;
+  if (body.effort !== undefined) out.effort = body.effort as string | null;
+  if (speedInput.speed !== undefined) out.speed = speedInput.speed;
+  if (typeof body.maxMode === "boolean") out.maxMode = body.maxMode;
+  if (opencodeServer !== undefined) out.opencodeServer = opencodeServer;
+  return out;
+}
+
+/** The lag-monitor label every native Open panel is bracketed with. */
+export const NATIVE_FILE_DIALOG_LAG_LABEL = "native file dialog";
+
+/**
+ * `native.openFileDialog`, bracketed with a context-free lag label.
+ * Electrobun's `Utils.openFileDialog` is a synchronous FFI call, so the Bun
+ * main thread is blocked for as long as the panel is up — an expected block
+ * the user is driving. The label makes the event-loop-lag monitor name it
+ * ("core was unresponsive for 12.3 s during native file dialog") instead of
+ * blaming whatever unrelated labelled work (a watcher restoring another task)
+ * happened to be in flight; having no task context, it never writes a status
+ * line into a transcript. The webview suspends its busy banner for the same
+ * requests (`api.ts`).
+ */
+async function openFileDialogLabelled(
+  native: ApiNative,
+  opts: Parameters<ApiNative["openFileDialog"]>[0],
+): Promise<string[]> {
+  const end = beginLagLabel(NATIVE_FILE_DIALOG_LAG_LABEL);
+  try {
+    return await native.openFileDialog(opts);
+  } finally {
+    end();
+  }
+}
+
+/**
+ * Native-host capabilities the API needs but that only exist inside the
+ * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
+ * open-in-browser, the self-updater, and app quit. The Electrobun entry
+ * (`index.ts`) injects a real implementation built from `electrobun/bun` +
+ * `updater.ts`; the headless CLI daemon injects nothing, so the handful of
+ * routes that need these return 501. Keeping them behind this interface is
+ * what lets `server.ts` load without importing `electrobun/bun`.
+ */
+export interface ApiNative {
+  openFileDialog(opts: {
+    startingFolder: string;
+    /** Comma-separated extensions the panel accepts (e.g. `"json"`);
+     *  omitted means any file. */
+    allowedFileTypes?: string;
+    canChooseFiles: boolean;
+    canChooseDirectory: boolean;
+    allowsMultipleSelection: boolean;
+  }): Promise<string[]>;
+  openPath(p: string): boolean;
+  /** Reveal `p` in the OS file manager (Finder on macOS, the only release
+   *  target) with the item itself selected, rather than opening it with its
+   *  default application the way `openPath` does. Backs `POST /reveal-path`
+   *  (a `SendUserFile` tile's "Reveal in Finder" menu item). Returns
+   *  whether the reveal command was successfully dispatched, not whether
+   *  Finder actually surfaced the item — same "best-effort boolean" contract
+   *  as `openPath`/`openExternal`. */
+  revealPath(p: string): boolean;
+  openExternal(url: string): boolean;
+  /** Post an OS notification. With a `taskId` it is the task's one
+   *  Notification Center entry (posted through the AgetorNotifier helper under
+   *  a fixed per-task id, deep-linking to the task on click): a newer post
+   *  replaces it. `kind` sets its urgency, which drives the sound rule. */
+  showNotification(n: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+    kind?: NotificationKind;
+  }): void;
+  /** Remove a task's Notification Center entry — with `ifKinds`, only when its
+   *  stored kind is listed. Fire-and-forget; never asks for permission. */
+  removeTaskNotification(r: TaskNotificationRemoval): void;
+  /** Raise + focus the app window. Returns `false` when there is no window to
+   *  act on — never to report a failed native call, so callers can map `false`
+   *  to "no window" without conflating it with a platform hiccup. Lives behind
+   *  this interface (rather than calling `focusWindow` here) because resolving
+   *  the display layout needs `Screen` from `electrobun/bun`, and importing
+   *  that at module scope would drag Electrobun — and its transitive `three`
+   *  dependency — into the headless CLI daemon, which imports this file. */
+  focusWindow(): boolean;
+  quit(): void;
+  updates: {
+    snapshot(): UpdaterSnapshot;
+    check(): Promise<void>;
+    apply(): Promise<void>;
+  };
+}
+
+/** 501 for native-only routes when running headless (no Electrobun host). */
+const notAvailableHeadless = (req: Request) =>
+  json(
+    { error: "not available in headless mode" },
+    { status: 501, headers: corsHeaders(req) },
+  );
+
+// A Claude session's folder comes from the transcript, not the request, so the
+// route table can't gate it up front (`pathParamsExempt` on the import route).
+// For a CLI-token caller the importer calls this before its first in-process
+// touch of the folder: the folder is probed in a disclaimed child and a
+// refusal message comes back (D24). The app caller passes no gate.
+function sessionCwdGate(req: Request): { gateCwd?: (cwd: string) => Promise<string | null> } {
+  if (callerOf(req) !== "cli") return {};
+  return { gateCwd: async (cwd) => (await gateCallerPath(cwd, "cli", "exists"))?.error ?? null };
+}
+
+// The policy walker gates a harness's top-level `home`/`bin` for a CLI-token
+// caller, but not the values inside its `env` map — and an env value that is an
+// absolute path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`…) names a directory
+// the core later tails or reads in-process. So the same disclaimed probe runs
+// over every absolute-path env value (D24); the first denied one refuses the
+// request with the gate's own 403 body. The app caller is never gated.
+async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
+  if (callerOf(req) !== "cli") return null;
+  for (const value of Object.values(env)) {
+    // Gate the trimmed spelling too: a consumer that trims the value would
+    // otherwise act on a protected path the raw string never named.
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("/")) continue;
+    for (const p of trimmed === value ? [value] : [value, trimmed]) {
+      const refusal = await gateCallerPath(p, "cli", "exists");
+      if (refusal) {
+        const { status, ...body } = refusal;
+        return json(body, { status, headers: corsHeaders(req) });
+      }
+    }
+  }
+  return null;
+}
+
+/** Loose shape of the `routes:` object (see the comment at the `applyRoutePolicy` call). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type RouteHandler = (req: any) => Response | Promise<Response>;
+type ServerRoutes = Record<string, RouteHandler | Record<string, RouteHandler>>;
+
+export function startApiServer(
+  deps: {
+    native?: ApiNative;
+    hostname?: string;
+    /** Headless OS notifications (docs/plans/always-on-host.md §3.7): the same
+     *  post/remove pair `native` offers, for a core that has no Electrobun host.
+     *  Removal prefers `native` when both are given. */
+    notifications?: {
+      post(n: Parameters<ApiNative["showNotification"]>[0]): void;
+      remove(r: TaskNotificationRemoval): void;
+    };
+    /** Headless shutdown seam for `POST /daemon/shutdown`: `"stop"` ends the
+     *  core, `"handoff"` is the app taking the port over (a login-item core
+     *  parks instead of exiting). Without it the route keeps its original
+     *  remove-creds-and-exit behavior. */
+    onShutdownRequest?: (mode: "stop" | "handoff") => void;
+    /** Resolves once the caller's boot restore is done (boot-gate.ts). Until
+     *  then every route but the ownership probes waits, so a core can bind —
+     *  claim the port, take it over from a live core — before it restores. */
+    ready?: Promise<void>;
+  } = {},
+) {
+  const native = deps.native;
+  /** Best-effort removal of a task's OS notification; never affects a response.
+   *  Goes through the native host when there is one, else the headless sink. */
+  const removeTaskNotification = (taskId: string, ifKinds?: TaskNotificationRemoval["ifKinds"]) => {
+    const remove = native
+      ? (r: TaskNotificationRemoval) => native.removeTaskNotification(r)
+      : deps.notifications?.remove;
+    if (!remove) return;
+    try {
+      remove(ifKinds ? { taskId, ifKinds } : { taskId });
+    } catch (err) {
+      console.error("[agetor] removeTaskNotification failed:", err);
+    }
+  };
+  // Live delivery of the D-14 "harnesses turned on" notice to clients that
+  // are already connected. Reports no delivery when nobody is listening, so
+  // the ids stay pending for the next `/app/events` subscriber.
+  setHarnessAutoEnableBroadcaster((e) => {
+    if (!hasAppEventListeners()) return false;
+    broadcastAppEvent(e);
+    return true;
+  });
+  // Test-only (e2e/unit): hold the main thread for `ms` so the core-busy
+  // banner and the event-loop lag monitor can be exercised end to end. Registered
+  // ONLY when AGETOR_TEST_BLOCK_ROUTE=1 was set when this server started (read
+  // once per `startApiServer` call so a test can run an enabled and a disabled
+  // instance side by side) — never in a production process. Disabled, the route
+  // simply isn't in the `routes` object, so the path reaches the `fetch()` 404
+  // fallback exactly like any unregistered one, before any auth check. Enabled,
+  // it is classified `app` in ROUTE_POLICY (`conditional`: the walker's "entry
+  // without a route" check skips it when the flag is off) and token-gated like
+  // every other route.
+  const blockRouteEnabled = process.env.AGETOR_TEST_BLOCK_ROUTE === "1";
+  const blockEventLoopRoute = authed(async (req: Request) => {
+    const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
+    const ms = body.ms;
+    // 20 s ceiling: long enough for the busy-banner e2e (two unanswered
+    // probes ≈ 8.5 s after the block starts, plus margin).
+    if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1 || ms > 20_000) {
+      return json({ error: "ms (integer 1..20000) required" }, { status: 400, headers: corsHeaders(req) });
+    }
+    Bun.sleepSync(ms);
+    return json({ ok: true, ms }, { headers: corsHeaders(req) });
+  });
+  // Test-only (e2e/unit): drop the open `/tasks/:id/events` streams of a task
+  // and optionally hold the next ones server-side, so the forward-resume path
+  // gets a deterministic gap (docs/plans/event-stream-forward-resume.md P8).
+  // Registered ONLY when AGETOR_TEST_DROP_STREAMS_ROUTE=1 was set when this
+  // server started (read once per `startApiServer` call, like the block route
+  // above); disabled, the route is absent (the `fetch()` 404 fallback), and
+  // `streamDrop` is null so the stream handler pays nothing — no registry, no
+  // hold map. Classified `app` + `conditional` in ROUTE_POLICY.
+  const streamDrop: {
+    /** taskId -> close function of each open stream. */
+    open: Map<string, Set<() => void>>;
+    /** taskId -> promise that resolves when the hold ends. */
+    holds: Map<string, Promise<void>>;
+  } | null = process.env.AGETOR_TEST_DROP_STREAMS_ROUTE === "1"
+    ? { open: new Map(), holds: new Map() }
+    : null;
+  const dropTaskStreamsRoute = authed(async (req: Request) => {
+    const body = (await req.json().catch(() => ({}))) as { taskId?: unknown; holdMs?: unknown };
+    const { taskId } = body;
+    if (typeof taskId !== "string" || taskId === "") {
+      return json({ error: "taskId (string) required" }, { status: 400, headers: corsHeaders(req) });
+    }
+    const holdMs = body.holdMs === undefined ? 0 : body.holdMs;
+    if (typeof holdMs !== "number" || !Number.isInteger(holdMs) || holdMs < 0 || holdMs > 30_000) {
+      return json({ error: "holdMs (integer 0..30000) must be a number in range" }, { status: 400, headers: corsHeaders(req) });
+    }
+    // Set the hold BEFORE closing, so a reconnect that lands right after the
+    // close already waits.
+    if (holdMs > 0) {
+      const hold = new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (streamDrop!.holds.get(taskId) === hold) streamDrop!.holds.delete(taskId);
+          resolve();
+        }, holdMs);
+        timer.unref?.();
+      });
+      streamDrop!.holds.set(taskId, hold);
+    }
+    const closers = [...(streamDrop!.open.get(taskId) ?? [])];
+    for (const close of closers) close();
+    return json({ closed: closers.length }, { headers: corsHeaders(req) });
+  });
+  // Read the port fresh — supports tests that import server.ts after setting
+  // AGETOR_API_PORT and rely on the bind to honour their override even when
+  // a sibling test file imported the module first.
+  const PORT = getApiPort();
+  // Bind address: loopback unless the caller passes one. Only the headless
+  // core does, from a validated AGETOR_API_HOST (`resolveApiHost` in
+  // api-config.ts); the desktop app always stays on 127.0.0.1.
+  const HOST = deps.hostname ?? DEFAULT_API_HOST;
+  ALLOWED_ORIGINS.clear();
+  ALLOWED_ORIGINS.add(`http://localhost:${PORT}`);
+  ALLOWED_ORIGINS.add("http://localhost:5173");
+  ALLOWED_ORIGINS.add("http://127.0.0.1:5173");
+  // A Vite dev server moved off :5173 (`AGETOR_E2E_VITE_PORT` in
+  // playwright.config.ts, which e2e/fixtures.ts forwards here as
+  // `AGETOR_DEV_ORIGIN_PORT`, so a second checkout can run Playwright beside
+  // one holding :5173). Loopback origins only, and only a valid port —
+  // anything else is ignored; the per-launch token still gates every route.
+  const devOriginPort = Number(process.env.AGETOR_DEV_ORIGIN_PORT ?? "");
+  if (Number.isInteger(devOriginPort) && devOriginPort > 0 && devOriginPort <= 65535 && devOriginPort !== 5173) {
+    ALLOWED_ORIGINS.add(`http://localhost:${devOriginPort}`);
+    ALLOWED_ORIGINS.add(`http://127.0.0.1:${devOriginPort}`);
+  }
+  // Electrobun's bundled `views://` scheme sends Origin: views://<viewName>
+  // (not the `null` originally documented here). Without this entry, every
+  // packaged-build fetch returns 200 from the server but WebKit rejects the
+  // response in the renderer with "Origin views://mainview is not allowed by
+  // Access-Control-Allow-Origin" — so the UI silently sees every API call
+  // reject and falls back to empty data (e.g. `v?`, empty harnesses list).
+  // The auth token still gates the actual request body.
+  ALLOWED_ORIGINS.add("views://mainview");
+
+  // Terminal-tab byte stream. Typed explicitly so `Bun.serve` infers the
+  // socket's `data` shape (TerminalSocketData) — that's what makes
+  // `server.upgrade(req, { data })` and `ws.data.terminalId` type-check.
+  // Text frames are JSON control messages (resize); binary frames are raw
+  // keystrokes fed straight to the PTY's stdin.
+  const terminalWebSocket: WebSocketHandler<TerminalSocketData> = {
+    open(ws) {
+      // Replay recent output, then stream live. If the terminal is already
+      // gone (closed/exited between upgrade and open), drop the socket.
+      if (!attachSocket(ws.data.terminalId, ws)) ws.close();
+    },
+    message(ws, message) {
+      if (typeof message === "string") {
+        try {
+          const msg = JSON.parse(message) as { t?: string; cols?: number; rows?: number };
+          if (msg.t === "resize" && typeof msg.cols === "number" && typeof msg.rows === "number") {
+            resizeTerminal(ws.data.terminalId, msg.cols, msg.rows);
+          }
+        } catch { /* ignore malformed control frames */ }
+        return;
+      }
+      writeTerminal(ws.data.terminalId, message as Uint8Array);
+    },
+    close(ws) {
+      detachSocket(ws.data.terminalId, ws);
+    },
+  };
+
+  const server = Bun.serve({
+    port: PORT,
+    hostname: HOST,
+    development: false,
+    // Bun's default idleTimeout is 10s, which is far too short here: it closes
+    // idle pooled keep-alive sockets that WKWebView then reuses for a POST
+    // (CFNetwork never auto-retries on a dropped reused connection, so the
+    // webview surfaces "cannot reach agetor API"), and it kills any handler
+    // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
+    // below opt out entirely via server.timeout(req, 0).
+    idleTimeout: 255,
+    // Bun refuses a larger Content-Length body itself (413) and keeps the
+    // keep-alive socket usable; see REFUSED_BODY_DRAIN_MAX_BYTES.
+    maxRequestBodySize: REFUSED_BODY_DRAIN_MAX_BYTES,
+    websocket: terminalWebSocket,
+    // Every route goes through the policy walker (route-policy.ts): it resolves
+    // the caller, refuses the CLI token on desktop-only routes, gates
+    // CLI-supplied paths, and THROWS HERE — the server won't start — when a route
+    // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
+    // keeps the handlers' contextual `req` typing, which a bare generic would
+    // lose; the cast hands Bun its own route typing back.
+    routes: gateRoutesUntilReady(applyRoutePolicy<ServerRoutes>({
+      // Unauthenticated liveness probe — never returns data (`callers:
+      // "public"` in ROUTE_POLICY). `app: "agetor"` is a self-identifier for
+      // its callers (the CLI's creds/daemon probes, the webview's busy-banner
+      // watchdog) so a different service that happens to listen on the same
+      // port (4317 is OTLP gRPC's default, for example) and returns 200 isn't
+      // mistaken for a core. Keep this string stable.
+      "/health": (req) => json({ ok: true, app: "agetor" }, { headers: corsHeaders(req) }),
+
+      "/defaults": {
+        GET: authed((req) =>
+          json(
+            { home: homedir(), cwd: process.cwd(), dataDir },
+            { headers: corsHeaders(req) },
+          )),
+      },
+
+      "/projects": {
+        GET: authed((req) => json(projects.list(), { headers: corsHeaders(req) })),
+        // Register a project by absolute path — the headless/CLI equivalent of
+        // the native folder picker at /projects/pick.
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; name?: unknown };
+          const p = typeof body.path === "string" ? body.path.trim() : "";
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!path.isAbsolute(p)) {
+            return json({ error: "path must be absolute" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // For a CLI-token caller the existence check runs in a disclaimed
+          // child (`probePaths`), not in the core (D24) — the walker already
+          // refused a `denied` path, so only "missing" is left to report. For
+          // the app caller `probePaths` is the same in-process stat as before.
+          const kind = (await probePaths([p], callerOf(req) ?? "app"))[0];
+          if (kind === "missing" || kind === "denied") {
+            return json({ error: `path does not exist: ${p}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          const name =
+            typeof body.name === "string" && body.name.trim()
+              ? body.name.trim()
+              : path.basename(p) || p;
+          return json(projects.upsert(p, name), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed(async (req) => {
+          const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          projects.delete(p);
+          return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Clone repository: clone an existing GitHub/GitLab/Bitbucket repo,
+      // register the destination in the projects list, and (unless
+      // eli5:false) create + start a task that writes an ELI5.md explainer
+      // at the clone's root, on the caller's selected agent profile /
+      // harness (default: the built-in claude-code). The explainer goes
+      // through agetor's own agent driver — never a direct LLM API call —
+      // so it shows up on the board like any other task.
+      //
+      // Addendum A (docs/plans/clone-repository-all-providers.md): the
+      // caller may mint its own `cloneId` up front (before this POST is even
+      // sent) so it can start listening on GET /app/events for this clone's
+      // `clone_progress` AppEvents and issue DELETE /projects/clone/:cloneId
+      // to cancel BEFORE the id round-trips back on this response — there is
+      // an inherent race between "POST is sent" and "id is known to the
+      // caller" otherwise. When the caller doesn't mint one, the server
+      // mints one itself; either way it's echoed on every response this
+      // route can return (success AND every error after the id is minted),
+      // so a client that generated the id can always correlate progress
+      // events / a cancel attempt with this specific request. A DELETE that
+      // arrives before git has even spawned, or in the brief gap between
+      // `cloneRepo`'s two attempts, is still honored — clone.ts latches the
+      // cancellation and the still-held POST resolves 409 `cancelled: true`
+      // below — so a 404 from the DELETE route means the id was never
+      // recognized at all (unknown, or already settled), not a missed
+      // narrow window.
+      "/projects/clone": {
+        POST: authed(async (req) => {
+          // Clones are network-bound and can take minutes; disable the
+          // per-request idle timeout like /tasks/:id/start does.
+          server.timeout(req, 0);
+          const body = (await req.json().catch(() => ({}))) as {
+            url?: unknown;
+            provider?: unknown;
+            dest?: unknown;
+            eli5?: unknown;
+            agent?: unknown;
+            mode?: unknown;
+            model?: unknown;
+            effort?: unknown;
+            speed?: unknown;
+            fast?: unknown;
+            maxMode?: unknown;
+            opencodeServer?: unknown;
+            agentProfileId?: unknown;
+            cloneId?: unknown;
+          };
+          const url = typeof body.url === "string" ? body.url.trim() : "";
+          if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.provider != null && !isGitProvider(body.provider)) {
+            return json(
+              { error: `provider must be one of ${CLONE_PROVIDERS.join(", ")}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          // Mint (or validate a client-supplied) cloneId right after the
+          // provider check, and before resolveCloneRepo — every response
+          // from here on, error or success, carries it.
+          let cloneId: string;
+          if (body.cloneId !== undefined) {
+            if (typeof body.cloneId !== "string" || !CLONE_ID_RE.test(body.cloneId)) {
+              return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+            }
+            cloneId = body.cloneId;
+          } else {
+            cloneId = crypto.randomUUID();
+          }
+
+          // Reject a duplicate in-flight cloneId up front — see
+          // inFlightCloneIds's own doc comment. This is a route-level guard
+          // (never touches clone.ts's registry) and is checked before any
+          // other validation so a racing second POST can't slip past it by
+          // arriving while the first request is still mid-clone.
+          if (inFlightCloneIds.has(cloneId)) {
+            return json(
+              { error: "a clone with that id is already in flight", cloneId },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+
+          const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
+          const resolvedInput = resolveCloneRepo(url, shorthandProvider);
+          if (!resolvedInput.ok) {
+            return json({ error: resolvedInput.error, cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+          const resolved = resolvedInput.repo;
+          const dest =
+            typeof body.dest === "string" && body.dest.trim()
+              ? body.dest.trim()
+              : defaultCloneDest(resolved.repo);
+          if (!path.isAbsolute(dest)) {
+            return json({ error: "dest must be an absolute path", cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          // Validate the launch selection before cloning anything to disk —
+          // see validateCloneLaunch's doc comment. Only checked when eli5 is
+          // actually going to run.
+          const runEli5 = body.eli5 !== false;
+          const launch: ReturnType<typeof validateCloneLaunch> =
+            runEli5 ? validateCloneLaunch(body) : {};
+          if ("error" in launch) {
+            return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Resolve the explainer's profile ONCE, before the clone, and hand
+          // that same object to `createTask` afterwards (`resolvedAgentProfile`)
+          // — `cloneRepo` takes seconds, and a profile edited or deleted in
+          // that window would otherwise make `createTask`'s own re-read bind
+          // a different profile, or fail, after the clone already landed:
+          // exactly the post-side-effect failure this pre-validation exists
+          // to prevent.
+          let launchProfile: AgentProfile | null = null;
+          if (runEli5 && launch.agentProfileId) {
+            launchProfile = agentProfiles.get(launch.agentProfileId);
+            if (!launchProfile) {
+              return json({ error: `unknown agent profile "${launch.agentProfileId}"`, cloneId }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+          // Pre-flight 1b (minimum CLI version for the explainer's model) —
+          // also before the clone, since `startTask` would otherwise refuse
+          // the explainer only after the repo is already on disk. Resolves
+          // the harness + model exactly as `createTask` will: the profile's
+          // own harness/model, else `agent` (default claude-code) and
+          // `model` (default the kind's DEFAULT_MODEL). Fail-open like the
+          // start-time check; validateCloneLaunch already proved the
+          // harness ids resolve.
+          if (runEli5) {
+            const launchHarness = harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
+            if (launchHarness) {
+              const launchModel = launchProfile ? launchProfile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
+              const floorError = await minCliVersionError(launchHarness, launchModel);
+              if (floorError !== null) {
+                return json({ error: floorError, cloneId }, { status: 400, headers: corsHeaders(req) });
+              }
+            }
+          }
+
+          inFlightCloneIds.add(cloneId);
+          try {
+            const cloned = await cloneRepo(resolved.cloneUrl, dest, {
+              transport: resolved.transport,
+              host: resolved.rawHost,
+              cloneId,
+              onProgress: (p) =>
+                broadcastAppEvent({
+                  type: "clone_progress",
+                  cloneId,
+                  phase: p.phase,
+                  percent: p.percent,
+                  line: p.line,
+                  ts: Date.now(),
+                }),
+              auth: resolved.authOrigin
+                ? async () => {
+                    const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
+                    return header ? { origin: resolved.authOrigin!, header } : null;
+                  }
+                : undefined,
+            });
+            if (cloned.cancelled) {
+              // cloneRepo already restored `dest` to absent/empty and reported
+              // its own terminal "cancelled" progress event — nothing here is
+              // registered, mirroring the "a failing clone registers nothing"
+              // behavior above. 409, not 502: the request wasn't refused by
+              // the remote or by validation, it was called off by the caller
+              // itself (or another client racing the same cloneId).
+              return json({ error: "clone cancelled", cancelled: true, cloneId }, { status: 409, headers: corsHeaders(req) });
+            }
+            if (!cloned.ok) {
+              return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
+            }
+            const project = projects.upsert(dest, resolved.repo);
+
+            // The explainer task runs with isolation "none" so ELI5.md lands
+            // directly in the clone the user just registered, not on a branch in
+            // a worktree. Task-creation failure downgrades the response, never
+            // rolls back the clone — the project is already usable.
+            let eli5TaskId: string | null = null;
+            let eli5Error: string | null = null;
+            if (runEli5) {
+              const created = await createTask({
+                title: eli5TaskTitle(resolved.repo),
+                prompt: buildEli5Prompt(resolved.repo),
+                workdir: dest,
+                isolation: "none",
+                ...launch,
+              }, {
+                // The profile validated before the clone, not a post-clone
+                // re-read — an internal argument, never a body field.
+                ...(launchProfile ? { resolvedAgentProfile: launchProfile } : {}),
+              });
+              if ("error" in created) {
+                eli5Error = created.error;
+              } else {
+                eli5TaskId = created.task.id;
+                const started = await startTask(created.task.id);
+                if ("error" in started) eli5Error = started.error;
+              }
+            }
+            return json(
+              { project, provider: resolved.provider, cloneId, eli5TaskId, eli5Error },
+              { headers: corsHeaders(req) },
+            );
+          } finally {
+            inFlightCloneIds.delete(cloneId);
+          }
+        }),
+      },
+
+      // Cancels the clone identified by `cloneId` (the id echoed by
+      // `POST /projects/clone`, or a caller-minted one that was sent on that
+      // POST's body) — see that route's own doc comment for the id
+      // round-trip. `cancelClone` matches any clone `cloneRepo` has announced
+      // as in flight for this id — even before the git child process has
+      // actually spawned (its own doc comment in clone.ts) — and returns
+      // `false` for an unknown id or one whose clone already settled, which
+      // is what 404s below. `cancelClone`'s `true` return doesn't mean the
+      // held POST has resolved yet, only that the in-flight attempt was told
+      // to stop; the POST itself answers 409 once `cloneRepo` observes the
+      // cancellation (see above).
+      //
+      // `cloneId` is NOT a secret: `clone_progress` AppEvents broadcast it to
+      // every `/app/events` subscriber, so any authed client — same user,
+      // same machine, gated only by the per-launch bearer token (the same
+      // trust tier as `/open-path` and `DELETE /tasks/:id`) — can cancel any
+      // clone whose id it has observed. The token is the guard here, not the
+      // id's obscurity.
+      "/projects/clone/:cloneId": {
+        DELETE: authed((req) => {
+          const { cloneId } = req.params;
+          if (!CLONE_ID_RE.test(cloneId)) {
+            return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelClone(cloneId);
+          if (!cancelled) {
+            return json(
+              { error: "no clone in flight with that id" },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Opens a native folder picker and registers whatever the user chose.
+      // Returns the newly-added project; returns `{ project: null }` on cancel
+      // so the client can distinguish cancel from error.
+      "/projects/pick": {
+        POST: authed(async (req) => {
+          let startingFolder = homedir();
+          try {
+            const body = await req.json().catch(() => null);
+            if (body && typeof (body as { startingFolder?: unknown }).startingFolder === "string") {
+              startingFolder = (body as { startingFolder: string }).startingFolder;
+            }
+          } catch { /* no body is fine */ }
+          if (!native) return notAvailableHeadless(req);
+          const paths = await openFileDialogLabelled(native, {
+            startingFolder,
+            canChooseFiles: false,
+            canChooseDirectory: true,
+            allowsMultipleSelection: false,
+          });
+          // Electrobun splits the panel's answer on ",", so a folder whose
+          // path has a comma arrives in pieces; nothing at all means cancelled.
+          const picked = singlePickedPath(paths);
+          if (!picked) {
+            return json({ project: null }, { headers: corsHeaders(req) });
+          }
+          const project = projects.upsert(picked, path.basename(picked) || picked);
+          return json({ project }, { headers: corsHeaders(req) });
+        }),
+        // Removal-by-path lives on `DELETE /projects` (used by both the webview
+        // and the CLI); /projects/pick is the native add-picker only.
+      },
+
+      "/projects/branches": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          // Hide branches agetor created for its own tasks so they don't clutter
+          // the base-ref picker. The legacy `agetor/` prefix is filtered inside
+          // listBranches; custom-prefixed branches (feature/…, fix/…) are only
+          // recognizable via the pinned names on task rows, so pass those too.
+          const managed = new Set(
+            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+          );
+          return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-project branch nomenclature. GET resolves to the built-in defaults
+      // when the project has no stored config (or isn't registered), so the
+      // client always renders a usable form. PUT persists a validated config.
+      "/projects/settings": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const p = url.searchParams.get("path");
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const config = projects.get(p)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+          return json(config, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; config?: unknown };
+          if (typeof body.path !== "string" || !body.path) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const coerced = coerceBranchConfig(body.config);
+          if ("error" in coerced) {
+            return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const updated = projects.setBranchConfig(body.path, coerced.config);
+          if (!updated) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(updated, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Fetch all remotes for a project so the branch picker can surface newly
+      // pushed branches without leaving agetor. Network-bound — the helper uses
+      // a longer git timeout than the read-only routes above.
+      "/projects/fetch": {
+        POST: authed(async (req) => {
+          const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitFetch(p);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git fetch failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Fast-forward a single local branch to its upstream (the branch picker's
+      // Git Pull button). Network-bound like /projects/fetch. `branch` is the
+      // selected branch's short name; the helper picks `git pull --ff-only` for
+      // the checked-out branch and a checkout-free fast-forward otherwise.
+      "/projects/pull": {
+        POST: authed(async (req) => {
+          const { path: p, branch } = (await req.json().catch(() => ({}))) as { path?: string; branch?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!branch) return json({ error: "branch required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitPull(p, branch);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git pull failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Push a local branch to its remote (the New PR composer's Push button) so
+      // a local-only branch — e.g. an agetor worktree branch — can be opened as a
+      // pull request. Network-bound like /projects/fetch. `--set-upstream` is set
+      // so PR creation and the behind indicator have a tracking ref afterwards.
+      "/projects/push": {
+        POST: authed(async (req) => {
+          const { path: p, branch } = (await req.json().catch(() => ({}))) as { path?: string; branch?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!branch) return json({ error: "branch required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitPush(p, branch);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git push failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true, remote: result.remote }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Read-only GitHub repo surface for the project selected in the app.
+      // The helper infers owner/repo from the project's GitHub remote and uses
+      // GITHUB_TOKEN/GH_TOKEN or `gh auth token` when available; public repos
+      // still work unauthenticated.
+      "/github/items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const kind = url.searchParams.get("kind");
+          const state = url.searchParams.get("state") ?? "open";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = (url.searchParams.get("labels") ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const assignee = url.searchParams.get("assignee") ?? "";
+          const rawPage = Number(url.searchParams.get("page"));
+          const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : undefined;
+          const sort = url.searchParams.get("sort");
+          const direction = url.searchParams.get("direction");
+          if (sort !== null && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (direction !== null && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.listItems({
+            dir,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: url.searchParams.get("q") ?? "",
+            labels,
+            assignee,
+            createdByMe: url.searchParams.get("createdByMe") === "1",
+            assignedToMe: url.searchParams.get("assignedToMe") === "1",
+            reviewRequested: url.searchParams.get("reviewRequested") === "1",
+            searchQuery: url.searchParams.get("searchQuery") ?? "",
+            page,
+            sort: sort ?? undefined,
+            direction: direction ?? undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+      // dialog. POST (not GET) because `paths` is an array. Mirrors /github/items'
+      // filters; per-repo fetches are fanned out server-side and merged.
+      "/github/items-aggregate": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            kind?: string;
+            state?: string;
+            q?: string;
+            labels?: unknown;
+            assignee?: string;
+            createdByMe?: boolean;
+            assignedToMe?: boolean;
+            reviewRequested?: boolean;
+            searchQuery?: string;
+            sort?: string;
+            direction?: string;
+          };
+          const paths = Array.isArray(body.paths)
+            ? body.paths.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+            : [];
+          if (paths.length === 0) return json({ error: "paths required" }, { status: 400, headers: corsHeaders(req) });
+          const kind = body.kind;
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state ?? "open";
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const sort = body.sort;
+          if (sort !== undefined && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const direction = body.direction;
+          if (direction !== undefined && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = Array.isArray(body.labels)
+            ? body.labels.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            : [];
+          const result = await gitHost.listItemsAcrossRepos({
+            dirs: paths,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: body.q ?? "",
+            labels,
+            assignee: body.assignee ?? "",
+            createdByMe: body.createdByMe === true,
+            assignedToMe: body.assignedToMe === true,
+            reviewRequested: body.reviewRequested === true,
+            searchQuery: body.searchQuery ?? "",
+            sort,
+            direction,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/repo-permissions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubRepoPermissions({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-diff": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullDiff({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the raw bytes of one file, on one side of a PR's diff, for the
+      // Git Integration modal's binary (image/PDF) preview. Mirrors
+      // /github/pull-diff's identifying params (`path` = the local repo dir
+      // used to resolve host/repo/number, `number` = the PR number) — the
+      // *blob's* repo-relative path is a distinct concept from that `path`
+      // param, so it's carried as `filePath` here to avoid a name collision
+      // with pull-diff's `path` (a deviation from the plan's literal
+      // `?path=<repo-rel>` shape, which would have shadowed the existing
+      // `path` meaning). Dispatches through git-host.ts's `pullBlob`, which
+      // resolves the PR's head/merge-base and fetches blob bytes via the
+      // provider's Contents API; unsupported providers (GitLab/Bitbucket in
+      // v1) return `{ ok: false, status: 501 }` from `pullBlob` itself.
+      "/github/pull-blob": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          const filePath = url.searchParams.get("filePath") ?? "";
+          const side = url.searchParams.get("side");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!filePath) {
+            return json({ error: "filePath required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(filePath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${filePath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await gitHost.pullBlob({ dir, number, path: filePath, side });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status ?? 502, headers: corsHeaders(req) });
+          }
+
+          // Strong ETag from the resolved `ref` (the exact sha the bytes were
+          // fetched at) + path — content-addressed, unlike the old weak etag
+          // (byte length + path only), which could collide/miss across two
+          // different shas of the same size. By the time we know `ref` the
+          // upstream GitHub fetch has already happened (pullBlob resolves
+          // after fetching), so a 304 here only saves the localhost transfer
+          // back to the browser, not the GitHub round trip — still worth it
+          // for a modal where the user pages back and forth between files.
+          const etag = `"${createHash("sha1").update(`${result.ref}:${filePath}`).digest("hex")}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag } });
+          }
+          // Not content-addressed by URL (PR number, not a pinned sha) — the
+          // merge-base can move between requests, so revalidate every time;
+          // the ETag above makes that a cheap 304.
+          return new Response(result.bytes, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": result.contentType,
+              "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
+            },
+          });
+        }),
+      },
+
+      "/github/pull-detail": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullDetail({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-thread": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // "false"/"0" → skip the comments fetch (the "View issue" prefill only
+          // needs the item); anything else (including absent) → the default true.
+          const includeCommentsParam = url.searchParams.get("includeComments");
+          const includeComments = includeCommentsParam !== "false" && includeCommentsParam !== "0";
+          const result = await gitHost.issueThread({ dir, number, includeComments });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/viewer": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.viewer({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — the
+      // dialog calls this before anything else to pick terminology/gating for
+      // the project's resolved provider (GitHub/GitLab/Bitbucket).
+      "/github/provider-info": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.providerInfoForDir(dir);
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/labels": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.labels({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubLabel({
+            dir,
+            name: body.name,
+            color: typeof body.color === "string" ? body.color : "",
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            newName?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubLabel({
+            dir,
+            name: body.name,
+            newName: typeof body.newName === "string" ? body.newName : undefined,
+            color: typeof body.color === "string" ? body.color : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; name?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubLabel({ dir, name: body.name });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/assignees": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubAssignees({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestones": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubMilestones({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            description?: string;
+            dueOn?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "milestone title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubMilestone({
+            dir,
+            title: body.title,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: typeof body.dueOn === "string" ? body.dueOn : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            title?: string;
+            description?: string;
+            dueOn?: string | null;
+            state?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state === "open" || body.state === "closed" ? body.state : undefined;
+          const result = await updateGitHubMilestone({
+            dir,
+            number: body.number,
+            title: typeof body.title === "string" ? body.title : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: body.dueOn === null || typeof body.dueOn === "string" ? body.dueOn : undefined,
+            state,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubMilestone({ dir, number: body.number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/releases": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubReleases({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            tagName?: string;
+            name?: string;
+            body?: string;
+            draft?: boolean;
+            prerelease?: boolean;
+            targetCommitish?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.tagName !== "string" || !body.tagName.trim()) {
+            return json({ error: "tag name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubRelease({
+            dir,
+            tagName: body.tagName,
+            name: typeof body.name === "string" ? body.name : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: typeof body.draft === "boolean" ? body.draft : undefined,
+            prerelease: typeof body.prerelease === "boolean" ? body.prerelease : undefined,
+            targetCommitish: typeof body.targetCommitish === "string" ? body.targetCommitish : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/release-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            id?: number;
+            name?: string;
+            body?: string;
+            draft?: boolean;
+            prerelease?: boolean;
+            tagName?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+            return json({ error: "valid release id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubRelease({
+            dir,
+            id: body.id,
+            name: typeof body.name === "string" ? body.name : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: typeof body.draft === "boolean" ? body.draft : undefined,
+            prerelease: typeof body.prerelease === "boolean" ? body.prerelease : undefined,
+            tagName: typeof body.tagName === "string" ? body.tagName : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/release-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; id?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+            return json({ error: "valid release id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubRelease({ dir, id: body.id });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/tags": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubTags({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-runs": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflowRuns({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflows": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflows({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-rerun": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number; failedOnly?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await rerunGitHubWorkflowRun({
+            dir,
+            runId: body.runId,
+            failedOnly: typeof body.failedOnly === "boolean" ? body.failedOnly : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-cancel": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await cancelGitHubWorkflowRun({ dir, runId: body.runId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-dispatch": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            workflowId?: number;
+            ref?: string;
+            inputs?: Record<string, string>;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.workflowId !== "number" || !Number.isInteger(body.workflowId) || body.workflowId <= 0) {
+            return json({ error: "valid workflow id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.ref !== "string" || !body.ref.trim()) {
+            return json({ error: "ref required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await dispatchGitHubWorkflow({
+            dir,
+            workflowId: body.workflowId,
+            ref: body.ref,
+            inputs: body.inputs && typeof body.inputs === "object" ? body.inputs : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubComment({ dir, commentId, kind: body.kind, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubComment({ dir, commentId, kind: body.kind });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comments": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          const rawKind = url.searchParams.get("kind");
+          const kind = rawKind === "pulls" || rawKind === "issues" ? rawKind : undefined;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.listComments({ dir, number, kind });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            body?: string;
+            kind?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const commentBody = body.body;
+          const kind = body.kind === "pulls" || body.kind === "issues" ? body.kind : undefined;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const number = rawNumber;
+          if (typeof commentBody !== "string" || !commentBody.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.createComment({
+            dir,
+            number,
+            body: commentBody,
+            kind,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-line-comment": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            body?: string;
+            filePath?: string;
+            line?: number;
+            side?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.filePath !== "string" || !body.filePath.trim()) {
+            return json({ error: "comment file path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.line !== "number" || !Number.isInteger(body.line) || body.line <= 0) {
+            return json({ error: "valid comment line required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.side !== "LEFT" && body.side !== "RIGHT") {
+            return json({ error: "valid comment side required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullLineComment({
+            dir,
+            number: rawNumber,
+            body: body.body,
+            path: body.filePath,
+            line: body.line,
+            side: body.side,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review-comments": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullReviewComments({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review-threads": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullReviewThreads({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/review-thread-resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; resolved?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId) {
+            return json({ error: "review thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.resolved !== "boolean") {
+            return json({ error: "resolved (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubReviewThreadResolved({ dir, threadId: body.threadId, resolved: body.resolved });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-line-comment-reply": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            commentId?: number;
+            body?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawCommentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawCommentId !== "number" || !Number.isInteger(rawCommentId) || rawCommentId <= 0) {
+            return json({ error: "valid review comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "reply body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullLineCommentReply({
+            dir,
+            number: rawNumber,
+            commentId: rawCommentId,
+            body: body.body,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-checks": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullChecks({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/commit-status": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const ref = url.searchParams.get("ref");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!ref || !ref.trim()) {
+            return json({ error: "valid commit ref required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubCommitStatus({ dir, ref });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-mergeability": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullMergeability({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-update-branch": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubPullBranch({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reopen": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullReopen({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-draft": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; draft?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.draft !== "boolean") {
+            return json({ error: "draft (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubPullDraft({ dir, number: rawNumber, draft: body.draft });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-auto-merge": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            enable?: boolean;
+            mergeMethod?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.enable !== "boolean") {
+            return json({ error: "enable (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.enable && body.mergeMethod !== undefined
+            && body.mergeMethod !== "merge" && body.mergeMethod !== "squash" && body.mergeMethod !== "rebase") {
+            return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const mergeMethod = (body.mergeMethod as GitHubPullMergeMethod | undefined) ?? "merge";
+          const result = await setGitHubPullAutoMerge({ dir, number: rawNumber, enable: body.enable, mergeMethod });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-commits": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubPullCommits({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-linked-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullLinkedIssues({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-defaults": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.pullDefaults({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            head?: string;
+            base?: string;
+            body?: string;
+            draft?: boolean;
+            reviewers?: string[];
+            taskId?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "pull request title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.head !== "string" || !body.head.trim()) {
+            return json({ error: "head branch required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.base !== "string" || !body.base.trim()) {
+            return json({ error: "base branch required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullCreate({
+            dir,
+            title: body.title,
+            head: body.head,
+            base: body.base,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: body.draft === true,
+            reviewers: Array.isArray(body.reviewers) ? body.reviewers.filter((x): x is string => typeof x === "string") : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Best-effort: persist the created PR's URL onto the task so the
+          // run panel can show a durable "View PR" link across restarts.
+          // A missing/invalid taskId or an item with no htmlUrl must never
+          // fail an otherwise-successful creation — this is pure bookkeeping
+          // layered on top of a request that already succeeded.
+          if (typeof body.taskId === "string" && body.taskId) {
+            try {
+              const task = tasks.get(body.taskId);
+              // Guards: archived tasks are frozen (same contract as PATCH /
+              // backlog), a first PR is never silently overwritten, and the
+              // task must actually belong to the project the PR was created
+              // from — a stale/mistargeted taskId must not stamp an unrelated
+              // task.
+              if (
+                task &&
+                task.archivedAt == null &&
+                !task.prUrl &&
+                task.workdir === dir &&
+                result.item?.htmlUrl
+              ) {
+                tasks.update(task.id, { prUrl: result.item.htmlUrl });
+              }
+            } catch (err) {
+              console.warn(`[agetor] failed to persist pr_url for task ${body.taskId}:`, err);
+            }
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            event?: string;
+            body?: string;
+            comments?: unknown;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.event !== "APPROVE" && body.event !== "REQUEST_CHANGES" && body.event !== "COMMENT") {
+            return json({ error: "valid review event required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const event = body.event as GitHubPullReviewEvent;
+          // Inline comments are re-validated/sanitized in gitHost.pullReview; here
+          // we just narrow the wire shape.
+          const comments = Array.isArray(body.comments)
+            ? body.comments.flatMap((c) => {
+                if (!c || typeof c !== "object") return [];
+                const o = c as Record<string, unknown>;
+                if (typeof o.path !== "string" || typeof o.body !== "string") return [];
+                if (typeof o.line !== "number") return [];
+                if (o.side !== "LEFT" && o.side !== "RIGHT") return [];
+                const side: "LEFT" | "RIGHT" = o.side === "LEFT" ? "LEFT" : "RIGHT";
+                return [{ path: o.path, line: o.line, side, body: o.body }];
+              })
+            : undefined;
+          const result = await gitHost.pullReview({
+            dir,
+            number: rawNumber,
+            event,
+            body: typeof body.body === "string" ? body.body : undefined,
+            comments,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-merge": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            method?: string;
+            title?: string;
+            message?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.method !== "merge" && body.method !== "squash" && body.method !== "rebase") {
+            return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const method = body.method as GitHubPullMergeMethod;
+          const result = await gitHost.pullMerge({
+            dir,
+            number: rawNumber,
+            method,
+            title: typeof body.title === "string" ? body.title : undefined,
+            message: typeof body.message === "string" ? body.message : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-close": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            comment?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullClose({
+            dir,
+            number: rawNumber,
+            comment: typeof body.comment === "string" ? body.comment : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            body?: string;
+            labels?: string[];
+            assignees?: string[];
+            milestone?: number | null;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "issue title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.issueCreate({
+            dir,
+            title: body.title,
+            body: typeof body.body === "string" ? body.body : undefined,
+            labels: Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === "string") : undefined,
+            assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
+            milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            kind?: string;
+            title?: string;
+            body?: string;
+            state?: string;
+            labels?: string[];
+            assignees?: string[];
+            milestone?: number | null;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.state && body.state !== "open" && body.state !== "closed") {
+            return json({ error: "valid issue state required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.issueUpdate({
+            dir,
+            number: rawNumber,
+            kind: body.kind === "pulls" ? "pulls" : "issues",
+            title: typeof body.title === "string" ? body.title : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            state: body.state === "open" || body.state === "closed" ? body.state : undefined,
+            labels: Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === "string") : undefined,
+            assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
+            milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-lock": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            locked?: boolean;
+            lockReason?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.locked !== "boolean") {
+            return json({ error: "locked (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssueLock({
+            dir,
+            number: rawNumber,
+            locked: body.locked,
+            lockReason: typeof body.lockReason === "string" ? body.lockReason : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pin": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; pinned?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.pinned !== "boolean") {
+            return json({ error: "pinned (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssuePinned({ dir, number: rawNumber, pinned: body.pinned });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pinned": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubIssuePinned({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubSubIssues({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childNumber?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildNumber = body.childNumber;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildNumber !== "number" || !Number.isInteger(rawChildNumber) || rawChildNumber <= 0) {
+            return json({ error: "valid child issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubSubIssue({ dir, number: rawNumber, childNumber: rawChildNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childId?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildId = body.childId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildId !== "number" || !Number.isInteger(rawChildId) || rawChildId <= 0) {
+            return json({ error: "valid child issue id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubSubIssue({ dir, number: rawNumber, childId: rawChildId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-transfer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; targetRepo?: string };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.targetRepo !== "string" || !body.targetRepo.trim()) {
+            return json({ error: "target repo required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await transferGitHubIssue({ dir, number: rawNumber, targetRepo: body.targetRepo });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/projects": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubProjectsV2({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const projectId = url.searchParams.get("projectId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!projectId) return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubProjectItems({ dir, projectId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            contentNumber?: number;
+            contentKind?: "issue" | "pr";
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.contentNumber !== "number" || !Number.isInteger(body.contentNumber) || body.contentNumber <= 0) {
+            return json({ error: "valid contentNumber required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const contentKind = body.contentKind === "pr" ? "pr" : "issue";
+          const result = await addGitHubProjectItem({
+            dir,
+            projectId: body.projectId,
+            contentNumber: body.contentNumber,
+            contentKind,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; projectId?: string; itemId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubProjectItem({ dir, projectId: body.projectId, itemId: body.itemId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-status": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            itemId?: string;
+            fieldId?: string;
+            optionId?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.fieldId !== "string" || !body.fieldId.trim()) {
+            return json({ error: "fieldId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.optionId !== "string" || !body.optionId.trim()) {
+            return json({ error: "optionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubProjectItemStatus({
+            dir,
+            projectId: body.projectId,
+            itemId: body.itemId,
+            fieldId: body.fieldId,
+            optionId: body.optionId,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubDiscussions({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const rawNumber = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid discussion number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubDiscussion({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            categoryId?: string;
+            title?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.categoryId !== "string" || !body.categoryId.trim()) {
+            return json({ error: "categoryId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubDiscussion({
+            dir,
+            categoryId: body.categoryId,
+            title: body.title,
+            body: body.body,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string; body?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubDiscussionComment({ dir, discussionId: body.discussionId, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string; answer?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.answer !== "boolean") {
+            return json({ error: "answer (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubDiscussionAnswer({ dir, commentId: body.commentId, answer: body.answer });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussion({ dir, discussionId: body.discussionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussionComment({ dir, commentId: body.commentId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reviewers": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            reviewers?: string[];
+            teamReviewers?: string[];
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const reviewers = Array.isArray(body.reviewers)
+            ? body.reviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          const teamReviewers = Array.isArray(body.teamReviewers)
+            ? body.teamReviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          if (reviewers.length === 0 && teamReviewers.length === 0) {
+            return json({ error: "at least one reviewer or team required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers, teamReviewers });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-apply-suggestion": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            commentId?: number;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawCommentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawCommentId !== "number" || !Number.isInteger(rawCommentId) || rawCommentId <= 0) {
+            return json({ error: "valid review comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await applyGitHubSuggestion({ dir, number: rawNumber, commentId: rawCommentId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reactions (👍 👎 😄 🎉 😕 ❤️ 🚀 👀) on an issue/PR or a comment.
+      // `subjectType`/`subjectId` identify the target — see
+      // `GitHubReactionSubject` in shared/types.ts for the id semantics
+      // (an "issue" subject's id is the issue/PR *number*; comment subjects
+      // carry a comment's REST id).
+      "/github/reactions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const subjectType = url.searchParams.get("subjectType");
+          const subjectId = Number(url.searchParams.get("subjectId"));
+          const viewer = url.searchParams.get("viewer") ?? "";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (subjectType !== "issue" && subjectType !== "issueComment" && subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!Number.isInteger(subjectId) || subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubReactions({
+            dir,
+            subject: { type: subjectType, id: subjectId },
+            viewer,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            content?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!REACTION_CONTENTS.has(body.content ?? "")) {
+            return json({ error: "valid reaction content required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await addGitHubReaction({ dir, subject, content: body.content as GitHubReactionContent });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            reactionId?: number;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.reactionId !== "number" || !Number.isInteger(body.reactionId) || body.reactionId <= 0) {
+            return json({ error: "valid reaction id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await removeGitHubReaction({ dir, subject, reactionId: body.reactionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const all = url.searchParams.get("all") === "true";
+          const result = await listGitHubNotifications({ dir, all });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notification-read": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await markGitHubNotificationRead({ dir, threadId: body.threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications-read-all": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await markAllGitHubNotificationsRead({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-subscription": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const threadId = url.searchParams.get("threadId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!threadId || !threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubThreadSubscription({ dir, threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; ignored?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubThreadSubscription({ dir, threadId: body.threadId, ignored: body.ignored === true });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-unsubscribe": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await unsubscribeGitHubThread({ dir, threadId: body.threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-host GitHub PATs (github-tokens.ts), keyed by the raw ssh-alias
+      // remote host — see docs/plans/github-multi-identity-tokens.md. The raw
+      // token is write-only from the webview's perspective: GET/PUT both
+      // reply with a `tokenPreview` (last 4 chars — withheld entirely for
+      // tokens so short the suffix would be the whole secret), never the
+      // token itself.
+      "/github/tokens": {
+        GET: authed(async (req) => {
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { host?: unknown; token?: unknown; label?: unknown };
+          const host = typeof body.host === "string" ? body.host.trim().toLowerCase() : "";
+          const token = typeof body.token === "string" ? body.token.trim() : "";
+          if (!host) return json({ error: "host required" }, { status: 400, headers: corsHeaders(req) });
+          if (!token) return json({ error: "token required" }, { status: 400, headers: corsHeaders(req) });
+          const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : null;
+          setGitHubToken(host, token, label);
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+      },
+      "/github/tokens/:host": {
+        DELETE: authed((req) => {
+          const removed = deleteGitHubToken(req.params.host);
+          if (!removed) return json({ error: "token not found" }, { status: 404, headers: corsHeaders(req) });
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cross-session UI preferences. Currently used by NewTaskForm to
+      // remember model + effort per agent (keys: `lastModel:<agent>` /
+      // `lastEffort:<agent>`). Values are opaque strings — the meaning
+      // lives in whichever caller writes them.
+      "/preferences": {
+        GET: authed((req) => json(preferences.list(), { headers: corsHeaders(req) })),
+      },
+      "/preferences/:key": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { value?: unknown };
+          if (typeof body.value !== "string") {
+            return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (req.params.key === ARCHIVED_HISTORY_RETENTION_PREF) {
+            // The retention age drives a destructive, one-way trim, so it is
+            // validated rather than stored opaquely: an off-word ("0",
+            // "false", …) is stored as "off", a day count as its integer
+            // string, and anything else is refused with nothing stored and
+            // nothing scheduled — a typo must never start a trim.
+            const normalized = normalizeArchivedHistoryRetentionValue(body.value);
+            if (normalized === null) {
+              return json({ error: ARCHIVED_HISTORY_RETENTION_INVALID_ERROR }, { status: 400, headers: corsHeaders(req) });
+            }
+            preferences.set(req.params.key, normalized);
+            // Turning retention on (or changing its age) asks for a pass soon
+            // — debounced inside `requestRetentionPass`, so a user stepping
+            // through the Settings select doesn't start one per click. "off"
+            // schedules nothing (an already-running pass is not interrupted;
+            // it finishes, and the next fire reads the pref fresh).
+            if (parseArchivedHistoryRetentionDays(normalized) !== null) requestRetentionPass();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          if (req.params.key === DISCLAIM_PREF_KEY) {
+            // The one switch that keeps Agetor's macOS permissions away from
+            // agents and every program the core spawns (D4, D7). The CLI token
+            // is what an agent can read, so it must not be able to turn the
+            // isolation OFF; turning it ON is allowed for anyone. The value
+            // rule lives here, not in the policy table, because the route
+            // itself stays `app+cli` for every other key.
+            if (isDisclaimOffValue(body.value) && callerOf(req) === "cli") {
+              return desktopOnlyResponse(req, corsHeaders);
+            }
+            preferences.set(req.params.key, body.value);
+            // Apply the stored value to the in-memory switch (app: immediately,
+            // D5; headless: stays on, logs when the value is off, D6).
+            applyDisclaimPreferenceWrite(native ? "app" : "headless", body.value, (m) => console.log(m));
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          if (req.params.key === REMOTE_ACCESS_PREF_KEY) {
+            // Remote access ON is a decision only the native confirm box may
+            // make (D10, C6): the preference row is agent-writable SQLite and
+            // this route is `app+cli`, so a stored "on" written here would
+            // otherwise be a way to switch it on without the user. Refused for
+            // EVERY caller, the master token included. "off" is always safe and
+            // behaves exactly like `DELETE /remote-access`.
+            if (body.value !== "off") {
+              return json(
+                { error: "remote access can only be turned on from Agetor › Remote Access…", code: "native-only" },
+                { status: 403, headers: corsHeaders(req) },
+              );
+            }
+            setRemoteAccessOff();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          if (req.params.key === TMUX_SOURCE_KEY) {
+            // Which tmux binary the core runs belongs to the desktop-only
+            // `POST /tmux-source`; this generic key route must not be a way
+            // around that for the CLI token. The app caller goes through the
+            // same validation and `setTmuxSource`, so the in-memory cache
+            // `resolveTmuxBin()` reads never disagrees with the stored value.
+            if (callerOf(req) === "cli") return desktopOnlyResponse(req, corsHeaders);
+            if (body.value !== "system" && body.value !== "bundled") {
+              return json({ error: "source must be 'system' or 'bundled'" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.value === "bundled" && !bundledTmuxAvailable()) {
+              return json({ error: "bundled tmux is not available in this build" }, { status: 409, headers: corsHeaders(req) });
+            }
+            setTmuxSource(body.value);
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          preferences.set(req.params.key, body.value);
+          return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Database size / maintenance (docs/plans/non-blocking-session-restore.md
+      // §2.4): Settings → General "Archived task history", `agetor compact`.
+      "/db/stats": {
+        GET: authed((req) => json(dbStats(activeRunCount()), { headers: corsHeaders(req) })),
+      },
+      // `VACUUM` rewrites the whole file synchronously on the single main
+      // thread, so every other request stalls for its duration (the stats'
+      // `compactEstimateSec`). It is refused while any run is live — a stalled
+      // loop would freeze the streaming transcripts and miss tmux/JSONL
+      // events — and while a retention pass is mid-yield (its writes would
+      // interleave with the rebuild). Opts out of the idle timeout: a large
+      // database can take minutes.
+      "/db/compact": {
+        POST: authed((req) => {
+          // A retention pass is checked first: it is the database's own
+          // maintenance (and ends on its own), so it names the more specific
+          // reason when both hold.
+          if (isRetentionRunning()) {
+            return json(
+              { error: "archived-history retention is running — try again when it finishes" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const n = activeRunCount();
+          if (n > 0) {
+            return json(
+              { error: `${n} task${n === 1 ? "" : "s"} running — stop or wait for them first`, activeRunCount: n },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          try {
+            return json({ ok: true, ...compactDatabase() }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+        }),
+      },
+      // Manual "trim archived history now" — the same pass the scheduler
+      // runs. Held open until it finishes (it yields to the event loop
+      // between slices, so other requests keep flowing).
+      "/db/retention/run": {
+        POST: authed(async (req) => {
+          if (isRetentionRunning()) {
+            return json(
+              { error: "archived-history retention is already running" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const days = configuredRetentionDays();
+          if (days === null) {
+            return json(
+              { error: "archived-history retention is off" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          return json(await runArchivedHistoryRetentionPass({ days }), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Test-only block route: present only under AGETOR_TEST_BLOCK_ROUTE=1
+      // (see `blockRouteEnabled` above); absent otherwise → the 404 fallback.
+      ...(blockRouteEnabled ? { "/test/block-event-loop": { POST: blockEventLoopRoute } } : {}),
+      // Test-only stream-drop route: present only under
+      // AGETOR_TEST_DROP_STREAMS_ROUTE=1 (see `streamDrop` above).
+      ...(streamDrop ? { "/test/drop-task-streams": { POST: dropTaskStreamsRoute } } : {}),
+
+      // App info — currently just the version. Read at module-load time
+      // from the bundled package.json so the value tracks releases without
+      // a CI-time env injection step.
+      "/info": {
+        GET: authed((req) =>
+          json({ version: pkg.version }, { headers: corsHeaders(req) })),
+      },
+
+      // Double-clicking the custom app bar in App.tsx hits this route to
+      // toggle the macOS "zoom" affordance. Electrobun's drag region only
+      // wires startWindowMove/stopWindowMove on mousedown/mouseup, so the
+      // native double-click-to-zoom gesture never reaches AppKit — the
+      // webview emulates it through here.
+      "/window/toggle-zoom": {
+        POST: authed((req) => {
+          const win = getMainWindow();
+          if (!win) {
+            return json(
+              { error: "no main window" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
+          if (win.isFullScreen()) {
+            return json(
+              { ok: true, skipped: "fullscreen" },
+              { headers: corsHeaders(req) },
+            );
+          }
+          if (win.isMaximized()) win.unmaximize();
+          else win.maximize();
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Bring the main window to the front from the webview side — the
+      // counterpart to `focusMainWindow()` in index.ts (notification click,
+      // Dock reopen). The webview needs this too: a clicked toast's `onOpen`
+      // runs entirely in the renderer, and a WKWebView's own `window.focus()`
+      // can't activate the host NSApplication, so it has to round-trip
+      // through here.
+      //
+      // Native-gated rather than calling `focusWindow()` inline (the way
+      // `/window/toggle-zoom` above pokes `getMainWindow()` directly): raising
+      // a window means first checking the frame against the live display
+      // layout, which needs `Screen` from `electrobun/bun`. Importing that
+      // here would pull Electrobun into the headless CLI daemon, which imports
+      // this module — see the note on ApiNative.
+      "/window/focus": {
+        POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          if (!native.focusWindow()) {
+            return json(
+              { error: "no main window" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Auto-update surface. The webview reads `/updates/status` on
+      // open (SSE is live-only — no replay — so a freshly-opened client
+      // needs a one-shot fetch to render current state), and POSTs
+      // `/updates/check` / `/updates/apply` for the manual menu item +
+      // the banner's "Restart now" button.
+      "/updates/status": {
+        GET: authed((req) =>
+          native
+            ? json(native.updates.snapshot(), { headers: corsHeaders(req) })
+            : notAvailableHeadless(req)),
+      },
+      "/updates/check": {
+        POST: authed(async (req) => {
+          if (!native) return notAvailableHeadless(req);
+          await native.updates.check();
+          return json(native.updates.snapshot(), { headers: corsHeaders(req) });
+        }),
+      },
+      "/updates/apply": {
+        POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          // Status check runs synchronously here — not inside applyUpdate —
+          // so the 409 reaches the client. An earlier shape wrapped a void
+          // applyUpdate() call in try/catch, but async functions never throw
+          // synchronously, so that catch was dead code and stale-button
+          // clicks silently 200'd while the actual rejection became an
+          // unhandled promise inside the bun process.
+          const snap = native.updates.snapshot();
+          if (snap.status !== "ready") {
+            return json(
+              { error: `no update is ready to apply (status: ${snap.status})` },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // applyUpdate quits + relaunches; the HTTP response races against
+          // process exit. Void on purpose — the webview drops its connection
+          // when the process goes away.
+          void native.updates.apply();
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // tmux source: which binary drives the claude-code harness. The UI
+      // reads this to render the install dialog + settings toggle. Writing
+      // here flips the preference; the next `checkAllHarnesses()` call
+      // (polled on `/agents` every 2s) reflects the change.
+      "/tmux-source": {
+        GET: authed((req) =>
+          json(
+            {
+              source: getTmuxSource(),
+              bundledAvailable: bundledTmuxAvailable(),
+              bundledPath: bundledTmuxPath(),
+              resolvedBin: resolveTmuxBin(),
+            },
+            { headers: corsHeaders(req) },
+          )),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { source?: unknown };
+          if (body.source !== "system" && body.source !== "bundled") {
+            return json(
+              { error: "source must be 'system' or 'bundled'" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Reject if bundled is requested but the binary isn't present in
+          // this build. The dialog already disables that option client-side,
+          // so this is belt-and-suspenders: prevents the preference from
+          // falling out of sync with reality if any future client misses the
+          // disabled check.
+          if (body.source === "bundled" && !bundledTmuxAvailable()) {
+            return json(
+              { error: "bundled tmux is not available in this build" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          setTmuxSource(body.source as TmuxSource);
+          return json({ ok: true, source: body.source }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Boot-seed endpoint for the topbar usage tracker
+      // (docs/plans/harness-usage-tracker.md, Wave C1): every persisted
+      // `HarnessQuota` snapshot, one per harness that's ever been polled.
+      // Cheap — reads straight from the `harness_usage` table, no network —
+      // the webview calls this once on load, then relies on `harness_usage`
+      // SSE pushes (broadcast by the poller/refresh path) plus its own
+      // manual Refresh for live updates. Not to be confused with
+      // `/harnesses/:id/usage` below, which is the unrelated task-count
+      // blast-radius probe.
+      "/usage": {
+        GET: authed((req) => json(harnessUsage.getAll(), { headers: corsHeaders(req) })),
+      },
+
+      // Per-harness availability + version. Replaces the per-kind `/agents`
+      // endpoint: each registered harness (built-in or alias) is probed
+      // with its own binary path + env so multi-account aliases report
+      // their own status independently.
+      "/harnesses": {
+        GET: authed(async (req) => {
+          const statuses = await checkAllHarnesses();
+          // D-14: turn on a disabled built-in harness the first time its CLI
+          // shows up installed, BEFORE the response is built, so the
+          // `harnesses.list()` read below already shows the flipped rows.
+          // Synchronous db writes; off under `bun test` unless the seam is on.
+          try {
+            applyHarnessAutoEnable(statuses);
+          } catch (err) {
+            console.error("[agetor] harness auto-enable failed:", err);
+          }
+          // Fire-and-forget: feeds the transition detector (docs/plans/
+          // fx-model-catalog-refresh.md §3 D4) so an availability/login
+          // flip noticed by this poll (fx login, an install, a version
+          // bump) schedules a debounced model-catalog refresh without this
+          // request waiting on it — never throws, so it can't affect the
+          // response below either way.
+          noteHarnessStatuses(statuses);
+          return json(
+            { harnesses: harnesses.list(), statuses },
+            { headers: corsHeaders(req) },
+          );
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            id?: unknown;
+            kind?: unknown;
+            label?: unknown;
+            home?: unknown;
+            bin?: unknown;
+            env?: unknown;
+            profileMcpServers?: unknown;
+          };
+          if (typeof body.id !== "string" || !body.id.trim()) {
+            return json({ error: "id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (
+            body.kind !== "claude-code" && body.kind !== "codex" &&
+            body.kind !== "cursor" && body.kind !== "gemini" && body.kind !== "fx" &&
+            body.kind !== "antigravity" && body.kind !== "opencode" && body.kind !== "copilot"
+          ) {
+            return json(
+              {
+                error:
+                  "kind must be 'claude-code', 'codex', 'cursor', 'gemini', 'fx', 'antigravity', 'opencode', or 'copilot'",
+              },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (typeof body.label !== "string" || !body.label.trim()) {
+            return json({ error: "label required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Reject paths that aren't absolute — relative paths would resolve
+          // against the agetor process cwd, which is rarely what the user
+          // intends and is a footgun.
+          const home = body.home == null || body.home === ""
+            ? null
+            : typeof body.home === "string" ? body.home : undefined;
+          const bin = body.bin == null || body.bin === ""
+            ? null
+            : typeof body.bin === "string" ? body.bin : undefined;
+          if (home === undefined) {
+            return json({ error: "home must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (bin === undefined) {
+            return json({ error: "bin must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (home && !path.isAbsolute(home)) {
+            return json({ error: "home must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (bin && !path.isAbsolute(bin)) {
+            return json({ error: "bin must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const env: Record<string, string> = {};
+          if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
+            for (const [k, v] of Object.entries(body.env)) {
+              if (typeof v !== "string") continue;
+              if (!isValidEnvKey(k)) {
+                return json(
+                  { error: `invalid env var name "${k}" — names must match [A-Za-z_][A-Za-z0-9_]*` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              env[k] = v;
+            }
+          }
+          const envRefusal = await gateHarnessEnvPaths(req, env);
+          if (envRefusal) return envRefusal;
+          // Whether fx sessions load the user's fx profile MCP servers
+          // (`_meta.fx.profileMcpServers`, D3/D4). Absent ⇒ on; only fx-kind
+          // rows act on it, every kind stores it.
+          if (body.profileMcpServers !== undefined && typeof body.profileMcpServers !== "boolean") {
+            return json({ error: "profileMcpServers must be a boolean" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (harnesses.get(body.id)) {
+            return json({ error: `harness "${body.id}" already exists` }, { status: 409, headers: corsHeaders(req) });
+          }
+          try {
+            const created = harnesses.insert({
+              id: body.id.trim(),
+              kind: body.kind,
+              label: body.label.trim(),
+              home,
+              bin,
+              env,
+              ...(typeof body.profileMcpServers === "boolean" ? { profileMcpServers: body.profileMcpServers } : {}),
+            });
+            // A brand-new harness (fx or otherwise) has no discovered
+            // catalog yet — probe it now instead of waiting for the next
+            // periodic sweep. Fire-and-forget: never blocks the response,
+            // never throws (see model-discovery.ts's contract).
+            void refreshHarnessModels(created.id);
+            return json(created, { headers: corsHeaders(req) });
+          } catch (e) {
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
+      // logged-in account that no registered harness points at yet — the
+      // Add-harness picker renders these as one-click "use existing account"
+      // entries. Identity fields only; never tokens or account uuids.
+      "/harness-discovery": {
+        GET: authed((req) => {
+          const registeredHomes = harnesses.list()
+            .filter((h) => h.kind === "claude-code")
+            .map((h) => h.home);
+          return json(
+            { accounts: discoverClaudeAccounts(registeredHomes) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      "/harnesses/:id": {
+        GET: authed((req) => {
+          const h = harnesses.get(req.params.id);
+          return h
+            ? json(h, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = harnesses.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+          // `enabled` is the one carve-out from built-in immutability: users
+          // can soft-delete Claude Code / Codex without being able to rename
+          // them or retarget the binary. Validate the *whole* patch up front
+          // so a mixed `{enabled, label}` body on a built-in returns a single
+          // 400 instead of half-applying the toggle and then erroring.
+          const hasConfigPatch =
+            typeof body.label === "string" ||
+            "home" in body ||
+            "bin" in body ||
+            (body.env && typeof body.env === "object" && !Array.isArray(body.env));
+          if (hasConfigPatch && current.isBuiltin) {
+            return json(
+              { error: "built-in harnesses can't be edited — create an alias instead" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // `profileMcpServers` (D3/D4) is a behaviour toggle like `enabled`,
+          // not config — allowed on built-ins too (the built-in fx row is the
+          // one most users run). Validated before anything is applied.
+          if ("profileMcpServers" in body && typeof body.profileMcpServers !== "boolean") {
+            return json(
+              { error: "profileMcpServers must be a boolean" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (typeof body.enabled === "boolean") {
+            harnesses.setEnabled(req.params.id, body.enabled);
+            // Re-enabling a harness that was previously excluded from every
+            // discovery sweep (disabled harnesses are skipped — see
+            // model-discovery.ts's discoveryTargets) needs its own probe now
+            // rather than waiting up to 15 minutes for the periodic sweep.
+            // Disabling needs no such trigger: getHarnessModelMap already
+            // skips disabled harnesses, so it drops out of the picker
+            // immediately with no probe required.
+            if (body.enabled) void refreshHarnessModels(req.params.id);
+          }
+          if (!hasConfigPatch) {
+            if (typeof body.profileMcpServers === "boolean") {
+              harnesses.update(req.params.id, { profileMcpServers: body.profileMcpServers });
+            }
+            return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
+          }
+          const patch: Parameters<typeof harnesses.update>[1] = {};
+          if (typeof body.profileMcpServers === "boolean") patch.profileMcpServers = body.profileMcpServers;
+          if (typeof body.label === "string") patch.label = body.label.trim();
+          if ("home" in body) {
+            if (body.home == null || body.home === "") patch.home = null;
+            else if (typeof body.home === "string" && path.isAbsolute(body.home)) patch.home = body.home;
+            else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if ("bin" in body) {
+            if (body.bin == null || body.bin === "") patch.bin = null;
+            else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) patch.bin = body.bin;
+            else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
+            const env: Record<string, string> = {};
+            for (const [k, v] of Object.entries(body.env)) {
+              if (typeof v !== "string") continue;
+              if (!isValidEnvKey(k)) {
+                return json(
+                  { error: `invalid env var name "${k}" — names must match [A-Za-z_][A-Za-z0-9_]*` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              env[k] = v;
+            }
+            const envRefusal = await gateHarnessEnvPaths(req, env);
+            if (envRefusal) return envRefusal;
+            patch.env = env;
+          }
+          try {
+            const updated = harnesses.update(req.params.id, patch);
+            // home/bin/env can each change which account's (or which
+            // binary's) catalog this harness resolves to — re-probe rather
+            // than let the picker show a stale list until the next periodic
+            // sweep. `refreshHarnessModels` → `resolveBin(harness)` (the
+            // same resolver every real fx spawn uses) is what makes a `bin`
+            // edit actually change what gets probed, not just what gets
+            // spawned.
+            void refreshHarnessModels(updated.id);
+            return json(updated, { headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof HarnessBuiltinError) {
+              return json({ error: e.message }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          try {
+            harnesses.delete(req.params.id);
+            // Prunes the deleted harness out of the per-harness discovery
+            // cache and its transition-detector bookkeeping, then publishes
+            // once — cheaper than a full `refreshAllModels()` sweep (which
+            // used to be called here just to exercise its own
+            // pruning-by-absence logic in agent-discovery.ts's runRefresh;
+            // that path still exists as a backstop for any harness removal
+            // that doesn't route through this DELETE handler).
+            noteHarnessRemoved(req.params.id);
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof HarnessInUseError) {
+              return json(
+                { error: e.message, taskIds: e.taskIds, profileIds: e.profileIds },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            if (e instanceof HarnessBuiltinError) {
+              return json({ error: e.message }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      // User-global reusable prompt snippets — not tied to any task/project.
+      "/saved-prompts": {
+        GET: authed((req) => json(savedPrompts.list(), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
+            name?: unknown;
+            content?: unknown;
+          };
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          const content = typeof body.content === "string" ? body.content.trim() : "";
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
+          const created = savedPrompts.insert({ name, content });
+          return json(created, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/saved-prompts/:id": {
+        PATCH: authed(async (req) => {
+          const current = savedPrompts.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
+            name?: unknown;
+            content?: unknown;
+          };
+          const patch: Parameters<typeof savedPrompts.update>[1] = {};
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+            patch.name = name;
+          }
+          if ("content" in body) {
+            const content = typeof body.content === "string" ? body.content.trim() : "";
+            if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
+            patch.content = content;
+          }
+          const updated = savedPrompts.update(req.params.id, patch);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const removed = savedPrompts.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reusable, named launch presets (docs/plans/agent-profiles.md) — the
+      // "Agents" the New Task picker and `agetor profile`/`agetor add --profile`
+      // work against. Validation style mirrors /saved-prompts above: a
+      // non-object body 400s, strings are trimmed, and the harness reference
+      // is resolved via `harnesses.getByIdOrKind` exactly like every other
+      // route that accepts one. `effort`/`mode` are string-or-null
+      // passthrough — same null-clear-only philosophy as the task PATCH route
+      // (see its own comment on the subject) — and are never validated
+      // against a model's supported-effort catalog here. `skills` is
+      // validated HONESTLY by `parseSkillsBody` below (400 on a non-string
+      // entry, 400 past the cap) rather than silently filtering/truncating —
+      // `agentProfiles.insert`/`update` (`sanitizeSkillsList` in db.ts) keeps
+      // its own defensive normalize+cap for the parse path (direct DB writes,
+      // migrations), but the HTTP route now rejects instead of mangling.
+      "/agent-profiles": {
+        GET: authed((req) => json(withTaskCounts(agentProfiles.list()), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          const nameError = agentProfileNameError(name);
+          if (nameError) return json({ error: nameError }, { status: 400, headers: corsHeaders(req) });
+
+          const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+          if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+          const harness = harnesses.getByIdOrKind(harnessRef);
+          if (!harness) {
+            return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const model = typeof body.model === "string" ? body.model.trim() : "";
+          const modelError = agentProfileModelError(model);
+          if (modelError) return json({ error: modelError }, { status: 400, headers: corsHeaders(req) });
+
+          const optionalError =
+            agentProfileOptionalFieldError(body.effort, "effort") ?? agentProfileOptionalFieldError(body.mode, "mode");
+          if (optionalError) return json({ error: optionalError }, { status: 400, headers: corsHeaders(req) });
+
+          const instructions = typeof body.instructions === "string" ? body.instructions : "";
+          const instructionsError = agentProfileInstructionsError(instructions);
+          if (instructionsError) return json({ error: instructionsError }, { status: 400, headers: corsHeaders(req) });
+
+          let skills: string[] = [];
+          if (body.skills !== undefined) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            skills = parsedSkills.skills;
+          }
+
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // OpenCode's server option (D-4); omitted ⇒ "shared" (db default).
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          try {
+            const created = agentProfiles.insert({
+              name,
+              harness: harness.id,
+              model,
+              effort: agentProfileOptionalField(body.effort),
+              mode: agentProfileOptionalField(body.mode),
+              speed: speedInput.speed ?? "off",
+              maxMode: body.maxMode === true,
+              ...(opencodeServer !== undefined ? { opencodeServer } : {}),
+              instructions,
+              skills,
+            });
+            return json(withTaskCount(created), { headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      // Copy a profile (and, with `copyTasks`, its live tasks). Omitted fields
+      // come from the source; the merged result goes through the same
+      // validators as POST. docs/plans/duplicate-agent-leftovers.md
+      "/agent-profiles/:id/duplicate": {
+        POST: authed(async (req) => {
+          const bad = (error: string, status = 400) =>
+            json({ error }, { status, headers: corsHeaders(req) });
+          const source = agentProfiles.get(req.params.id);
+          if (!source) return bad("not found", 404);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("invalid body");
+          const body = raw as Record<string, unknown>;
+
+          for (const key of ["copyTasks", "maxMode"]) {
+            if (key in body && typeof body[key] !== "boolean") return bad(`${key} must be a boolean`);
+          }
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins;
+          // neither present keeps the source's tier.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) return bad(speedInput.error);
+          // Omitted keeps the source's OpenCode server option (D-4).
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") return bad(opencodeServer.error);
+
+          const name =
+            "name" in body
+              ? typeof body.name === "string"
+                ? body.name.trim()
+                : ""
+              : duplicateAgentName(source.name, agentProfiles.list().map((p) => p.name));
+          const nameError = agentProfileNameError(name);
+          if (nameError) return bad(nameError);
+
+          let harnessId = source.harness;
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return bad("harness required");
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) return bad(`unknown harness "${harnessRef}"`);
+            harnessId = harness.id;
+          }
+
+          const model = "model" in body ? (typeof body.model === "string" ? body.model.trim() : "") : source.model;
+          const modelError = agentProfileModelError(model);
+          if (modelError) return bad(modelError);
+
+          const optionalError =
+            ("effort" in body ? agentProfileOptionalFieldError(body.effort, "effort") : null) ??
+            ("mode" in body ? agentProfileOptionalFieldError(body.mode, "mode") : null);
+          if (optionalError) return bad(optionalError);
+
+          if ("instructions" in body && typeof body.instructions !== "string") {
+            return bad("instructions must be a string");
+          }
+          const instructions = "instructions" in body ? (body.instructions as string) : source.instructions;
+          const instructionsError = agentProfileInstructionsError(instructions);
+          if (instructionsError) return bad(instructionsError);
+
+          let skills = source.skills;
+          if ("skills" in body) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) return bad(parsedSkills.error);
+            skills = parsedSkills.skills;
+          }
+
+          // Each copied worktree task resolves a git ref inside createTask.
+          // A profile with many of those can outlast Bun's 255s idle ceiling,
+          // which would kill the handler after the profile row already exists.
+          // Opt out for the copy itself. The CLI waits on a matching long
+          // timeout so it hears this response instead of retrying into a
+          // second profile.
+          if (body.copyTasks === true) server.timeout(req, 0);
+          try {
+            const result = await duplicateAgentProfile(
+              source.id,
+              {
+                name,
+                harness: harnessId,
+                model,
+                effort: "effort" in body ? agentProfileOptionalField(body.effort) : source.effort,
+                mode: "mode" in body ? agentProfileOptionalField(body.mode) : source.mode,
+                speed: speedInput.speed ?? source.speed,
+                maxMode: "maxMode" in body ? body.maxMode === true : source.maxMode,
+                opencodeServer: opencodeServer ?? source.opencodeServer,
+                instructions,
+                skills,
+              },
+              body.copyTasks === true,
+            );
+            if ("notFound" in result) return bad("not found", 404);
+            return json(
+              {
+                profile: withTaskCount(result.profile),
+                copiedTasks: result.copiedTasks,
+                taskCopyErrors: result.taskCopyErrors,
+              },
+              { status: 201, headers: corsHeaders(req) },
+            );
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) return bad(e.message, 409);
+            return bad((e as Error).message);
+          }
+        }),
+      },
+
+      "/agent-profiles/:id": {
+        GET: authed((req) => {
+          const p = agentProfiles.get(req.params.id);
+          return p
+            ? json(withTaskCount(p), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = agentProfiles.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: AgentProfilePatch = {};
+
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            const nameError = agentProfileNameError(name);
+            if (nameError) return json({ error: nameError }, { status: 400, headers: corsHeaders(req) });
+            patch.name = name;
+          }
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) {
+              return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.harness = harness.id;
+          }
+          if ("model" in body) {
+            const model = typeof body.model === "string" ? body.model.trim() : "";
+            const modelError = agentProfileModelError(model);
+            if (modelError) return json({ error: modelError }, { status: 400, headers: corsHeaders(req) });
+            patch.model = model;
+          }
+          if ("effort" in body) {
+            const effortError = agentProfileOptionalFieldError(body.effort, "effort");
+            if (effortError) return json({ error: effortError }, { status: 400, headers: corsHeaders(req) });
+            patch.effort = agentProfileOptionalField(body.effort);
+          }
+          if ("mode" in body) {
+            const modeError = agentProfileOptionalFieldError(body.mode, "mode");
+            if (modeError) return json({ error: modeError }, { status: 400, headers: corsHeaders(req) });
+            patch.mode = agentProfileOptionalField(body.mode);
+          }
+          // `speed`, or its legacy boolean alias `fast` (D13) — `speed` wins.
+          const speedInput = resolveSpeedInput(body);
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (speedInput.speed !== undefined) patch.speed = speedInput.speed;
+          if ("maxMode" in body) patch.maxMode = body.maxMode === true;
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (opencodeServer !== undefined) patch.opencodeServer = opencodeServer;
+          if ("instructions" in body) {
+            const instructions = typeof body.instructions === "string" ? body.instructions : "";
+            const instructionsError = agentProfileInstructionsError(instructions);
+            if (instructionsError) {
+              return json({ error: instructionsError }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.instructions = instructions;
+          }
+          if ("skills" in body) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.skills = parsedSkills.skills;
+          }
+
+          try {
+            const updated = agentProfiles.update(req.params.id, patch);
+            return updated
+              ? json(withTaskCount(updated), { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a profile always succeeds — a task already launched from
+          // it keeps its own frozen snapshot (D7), so there's nothing to
+          // guard against the way `/harnesses/:id` DELETE must guard against
+          // in-use tasks/profiles.
+          const removed = agentProfiles.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Named, reusable step graphs (docs/plans/pipelines.md §3) — the
+      // templates a pipeline task is launched from via `POST /tasks`'s
+      // `pipelineId`. Validation style mirrors `/agent-profiles*` above:
+      // `graph` is checked here with the SAME `validatePipelineGraph` the db
+      // layer (`pipelines.insert`/`update`) re-validates with, so a bad graph
+      // always 400s with the parser's own message rather than a generic db
+      // error; a name clash surfaces as 409 via `PipelineNameError`.
+      "/pipelines": {
+        GET: authed((req) => json(withPipelineTaskCounts(pipelines.list()), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const nameResult = parsePipelineName(body);
+          if ("error" in nameResult) {
+            return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const name = nameResult.value;
+
+          const descriptionResult = parsePipelineDescription(body);
+          if ("error" in descriptionResult) {
+            return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const description = descriptionResult.value ?? "";
+
+          const graphResult = validatePipelineGraph(body.graph);
+          if (!graphResult.ok) {
+            return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const maxStepsResult = parsePipelineMaxSteps(body);
+          if ("error" in maxStepsResult) {
+            return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          try {
+            const input: PipelineInput = {
+              name,
+              description,
+              graph: graphResult.graph,
+              ...(maxStepsResult.value !== undefined ? { maxSteps: maxStepsResult.value } : {}),
+            };
+            const created = pipelines.insert(input);
+            return json(withPipelineTaskCount(created), { status: 201, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/pipelines/:id": {
+        GET: authed((req) => {
+          const p = pipelines.get(req.params.id);
+          return p
+            ? json(withPipelineTaskCount(p), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = pipelines.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: Partial<PipelineInput> = {};
+
+          if ("name" in body) {
+            const nameResult = parsePipelineName(body);
+            if ("error" in nameResult) {
+              return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.name = nameResult.value;
+          }
+          if ("description" in body) {
+            const descriptionResult = parsePipelineDescription(body);
+            if ("error" in descriptionResult) {
+              return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (descriptionResult.value !== undefined) patch.description = descriptionResult.value;
+          }
+          if ("graph" in body) {
+            const graphResult = validatePipelineGraph(body.graph);
+            if (!graphResult.ok) {
+              return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.graph = graphResult.graph;
+          }
+          if ("maxSteps" in body) {
+            const maxStepsResult = parsePipelineMaxSteps(body);
+            if ("error" in maxStepsResult) {
+              return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (maxStepsResult.value !== undefined) patch.maxSteps = maxStepsResult.value;
+          }
+
+          try {
+            const updated = pipelines.update(req.params.id, patch);
+            return updated
+              ? json(withPipelineTaskCount(updated), { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a pipeline always succeeds — a parent task already
+          // launched from it keeps its own frozen `pipelineRun.snapshot`
+          // (D8, docs/plans/pipelines.md), so there's nothing to guard
+          // against the way `/harnesses/:id` DELETE must guard against
+          // in-use harnesses/profiles.
+          const removed = pipelines.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // ── Agents + Pipelines bundle export/import ─────────────────────────
+      // docs/plans/agents-pipelines-import-export.md K4. The logic lives in
+      // ./bundle.ts; these routes only validate, call it and map results to
+      // statuses. None of them reads or writes a client-supplied path: save
+      // targets are the Downloads dir or a folder the native panel returned,
+      // and Choose file reads only what the native panel returned.
+      "/bundle/export": {
+        POST: authed(async (req) => {
+          const sel = parseBundleSelection(await req.json().catch(() => null));
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+          return json(
+            { text: built.text, filename: built.filename, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Save the export to ~/Downloads (then reveal it in Finder) or into a
+      // folder picked in the native panel — never overwriting (K7).
+      "/bundle/export/save": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+          const sel = parseBundleSelection(body);
+          if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
+          const target = body?.target;
+          if (target !== "downloads" && target !== "folder") {
+            return json({ error: 'target must be "downloads" or "folder"' }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Built up front so a selection that can't export fails before any
+          // panel opens; Choose folder builds again after the pick (below).
+          let built = exportBundleFor(sel.selection);
+          if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+
+          let dir: string;
+          if (target === "downloads") {
+            dir = bundleDownloadsDir();
+          } else {
+            // Same fake-pick seam `/refs/pick` honors (e2e/fixtures.ts).
+            const fake = fakePickDir();
+            if (fake) {
+              const picked = fakePickedFolder(fake);
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+            } else {
+              if (!native) return notAvailableHeadless(req);
+              // The request stays open while the panel is up.
+              server.timeout(req, 0);
+              const picks = await openFileDialogLabelled(native, {
+                startingFolder: homedir(),
+                canChooseFiles: false,
+                canChooseDirectory: true,
+                allowsMultipleSelection: false,
+              });
+              const picked = singlePickedPath(picks);
+              if (!picked) return json({ cancelled: true }, { headers: corsHeaders(req) });
+              dir = picked;
+              // The panel can stay up for minutes: write what the Agents and
+              // Pipelines hold now, not what they held when it opened.
+              built = exportBundleFor(sel.selection);
+              if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+
+          let written: { path: string; filename: string };
+          try {
+            written = writeBundleFile(dir, built.filename, built.text, { createDir: target === "downloads" });
+          } catch (e) {
+            return json({ error: bundleSaveErrorMessage(e, target, dir) }, { status: 500, headers: corsHeaders(req) });
+          }
+          const revealed = target === "downloads" && native ? native.revealPath(written.path) : false;
+          return json(
+            { path: written.path, filename: written.filename, revealed, warnings: built.warnings, counts: built.counts },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Choose file: a native Open panel filtered to .json (K8).
+      "/bundle/pick-file": {
+        POST: authed(async (req) => {
+          let file: string | null;
+          const fake = fakePickDir();
+          if (fake) {
+            file = fakePickedJsonFile(fake);
+          } else {
+            if (!native) return notAvailableHeadless(req);
+            server.timeout(req, 0);
+            const picks = await openFileDialogLabelled(native, {
+              startingFolder: homedir(),
+              allowedFileTypes: "json",
+              canChooseFiles: true,
+              canChooseDirectory: false,
+              allowsMultipleSelection: false,
+            });
+            file = singlePickedPath(picks);
+          }
+          if (!file) return json({ cancelled: true }, { headers: corsHeaders(req) });
+          const read = readPickedBundleFile(file);
+          if ("error" in read) return json({ error: read.error }, { status: 400, headers: corsHeaders(req) });
+          return json(read, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Dry run: what an import would create, rename and bind (K5/K6).
+      "/bundle/import/preview": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          const r = await previewBundleImport(body.text, body.options);
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(r.plan, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Commit: everything in one transaction, or nothing (K13).
+      "/bundle/import": {
+        POST: authed(async (req) => {
+          const body = await readBundleImportBody(req);
+          if (body instanceof Response) return body;
+          let r: Awaited<ReturnType<typeof commitBundleImport>>;
+          try {
+            r = await commitBundleImport(body.text, body.options, body.planFingerprint);
+          } catch (e) {
+            return json(
+              { error: `import failed — nothing was imported: ${(e as Error).message}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          if (!r.ok) return bundleImportErrorResponse(req, r);
+          return json(
+            {
+              ...r.result,
+              agents: r.result.agents.map((a) => ({ ...a, taskCount: 0 })),
+              pipelines: r.result.pipelines.map((p) => ({ ...p, taskCount: 0 })),
+            },
+            { status: 201, headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Blast-radius probe for the disable-confirmation UI. Returns the
+      // running task ids (so we can warn "N tasks are still using this")
+      // plus the total task count for context.
+      "/harnesses/:id/usage": {
+        GET: authed((req) => {
+          const h = harnesses.get(req.params.id);
+          if (!h) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Daily per-model token rollups for the harness's ACCOUNT (config dir),
+      // for the Settings drill-down. Distinct from `/harnesses/:id/usage`
+      // above, which reports task counts — do not overload that route.
+      // claude-code only: other kinds have no local usage source wired yet.
+      "/harnesses/:id/account-usage": {
+        GET: authed((req) => {
+          const h = harnesses.getByIdOrKind(req.params.id);
+          if (!h) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (h.kind !== "claude-code") {
+            return json(
+              { error: "account usage is only available for claude-code harnesses" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const configDir = effectiveClaudeConfigDir(h.home);
+          return json(
+            { configDir, days: accountUsageDays(configDir) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Force a live refresh of the quota/usage tracker snapshot for one
+      // harness (docs/plans/harness-usage-tracker.md, Wave C1). Distinct
+      // from `/harnesses/:id/usage` above, which is the unrelated
+      // task-count blast-radius probe. `refreshOne` returns null when the
+      // harness id is unknown/disabled, or when its kind has no registered
+      // usage provider (gemini, grok) — in every such case there is nothing
+      // to show beyond the existing availability dot, so we 404 rather than
+      // synthesize an empty snapshot.
+      "/harnesses/:id/usage/refresh": {
+        POST: authed(async (req) => {
+          const quota = await refreshOne(req.params.id, { force: true });
+          if (!quota) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(quota, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Resolve a harness's environment for `agetor harness shell` — the CLI
+      // execs a shell with this env applied (drift-free: reuses harnessEnv).
+      // Headless-safe (no native bridge), unlike open-terminal below.
+      "/harnesses/:id/shell-env": {
+        GET: authed((req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) {
+            return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(
+            {
+              env: harnessEnv(harness),
+              // Only an absolute bin override needs to join PATH (mirrors
+              // buildHarnessTerminalCommand); the default agent is on PATH.
+              binDir: harness.bin && path.isAbsolute(harness.bin) ? path.dirname(harness.bin) : null,
+              launch: path.basename(resolveBin(harness)),
+              kind: harness.kind,
+            },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Open a configured shell for this harness in a new Terminal.app window.
+      // The harness's home-derived vars (CLAUDE_CONFIG_DIR for claude-code,
+      // HOME + CODEX_HOME for codex), its custom env, and its binary's
+      // directory on PATH are all exported, then the window is left at an
+      // interactive prompt. This is the supported way to authenticate or
+      // inspect a multi-account alias: `claude /login` run in this shell
+      // writes credentials against the alias's own config dir, exactly as a
+      // real run would. macOS-only (osascript + Terminal.app), same as
+      // `/tasks/:id/open-tmux`.
+      "/harnesses/:id/open-terminal": {
+        POST: authed(async (req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) {
+            return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const script = toTerminalAppleScript(buildHarnessTerminalCommand(harness));
+          // spawn-exempt(osascript): Terminal.app automation is Agetor's own Automation grant; /usr/bin/osascript is SIP-protected and spawned by absolute path so PATH can't swap it.
+          const proc = Bun.spawn(["/usr/bin/osascript", "-e", script], {
+            stdout: "ignore",
+            stderr: "pipe",
+            env: childEnv(),
+          });
+          // Await the launch so the UI gets real feedback. `do script` returns
+          // as soon as Terminal accepts the command (it does NOT wait for the
+          // shell command to finish), so this resolves in well under a second
+          // on success and fails fast when Automation permission is denied.
+          // A 5s ceiling guards against a wedged osascript holding the
+          // response open.
+          const exit = await Promise.race([
+            proc.exited,
+            Bun.sleep(5000).then(() => "timeout" as const),
+          ]);
+          if (exit === "timeout") {
+            // Assume it's still coming up rather than reporting a false error.
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          }
+          if (exit !== 0) {
+            const detail = (await new Response(proc.stderr).text()).trim();
+            console.warn(
+              `[agetor] osascript exited ${exit} while opening a terminal for harness "${harness.id}": ${detail}`,
+            );
+            return json(
+              {
+                error:
+                  `Couldn't open Terminal (osascript exited ${exit}).` +
+                  (detail ? ` ${detail}` : "") +
+                  " Check System Settings → Privacy & Security → Automation.",
+              },
+              { status: 502, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Legacy alias — UI still polls /agents for the header dots. Now
+      // returns the per-harness shape so each alias appears as its own dot.
+      "/agents": {
+        GET: authed(async (req) =>
+          json(await checkAllHarnesses(), { headers: corsHeaders(req) })),
+      },
+
+      // Per-agent dynamic data discovered from the CLI: model list (and
+      // anything else we learn to probe later). Cached in-memory and refreshed
+      // on demand via POST.
+      "/agent-models": {
+        GET: authed((req) =>
+          json(
+            {
+              "claude-code": getDiscoveredModels("claude-code"),
+              "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
+              "gemini": getDiscoveredModels("gemini"),
+              "antigravity": getDiscoveredModels("antigravity"),
+              "fx": getDiscoveredModels("fx"),
+              "opencode": getDiscoveredModels("opencode"),
+              "copilot": getDiscoveredModels("copilot"),
+            },
+            { headers: corsHeaders(req) },
+          )),
+        POST: authed(async (req) => {
+          // Optional `?harness=<id>` refreshes just that one harness via the
+          // scheduler (cheaper than a full sweep for the common "I just
+          // fixed this one harness" case — fx login, a binary swap, …);
+          // omitted, it re-probes everything. Both branches await the
+          // refresh before responding, same as the unqualified form always
+          // has, so a caller reading this response sees the fresh list.
+          //
+          // The response body is ALWAYS the kind-keyed map below, byte-
+          // compatible with the unqualified POST/GET — including when
+          // `?harness=` names a non-built-in alias (e.g. a second fx
+          // account), whose per-harness catalog has no slot in this
+          // kind-keyed shape at all. To read that harness's own list after
+          // the refresh resolves, follow up with `GET /agent-models/harnesses`
+          // (keyed by harness id, not kind).
+          const harnessId = new URL(req.url).searchParams.get("harness");
+          if (harnessId) {
+            if (!harnesses.get(harnessId)) {
+              return json({ error: "unknown harness" }, { status: 404, headers: corsHeaders(req) });
+            }
+            await refreshHarnessModels(harnessId);
+          } else {
+            await refreshAllModels();
+          }
+          return json(
+            {
+              "claude-code": getDiscoveredModels("claude-code"),
+              "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
+              "gemini": getDiscoveredModels("gemini"),
+              "antigravity": getDiscoveredModels("antigravity"),
+              "fx": getDiscoveredModels("fx"),
+              "opencode": getDiscoveredModels("opencode"),
+              "copilot": getDiscoveredModels("copilot"),
+            },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Harness-keyed sibling of GET /agent-models above: one key per
+      // *enabled* harness (all kinds), not per kind — an additional-account
+      // fx harness (its own `HOME` override) gets its own catalog here
+      // instead of being filtered against the built-in fx harness's list,
+      // which is what makes D3's account-scoped picker filtering (see
+      // docs/plans/fx-model-catalog-refresh.md) correct for multi-account
+      // setups. `ready` mirrors `isDiscoveryReady()` — false until the first
+      // boot sweep has fully settled, which is what lets the webview tell
+      // "discovery hasn't run yet" apart from "ran and found nothing" and
+      // closes the boot race the plan's §2 reproduced. GET /agent-models
+      // itself stays byte-compatible (kind-keyed) for the CLI and existing
+      // tests — this is strictly additive.
+      "/agent-models/harnesses": {
+        GET: authed((req) => json(getHarnessModelMap(), { headers: corsHeaders(req) })),
+      },
+
+      // Slash commands/skills (for the `/…` autocomplete) and MCP/skill/plugin
+      // extensions (for the prompt-top picker) for the picked harness in the
+      // picked project. The new-task form and run panel query this whenever
+      // harness/workdir/branch change. Bundled into one response so discovery
+      // runs once per refresh instead of resolving the repo root and walking
+      // the skills tree twice.
+      //
+      // The `agent` query param is a harness id (or, for built-ins, the bare
+      // AgentKind — they share the same value). Resolving via getByIdOrKind
+      // lets us look up the harness's home, so an aliased multi-account
+      // harness reads its own per-harness commands/skills instead of the
+      // system home's.
+      "/agent-discovery": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const agentParam = url.searchParams.get("agent");
+          const workdir = url.searchParams.get("workdir");
+          const branch = url.searchParams.get("branch")?.trim() || null;
+          if (!agentParam) {
+            return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(agentParam);
+          if (!harness) {
+            return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // `workdir` is caller-controlled, and in ref mode it becomes a
+          // `cwd` a git process actually spawns in (`resolveProjectTree` ->
+          // `loadRefProjectTree`) — defense-in-depth mirroring
+          // `project-files.ts`'s `validateScope`. Deliberately NOT a 4xx:
+          // this route silently backs the `/`/`@` picker with no error
+          // surface in the UI, so a stale/deleted-worktree `workdir` should
+          // degrade to "no capabilities" rather than surface an error the
+          // caller can't show. `workdir === null` (no workdir picked yet)
+          // keeps today's user-level-only behavior untouched.
+          //
+          // For a CLI-token caller (D24) the stat runs in a disclaimed child
+          // (`probePaths`), never in the core: the walker already refused a
+          // `denied` workdir before this handler, so here only dir vs. not-dir
+          // is left to decide. The app caller keeps the in-process stat.
+          const caller = callerOf(req);
+          if (workdir != null) {
+            let workdirOk: boolean;
+            if (caller === "cli") {
+              workdirOk = path.isAbsolute(workdir) && (await probePaths([workdir], "cli"))[0] === "dir";
+            } else {
+              try {
+                workdirOk = path.isAbsolute(workdir) && statSync(workdir).isDirectory();
+              } catch {
+                workdirOk = false;
+              }
+            }
+            if (!workdirOk) {
+              return json({ commands: [], extensions: [] }, { headers: corsHeaders(req) });
+            }
+          }
+          return json(
+            await listAgentCapabilities({
+              agent: harness.kind,
+              workdir,
+              branch,
+              harnessHome: harness.home,
+              harnessEnv: harness.env,
+              // Live-disk project capability files of a CLI caller's workdir are
+              // read through a disclaimed `tar` child (D24); a ref (`branch`) is
+              // read from git objects and needs no loader.
+              ...(caller === "cli" && !branch
+                ? {
+                    projectTreeLoader: (root: string, shouldRead: (rel: string) => boolean) =>
+                      callerProjectTree(root, "cli", PROJECT_CAPABILITY_PATHSPECS, shouldRead),
+                  }
+                : {}),
+            }),
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      "/tasks": {
+        GET: authed((req) => {
+          const counts = subagents.runningCountsByTask();
+          return json(
+            tasks.list().map((t) => ({
+              ...t,
+              // M-S3: the list route ships the trimmed pipelineRun variant
+              // (no handoffs, no profile snapshots) — see the field's doc.
+              ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
+              runningSubagents: counts.get(t.id) ?? 0,
+              stalledSince: stalledSince(t.id),
+            })),
+            { headers: corsHeaders(req) },
+          );
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json()) as Partial<Task> & {
+            baseRef?: string;
+            existingBranch?: string;
+            references?: TaskReference[];
+            /** Full markdown snapshot of the issue thread — written to
+             *  `dataDir/issue-threads/<taskId>/` and attached as a task
+             *  reference. Only meaningful alongside `issueUrl`. */
+            issueSnapshot?: string;
+          };
+          if (!body.title || !body.prompt) {
+            return json(
+              { error: "title and prompt required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
+            return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // `speed` (or its legacy boolean alias `fast`, D13) — resolved
+          // here so a bad value 400s and `fast` itself never reaches
+          // `createTask`.
+          const speedInput = resolveSpeedInput(body as { speed?: unknown; fast?: unknown });
+          if ("error" in speedInput) {
+            return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // OpenCode's per-task server option (D-4). A selected profile's own
+          // value wins inside `createTask`, like the other launch fields.
+          const opencodeServer = parseOpencodeServerInput((body as { opencodeServer?: unknown }).opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Additive agent-profile binding (docs/plans/agent-profiles.md):
+          // `createTask` resolves it and overrides agent/model/effort/mode/
+          // speed/maxMode from the profile — this route only checks the
+          // wire shape, same division of labor as every other field here.
+          // `null` is accepted as "no profile", matching createTask's own
+          // `input.agentProfileId?.trim()` handling.
+          if (
+            body.agentProfileId !== undefined &&
+            body.agentProfileId !== null &&
+            typeof body.agentProfileId !== "string"
+          ) {
+            return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Additive pipeline binding (docs/plans/pipelines.md D1/T4):
+          // `pipelineId` is tri-state (undefined = no pipeline, null = no
+          // pipeline, or a string id) — this route only checks the wire
+          // shape; `createTask` resolves the id (400 on unknown) and rejects
+          // the combination with `agentProfileId` (400) itself.
+          if (
+            body.pipelineId !== undefined &&
+            body.pipelineId !== null &&
+            typeof body.pipelineId !== "string"
+          ) {
+            return json({ error: "pipelineId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.issueSnapshot !== undefined) {
+            if (typeof body.issueSnapshot !== "string") {
+              return json({ error: "issueSnapshot must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.issueSnapshot.length > 2_000_000) {
+              return json({ error: "issueSnapshot is too large" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (!body.issueUrl) {
+              return json({ error: "issueSnapshot requires issueUrl" }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+          // Sanitize references: keep only entries with a non-empty string
+          // `path` of reasonable length; coerce `isDirectory` to boolean.
+          // Cap the array so a runaway client can't bloat the SQLite row.
+          // Bad entries are dropped silently rather than 400-ing the whole
+          // request (paths inline as plain text — partial intake is fine).
+          const MAX_REFS = 100;
+          const MAX_PATH_LEN = 4096;
+          const references: TaskReference[] = Array.isArray(body.references)
+            ? body.references
+                .slice(0, MAX_REFS)
+                .flatMap((r): TaskReference[] => {
+                  if (!r || typeof r !== "object") return [];
+                  const p = (r as { path?: unknown }).path;
+                  if (typeof p !== "string" || !p) return [];
+                  if (p.length > MAX_PATH_LEN) return [];
+                  return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
+                })
+            : [];
+          const { fast: _legacyFast, speed: _rawSpeed, opencodeServer: _rawOpencodeServer, ...rest } = body;
+          const result = await createTask({
+            ...rest,
+            ...(speedInput.speed !== undefined ? { speed: speedInput.speed } : {}),
+            ...(opencodeServer !== undefined ? { opencodeServer } : {}),
+            title: body.title,
+            prompt: body.prompt,
+            references,
+          });
+          if ("error" in result) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id": {
+        GET: authed((req) => {
+          const t = tasks.get(req.params.id);
+          return t
+            ? json(withRunningSubagents(t), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          // Parse first, then load the row. Every guard below — the archived
+          // freeze and the pipeline Done park especially — has to see the
+          // task as it is after this await. A Restart (or any status-changing
+          // persist) can land during the parse and move the column; a
+          // snapshot taken beforehand would still treat the run as `done`
+          // and write `column: "done"` onto a run that is no longer finished.
+          const filtered = filterPatch(await req.json());
+          if ("error" in filtered) {
+            return json({ error: filtered.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const { patch } = filtered;
+          const before = tasks.get(req.params.id);
+          if (!before) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // Archived rows are frozen — the UI hides every mutator (drag is
+          // disabled, action buttons are stripped, the composer is replaced
+          // by a footer). Enforce it server-side too so a direct API caller
+          // (or a stale tab racing the timestamp flip) can't drag the row
+          // back to a live column and re-trigger session reconciliation.
+          if (before.archivedAt != null) {
+            return json(
+              { error: "task is archived — unarchive it before editing" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // A pipeline step task's `column` is managed entirely by the
+          // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
+          // step's own run settles, and letting a direct PATCH drag it to a
+          // different column would desync the parent's `pipelineRun` state
+          // from what the board actually shows. Every OTHER field
+          // (title/prompt/etc.) stays patchable on a step task exactly like
+          // any other task — RunPanel edits it unchanged (D1).
+          if (isPipelineStepTask(before) && "column" in patch) {
+            return json(
+              { error: "step task's column is managed by its pipeline" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // M-S4: a pipeline PARENT's column mirrors its run status
+          // (`persist()` in pipeline-runner.ts — running/blocked/review/
+          // ready). A manual move of a live run would desync the card from
+          // the run. Once the run has finished (`status === "done"`), the
+          // user may park the card in the Done column — the card's Done
+          // button, the run view's Done button, a drag onto Done, and
+          // `agetor move`. `persist()` only mirrors the column on a status
+          // transition, so that park survives later bookkeeping writes and
+          // a Restart (a real status change) still pulls the card back.
+          // A same-value resend is a no-op and passes, like the
+          // profile-bound-field guard below. Every other column change
+          // stays refused.
+          if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
+            const parkingFinished = before.pipelineRun?.status === "done" && patch.column === "done";
+            if (!parkingFinished) {
+              return json(
+                { error: "pipeline task's column is managed by its run" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+          }
+          // A task bound to an agent profile (docs/plans/agent-profiles.md
+          // D5) has its agent/mode/model/effort/speed/maxMode/opencodeServer
+          // locked — the profile owns those seven fields, and the only sanctioned way to
+          // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
+          // or edit the profile itself. Refuse the whole PATCH with 409 if it
+          // touches any of the seven with a value that actually differs from
+          // what's already on the row — a same-value resend (e.g. a stale
+          // form re-submitting unchanged fields) is allowed through rather
+          // than punishing a no-op.
+          if (before.agentProfileId) {
+            // `speed` is already resolved from a `speed` or legacy `fast`
+            // body field by `filterPatch`, so a tier change through either
+            // spelling is compared against the row here.
+            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode", "opencodeServer"] as const;
+            const touchesBoundField = boundFields.some(
+              (field) => field in patch && patch[field] !== before[field],
+            );
+            if (touchesBoundField) {
+              const profileName = before.agentProfile?.name ?? before.agentProfileId;
+              return json(
+                { error: `task is bound to agent "${profileName}" — detach it first` },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+          }
+          // Prevent workdir from being swapped after a worktree has been
+          // materialized. The worktree is registered against the original repo;
+          // changing workdir would make removeWorktree run git ops against the
+          // wrong repo, leaking the .git/worktrees/<id> registration.
+          if ("workdir" in patch && patch.workdir !== before.workdir && before.worktreePath !== null) {
+            return json(
+              { error: "workdir cannot be changed once a worktree exists — delete the task to start fresh with a new workdir" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Validate `agent` resolves to a real harness — otherwise the
+          // kanban shows a stuck row whose AgentSelect can't reflect its
+          // own value and whose startTask fails downstream with the same
+          // (less obvious) error. Catch it at the boundary.
+          if (typeof patch.agent === "string" && !harnesses.getByIdOrKind(patch.agent)) {
+            return json(
+              { error: `unknown harness: ${patch.agent}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Enforce the "model is always set, effort is set unless the
+          // model declines it" invariant at the PATCH boundary so direct
+          // API callers can't reintroduce nulls that `buildCommand` would
+          // later throw on. The UI never sends nulls here; this is the
+          // belt to the migration's suspenders.
+          if ("model" in patch) {
+            if (patch.model === null || patch.model === "") {
+              return json(
+                { error: "model cannot be cleared" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+          }
+          if (
+            "taskType" in patch
+            && !TASK_TYPES.some((t) => t.id === patch.taskType)
+          ) {
+            return json(
+              { error: `unknown taskType: ${patch.taskType}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if ("effort" in patch && patch.effort === null) {
+            const resolvedAgent = typeof patch.agent === "string" ? patch.agent : before.agent;
+            const resolvedHarness = harnesses.getByIdOrKind(resolvedAgent);
+            const resolvedKind = resolvedHarness?.kind ?? null;
+            const resolvedModel =
+              typeof patch.model === "string" ? patch.model : before.model;
+            if (resolvedKind && resolvedModel) {
+              // Discovered-then-curated, same contract as every other
+              // `supportedEfforts` call site (a harness-reported catalog wins
+              // when non-empty; the curated MODEL_EFFORT_SUPPORT table is the
+              // fallback). This stays NULL-CLEAR-ONLY, exactly as before: a
+              // model whose supported-effort set is empty (by either source)
+              // declines effort entirely, so clearing it is allowed. A
+              // non-null effort id is deliberately never validated here —
+              // the discovered/curated catalog can understate what the live
+              // CLI/API actually accepts (Codex's app-server `model/list`
+              // never lists `none`, and `ultra` runs on models the API
+              // accepts it on but the catalog doesn't offer it for), so
+              // rejecting a value here would block a choice that runs fine.
+              // See docs/plans/add-gpt-6-astra.md §3.
+              const support = supportedEfforts(
+                resolvedKind,
+                resolvedModel,
+                getDiscoveredEfforts(resolvedKind, resolvedModel, resolvedHarness?.id),
+              );
+              const modelDeclinesEffort = support.length === 0;
+              if (!modelDeclinesEffort) {
+                return json(
+                  { error: `effort cannot be cleared for model "${resolvedModel}"` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+            }
+          }
+          const updated = tasks.update(req.params.id, patch);
+          if (!updated) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // A manual move (drag, `agetor move`) emits no global `column` event,
+          // so the notification hooks never see a card leave `blocked` this
+          // way. Its reason-family OS entry goes with the block.
+          if (before.column === "blocked" && updated.column !== "blocked") {
+            removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+          }
+          // Mirror behavioural changes onto a live claude session via slash
+          // commands so the conversation context survives a model/mode/effort
+          // change. Agent changes wipe the session — different harness entirely.
+          // Fire-and-forget: the mode-change path now verifies via the JSONL
+          // event before resolving, which can take up to 4.5s on the
+          // exhaust-retries path. The PATCH response payload only carries the
+          // updated Task row (already in hand); the verify outcome reaches
+          // the user through the `status` SSE events that
+          // `emitModeChangeStatus` writes. Blocking the response would add
+          // unbounded latency for no benefit. `.catch` keeps an unexpected
+          // throw from becoming an unhandledRejection — every failure mode
+          // the function knows about already surfaces via SSE.
+          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+            console.error("reconcileTaskSession failed:", err);
+          });
+          return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed(async (req) => {
+          // A pipeline step task can't be deleted on its own — the parent
+          // owns its lifecycle (D9, docs/plans/pipelines.md) and its
+          // teardown is what removes the shared worktree; deleting a step
+          // out from under a running pipeline would strand the parent's
+          // `pipelineRun` state. Delete/archive the pipeline task instead.
+          // M7: exempt an ORPHANED step (its parent row no longer exists) —
+          // there is no pipeline task left to redirect to, so refusing here
+          // would leave the row permanently undeletable (orphan cleanup).
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // Worktree teardown (`git worktree remove` + branch delete, with an
+          // rm -rf fallback) can exceed even the 255s idleTimeout ceiling on
+          // large repos — opt this request out of idle timeout entirely.
+          server.timeout(req, 0);
+          await deleteTask(req.params.id);
+          // The task is gone, so is its notification (D6c). Its own id only:
+          // a step's entry is its parent's, and the parent outlives the step.
+          removeTaskNotification(req.params.id);
+          return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/start": {
+        POST: authed(async (req) => {
+          // M-R5: a hidden step task's launches are owned by its pipeline —
+          // the runner calls `orchestrator.startTask` DIRECTLY (never this
+          // route), so refusing here can't break a pipeline's own step
+          // (re)launches; it only stops a direct API caller / stale UI
+          // from spawning a step turn the parent's `pipelineRun` never
+          // asked for. Same orphan exemption as DELETE/archive: a step
+          // whose parent row is gone has no pipeline left to redirect to.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task is managed by its pipeline — retry the pipeline task instead" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          const result = await startTask(req.params.id);
+          // A core about to exit (`freezeLaunches`) answers 503: retry against
+          // the next owner, not a bad request.
+          const status = !("error" in result)
+            ? 200
+            : result.code === "imported-session"
+            ? 409
+            : result.code === "launches-frozen"
+            ? 503
+            : 400;
+          return "error" in result
+            ? json(result, { status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/claude-session/retry": {
+        POST: authed(async (req) => {
+          // The handler waits until the backfill settles so a failure is the
+          // response, not a later status the click never observes. A large
+          // transcript can outlast the idle timeout.
+          server.timeout(req, 0);
+          const result = await retryImport(req.params.id, claudeSessionScanOptions());
+          return "error" in result
+            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // OpenCode counterpart of the Claude retry route above (D-13): same
+      // wait-for-settle contract and the same status codes.
+      "/tasks/:id/opencode-session/retry": {
+        POST: authed(async (req) => {
+          // An export of a long session can outlast the idle timeout.
+          server.timeout(req, 0);
+          const result = await retryOpencodeImport(req.params.id);
+          return "error" in result
+            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions": {
+        GET: authed(async (req) => {
+          // A first scan reads every transcript Agetor does not own; it can
+          // outlast the idle timeout on a large ~/.claude.
+          server.timeout(req, 0);
+          const opts = claudeSessionScanOptions();
+          const sessions = await scanClaudeSessions(opts);
+          const livenessCheckedAt = claudeSessionLivenessCheckedAt(claudeConfigDirsToScan(opts));
+          return json({ sessions, livenessCheckedAt }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/recheck": {
+        POST: authed(async (req) => {
+          // `claude agents --json` per config dir (up to 8 s each), then a scan.
+          server.timeout(req, 0);
+          const opts = claudeSessionScanOptions();
+          const configDirs = claudeConfigDirsToScan(opts);
+          await refreshClaudeSessionLiveness(configDirs, process.env, opts.harnesses, opts.homeDir);
+          const sessions = await scanClaudeSessions(opts);
+          const livenessCheckedAt = claudeSessionLivenessCheckedAt(configDirs);
+          return json({ sessions, livenessCheckedAt }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/import": {
+        POST: authed(async (req) => {
+          // Finding and replaying transcripts can outlast the idle timeout.
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { ids?: unknown } | null;
+          if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
+            return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await importClaudeSessions(body.ids, { ...claudeSessionScanOptions(), ...sessionCwdGate(req) });
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // OpenCode sessions started outside Agetor (D-13): `session list` per
+      // enabled OpenCode harness × registered project, cached 10 s by the
+      // scanner; `recheck` bypasses that cache.
+      "/opencode-sessions": {
+        GET: authed(async (req) => {
+          // One CLI call per harness × project (plus a busy-check export per
+          // unfinished session) can outlast the idle timeout.
+          server.timeout(req, 0);
+          const body: OpencodeSessionList = { sessions: await scanOpencodeSessions() };
+          return json(body, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/opencode-sessions/recheck": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const body: OpencodeSessionList = { sessions: await scanOpencodeSessions({ force: true }) };
+          return json(body, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/opencode-sessions/import": {
+        POST: authed(async (req) => {
+          // One export per session plus the event replay can outlast the
+          // idle timeout.
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { ids?: unknown; harnessId?: unknown } | null;
+          if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
+            return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // An unknown or non-OpenCode `harnessId` is reported per id by
+          // `importOpencodeSessions` itself; only the wire shape is checked here.
+          if (body.harnessId !== undefined && (typeof body.harnessId !== "string" || !body.harnessId)) {
+            return json({ error: "harnessId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await importOpencodeSessions(body.ids as string[], {
+            ...(typeof body.harnessId === "string" ? { harnessId: body.harnessId } : {}),
+            ...sessionCwdGate(req),
+          });
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/claude-sessions/checkout": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { sessionId?: unknown; branch?: unknown } | null;
+          if (!body || typeof body.sessionId !== "string" || !body.sessionId) {
+            return json({ error: "sessionId is required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.branch !== undefined && (typeof body.branch !== "string" || !body.branch)) {
+            return json({ error: "branch must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await checkoutSessionBranch(
+            body.sessionId,
+            { ...claudeSessionScanOptions(), ...sessionCwdGate(req) },
+            typeof body.branch === "string" ? body.branch : undefined,
+          );
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/archive": {
+        POST: authed(async (req) => {
+          // Same pipeline-step guard as DELETE /tasks/:id above — a step
+          // task's archive/unarchive lifecycle is owned by its pipeline
+          // parent (D9, docs/plans/pipelines.md). M7: same orphan exemption
+          // too.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // Worktree teardown can now be awaited inline (`awaitTeardown`)
+          // behind a real `git worktree remove`, which — like DELETE
+          // /tasks/:id — can exceed the idle timeout ceiling on large repos.
+          server.timeout(req, 0);
+          // Optional body — no body (or a malformed one) means every flag
+          // defaults to false, same as the pre-existing behaviour. `force`
+          // bypasses the done-column gate (Worktrees page's delete action);
+          // `stopRun` additionally stops an in-flight/held run before
+          // archiving instead of erroring; `forceWorktree` discards
+          // uncommitted changes in the checkout instead of leaving a dirty
+          // worktree in place; `awaitTeardown` blocks until the deferred
+          // teardown has actually run and surfaces its outcome.
+          const body = (await req.json().catch(() => ({}))) as {
+            force?: boolean;
+            stopRun?: boolean;
+            forceWorktree?: boolean;
+            awaitTeardown?: boolean;
+          };
+          const result = await archiveTask(req.params.id, {
+            force: body.force === true,
+            stopRun: body.stopRun === true,
+            forceWorktree: body.forceWorktree === true,
+            awaitTeardown: body.awaitTeardown === true,
+          });
+          if ("error" in result) {
+            return json(result, { status: 400, headers: corsHeaders(req) });
+          }
+          // Archived from any client → its notification goes (D6c). Own id
+          // only: a pipeline Restart's internal step archives never reach this
+          // route, and a step never owns an entry anyway.
+          removeTaskNotification(req.params.id);
+          // Nest `teardown` as a sibling key rather than spreading its fields
+          // onto the task, so it can never collide with an actual Task
+          // column — the client only reads it when it explicitly asked for
+          // `awaitTeardown`, and it's absent (not `undefined`-valued) on the
+          // ordinary fire-and-forget path.
+          const payload: ReturnType<typeof withRunningSubagents> & { teardown?: typeof result.teardown } =
+            withRunningSubagents(result.task);
+          if (result.teardown) payload.teardown = result.teardown;
+          return json(payload, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/unarchive": {
+        POST: authed(async (req) => {
+          // Same pipeline-step guard as archive above: a step row's
+          // archive/unarchive lifecycle belongs to its pipeline parent, and
+          // an orphaned step (parent row gone) is the one exemption.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          server.timeout(req, 0);
+          const result = await unarchiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // A pipeline task's parent + its hidden step tasks, enriched the same
+      // way `GET /tasks`/`GET /tasks/:id` are (`withRunningSubagents`), so
+      // the run view can render step nodes with the same "N background
+      // agents"/stalled-since decorations any other task card would show.
+      // 400s for a task that was never bound to a pipeline (`pipelineId`
+      // null) — the run view has no business asking for one.
+      "/tasks/:id/pipeline": {
+        GET: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const steps = tasks.stepsForParent(task.id);
+          return json(
+            { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Pipeline-run control routes (docs/plans/pipelines.md §3/D9) — all
+      // three delegate to `./pipeline-runner.ts`, which owns every rule
+      // about when an advance/retry/cancel is legal for the parent's current
+      // `pipelineRun.status` and returns the HTTP status to use on failure
+      // (400 bad request, 404 unknown parent, 409 wrong state) alongside the
+      // message, so this route layer only needs to translate that shape.
+      "/tasks/:id/pipeline/advance": {
+        POST: authed(async (req) => {
+          // Launching the next step (or steps) can itself materialize/verify
+          // a worktree — same rationale as /tasks/:id/start — so this opts
+          // out of the idle timeout like the other launch routes.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          if (!("nextStepIds" in body)) {
+            return json({ error: "nextStepIds required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let nextStepIds: string[] | null;
+          if (body.nextStepIds === null) {
+            nextStepIds = null;
+          } else if (Array.isArray(body.nextStepIds) && body.nextStepIds.every((s) => typeof s === "string")) {
+            nextStepIds = body.nextStepIds as string[];
+          } else {
+            return json(
+              { error: "nextStepIds must be an array of strings or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          let handoff: Partial<Handoff> | undefined;
+          if (body.handoff !== undefined) {
+            if (!body.handoff || typeof body.handoff !== "object" || Array.isArray(body.handoff)) {
+              return json({ error: "handoff must be an object" }, { status: 400, headers: corsHeaders(req) });
+            }
+            handoff = body.handoff as Partial<Handoff>;
+          }
+
+          let fromTaskId: string | undefined;
+          if (body.fromTaskId !== undefined) {
+            // An empty string would silently fall through the runner's
+            // `if (opts.fromTaskId)` into auto-detect — the caller named a
+            // target, so a blank one is a bad request, not "pick for me"
+            // (mirrors the CLI's own empty `--from` rejection).
+            if (typeof body.fromTaskId !== "string" || body.fromTaskId.length === 0) {
+              return json({ error: "fromTaskId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            fromTaskId = body.fromTaskId;
+          }
+
+          const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/retry": {
+        POST: authed(async (req) => {
+          // Same rationale as /tasks/:id/pipeline/advance above — a retry
+          // can (re-)launch a step, which can (re-)materialize a worktree.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => ({}));
+          const body =
+            raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+          let taskId: string | undefined;
+          if (body.taskId !== undefined) {
+            if (typeof body.taskId !== "string" || body.taskId.trim() === "") {
+              return json({ error: "taskId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            taskId = body.taskId;
+          }
+
+          const result = await retryPipelineStep(req.params.id, { taskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/cancel": {
+        POST: authed(async (req) => {
+          const result = await cancelPipelineRun(req.params.id);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // M15: restart a pipeline run that's already finished (`done` in
+      // `pipelineRun.status`) — plain `POST /tasks/:id/start` on a pipeline
+      // parent still routes through `startTaskInner` → `startPipelineRun(task)`
+      // with no `restart` flag, which `startPipelineRun` now errors out on
+      // once a run is `done` (there's nothing left `active`/blocked to retry
+      // and no fresh run was explicitly asked for) — this route is the
+      // explicit "yes, run it again from the top" action. 404 for an unknown
+      // task, 400 for a task that was never bound to a pipeline at all
+      // (mirrors `GET /tasks/:id/pipeline`'s own 400), 409 for every other
+      // failure `startPipelineRun` reports (already running, snapshot
+      // build failed, …).
+      "/tasks/:id/pipeline/restart": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          server.timeout(req, 0);
+          const result = await startPipelineRun(task, { restart: true });
+          return "error" in result
+            ? json({ error: result.error }, { status: 409, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Every agetor-managed git worktree materialized on disk, with staleness
+      // classification — backs the Worktrees list page.
+      "/worktrees": {
+        GET: authed((req) => json(listWorktrees(), { headers: corsHeaders(req) })),
+      },
+
+      // Delete an orphaned worktree directory (no owning task row — see
+      // `deleteOrphanWorktree`). A worktree still owned by a task is deleted
+      // by archiving the task instead (`POST /tasks/:id/archive`).
+      "/worktrees/:id": {
+        DELETE: authed(async (req) => {
+          // Same rationale as DELETE /tasks/:id — `rm -rf` over a large
+          // worktree can exceed the idle timeout.
+          server.timeout(req, 0);
+          const result = await deleteOrphanWorktree(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // On-demand live git status (dirty/ahead/merged) for a single worktree
+      // — task-backed or orphaned. Deliberately not part of `GET /worktrees`:
+      // each field spawns a git subprocess, so it's fetched per row rather
+      // than on every poll of the bulk list.
+      "/worktrees/:id/git-status": {
+        GET: authed(async (req) => {
+          const res = await worktreeGitStatus(req.params.id);
+          if ("error" in res) return json(res, { status: 400, headers: corsHeaders(req) });
+          return json(res, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/runs": {
+        GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Snapshot of the background/sub agents tracked for a task — drives the
+      // run panel's read-only tab strip on open, and is polled (like /runs)
+      // as a backstop to the live `subagent` SSE deltas.
+      "/tasks/:id/subagents": {
+        GET: authed((req) => json(subagents.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Everything the task's worktree changed vs its pinned base ref. Returns
+      // a friendly `note` (empty `files`) when there's no worktree or no diff.
+      "/tasks/:id/diff": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(await getTaskDiff(t), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the raw bytes of one file, on one side of a task's diff, so the
+      // Diff Modal can render an old-vs-new preview for binary files it knows
+      // how to display (images, PDFs) instead of the plain "binary file — no
+      // textual diff" placeholder. Same trust posture as /files/preview
+      // (desktop-only): master-token-gated + loopback bind (the default; see
+      // AGETOR_API_HOST) is the
+      // real boundary, the extension allowlist (`binaryPreviewKind`) just
+      // keeps this from doubling as a generic blob reader, and
+      // `getTaskDiffBlob` rejects any path that would lexically escape the
+      // task's cwd (symlink containment is not enforced, consistent with
+      // /files/preview's trust posture).
+      "/tasks/:id/diff/blob": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+          const url = new URL(req.url);
+          const relPath = url.searchParams.get("path") ?? "";
+          const side = url.searchParams.get("side");
+          if (!relPath) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(relPath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${relPath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await getTaskDiffBlob(t, relPath, side);
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          }
+
+          if (req.headers.get("if-none-match") === result.etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag: result.etag } });
+          }
+          return new Response(result.bytes, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": blobContentType(relPath, kind),
+              "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
+              // Neither side is content-addressed by URL: "new" is the
+              // working tree (can change under the user's feet), and "old"
+              // is pinned to `task.baseRef` which itself isn't stable — an
+              // isolation=none task's base is literally "HEAD" (moves with
+              // every commit), and a worktree task's baseRef can be null.
+              // Both sides revalidate on every request; the ETag (content
+              // hash for "old", size+mtime for "new") makes that a cheap 304.
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag: result.etag,
+            },
+          });
+        }),
+      },
+
+      // Open the task's claude-code tmux session in a new Terminal.app window.
+      // The session name is deterministic (`agetor-<taskId-prefix>`) so we can
+      // look it up without consulting the run row. We probe tmux availability
+      // and session liveness up-front so the UI gets a clear, distinct error
+      // for each failure mode instead of an empty Terminal that immediately
+      // errors with "can't find session".
+      "/tasks/:id/open-tmux": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(task.agent);
+          if (harness?.kind !== "claude-code") {
+            return json(
+              { error: "tmux attach is only available for claude-code tasks" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const sessionName = sessionNameFor(task.id);
+          // Distinguish "tmux missing" from "session missing" — both would
+          // otherwise look like sessionExists() === false and tell the user
+          // to restart the task, which doesn't help when the real problem
+          // is the tmux binary itself. Mirror the resolution path used by
+          // checkHarness so the same install hint applies.
+          const tmuxBin = resolveTmuxBin();
+          const tmuxPath = path.isAbsolute(tmuxBin)
+            ? (existsSync(tmuxBin) ? tmuxBin : null)
+            : Bun.which(tmuxBin, { PATH: process.env.PATH });
+          if (!tmuxPath) {
+            return json(
+              {
+                error: "tmux binary not found — install tmux (brew install tmux) or enable the bundled tmux in Settings",
+                sessionName,
+                reason: "tmux-missing",
+              },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
+          if (!(await sessionExists(task.id))) {
+            return json(
+              {
+                error: `no live tmux session "${sessionName}" — start (or send a message to) the task first`,
+                sessionName,
+                reason: "session-missing",
+              },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          // Heal a stuck `window-size manual` pin (a prior crash mid pane-grow)
+          // before attaching, so the client's own size wins instead of being
+          // confined to whatever the pin left behind — see `healWindowSize`.
+          // Best-effort: intentionally not awaited — must not block or delay
+          // the attach below. `healWindowSize` never throws (it only awaits
+          // `tmux()`, which itself never throws — see its doc comment), so
+          // this fire-and-forget can't produce an unhandled rejection.
+          // `assumeAlive`: `sessionExists(task.id)` was just checked above, so
+          // skip the internal probe's duplicate round-trip.
+          void healWindowSize(task.id, { assumeAlive: true });
+          // AppleScript `do script` runs the string through `/bin/bash`, so
+          // we escape anything bash would interpret inside double-quotes:
+          // backslash, dollar, backtick, and the double-quote itself. Without
+          // this, a tmux bin path containing `$` (legal but unusual) would
+          // silently misbehave. Session names are server-generated and only
+          // contain `agetor-<hex>` so they don't strictly need escaping, but
+          // we apply the same helper for symmetry.
+          const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          // Honor an active non-default socket (test isolation / a future
+          // dedicated production socket) so "Open in Terminal" attaches to
+          // the same server the session actually lives on, not whatever the
+          // default socket happens to be. Empty in production today.
+          const socketArgsStr = tmuxSocketArgs()
+            .map((a) => `\\"${shellEscape(a)}\\"`)
+            .join(" ");
+          const script =
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `activate application "Terminal"`;
+          // spawn-exempt(osascript): Terminal.app automation is Agetor's own Automation grant; /usr/bin/osascript is SIP-protected and spawned by absolute path so PATH can't swap it.
+          const proc = Bun.spawn(["/usr/bin/osascript", "-e", script], {
+            stdout: "ignore",
+            stderr: "ignore",
+            env: childEnv(),
+          });
+          // Don't block on the AppleScript — Terminal.app opening shouldn't
+          // hold the HTTP response open. Log non-zero exits so users with
+          // Automation permissions revoked have a breadcrumb in the console.
+          void proc.exited.then((code) => {
+            if (code !== 0) {
+              console.warn(
+                `[agetor] osascript exited ${code} while attaching to tmux session "${sessionName}" — check System Settings → Privacy & Security → Automation`,
+              );
+            }
+          });
+          return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Whether the task's working tree has uncommitted changes, and how many
+      // commits on HEAD haven't been pushed yet. Drives the "Commit & push"
+      // chip in the run panel: `hasChanges` gates the "commit" half, `ahead`
+      // gates the "push" half, and the chip appears on git state alone —
+      // regardless of whether a run is active. `ignored: true` means we
+      // couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing, and in
+      // that case we don't bother computing `ahead` either. An `ahead`
+      // lookup failure (no upstream, no baseRef, or a git error) degrades to
+      // `0` rather than flipping `ignored` — that flag stays keyed to
+      // `hasUncommittedChanges` alone.
+      //
+      // `hasUpstream`/`remoteSynced` additionally drive the "Open PR" chip —
+      // computed via `remoteSyncState` (local tracking-ref check, no
+      // network) — as do `branch`/`isDefaultBranch` from `headBranchState`,
+      // which are what let an `isolation: "none"` task (no agetor-managed
+      // `task.branch`, so NULL on the row) still offer the chip when the
+      // user's own checkout is on a real non-default branch.
+      // When an upstream exists, its ahead count IS the push-ahead
+      // count (`rev-list @{u}..HEAD` — the same first tier `getAheadCount`
+      // would run), so `ahead` reuses it and `getAheadCount` only runs as
+      // the fallback for branches with no upstream yet (or a failed count),
+      // where it degrades through `baseRef` comparisons. This route is
+      // polled every 5s per open panel — don't add git spawns here that
+      // recompute what a sibling call already knows.
+      "/tasks/:id/git-status": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const dir = t.worktreePath ?? t.workdir;
+          const [result, syncState, headState] = await Promise.all([
+            hasUncommittedChanges(dir),
+            remoteSyncState(dir),
+            headBranchState(dir),
+          ]);
+          if (result === null) {
+            return json(
+              {
+                hasChanges: false,
+                ahead: 0,
+                ignored: true,
+                hasUpstream: false,
+                remoteSynced: false,
+                branch: null,
+                isDefaultBranch: false,
+              } satisfies TaskGitStatus,
+              { headers: corsHeaders(req) },
+            );
+          }
+          const ahead = syncState.hasUpstream && syncState.ahead !== null
+            ? syncState.ahead
+            : (await getAheadCount(dir, t.baseRef ?? null)) ?? 0;
+          return json(
+            {
+              hasChanges: result,
+              ahead,
+              ignored: false,
+              hasUpstream: syncState.hasUpstream,
+              remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
+              branch: headState.branch,
+              isDefaultBranch: headState.isDefaultBranch,
+            } satisfies TaskGitStatus,
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+      // Which branches `DELETE /tasks/:id` would remove — `task.branch` plus,
+      // when the worktree drifted onto another named branch, that one too,
+      // after the default-branch / PR-head / held-by-another-task exclusions
+      // (`teardownBranchesForTask`, the same plan the delete itself runs).
+      // Read-only; fetched by the delete confirm and `agetor rm` so both can
+      // name every branch before anything is torn down. `DELETE` itself keeps
+      // answering 204 with no body, so older clients are unaffected.
+      "/tasks/:id/teardown-preview": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(await teardownBranchesForTask(t) satisfies TaskTeardownPreview, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/runs/:id/cancel": {
+        POST: authed(async (req) =>
+          json({ cancelled: await cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
+      },
+
+      // Forward a line of user input to the running agent's stdin. Returns
+      // `{ delivered: false }` (HTTP 200) when there's no active run or the
+      // stdin pipe is already closed — the UI surfaces that as a hint rather
+      // than treating it as an error.
+      // Open a file or directory with the OS default application via
+      // Electrobun's native bridge. Accepts either an absolute path or a path
+      // relative to a task's cwd (caller passes `taskId` so the server can
+      // resolve). We require the resolved path to exist before forwarding —
+      // openPath on a missing path silently no-ops on macOS, which would look
+      // like a broken button.
+      "/open-path": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            taskId?: string;
+          };
+          const raw = typeof body.path === "string" ? body.path.trim() : "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let abs = raw;
+          if (!path.isAbsolute(abs)) {
+            const t = body.taskId ? tasks.get(body.taskId) : null;
+            const cwd = t?.worktreePath ?? t?.workdir;
+            if (!cwd) {
+              return json(
+                { error: "relative path requires a taskId with a known cwd" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            abs = path.resolve(cwd, abs);
+          }
+          if (!existsSync(abs)) {
+            return json(
+              { error: `path does not exist: ${abs}` },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.openPath(abs);
+          return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reveal a file or directory in the OS file manager (Finder), with the
+      // item itself selected, via Electrobun's native bridge — the
+      // `SendUserFile` tile's "Reveal in Finder" menu item (plan §3 decision
+      // 7, `docs/plans/send-files-to-user.md`). Same abs-or-task-relative +
+      // `existsSync` + 501-headless contract as `/open-path` above — kept as
+      // a distinct route (rather than an `/open-path?reveal=1` flag) so
+      // headless behaves identically to `/open-path` (both 501 without
+      // `native`) and both are independently testable through
+      // `makeTestNative`.
+      "/reveal-path": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            taskId?: string;
+          };
+          const raw = typeof body.path === "string" ? body.path.trim() : "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let abs = raw;
+          if (!path.isAbsolute(abs)) {
+            const t = body.taskId ? tasks.get(body.taskId) : null;
+            const cwd = t?.worktreePath ?? t?.workdir;
+            if (!cwd) {
+              return json(
+                { error: "relative path requires a taskId with a known cwd" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            abs = path.resolve(cwd, abs);
+          }
+          if (!existsSync(abs)) {
+            return json(
+              { error: `path does not exist: ${abs}` },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.revealPath(abs);
+          return json({ revealed: ok, path: abs }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Open a URL in the OS default browser via Electrobun's native bridge.
+      // Restricted to http(s)/mailto so an attacker-controlled prompt can't
+      // launch `file://` or custom-scheme handlers from a webview click.
+      "/open-external": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { url?: string };
+          const raw = typeof body.url === "string" ? body.url.trim() : "";
+          if (!raw) {
+            return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!/^(https?|mailto):/i.test(raw)) {
+            // Don't echo the raw URL — keeps user-supplied content out of any
+            // downstream log line that might pick the response body up.
+            return json(
+              { error: "unsupported url scheme (only http, https, mailto)" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.openExternal(raw);
+          return json({ opened: ok, url: raw }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Open a native macOS open-panel and return whatever the user picked as
+      // file/folder references. This is the reliable way to get absolute
+      // paths into the prompt: WKWebView never populates the non-standard
+      // `File.path`, so an `<input type=file>` can't expose a real path — the
+      // native panel does. `mode` constrains the panel to files or
+      // directories; `refsFromPaths` stats each pick for authoritative
+      // directory-ness and drops anything that doesn't exist.
+      "/refs/pick": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            mode?: "files" | "folder";
+            startingFolder?: string;
+          };
+          const mode = body.mode === "folder" ? "folder" : "files";
+          const startingFolder =
+            typeof body.startingFolder === "string" && body.startingFolder.trim()
+              ? body.startingFolder
+              : homedir();
+          // Test seam for the Playwright harness (`e2e/fixtures.ts`), which
+          // has no native open-panel to drive: when set, this env var wins
+          // over the real dialog, mirroring the `AGETOR_*_DRIVER=fake`
+          // convention used for agent drivers. Never set in production
+          // launches — the fixture is the only writer. "folder" mode returns
+          // the directory itself; "files" mode lists its immediate regular
+          // files (no recursion, no dotfiles filtering — the fixture owns
+          // what it plants there). A missing/unreadable directory reads as a
+          // cancelled pick (`refs: []`) rather than a 500.
+          const fakeDir = process.env.AGETOR_FAKE_PICK_REFS_DIR?.trim();
+          if (fakeDir) {
+            if (mode === "folder") {
+              return json({ refs: refsFromPaths([fakeDir]) }, { headers: corsHeaders(req) });
+            }
+            try {
+              const entries = readdirSync(fakeDir, { withFileTypes: true })
+                .filter((e) => e.isFile())
+                .sort((a, b) => a.name.localeCompare(b.name));
+              return json(
+                { refs: refsFromPaths(entries.map((e) => path.join(fakeDir, e.name))) },
+                { headers: corsHeaders(req) },
+              );
+            } catch {
+              return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
+            }
+          }
+          if (!native) return notAvailableHeadless(req);
+          const paths = await openFileDialogLabelled(native, {
+            startingFolder,
+            canChooseFiles: mode === "files",
+            canChooseDirectory: mode === "folder",
+            allowsMultipleSelection: true,
+          });
+          // Electrobun splits the panel's answer on ",", so a path with a
+          // comma arrives in pieces — put them back together; nothing at all
+          // means the user cancelled.
+          return json({ refs: refsFromPaths(pickedPaths(paths)) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Resolve a list of absolute paths (extracted from a drag/drop's
+      // file:// URLs) into references. We stat each to set `isDirectory`
+      // authoritatively and to drop anything that no longer exists, rather
+      // than trusting the webview's view of directory-ness.
+      "/refs/resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const raw = Array.isArray(body.paths) ? body.paths : [];
+          return json({ refs: await refsFromPathsForCaller(raw, callerOf(req)) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // WKWebView drops carry no `file://` URL for non-image files/folders
+      // (see the header comment in ./drag-pasteboard.ts), so there's nothing
+      // for the webview to hand `/refs/resolve`. This route reads the macOS
+      // drag pasteboard directly instead — it always reflects the drag that
+      // just ended, since a drop event fires the instant that drag ends.
+      "/refs/drag": {
+        POST: authed((req) => {
+          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // List a project's files for the `@`-mention file picker: either the
+      // live working tree (tracked + untracked-not-ignored, `dir` mode) or
+      // the tracked files at a given ref (`ref` mode, for previewing a
+      // worktree that hasn't been materialized yet). Thin wrapper over
+      // `listProjectFiles` — see its header for the two listing shapes.
+      // Trust posture matches `/projects/branches?path=`: the bearer token +
+      // 127.0.0.1 bind (the default; see AGETOR_API_HOST) is the boundary,
+      // there's no additional path allow-list, so any absolute directory the
+      // caller names is listable — except that for a CLI-token caller the
+      // route table gates `dir` through a disclaimed probe first (D24).
+      // Deliberately has NO `native` dependency (unlike `/refs/pick` above)
+      // so it works under `headless.ts` (CLI/e2e), not just the packaged app.
+      // `q` (present, even as `q=`) switches to server-side search mode for
+      // monorepos past the client's `MAX_PROJECT_FILES` cap — see
+      // `listProjectFiles`'s header. `q` is read as-is (no trim — it's user
+      // text the scorer treats verbatim, matching `filterFileEntries`'s own
+      // trim-only-for-blank-check behavior); `limit` is parsed as an int and
+      // passed through un-clamped — `listProjectFiles`/`clampLimit` own the
+      // 1..200 clamp and the default-50 fallback for anything not a finite
+      // number, so this route doesn't duplicate that policy.
+      "/files/index": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("dir");
+          if (!dir || !path.isAbsolute(dir)) {
+            return json(
+              { error: "dir must be a non-empty absolute path" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const refParam = url.searchParams.get("ref")?.trim();
+          const q = url.searchParams.has("q") ? (url.searchParams.get("q") ?? "") : undefined;
+          const limitParam = url.searchParams.get("limit");
+          const limit = limitParam === null ? undefined : Number.parseInt(limitParam, 10);
+          const result = await listProjectFiles({ dir, ref: refParam ? refParam : undefined, q, limit });
+          if ("error" in result) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist an arbitrary-content-type blob to `${dataDir}/attachments/`
+      // and return its absolute path. Backs non-image file/folder drops
+      // whose source isn't Finder (so there's no drag-pasteboard path to
+      // recover — e.g. a browser or another app's internal drag) and pasted
+      // non-image blobs: both carry bytes but no filesystem path, so — same
+      // rationale as `/screenshots` above — the only way to give an agent a
+      // path to read is to write the bytes out ourselves. Unlike
+      // `/screenshots`, any content type is accepted (there's no fixed set
+      // of "file" mime types to gate on) and the filename comes from the
+      // caller via `?name=`, sanitized to a safe basename below.
+      "/attachments": {
+        POST: authed(async (req) => {
+          try {
+            const MAX = 25 * 1024 * 1024;
+            const claimed = Number(req.headers.get("content-length") ?? "");
+            if (Number.isFinite(claimed) && claimed > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            const buf = await req.arrayBuffer();
+            if (buf.byteLength > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            if (buf.byteLength === 0) {
+              return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+            }
+            const url = new URL(req.url);
+            const rawName = url.searchParams.get("name") ?? "";
+            const dir = path.join(dataDir, "attachments");
+            // mkdirSync must run before any name computation that touches the
+            // dir (the atomic `wx` create below stats/creates inside it).
+            mkdirSync(dir, { recursive: true });
+            const { stem, ext } = sanitizeAttachmentBasename(rawName);
+            const { abs, basename } = writeAttachmentAtomic(dir, stem, ext, buf);
+            return json({ path: abs, basename }, { headers: corsHeaders(req) });
+          } catch (e) {
+            const msg = (e as Error).message ?? String(e);
+            console.error("[agetor] /attachments failed:", e);
+            return json(
+              { error: `attachment write failed: ${msg}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+        }),
+      },
+
+      // Serve the bytes of a local image file so the webview can render an
+      // `<img>` thumbnail for a referenced attachment. Same trust level as
+      // `/open-path` above — an absolute path under a token-gated route
+      // (127.0.0.1-only by default; see AGETOR_API_HOST) can already be
+      // opened with the OS default app, so reading its bytes back adds
+      // nothing a malicious caller couldn't already get. Desktop-only (the CLI
+      // token is refused); the master token + the bind address is the actual
+      // security boundary; the
+      // `isImagePath` extension gate exists only to keep this route from
+      // doubling as a generic "read any file" endpoint. The path itself is
+      // usually an agent's choice, so the read goes through `openFileBytes`
+      // (a disclaimed child while disclaiming — see core-file-read.ts).
+      "/files/preview": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const raw = url.searchParams.get("path") ?? "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!path.isAbsolute(raw)) {
+            return json(
+              { error: `path must be absolute: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (!isImagePath(raw)) {
+            return json(
+              { error: `not an image path: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // The path is the agent's (its markdown, its SendUserFile call), so
+          // while disclaiming the file is opened by a disclaimed child, never
+          // in the core's own process under Agetor's TCC identity (D26(j)).
+          // Only regular files (a FIFO named `*.png` would hang the stream).
+          // `maxBytes` bounds the memory `settleFileBytes` holds below.
+          const opened = await openFileBytes(raw, {
+            followSymlinks: true,
+            ifNoneMatch: req.headers.get("if-none-match"),
+            maxBytes: MAX_FILE_PREVIEW_BYTES,
+          });
+          if (opened.kind === "missing") {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (opened.kind === "denied") {
+            return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });
+          }
+          if (opened.kind === "too-large") {
+            return json(
+              { error: `image exceeds ${MAX_FILE_PREVIEW_BYTES} bytes: ${raw}` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (opened.kind === "error") {
+            return json({ error: `could not read ${raw}: ${opened.message}` }, { status: 500, headers: corsHeaders(req) });
+          }
+          const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
+          // Shared canonical map (../shared/attachments.ts) — behavior is
+          // unchanged from the old inline map + `image/<ext>` fallback: every
+          // extension reachable here already passed `isImagePath`, so the
+          // shared lookup always hits and the fallback is never exercised.
+          const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
+          // ETag derived from size+mtime so a re-saved file at the same path
+          // (e.g. a screenshot overwritten in place) is detected as changed.
+          const etag = opened.etag;
+          if (opened.kind === "not-modified") {
+            return new Response(null, {
+              status: 304,
+              headers: { ...corsHeaders(req), etag },
+            });
+          }
+          // A streamed body is read whole before the 200: Bun ends a chunked
+          // response cleanly when its stream errors, so a short read would
+          // otherwise reach the webview as a complete, truncated image.
+          const settled = await settleFileBytes(opened, req.signal);
+          if (settled.kind === "error") {
+            return json({ error: `could not read ${raw}: ${settled.message}` }, { status: 500, headers: corsHeaders(req) });
+          }
+          return new Response(settled.body, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": contentType,
+              // This route serves agent-writable content (e.g. SVG, which can
+              // carry <script>) on the API origin; nosniff + img-only
+              // consumption (the webview fetches it with its Authorization
+              // header and shows a blob: URL) keeps active-content risk down.
+              // The CSP header below makes that img-only mitigation
+              // self-enforcing: a browser ignores CSP on an <img> fetch, but
+              // if this URL were ever navigated to or framed
+              // instead, `sandbox` + `default-src 'none'` block script
+              // execution in an SVG. Agent-authored markdown can now point
+              // this route anywhere (plan
+              // docs/plans/markdown-image-rendering.md D9).
+              "x-content-type-options": "nosniff",
+              "content-security-policy": "sandbox; default-src 'none'",
+              // Content at a given path can change (a screenshot re-saved in
+              // place), so don't let the browser serve stale bytes without
+              // asking; the ETag makes the revalidation cheap (304, no body).
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
+            },
+          });
+        }),
+      },
+
+      // ─── Interactions: claude built-in AskUserQuestion (scraper-sourced) ──
+      // The native modal is live on the tmux pane; there's no promise. Plan
+      // the keystrokes from the user's picks and drive them into the modal
+      // (planAskAnswers + driveAskAnswers, which verifies-and-retries the
+      // review-screen confirm rather than trusting send-keys exit codes). A
+      // typed custom answer is driven too: it is typed into the modal's native
+      // `Type something` row and verified on the pane before Enter. Only what
+      // can't be driven — multiline, over-long or control-character custom
+      // text, custom text for a question with no `Type something` row (the
+      // preview layout), an unknown option, an arity mismatch — falls back to
+      // Esc'ing the modal (dismissAskModalForMessage, which verifies the modal
+      // left the pane and clears any leftover composer draft) and posting the
+      // answer as a normal follow-up turn. The same fallback runs when the drive returns
+      // `"typed-abort"`: the typed step couldn't be delivered or verified, so
+      // the modal (now holding stray text) is dismissed and the answer goes as
+      // a follow-up message instead. Then drop the card.
+      "/ask-questions/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer> & { skip?: unknown };
+          const answers = Array.isArray(body.answers) ? body.answers : [];
+          // Light-weight shape check — sub-arrays normalised, strings trimmed.
+          const sanitised = answers.map((a) => ({
+            selected: Array.isArray(a?.selected) ? a.selected.filter((s): s is string => typeof s === "string") : [],
+            selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+              ? a.selectedOptionIds.filter((s): s is string => typeof s === "string")
+              : undefined,
+            custom: typeof a?.custom === "string" ? a.custom : undefined,
+          }));
+          const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "cursor") {
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // Unset in production. The restart follow-up's send is fast under
+              // the fake driver, so the in-flight 409 test holds the claim open.
+              const holdMs = Number(process.env.AGETOR_TEST_HOLD_CURSOR_ASK_MS ?? "");
+              if (Number.isFinite(holdMs) && holdMs > 0) {
+                await new Promise((r) => setTimeout(r, holdMs));
+              }
+              // A restart follow-up has no live child. Send first. Writing the
+              // outcome before sendInput consumes the card when the send is
+              // refused, and resolveCursorAsk will not reopen a row that
+              // already has an outcome.
+              const sendRestart = async (text: string): Promise<Response | null> => {
+                if (pending.delivery !== "restart-followup") return null;
+                const sent = await sendInput(pending.runId, text);
+                if (!sent.delivered) {
+                  return json(
+                    { error: sent.reason || "could not send the answer" },
+                    { status: 400, headers: corsHeaders(req) },
+                  );
+                }
+                // The dead child never emits tool_call_update completed, so
+                // the tool block would keep "Cursor is waiting" after this
+                // answer. Record the result only once the message is in.
+                if (pending.toolCallId) {
+                  recordCursorAskToolResult({
+                    taskId: pending.taskId,
+                    runId: pending.runId,
+                    toolCallId: pending.toolCallId,
+                    content: text,
+                  });
+                }
+                return null;
+              };
+              if (body.skip === true) {
+                // Read delivery after the hold, and do not await on the live
+                // branch. Awaiting a no-op lets the child exit, flip this
+                // card to the follow-up, and then a skipped write would
+                // report a message that was never sent. A follow-up sends
+                // first. A card that is still live completes the RPC now.
+                if (pending.delivery === "restart-followup") {
+                  const refused = await sendRestart(CURSOR_ASK_SKIP_FOLLOWUP);
+                  if (refused) return refused;
+                  const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                  return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+                }
+                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              if (sanitised.length === 0) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const mapped = cursorAskAnswersFromLabels(
+                pending.questions.map((q) => ({
+                  id: q.id ?? "",
+                  multiSelect: q.multiSelect,
+                  options: q.options.map((o) => ({ id: o.id ?? "", label: o.label })),
+                })),
+                sanitised,
+              );
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const empty = mapped.answers.length === 0 || mapped.answers.some((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
+              if (empty) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const followup = pending.delivery === "restart-followup";
+              if (followup) {
+                // The mapper already dropped leftover custom text. The
+                // follow-up must name those option labels, not the raw
+                // answers (single-select custom would replace the pick).
+                // `followup` is the decision to send, captured before the
+                // await, so a later delivery change cannot report a message
+                // that this request did not send.
+                const refused = await sendRestart(formatCursorAskFollowup(
+                  pending.questions.map((q) => ({
+                    question: q.question,
+                    options: q.options.map((o) => ({ id: o.id, label: o.label })),
+                  })),
+                  mapped.answers,
+                ));
+                if (refused) return refused;
+              }
+              const ok = answerCursorAsk(req.params.id, { outcome: "answered", answers: mapped.answers });
+              if (followup) {
+                return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+              }
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
+          if (sanitised.length === 0) {
+            return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (pending && pending.source === "scraper") {
+            // Claimed synchronously, before the first answer-delivery await: a
+            // second request for the same card must not send keys or a
+            // message. The loser gets a 409 here, before touching anything
+            // else — same contract as the plan-approve route's claim.
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              const specs = pending.questions.map((q) => ({
+                question: q.question,
+                multiSelect: !!q.multiSelect,
+                options: q.options.map((o) => o.label),
+                hasTypeRow: q.hasTypeRow,
+              }));
+              const plan = planAskAnswers(specs, sanitised);
+              let ok = false;
+              // Only the message-mode fallback routes through `sendInput`
+              // (which is the only thing capable of reporting a withhold — the
+              // "drive" path types keys straight into an already-open modal via
+              // tmux send-keys, with no composer paste for a blocking modal to
+              // hold up). Left undefined on a successful/failed drive; the
+              // response only carries these when the fallback actually ran.
+              let withheld: true | undefined;
+              let savedToBacklog: boolean | undefined;
+              let reason: string | undefined;
+              // Which path actually delivered (or attempted) the answer — lets
+              // the UI word a failure toast accurately.
+              let delivery: "drive" | "message" = "drive";
+              // Message-mode fallback — shared by the planner's `mode: "message"`
+              // and a drive that aborted its typed step (`"typed-abort"`):
+              // dismiss the native modal, then deliver the answer as a follow-up
+              // turn.
+              const deliverAsMessage = async (): Promise<void> => {
+                delivery = "message";
+                // Escape the modal, verify it left the pane and clear any
+                // leftover draft from claude's composer before pasting, so the
+                // paste isn't eaten by a dismissing modal or appended to stray
+                // typed text. When a clean composer can't be reached, do NOT
+                // paste: the card still resolves below and the scraper
+                // re-collects a modal that is still open.
+                const clean = await dismissAskModalForMessage(pending.taskId);
+                if (!clean) {
+                  ok = false;
+                  reason = "the question modal could not be dismissed cleanly — answer it in the terminal";
+                  return;
+                }
+                const r = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
+                ok = r.delivered;
+                // A withheld paste (e.g. a DIFFERENT blocking modal came up
+                // while the Escape above was settling) must not read to the UI
+                // as an ordinary failure with no indication the answer was
+                // safely saved to the backlog tray rather than lost outright.
+                // Thread the full shape through so the UI can toast the
+                // informational "saved to backlog" framing exactly like
+                // `sendRunInput`'s withheld branch, instead of a bare error.
+                if (!r.delivered) {
+                  withheld = r.withheld;
+                  savedToBacklog = r.savedToBacklog;
+                  reason = r.reason;
+                }
+              };
+              if (plan.mode === "drive") {
+                const driven = await driveAskAnswers(pending.taskId, plan);
+                if (driven === "typed-abort") {
+                  await deliverAsMessage();
+                } else {
+                  ok = driven;
+                }
+              } else {
+                await deliverAsMessage();
+              }
+              // Drop the card either way — including a withheld answer. On the
+              // fallback path the Escape above dismissed the ORIGINAL
+              // AskUserQuestion modal; a withhold there means some OTHER
+              // blocking modal came up while delivering the follow-up turn, an
+              // unrelated problem the "saved to backlog" toast covers. On the
+              // drive path no Escape is sent, and a FAILED drive can leave the
+              // modal still open: `resolveAskCard` also clears the session's
+              // `askCardId` tracker, so the scraper re-collects a fresh card on
+              // its next tick (without clearing it, the `!askCardId` gate would
+              // block re-registration and strand the modal with no card).
+              resolveAskCard(req.params.id, pending.taskId);
+              return json({ ok, withheld, savedToBacklog, reason, delivery }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
+          // No scraper-sourced card matched this id (and there are no
+          // hook-sourced ask cards any more) — nothing to drive.
+          return json({ ok: false }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // ─── Interactions: tmux pane scraper (catch-all REPL prompts) ────
+      // The scraper detects modals the PreToolUse hook never sees
+      // (plan-mode safety dialogs that bypass hooks, `/login`, model
+      // picker, …). Answering ships the chosen key — typically a single
+      // digit — back into the tmux pane via send-keys so claude reads
+      // it as the user's keypress and dismisses the modal.
+      "/tmux-prompts/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { key?: unknown; reject?: unknown };
+          const pending = findTmuxPromptById(req.params.id);
+          if (!pending) {
+            // Either the prompt was auto-cancelled (scraper saw the pane
+            // change) or the id is unknown. Either way return ok:false so
+            // the UI can drop the card on its next poll.
+            return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // Reject: the user wants none of the options. Esc the modal and drop
+          // the card. Once no card is pending the message box re-enables, so
+          // the user sends their redirect as a normal, separate turn — no
+          // in-flight Esc-then-send interrupt (which is what corrupts the run
+          // accounting). The modal having been Esc'd, the message reaches claude.
+          if (body.reject === true) {
+            if (!(await sessionExists(pending.taskId))) {
+              return json(
+                { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+                { status: 410, headers: corsHeaders(req) },
+              );
+            }
+            await sendModalKeys(pending.taskId, ["Escape"]);
+            markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+            const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
+            return json({ ok }, { headers: corsHeaders(req) });
+          }
+          const key = typeof body.key === "string" ? body.key : "";
+          if (!key) {
+            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Reject anything not in the recorded choice set — the request
+          // ships the exact keys we want the user to be able to send, and
+          // the UI is the only legitimate caller, so an unknown key here
+          // is an attempt to inject arbitrary keystrokes. Letting it
+          // through would let any code that reaches this endpoint type
+          // into the user's REPL.
+          if (!pending.choices.some((c) => c.key === key)) {
+            return json(
+              { error: `key '${key}' is not one of the registered choices` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Drive tmux FIRST. If the session is gone or send-keys
+          // fails, we must not resolve the interaction — doing so would
+          // remove the card from the UI while leaving claude paused on
+          // the modal. The user clicks "Yes", the card vanishes, and
+          // nothing actually happens. Surface the failure so the UI
+          // can leave the card up for retry.
+          if (!(await sessionExists(pending.taskId))) {
+            return json(
+              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+              { status: 410, headers: corsHeaders(req) },
+            );
+          }
+          const delivered = await dismissTmuxPrompt(pending.taskId, key, {
+            choices: pending.choices,
+            cursorIndex: pending.cursorIndex,
+            nav: pending.nav,
+            confirmKey: pending.confirmKey,
+          });
+          if (!delivered) {
+            return json(
+              { ok: false, error: "failed to deliver keystroke to tmux" },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          // Stamp the fingerprint as just-answered before resolving so
+          // the next scrape tick (which may catch the modal still on
+          // screen mid-repaint) doesn't register a ghost duplicate. See
+          // `markTmuxPromptAnswered` for why this is two-step.
+          markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+          const ok = answerTmuxPrompt(req.params.id, { key });
+          return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // ─── Interactions: fx ACP permission requests ────────────────────
+      // fx's `session/request_permission` blocks the driver's in-process
+      // awaiter (`fx-acp.ts`) until we resolve it here — unlike the tmux
+      // kinds above there is no pane and no keystroke leg; resolving the
+      // interaction directly unblocks the awaiter, which sends the ACP
+      // JSON-RPC response back to the fx child.
+      //
+      // Not-found and lost-race outcomes return `{ ok: false }` at HTTP 200,
+      // mirroring the tmux-prompt sibling above: either the request was
+      // already resolved by someone else (a concurrent answer, or fx
+      // auto-cancelling) or the id is unknown, and in both cases the UI
+      // should just drop the card on its next poll rather than treat it as
+      // an error — a 404 here would also make health-gated fetch replays
+      // invisible. Genuine validation failures (missing/unknown optionId)
+      // stay 400.
+      "/fx-permissions/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { optionId?: unknown; cancel?: unknown };
+          const pending = findFxPermissionById(req.params.id);
+          if (!pending) {
+            return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          if (body.cancel === true) {
+            const ok = answerFxPermission(req.params.id, { cancelled: true });
+            return json({ ok }, { headers: corsHeaders(req) });
+          }
+          const optionId = typeof body.optionId === "string" ? body.optionId : "";
+          if (!optionId) {
+            return json({ error: "optionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Reject anything not in the recorded option set — mirrors the
+          // tmux route's key validation: the request ships the exact
+          // option ids fx offered, and an unknown id here is an attempt
+          // to inject an arbitrary outcome into the ACP reply.
+          if (!pending.options.some((o) => o.optionId === optionId)) {
+            return json({ error: "unknown option" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const ok = answerFxPermission(req.params.id, { optionId });
+          return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/interactions/pending": {
+        GET: authed((req) => {
+          const id = req.params.id;
+          let pending = listPendingForTask(id);
+          // H4: a pipeline PARENT never has interactions registered against
+          // its own (hidden, agent-less) id — they live on its step tasks,
+          // whose counts `tasks.list()/get()` already fold into the parent's
+          // `pendingInteractionCount`. Union the steps' pending requests here
+          // too, so the id the board showed as "waiting on you" is the id
+          // whose pending list actually carries the cards to answer.
+          const task = tasks.get(id);
+          if (task?.pipelineId) {
+            for (const step of tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
+            pending.sort((a, b) => a.createdAt - b.createdAt);
+          }
+          return json(pending, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Messages backlog — saved, not-yet-sent drafts for a task. Each mutation
+      // returns the full updated Task so the webview can re-sync optimistically.
+      // Reorder is PUT on the collection (whole-order replace) so it doesn't
+      // collide with DELETE/PATCH on the `/:itemId` member route.
+      "/tasks/:id/backlog": {
+        POST: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          if (!text.trim() && references.length === 0) {
+            return json(
+              { error: "text or references required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = backlog.add(req.params.id, { text, references });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { order?: unknown };
+          const order = Array.isArray(body.order)
+            ? body.order.filter((x): x is string => typeof x === "string")
+            : [];
+          const updated = backlog.reorder(req.params.id, order);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/backlog/:itemId": {
+        PATCH: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const patch: { text?: string; references?: TaskReference[] } = {};
+          if (typeof body.text === "string") patch.text = body.text;
+          if (Array.isArray(body.references)) {
+            patch.references = body.references as TaskReference[];
+          }
+          // Parity with POST: an edit must not leave a draft with neither text
+          // nor references. Only enforced when the item actually exists (an
+          // unknown id is a no-op in `updateItem`, handled below).
+          const current = tasks
+            .get(req.params.id)
+            ?.backlog.find((m) => m.id === req.params.itemId);
+          if (current) {
+            const nextText = patch.text !== undefined ? patch.text : current.text;
+            const nextRefs =
+              patch.references !== undefined ? patch.references : current.references;
+            if (!nextText.trim() && nextRefs.length === 0) {
+              return json(
+                { error: "text or references required" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+          }
+          const updated = backlog.updateItem(req.params.id, req.params.itemId, patch);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Detach a task from its bound agent profile (docs/plans/
+      // agent-profiles.md D5): clears both `agentProfileId` and the frozen
+      // `agentProfile` snapshot via `tasks.setAgentProfile`, which unlocks
+      // the agent/mode/model/effort/speed/maxMode dropdowns (the values
+      // themselves are left exactly as they were — "detach" keeps state,
+      // it doesn't revert it) and lifts the PATCH route's bound-agent 409
+      // guard above. Archived-gated (409, not 400 — unlike `backlogGuard`'s
+      // 400 for the same condition) since detaching is a task mutation the
+      // archived freeze already covers everywhere else.
+      "/tasks/:id/agent-profile": {
+        DELETE: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (task.archivedAt != null) {
+            return json({ error: "task is archived" }, { status: 409, headers: corsHeaders(req) });
+          }
+          const updated = tasks.setAgentProfile(req.params.id, null, null);
+          return updated
+            ? json(withRunningSubagents(updated), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Unread-messages indicator: mark a task's watermark caught up (POST)
+      // or re-flag it as unread (DELETE — "Mark as unread" in the board's
+      // task context menu). Intentionally NOT gated by `backlogGuard`/an
+      // archived check for either verb — both are user-side read state, not
+      // a task mutation, and the archived board view still needs to be able
+      // to set/clear a dot (plan §3/§4).
+      "/tasks/:id/seen": {
+        POST: authed((req) => {
+          const updated = tasks.markSeen(req.params.id);
+          // Opening the task (panel open/switch, "Mark as read") removes its
+          // OS notification (D6a). A step's entry belongs to its pipeline
+          // parent (D16).
+          if (updated) removeTaskNotification(notificationTargetTaskId(req.params.id));
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const updated = tasks.markUnread(req.params.id);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cursor plan approval (see task-plans.ts + docs/plans/cursor-plan-approval.md).
+      // Plans are detected server-side in `attachDoneHandler`; these two
+      // routes are the only writers of `editedContent`/`status` thereafter.
+      "/tasks/:id/plans/:planId": {
+        PATCH: authed(async (req) => {
+          const blocked = planGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { editedContent?: unknown };
+          if (body.editedContent !== null && typeof body.editedContent !== "string") {
+            return json(
+              { error: "editedContent must be a string or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // 256 KB — a plan edit is bounded prose, not a file upload. Same
+          // budget as the composer draft cap (`DRAFT_TEXT_MAX_LENGTH` below):
+          // the draft rides the 2s `/tasks` poll same as `plans` does, so an
+          // unbounded edit would bloat every poll response the same way.
+          const EDITED_CONTENT_MAX_LENGTH = 256 * 1024;
+          if (
+            typeof body.editedContent === "string"
+            && body.editedContent.length > EDITED_CONTENT_MAX_LENGTH
+          ) {
+            return json(
+              { error: `editedContent exceeds ${EDITED_CONTENT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // A non-null edit that's whitespace-only must be rejected outright
+          // rather than silently normalized to "no draft" — that used to let
+          // approve silently ship the ORIGINAL plan while the UI still showed
+          // the user's edit as accepted. `setEditedContent` no longer does
+          // that normalization itself; this is the only place it's enforced.
+          if (typeof body.editedContent === "string" && body.editedContent.trim() === "") {
+            return json(
+              { error: "plan edit cannot be empty" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const kindBlocked = planKindGuard(req, task);
+          if (kindBlocked) return kindBlocked;
+          const nextPlans = setEditedContent(task.plans, req.params.planId, body.editedContent ?? null);
+          if (!nextPlans) {
+            return json(
+              { error: "plan not found or not pending" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = tasks.update(req.params.id, { plans: nextPlans });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Approve-route ordering: claim (`approvalsInFlight`) → checks (task /
+      // kind / plan-pending / runId / worktree-presence, all read from ONE
+      // fresh `task` snapshot) → write (plan file to disk) → flip (an unbound
+      // plan-mode task to auto; reverted if the send below doesn't deliver)
+      // → send (the approval message into the live session) → persist (`approvePlan` +
+      // `tasks.update`, still against that same snapshot) → release the claim
+      // in `finally`. See the finding-by-finding notes below for why each
+      // step is where it is.
+      "/tasks/:id/plans/:planId/approve": {
+        POST: authed(async (req) => {
+          const key = `${req.params.id}:${req.params.planId}`;
+          // Claimed synchronously, before any `await` in this handler — two
+          // POSTs racing in on the same plan must not both observe
+          // `status === "pending"` and both send the approval message. The
+          // loser gets a 409 here, before touching anything else.
+          if (approvalsInFlight.has(key)) {
+            return json(
+              { error: "an approval is already in flight for this plan" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          approvalsInFlight.add(key);
+          try {
+            const blocked = planGuard(req);
+            if (blocked) return blocked;
+
+            // Single fresh snapshot for the whole request: `content`, the
+            // message wording, and the `approvedEdited` persisted at the end
+            // must all derive from the SAME read of `task`/`plan`, or a
+            // concurrent PATCH edit landing between two separate fetches
+            // could make the written file, the message text, and the final
+            // `approvedEdited` flag disagree with each other. (The
+            // `approvalsInFlight` claim above only serializes concurrent
+            // *approves* of this plan; it doesn't need to also block a
+            // concurrent PATCH, because PATCH never touches `status`, so
+            // `approvePlan`'s pending-check below still holds against this
+            // snapshot even if a PATCH races in.)
+            const task = tasks.get(req.params.id);
+            if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+            const kindBlocked = planKindGuard(req, task);
+            if (kindBlocked) return kindBlocked;
+
+            const plan = task.plans.find((p) => p.id === req.params.planId);
+            if (!plan || plan.status !== "pending") {
+              return json(
+                { error: "plan not found or not pending" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            // `task.runId` survives a normal run completion (only nulled by
+            // orphan-reconciliation / a harness-not-found spawn failure —
+            // see orchestrator.ts), so the run that produced this plan is
+            // still the one `sendInput` needs to resume. No
+            // fallback-to-newest-run: if it's null the task genuinely has
+            // nothing live to resume.
+            if (!task.runId) {
+              return json(
+                { error: "task has no resumable run — approval cannot be delivered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            // A missing worktree must 409 here, BEFORE the plan write below
+            // can recreate it as an empty stub. The write creates the plan
+            // file's parent directories (`mkdirParent`), which would happily
+            // materialize an empty directory at `task.worktreePath`, which
+            // then satisfies the existence check and defeats `sendInput`'s own
+            // restore trigger (orchestrator.ts) — the agent would resume into
+            // an empty directory instead of the real worktree being restored.
+            // Both the check and the write go through the task-directory
+            // helpers (D25): the core never touches a task's directory itself
+            // — a disclaimed child of system tools does, whenever the one
+            // disclaim switch is on — whoever triggered the approve.
+            if (task.worktreePath && !(await taskDirExists(task.worktreePath))) {
+              return json(
+                {
+                  error:
+                    "task worktree is missing — send a message to restore it, then approve the plan",
+                },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+
+            const content = effectiveContent(plan);
+            const edited = plan.editedContent !== null;
+            // GitHub Copilot writes NO plan file (no `.copilot/plans` in the
+            // user's repo): the effective plan always rides inline in the
+            // approval message and the plan record keeps `filePath: null`.
+            // Cursor keeps its `.cursor/plans/*.plan.md` file, unchanged.
+            const isCopilot = harnesses.getByIdOrKind(task.agent)?.kind === "copilot";
+            const agentLabel = isCopilot ? "GitHub Copilot" : "cursor";
+            let relPath: string | null = null;
+            let message: string;
+            if (isCopilot) {
+              message = edited
+                ? `The plan is approved with edits by the user — follow this version; it supersedes your original plan. Implement it now. Approved plan:\n\n${content}`
+                : `The plan is approved — implement it now. Approved plan:\n\n${content}`;
+            } else {
+              const cwd = task.worktreePath ?? task.workdir;
+              const relDir = ".cursor/plans";
+              const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
+              relPath = path.join(relDir, filename);
+              try {
+                await writeTaskDirFileAtomic(path.join(cwd, relPath), content, { mkdirParent: true });
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                // Plan stays pending, no message sent — the user can retry.
+                return json(
+                  { error: `failed to write plan file: ${msg}` },
+                  { status: 500, headers: corsHeaders(req) },
+                );
+              }
+              message = edited
+                ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
+                : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
+            }
+            // Plan mode (`cursor-agent --mode plan`) is read-only, so an
+            // approved plan could never be implemented in it: an unbound task
+            // is switched to Auto (force) right before the approval message
+            // goes out — the follow-up turn re-reads `task.mode` at spawn, so
+            // it runs with `--force` and can read the plan file. Flipped
+            // here, AFTER the plan file was written (a failed write must not
+            // leave a flipped mode behind) and through a direct
+            // `tasks.update`, never the PATCH route. A profile-bound task
+            // keeps Plan — its mode belongs to the agent profile (PATCH 409s
+            // it) — and gets a warning instead. Plan §3.3 (Q1 = a).
+            const flipToAuto = task.mode === "plan" && task.agentProfileId === null;
+            const boundPlanWarning =
+              task.mode === "plan" && !flipToAuto
+                ? `plan approved, but this task's agent runs ${agentLabel} in Plan mode — detach the agent or switch the mode to implement`
+                : null;
+            // ask-mode — and plan-mode when it stays plan — is propose-only
+            // and may not be able to read the file back off disk headlessly —
+            // embed the full effective content inline so the agent has it
+            // regardless. `null` mode means auto (buildCommand's convention).
+            // Copilot's message already embeds the plan, so it is skipped here.
+            if (!isCopilot && (task.mode === "ask" || boundPlanWarning !== null)) {
+              message += `\n\n--- Approved plan ---\n\n${content}`;
+            }
+
+            // Undo the flip when the approval never reached the agent: the
+            // plan stays pending, so the task must stay in the mode it was
+            // in. Only reverted while the mode is still the `auto` this
+            // request wrote — a concurrent edit wins.
+            const revertFlip = () => {
+              if (flipToAuto && tasks.get(task.id)?.mode === "auto") {
+                tasks.update(task.id, { mode: task.mode });
+              }
+            };
+            if (flipToAuto) tasks.update(task.id, { mode: "auto" });
+            let sendResult: Awaited<ReturnType<typeof sendInput>>;
+            try {
+              sendResult = await sendInput(task.runId, message);
+            } catch (err) {
+              revertFlip();
+              throw err;
+            }
+            if (!sendResult.delivered) {
+              revertFlip();
+              // Any plan file is already written but nothing was sent — leave
+              // the plan pending so the user can retry the approve action.
+              return json(
+                { error: `approval message not delivered: ${sendResult.reason}` },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            // Breadcrumbs on the run that produced the plan (settled, so no
+            // live chunk handler) — only once the approval was delivered, so
+            // a failed send never leaves a line claiming the plan was
+            // approved.
+            if (flipToAuto) {
+              appendRunStatusLine(
+                task.id,
+                task.runId,
+                isCopilot
+                  ? "plan approved — switched this task to Auto so GitHub Copilot can implement it"
+                  : "plan approved — switched this task to Auto (force) so cursor can implement it",
+              );
+            } else if (boundPlanWarning !== null) {
+              appendRunStatusLine(task.id, task.runId, boundPlanWarning);
+            }
+
+            // The message is now delivered and cannot be un-sent — every
+            // branch from here on must report `messageSent: true` so the
+            // webview knows not to let the user retry the approve action
+            // (a retry would double-send). `approvePlan` re-validates
+            // `status === "pending"` against the same snapshot captured
+            // above, so a `null` result here is a defensive check for an
+            // in-memory-shape surprise rather than a real race — the
+            // `approvalsInFlight` claim already rules out a concurrent
+            // approve of this exact plan.
+            const result = approvePlan(task.plans, req.params.planId, {
+              now: Date.now(),
+              filePath: relPath,
+            });
+            if (!result) {
+              return json(
+                {
+                  error:
+                    "approval message was sent, but the plan record could not be updated "
+                    + "— check the run panel",
+                  messageSent: true,
+                },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            const updated = tasks.update(req.params.id, { plans: result.plans });
+            if (!updated) {
+              return json(
+                {
+                  error: "approval message was sent, but the task could not be found to persist it",
+                  messageSent: true,
+                },
+                { status: 404, headers: corsHeaders(req) },
+              );
+            }
+            // `warning` is additive on the Task payload (a bound plan-mode
+            // task that keeps Plan); every other approve answers the plain
+            // Task as before.
+            return json(
+              boundPlanWarning !== null ? { ...updated, warning: boundPlanWarning } : updated,
+              { headers: corsHeaders(req) },
+            );
+          } finally {
+            approvalsInFlight.delete(key);
+          }
+        }),
+      },
+
+      // Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+      // recovery — see `resumeFxRecovery`'s doc in orchestrator.ts and plan
+      // `docs/plans/fix-fx-harness-rate-limit.md` §2/§3.5,
+      // `docs/plans/fx-recovery-follow-ups.md` §3). The synchronous per-task
+      // double-resume claim used to live here (`fxResumesInFlight`) — it now
+      // lives inside `resumeFxRecovery` itself (`resumingTaskIds`), so the
+      // auto-resume engine's own timer and every HTTP caller share ONE
+      // guard. This route just calls it (with no `opts` — always a manual
+      // resume) and maps the result onto HTTP.
+      "/tasks/:id/fx-resume": {
+        POST: authed(async (req) => {
+          const result = await resumeFxRecovery(req.params.id);
+          return result.ok
+            ? json(result, { headers: corsHeaders(req) })
+            : json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cancel a pending fx auto-resume schedule (plan
+      // `docs/plans/fx-recovery-follow-ups.md` §3 T2 item 11) — the paused
+      // notice's Cancel button, the board card's context-menu
+      // "Cancel auto-resume" entry, and `agetor resume <id> --cancel`. All
+      // the real logic (clearing the timer, persisting the row, the status
+      // line, the `fx-auto-resume` event) lives in `cancelFxAutoResume`
+      // itself; this route just maps its boolean onto HTTP.
+      "/tasks/:id/fx-auto-resume": {
+        DELETE: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelFxAutoResume(taskId, "cancelled");
+          if (!cancelled) {
+            return json({ error: "no auto-resume pending" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Composer draft — the single unsent text+refs currently sitting in the
+      // task details modal, autosaved by the webview so closing the modal (or
+      // restarting agetor) doesn't lose it. Unlike the backlog routes above,
+      // draft writes are intentionally allowed on an archived task: the
+      // composer stays typable there (sending auto-unarchives), and freezing
+      // draft writes would reintroduce the very data loss this feature fixes.
+      // Only a missing task 404s.
+      "/tasks/:id/draft": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          // The draft rides the 2s /tasks poll, so an unbounded composer paste
+          // would bloat every poll response — cap it well above any realistic
+          // prompt length.
+          const DRAFT_TEXT_MAX_LENGTH = 256 * 1024;
+          if (text.length > DRAFT_TEXT_MAX_LENGTH) {
+            return json(
+              { error: `text exceeds ${DRAFT_TEXT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          const draft = text.trim() || references.length > 0 ? { text, references } : null;
+          const updated = drafts.set(req.params.id, draft);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const updated = drafts.set(req.params.id, null);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/runs/:id/input": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { line?: string };
+          const line = typeof body.line === "string" ? body.line : "";
+          if (!line.trim()) {
+            return json(
+              { error: "line required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          return json(
+            await sendInput(req.params.id, line, { bounded: true }),
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Rebuild a run's events directly from claude's on-disk JSONL session
+      // transcript. Lets the UI recover data that pre-refactor truncation
+      // permanently destroyed in run_events (the old mapper capped each
+      // tool_use chunk at 500 chars before persisting). Read-only on the
+      // disk file; no mutation of run_events.
+      //
+      // Wrapped in an outer try/catch so any thrown error surfaces as a
+      // proper JSON 500 — bare throws inside a Bun.serve route handler
+      // close the connection mid-flight and the webview reports the
+      // unhelpful "Load failed" with no diagnostic info.
+      // NOTE: object-style with explicit GET so OPTIONS preflight requests
+      // fall through to the global fetch handler (which returns CORS
+      // headers + 200). A bare `authed(...)` would gate OPTIONS on the
+      // bearer header — preflight doesn't carry it, so authed would 401
+      // and WebKit's fetch rejects with the unhelpful "Load failed".
+      "/runs/:id/rebuild-events": { GET: authed((req) => {
+        try {
+          // Optional `?limit=` caps the response to the most recent N mapped
+          // events (ascending) — an event-count cut AND a byte budget
+          // (`clampWindowByBytes`/`EVENTS_REPLAY_MAX_BYTES`/`MIN_REPLAY_EVENTS`,
+          // below) — so the RunPanel's auto-rebuild on opening a finished
+          // claude task doesn't defeat the SSE replay window by pulling
+          // unbounded full JSONL history; `hasMore` reports either cut. One
+          // deliberate exception to "caps at N": the last-user-message anchor
+          // (further down) may extend the window PAST `limit`, up to
+          // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` events / `_MAX_BYTES`, when the
+          // newest `user` line sits before the cut — same rule as the SSE
+          // replay route, so a caller passing a small `limit` can still get
+          // up to that ceiling back. Absent
+          // `limit` (the panel's manual "Rebuild from session JSONL" button
+          // and the CLI) the response is the COMPLETE history in its
+          // pre-existing shape (bare `events`/`source`, never `hasMore`) —
+          // see the comment on that branch for why it must stay unbounded.
+          const url = new URL(req.url);
+          const limitParam = url.searchParams.get("limit");
+          const hasLimit = limitParam !== null;
+          const limitRaw = Number(limitParam);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
+          const run = runs.get(req.params.id);
+          if (!run) return json({ error: "run not found" }, { status: 404, headers: corsHeaders(req) });
+          if (!run.claudeSessionId) {
+            return json(
+              { events: [], reason: "run has no claude session id", ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
+          const task = tasks.get(run.taskId);
+          if (!task) return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
+          // Reconstruct the cwd claude was launched against. Worktree tasks
+          // had cwd = worktreePath; isolation=none had cwd = workdir.
+          const cwd = task.worktreePath ?? task.workdir;
+          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
+          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
+          // the `configDir: null` branch inside jsonlPathFor.
+          const harness = harnesses.getByIdOrKind(task.agent);
+          const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
+          if (!existsSync(jsonlPath)) {
+            return json(
+              { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
+          // Drive the JSONL through the same staging pipeline live tailing
+          // uses, so the rebuilt event stream contains "turn complete"
+          // banners (emitted by firePendingEndTurn when a turn is confirmed
+          // real) in the same positions the live stream produced them. Going
+          // through mapJsonlEventToChunks directly would emit zero banners.
+          const baseTs = run.startedAt;
+          let i = 0;
+          const events: RunEvent[] = [];
+          const onChunk = (stream: RunEvent["stream"], data: string) => {
+            events.push({
+              runId: run.id,
+              taskId: run.taskId,
+              stream,
+              data,
+              // Synthetic monotonically-increasing ts so the client's dedup
+              // can preserve order. Anchored at run.startedAt to look
+              // natural alongside any stored status events.
+              ts: baseTs + i++,
+            });
+          };
+          // No-follow: an agent can replace its own transcript with a symlink
+          // into a protected folder; the core must not read through it.
+          let jsonlText: string;
+          try {
+            jsonlText = readTextNoFollow(jsonlPath);
+          } catch {
+            return json(
+              { events: [], reason: `JSONL at ${jsonlPath} is not a readable regular file`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
+          rebuildEventsFromJsonl(jsonlText, onChunk);
+          if (hasLimit) {
+            // Two cuts, both from the END (newest events), same as the SSE
+            // replay / page routes above: first the event-count cap
+            // (`limit`), then a byte budget (`EVENTS_REPLAY_MAX_BYTES`,
+            // floor `MIN_REPLAY_EVENTS`) on top of it — a rebuilt JSONL
+            // transcript can weigh just as much as the persisted one, and
+            // this route feeds the RunPanel's auto-rebuild on opening a
+            // finished claude task, so it needs the same protection. `hasMore`
+            // is true whenever EITHER cut actually removed events; the
+            // no-`limit` response shape below is unchanged (additive-only
+            // contract, per the route's own comment above).
+            const hasCountCut = events.length > limit;
+            const countWindowed = hasCountCut ? events.slice(events.length - limit) : events;
+            const rowsDesc = countWindowed
+              .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
+              .reverse();
+            const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
+            // Index into the FULL `events` array (mapped JSONL, oldest to
+            // newest) where the count+byte window above currently starts.
+            let start = events.length - countWindowed.length + cutIdx;
+            // Anchor extension: same first-load rule as the SSE replay route
+            // (docs/plans/first-load-reaches-last-user-message.md §3),
+            // applied here over the in-memory mapped events (`id` = array
+            // index) via the shared `resolveAnchoredMinId`, instead of a
+            // second, route-local copy of the fit/no-fit decision. Find the
+            // newest main-stream `user` event in the WHOLE mapped transcript
+            // (scanning from the end — the newest occurrence), and — only
+            // when it sits before the window's current start — extend back
+            // to it as long as the span `[userIdx, events.length)` fits
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
+            // `start` becomes `userIdx`, or it's left exactly as computed
+            // above.
+            // (`idx`, not `i`: the outer `i` is the live counter `onChunk`
+            // closes over for its synthetic `ts`, and must not be shadowed.)
+            let userIdx = -1;
+            for (let idx = events.length - 1; idx >= 0; idx--) {
+              if (events[idx]!.stream === "user") {
+                userIdx = idx;
+                break;
+              }
+            }
+            if (userIdx >= 0 && userIdx < start) {
+              // DESC (newest-first) span rows, capped at
+              // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1` — enough for
+              // `resolveAnchoredMinId` to tell "fits" from "exceeds the
+              // count ceiling" without ever walking the whole transcript.
+              const spanRowsDesc: Array<{ id: number; len: number }> = [];
+              for (let idx = events.length - 1; idx >= userIdx; idx--) {
+                spanRowsDesc.push({ id: idx, len: Buffer.byteLength(events[idx]!.data, "utf8") });
+                if (spanRowsDesc.length >= EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1) break;
+              }
+              start = resolveAnchoredMinId({
+                minId: start,
+                anchorId: userIdx,
+                spanRowsDesc,
+                maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
+                maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+              });
+            }
+            const windowed = events.slice(start);
+            const hasMore = start > 0;
+            return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
+          }
+          // No `?limit=`: the panel's manual "Rebuild from session JSONL"
+          // button and the CLI call the route this way, and both are
+          // deliberate, one-off user actions taken precisely when the
+          // persisted `run_events` may be wrong or incomplete — so this path
+          // returns the COMPLETE mapped history, unbounded. The byte budget
+          // lives on the `?limit=` branch above only (the auto-rebuild that
+          // fires on every panel open): capping here would drop the oldest
+          // JSONL-only events with no way to page them back, since "Load
+          // earlier" reads the persisted rows, not the JSONL (review finding
+          // on PR #230). Response shape unchanged: `{ events, source }`.
+          return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
+        } catch (e) {
+          const msg = (e as Error).message ?? String(e);
+          console.error("[agetor] /runs/:id/rebuild-events failed:", e);
+          return json(
+            { error: `rebuild failed: ${msg}` },
+            { status: 500, headers: corsHeaders(req) },
+          );
+        }
+      }) },
+
+      "/runs/:id/events": authed((req) => {
+        const runId = req.params.id;
+        const stream = new ReadableStream({
+          start(controller) {
+            attachedClients++;
+            const enc = new TextEncoder();
+            const send = (e: RunEvent | { type: "ping" }) => {
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
+            };
+            // Subscribe BEFORE reading the stored history snapshot so any
+            // live event fired between the snapshot read and the subscribe
+            // call isn't dropped. Live events are buffered until the
+            // replay finishes; client-side dedup (ts|stream|data-prefix)
+            // collapses anything that lands in both lists.
+            let buffer: RunEvent[] | null = [];
+            const unsubscribe = subscribe((e) => {
+              if (e.runId !== runId) return;
+              // This endpoint is the MAIN run's stream. Background/sub-agent
+              // events are stored under the same parent run_id but belong to
+              // their own (read-only) streams — they surface via
+              // /tasks/:id/subagents + the task-level events endpoint, not here.
+              if (e.subagentId) return;
+              if (buffer) buffer.push(e);
+              else send(e);
+            });
+            for (const ev of runs.events(runId)) {
+              if (ev.subagentId) continue;
+              send({
+                runId,
+                taskId: "",
+                stream: ev.stream as RunEvent["stream"],
+                data: ev.data,
+                ts: ev.ts,
+              });
+            }
+            const drained = buffer;
+            buffer = null;
+            for (const ev of drained) send(ev);
+            const ping = setInterval(() => send({ type: "ping" }), 15_000);
+            req.signal.addEventListener("abort", () => {
+              clearInterval(ping);
+              unsubscribe();
+              controller.close();
+              attachedClients--;
+            });
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            ...corsHeaders(req),
+          },
+        });
+      }),
+      // App-wide lifecycle stream — run-status terminal transitions + column
+      // changes. Live-only (no replay): subscribers get events from the
+      // moment they connect. Drives the toast hook in the webview. The
+      // persisted `run_events` table still backs per-task replay used by
+      // RunPanel — different mechanism, different shape.
+      "/events": authed((req) => {
+        const stream = new ReadableStream({
+          start(controller) {
+            attachedClients++;
+            const enc = new TextEncoder();
+            // Flush an initial frame immediately so a fresh client sees
+            // response bytes right away instead of waiting up to 15s for the
+            // first live event or the keepalive ping below — an SSE comment
+            // line (leading `:`), which `EventSource` silently ignores.
+            try {
+              controller.enqueue(enc.encode(": connected\n\n"));
+            } catch {
+              // Client already gone before the first byte — the abort
+              // handler below still fires and does the real cleanup.
+            }
+            const send = (e: GlobalEvent | { type: "ping" }) => {
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
+            };
+            const unsubscribe = subscribeGlobal((e) => send(e));
+            const ping = setInterval(() => send({ type: "ping" }), 15_000);
+            req.signal.addEventListener("abort", () => {
+              clearInterval(ping);
+              unsubscribe();
+              controller.close();
+              attachedClients--;
+            });
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            ...corsHeaders(req),
+          },
+        });
+      }),
+
+      // Background ("keep Agetor running in the background", the login item) and
+      // remote access (preview). Docs: docs/plans/always-on-host.md §3.5. Status
+      // is readable by the CLI too; turning the background ON and opening the
+      // Login Items pane reach the user's screen and system settings, so they
+      // are desktop-only (POST /background answers its own 501 headless,
+      // because the e2e fake-helper seam must keep it reachable there).
+      // Remote access is read/turn-off only over HTTP: turning it on is the
+      // native box's job (D10) and `PUT /preferences/remoteAccess` refuses it.
+      "/background": {
+        GET: authed(async (req) => {
+          const fresh = new URL(req.url).searchParams.get("fresh") === "1";
+          return json(await getBackgroundStatus({ fresh }), { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          if (!native && process.env.AGETOR_FAKE_LOGIN_ITEM !== "1") return notAvailableHeadless(req);
+          return json(await turnOnBackground(), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed(async (req) => {
+          return json(await turnOffBackground(), { headers: corsHeaders(req) });
+        }),
+      },
+      "/background/start": {
+        POST: authed(async (req) => {
+          try {
+            return json(await startBackgroundNow(), { headers: corsHeaders(req) });
+          } catch (err) {
+            if (err instanceof BackgroundStartError) {
+              return json({ error: err.message, code: err.code }, { status: 409, headers: corsHeaders(req) });
+            }
+            throw err;
+          }
+        }),
+      },
+      "/background/open-settings": {
+        POST: authed(async (req) => {
+          if (!native && process.env.AGETOR_FAKE_LOGIN_ITEM !== "1") return notAvailableHeadless(req);
+          try {
+            await openLoginItems();
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+        }),
+      },
+      "/remote-access": {
+        GET: authed((req) => json(getRemoteAccess(), { headers: corsHeaders(req) })),
+        DELETE: authed((req) => {
+          setRemoteAccessOff();
+          return json(getRemoteAccess(), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Bridge from webview to native macOS notifications. The webview can't
+      // call electrobun's FFI directly — it lives in WKWebView and the
+      // notification machinery is in the Bun process. Caps every field at a
+      // reasonable length so a runaway client can't push huge strings into
+      // the OS notification queue.
+      "/notifications": {
+        POST: authed(async (req) => {
+          // The native host posts when there is one; a headless core with a
+          // notification sink (headless-notifications.ts) posts through it —
+          // `agetor logs --notify` reaches the background core this way.
+          const post = native
+            ? (n: Parameters<ApiNative["showNotification"]>[0]) => native.showNotification(n)
+            : deps.notifications?.post;
+          if (!post) return notAvailableHeadless(req);
+          const body = (await req.json().catch(() => ({}))) as {
+            title?: unknown;
+            body?: unknown;
+            subtitle?: unknown;
+            silent?: unknown;
+            taskId?: unknown;
+            kind?: unknown;
+          };
+          const MAX_LEN = 256;
+          const trunc = (v: unknown): string | undefined =>
+            typeof v === "string" && v.length > 0 ? v.slice(0, MAX_LEN) : undefined;
+          const title = trunc(body.title);
+          if (!title) {
+            return json(
+              { error: "title required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // taskId is an identifier, not display text — not truncated (a
+          // truncated id wouldn't match any task), but bounded: real ids are
+          // short, so an over-length value is treated as absent (falls back to
+          // a plain, non-deep-linking notification) rather than flowed into an
+          // argv unbounded.
+          const taskId =
+            typeof body.taskId === "string" &&
+            body.taskId.length > 0 &&
+            body.taskId.length <= 512
+              ? body.taskId
+              : undefined;
+          post({
+            title,
+            body: trunc(body.body),
+            subtitle: trunc(body.subtitle),
+            silent: Boolean(body.silent),
+            taskId,
+            // An unknown kind is dropped (posts as quiet, stores no kind).
+            kind: isNotificationKind(body.kind) ? body.kind : undefined,
+          });
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Removes a task's OS notification for the webview-only triggers: the
+      // pipeline run view opened, the window coming to the front with the
+      // task open (D6d), and an event arriving while the window is focused
+      // (D7). A step id maps to its pipeline parent, which owns the entry.
+      "/notifications/:taskId": {
+        DELETE: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          const taskId = req.params.taskId;
+          if (!taskId || taskId.length > 512) {
+            return json({ error: "invalid task id" }, { status: 400, headers: corsHeaders(req) });
+          }
+          removeTaskNotification(notificationTargetTaskId(taskId));
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // App-level SSE channel. Currently used by the QuitConfirmDialog so the
+      // main process can ask the webview "are you sure?" when Cmd+Q lands
+      // while runs are active. Live-only (no replay) — events are transient
+      // and short-lived.
+      "/app/events": authed((req) => {
+        const stream = new ReadableStream({
+          start(controller) {
+            attachedClients++;
+            const enc = new TextEncoder();
+            // Flush an initial frame immediately so a fresh client sees
+            // response bytes right away instead of waiting up to 15s for the
+            // first live event or the keepalive ping below — an SSE comment
+            // line (leading `:`), which `EventSource` silently ignores.
+            try {
+              controller.enqueue(enc.encode(": connected\n\n"));
+            } catch {
+              // Client already gone before the first byte — the abort
+              // handler below still fires and does the real cleanup.
+            }
+            const send = (e: AppEvent | { type: "ping" }) => {
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
+            };
+            const unsubscribe = subscribeAppEvents((e) => send(e));
+            const ping = setInterval(() => send({ type: "ping" }), 15_000);
+            // Flush a deep-link open that arrived before this client
+            // connected (e.g. a notification click while the app had no
+            // window and the webview was still booting) — see
+            // pending-open.ts and index.ts's "open-url" handler.
+            const pendingTaskId = consumePendingOpenTask();
+            if (pendingTaskId) {
+              send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
+            // Same for the boot-time "Claude Code sessions found" notice: the
+            // launch scan usually finishes before the webview connects.
+            try {
+              flushPendingClaudeSessionsNotice(send);
+            } catch {
+              // Never let a db hiccup stop `start` before the abort handler below
+              // is registered — see `send` above for why that leaks.
+            }
+            // And the "harnesses turned on" notice (D-14): rows auto-enabled
+            // while no client was connected (boot, or a poll before the
+            // webview attached) are announced to the next one.
+            try {
+              flushPendingHarnessAutoEnableNotice(send);
+            } catch {
+              // Same reason as above.
+            }
+            req.signal.addEventListener("abort", () => {
+              clearInterval(ping);
+              unsubscribe();
+              controller.close();
+              attachedClients--;
+            });
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            ...corsHeaders(req),
+          },
+        });
+      }),
+
+      // Confirm-on-quit follow-up. The QuitConfirmDialog POSTs here when the
+      // user picks "Quit anyway"; we arm the force-quit flag and re-issue
+      // Utils.quit(), which fires `before-quit` again — index.ts sees the
+      // flag and allows the second pass through. Desktop-only (master token,
+      // never the CLI token) so neither a foreign page that knows the port nor
+      // an agent holding the credentials file can forcibly close the app.
+      "/app/force-quit": {
+        POST: authed(async (req) => {
+          if (!native) return notAvailableHeadless(req);
+          // Only the first call queues Utils.quit() — subsequent POSTs
+          // (rapid double-click on "Quit anyway", a buggy/looping caller,
+          // etc.) short-circuit. Electrobun's own `isQuitting` guard is a
+          // backstop, but no point spawning extra timers + log-spamming in
+          // the meantime.
+          // The confirm dialog's "Quit completely" button sends `completely:
+          // true`; absent/invalid bodies mean a plain quit-anyway.
+          const body = (await req.json().catch(() => ({}))) as { completely?: unknown };
+          const armed = armForceQuit({ completely: body?.completely === true });
+          if (!armed) {
+            return json({ ok: true, alreadyArmed: true }, { headers: corsHeaders(req) });
+          }
+          // The HTTP response races process exit. Send synchronously, then
+          // queue the quit to fire on the next tick so the response actually
+          // reaches the webview before the renderer is torn down. (Even if
+          // it doesn't, the client doesn't care — its event stream just drops.)
+          setTimeout(() => {
+            try { native.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
+          }, 0);
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Shut the core down gracefully. Used for the app⇄daemon port handoff
+      // (the app POSTs this to a running cli-daemon before binding) and by
+      // `agetor daemon stop`. Removes the creds file, then quits via the
+      // native host if present (app mode) or exits the process (headless).
+      // `app+cli` on purpose: the app's handoff and `agetor daemon stop` both
+      // authenticate with the credentials file's CLI token. The setTimeout(…, 0)
+      // lets the 200 flush before the process goes away (same pattern as
+      // force-quit).
+      //
+      // Optional body `{mode?: "stop" | "handoff"}` (missing, empty or invalid
+      // → "stop"; never a 400). "handoff" is the app asking a running headless
+      // core to give up the port: a core the login item launched parks instead
+      // of exiting (`deps.onShutdownRequest("handoff")` in headless.ts decides),
+      // so the supervisor can bring it back when the app quits. "stop" is
+      // `agetor daemon stop`. The app itself ignores the mode — quitting goes
+      // through its own before-quit flow either way.
+      "/daemon/shutdown": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as { mode?: unknown } | null;
+          const mode: "stop" | "handoff" = body?.mode === "handoff" ? "handoff" : "stop";
+          setTimeout(() => {
+            // On the app, quitting goes through the before-quit confirm, which
+            // removes the creds file only once the quit is actually allowed —
+            // deleting it here first would strand the CLI if the user cancels.
+            if (native) {
+              // `agetor daemon stop` means "stop the core": on the app that is a
+              // complete quit, or a background supervisor parked under it would
+              // just take the port back (a handoff). "handoff" never reaches an
+              // app in practice — only cores hand off to the app.
+              if (mode === "stop") requestQuitCompletely();
+              native.quit();
+            } else if (deps.onShutdownRequest) deps.onShutdownRequest(mode);
+            else {
+              removeCoreCreds(dataDir);
+              process.exit(0);
+            }
+          }, 0);
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Terminal tabs for a task (desktop-only). State lives in-memory in
+      // terminals.ts; the live byte stream runs over the WebSocket at
+      // /terminals/:id/ws?ticket=… (handled in `fetch` below, since Bun's routes
+      // API doesn't do upgrades; the ticket comes from POST …/ws-ticket).
+      "/tasks/:id/terminals": {
+        GET: authed((req) => json(listTerminals(req.params.id), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const result = await createTerminal(req.params.id);
+          if ("error" in result) {
+            return json(
+              { error: result.error },
+              { status: result.notFound ? 404 : 400, headers: corsHeaders(req) },
+            );
+          }
+          return json(result, { status: 201, headers: corsHeaders(req) });
+        }),
+      },
+      "/terminals/:id": {
+        DELETE: authed((req) => {
+          const ok = closeTerminal(req.params.id);
+          return ok
+            ? new Response(null, { status: 204, headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+      // Single-use ticket for the terminal WebSocket (P7, D13): the webview
+      // POSTs here with its Authorization header (desktop-only — the CLI token
+      // is refused by the policy walker) and opens `/terminals/:id/ws?ticket=…`.
+      "/terminals/:id/ws-ticket": {
+        POST: authed((req) => {
+          if (!getTerminal(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(mintWsTicket(req.params.id), { status: 201, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Paged access to older events, for the "Load earlier" affordance once
+      // the SSE replay window (below) has been exhausted. `beforeId` is
+      // required — this is a backward-paging cursor, not a general listing
+      // endpoint. Ascending order, same event shape as the SSE frames (plus
+      // `id`, which is handy for chaining the next `beforeId`).
+      //
+      // Byte-budgeted like the SSE replay window below (`EVENTS_PAGE_MAX_BYTES`,
+      // smaller than the replay budget since this is a foreground click the
+      // user is waiting on, not a background connect) — `eventsForTask`'s
+      // `maxBytes` walk may raise the effective `beforeId`-to-`earliestId`
+      // floor above what `limit` alone would have returned, in which case
+      // `hasMore` (derived from the returned window's own `earliestId`, same
+      // as always) correctly reports more history to page through even
+      // though the `limit`-worth of rows technically existed.
+      "/tasks/:id/events/page": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const beforeIdParam = url.searchParams.get("beforeId");
+          const beforeIdRaw = beforeIdParam === null ? NaN : Number(beforeIdParam);
+          if (!Number.isInteger(beforeIdRaw) || beforeIdRaw <= 0) {
+            return json(
+              { error: "beforeId (positive integer) required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
+          const rows = runs.eventsForTask(taskId, {
+            beforeId: beforeIdRaw,
+            limit,
+            maxBytes: EVENTS_PAGE_MAX_BYTES,
+            minEvents: MIN_REPLAY_EVENTS,
+          });
+          const events = rows.map((ev) => ({
+            id: ev.id,
+            runId: ev.runId,
+            taskId,
+            stream: ev.stream as RunEvent["stream"],
+            data: ev.data,
+            ts: ev.ts,
+            subagentId: ev.subagentId,
+          }));
+          const earliestId = events.length > 0 ? events[0]!.id : null;
+          const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+          return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // `:id` is only a 404-on-unknown-task existence gate — the payload
+      // itself is global (every task, every harness), not scoped to `:id`.
+      "/tasks/:id/messages/history": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          const task = tasks.get(taskId);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 200))
+            : 50;
+          const rows = runs.userMessageHistory(limit);
+          // Resolve each distinct agent id/kind to its human harness label
+          // once per request rather than per row.
+          const agentLabels = new Map<string, string>();
+          for (const row of rows) {
+            if (agentLabels.has(row.taskAgent)) continue;
+            agentLabels.set(row.taskAgent, harnesses.getByIdOrKind(row.taskAgent)?.label ?? row.taskAgent);
+          }
+          const messages = rows.map((row) => ({
+            id: row.id,
+            text: row.data,
+            ts: row.ts,
+            taskId: row.taskId,
+            taskTitle: row.taskTitle,
+            project: row.projectName ?? (row.taskWorkdir.split("/").filter(Boolean).pop() ?? row.taskWorkdir),
+            agent: agentLabels.get(row.taskAgent)!,
+          }));
+          return json({ messages }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/events": authed(async (req) => {
+        const taskId = req.params.id;
+        const url = new URL(req.url);
+        // `?anchor=0` opts the replay window out of the last-user-message
+        // extension below. The webview and `agetor logs` want it (they render
+        // everything replayed); the TUI dashboard does not — it keeps only its
+        // newest 500 lines (`MAX_LINES` in `useCoalescedStream`), so an
+        // anchored window of up to 3000 events / 16 MB would be paid for and
+        // immediately discarded there. Anything but the literal `0` keeps the
+        // default (anchored) behaviour, so older clients are unaffected.
+        const anchorReplay = url.searchParams.get("anchor") !== "0";
+        // Forward resume (docs/plans/event-stream-forward-resume.md §3.1): a
+        // reconnecting client names the last event id it saw, as the standard
+        // `Last-Event-ID` header (what `EventSource` and fetch-based readers
+        // send on reconnect) or `?afterId=`. The first valid of the two wins;
+        // a malformed value is ignored as if absent — never a 400, since a
+        // client retries an error forever. No cursor = today's behaviour.
+        const cursor = resolveResumeCursor(req.headers.get("last-event-id"), url.searchParams.get("afterId"));
+        // Test-only (AGETOR_TEST_DROP_STREAMS_ROUTE): a hold set by
+        // `POST /test/drop-task-streams` parks this request until it ends,
+        // so the events landing meanwhile are the gap the cursor resumes
+        // over. Resolves early when the client gives up so nothing leaks.
+        const hold = streamDrop?.holds.get(taskId);
+        if (hold) {
+          await new Promise<void>((resolve) => {
+            if (req.signal.aborted) return resolve();
+            const done = () => {
+              req.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            req.signal.addEventListener("abort", done, { once: true });
+            void hold.then(done);
+          });
+          if (req.signal.aborted) return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }
+        const stream = new ReadableStream({
+          start(controller) {
+            attachedClients++;
+            const enc = new TextEncoder();
+            // A SAVED row carries its `run_events.id` both in the JSON and as
+            // the SSE `id:` line (replayed and live alike), which is what a
+            // reconnect sends back as `Last-Event-ID`. Live-only frames
+            // (`interaction`, `interaction_resolved`, `subagent`, ping) have
+            // no numeric id and get no `id:` line — an empty one would reset
+            // the client's cursor.
+            const send = (e: RunEvent | { type: "ping" }) => {
+              try {
+                const id = (e as { id?: unknown }).id;
+                const idLine = typeof id === "number" ? `id: ${id}\n` : "";
+                controller.enqueue(enc.encode(`${idLine}data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
+            };
+            // Named frame — invisible to a plain `onmessage` listener (only
+            // `addEventListener(name, ...)` sees it), so old/unmodified
+            // clients keep working unchanged even though a new frame now
+            // precedes the replayed window. Never carries an `id:` line.
+            const sendNamed = (name: string, data: unknown) => {
+              try {
+                controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+              } catch {
+                // Same rationale as `send`'s catch above.
+              }
+            };
+            // Unified task-level stream: one scrollback per task, merging
+            // events across every run. Subscribe before replay (same race
+            // protection as the per-run endpoint).
+            let buffer: RunEvent[] | null = [];
+            const unsubscribe = subscribe((e) => {
+              if (e.taskId !== taskId) return;
+              if (buffer) buffer.push(e);
+              else send(e);
+            });
+            let ping: ReturnType<typeof setInterval> | null = null;
+            // One idempotent teardown for both exits — the client aborting
+            // and the test-only drop route — so neither can double-decrement
+            // `attachedClients` or close an already-closed controller.
+            let cleanedUp = false;
+            const cleanup = () => {
+              if (cleanedUp) return;
+              cleanedUp = true;
+              if (ping) clearInterval(ping);
+              unsubscribe();
+              try {
+                controller.close();
+              } catch {
+                // Already closed/errored by the client going away.
+              }
+              attachedClients--;
+              if (streamDrop) {
+                const set = streamDrop.open.get(taskId);
+                set?.delete(cleanup);
+                if (set?.size === 0) streamDrop.open.delete(taskId);
+              }
+            };
+            if (streamDrop) {
+              let set = streamDrop.open.get(taskId);
+              if (!set) streamDrop.open.set(taskId, (set = new Set()));
+              set.add(cleanup);
+            }
+            // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
+            // of the task's full history — a task with thousands of events
+            // used to replay every one of them on every SSE (re)connect.
+            // Older history is fetched on demand via /tasks/:id/events/page.
+            // Also cap it in BYTES (EVENTS_REPLAY_MAX_BYTES): the event-count
+            // cap alone still let a replay window weigh tens of MB on large
+            // transcripts (measured 61 MB — see
+            // docs/plans/task-details-blank-while-session-restores.md §2/§3.3),
+            // which is what made opening a task with a big transcript stall.
+            // `eventsForTask` may raise the window's floor above what `limit`
+            // alone would keep, never below MIN_REPLAY_EVENTS; `hasMore` below
+            // still derives from the returned window's own earliest id, so it
+            // correctly flips true whenever the byte cut (not just the count
+            // cap) dropped older events.
+            // `anchor` extends that floor BACK DOWN to the newest main-stream
+            // `user` event when the span to it fits under
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES, so opening a task shows
+            // at least the user's last message without a "Load earlier" click
+            // — see docs/plans/first-load-reaches-last-user-message.md. All
+            // or nothing: over either ceiling, the plain count/byte window
+            // above stands unchanged. Skipped entirely on `?anchor=0` (see
+            // `anchorReplay` above).
+            // Shared by the no-cursor connect and the snapshot answer, so a
+            // snapshot is exactly the window a fresh connect would get.
+            const freshWindow = () => {
+              const window = runs.eventsForTask(taskId, {
+                limit: EVENTS_REPLAY_LIMIT,
+                maxBytes: EVENTS_REPLAY_MAX_BYTES,
+                minEvents: MIN_REPLAY_EVENTS,
+                ...(anchorReplay
+                  ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
+                  : {}),
+              });
+              const earliestId = window.length > 0 ? window[0]!.id : null;
+              const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+              return { window, earliestId, hasMore };
+            };
+            let meta: TaskEventsReplayMeta;
+            let replay: ReturnType<typeof freshWindow>["window"];
+            if (cursor === null) {
+              const fresh = freshWindow();
+              meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore };
+              replay = fresh.window;
+            } else {
+              // Resume: only the rows after the cursor, subagent rows included.
+              // `earliestId`/`hasMore` describe a window, which a resume
+              // doesn't send, so the client is told to leave its own alone.
+              // Snapshot (gap too big, or a cursor from another database):
+              // the fresh window plus `snapshotRequired`, so the client
+              // replaces what it holds instead of splicing across the gap.
+              const after = runs.eventsForTaskAfter(taskId, cursor, {
+                maxEvents: EVENTS_REPLAY_LIMIT,
+                maxBytes: EVENTS_REPLAY_MAX_BYTES,
+              });
+              if (after.kind === "resume") {
+                meta = { earliestId: null, hasMore: false, resumedAfter: cursor };
+                replay = after.rows;
+              } else {
+                const fresh = freshWindow();
+                meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore, snapshotRequired: true };
+                replay = fresh.window;
+              }
+            }
+            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, meta);
+            for (const ev of replay) {
+              send({
+                id: ev.id,
+                runId: ev.runId,
+                taskId,
+                stream: ev.stream as RunEvent["stream"],
+                data: ev.data,
+                ts: ev.ts,
+                subagentId: ev.subagentId,
+              });
+            }
+            const drained = buffer;
+            buffer = null;
+            for (const ev of drained) send(ev);
+            ping = setInterval(() => send({ type: "ping" }), 15_000);
+            if (req.signal.aborted) cleanup();
+            else req.signal.addEventListener("abort", cleanup, { once: true });
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            ...corsHeaders(req),
+          },
+        });
+      }),
+    }, {
+      headless: !native,
+      cors: corsHeaders,
+      gate: gateCallerPath,
+      notAvailableHeadless,
+    }), deps.ready, native ? BOOT_GATE_EXEMPT_ALWAYS : [...BOOT_GATE_EXEMPT_ALWAYS, ...BOOT_GATE_EXEMPT_HEADLESS]) as never,
+    fetch(req, server) {
+      if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
+      // WebSocket upgrade for a terminal tab's live byte stream. The routes API
+      // can't upgrade, so we match it here. It sits outside the policy table
+      // (P11) and takes ONLY a single-use ticket minted by
+      // `POST /terminals/:id/ws-ticket` (P7): a WebSocket can't set an
+      // Authorization header, and neither token may ride in a URL (D13), so
+      // `?token=` on this path is refused outright.
+      const url = new URL(req.url);
+      const wsMatch = url.pathname.match(/^\/terminals\/([^/]+)\/ws$/);
+      if (wsMatch) {
+        if (req.method !== "GET") return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        const terminalId = decodeURIComponent(wsMatch[1]!);
+        if (!consumeWsTicket(url.searchParams.get("ticket"), terminalId)) return unauthorized(req);
+        // Reject unknown ids before upgrading, rather than upgrading then
+        // immediately closing the socket in the `open` handler.
+        if (!getTerminal(terminalId)) {
+          return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }
+        const upgraded = server.upgrade(req, { data: { terminalId } });
+        // `upgrade` returns true and assumes responsibility for the response.
+        if (upgraded) return undefined;
+        return json({ error: "websocket upgrade failed" }, { status: 426, headers: corsHeaders(req) });
+      }
+      return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+    },
+  });
+
+  // Background/remote-access changes (turn on/off, start now, remote off, a
+  // supervisor appearing) reach every connected webview as one event, so the
+  // Settings section never needs a poll. Subscribed only once the bind has
+  // succeeded — the app retries `startApiServer` while it takes the port over,
+  // and a failed bind must not leave a listener behind. The subscription then
+  // lives as long as the process (the server is never torn down short of a
+  // process exit).
+  subscribeBackgroundChanges((status) => {
+    broadcastAppEvent({ type: "background_changed", status, ts: Date.now() });
+  });
+
+  console.log(`[agetor] api listening on http://${formatHostForUrl(HOST)}:${server.port}`);
+  const bindWarning = nonLoopbackBindWarning(HOST, server.port!);
+  if (bindWarning) console.warn(bindWarning);
+  return server;
+}

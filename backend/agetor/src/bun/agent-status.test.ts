@@ -1,0 +1,1211 @@
+import { describe, test, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { AgentKind, Harness } from "../shared/types.ts";
+
+// agent-status.ts imports `harnesses` from db.ts, which opens its sqlite
+// connection at module-load time — a plain top-level `import` is hoisted
+// ahead of any other code in this file, so AGETOR_DATA_DIR must be set
+// before a *dynamic* import instead (same pattern as harnesses.test.ts).
+// Without this, this file (or whichever file `bun test` loads first) can
+// silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
+const { checkHarness, cachedCliVersion, parseOpencodeAuthList, upgradeHintFor, FX_UPGRADE_NOTICE, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
+
+function builtin(kind: AgentKind): Harness {
+  return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
+}
+const checkAgent = (kind: AgentKind) => checkHarness(builtin(kind));
+
+// Capture once at load so the integrity-check tests below can restore the
+// file's entry PATH regardless of how the prior test interleaved.
+const ORIGINAL_PATH = process.env.PATH;
+let sandbox: string | null = null;
+
+beforeEach(() => {
+  delete process.env.AGETOR_CODEX_BIN;
+  delete process.env.AGETOR_CLAUDE_BIN;
+  delete process.env.AGETOR_GEMINI_BIN;
+  delete process.env.AGETOR_FX_BIN;
+  delete process.env.AGETOR_TMUX_BIN;
+  sandbox = null;
+  // The fx auth-status memoization (agent-status.ts's getCachedStatus) is
+  // module-level state that would otherwise leak between tests that happen
+  // to reuse a harness id + path.
+  __testing.clearStatusCache();
+});
+
+afterEach(() => {
+  process.env.PATH = ORIGINAL_PATH;
+  if (sandbox) rmSync(sandbox, { recursive: true, force: true });
+});
+
+test("returns available=true with version for a real binary (claude needs tmux too)", async () => {
+  // /bin/echo stands in for both claude and tmux so the dual probe passes
+  // without either CLI installed. We don't assert the version string — just
+  // that the probe completes and reports available.
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+  process.env.AGETOR_TMUX_BIN = "/bin/echo";
+  const status = await checkAgent("claude-code");
+  expect(status.available).toBe(true);
+  expect(status.path).toBe("/bin/echo");
+  expect(status.reason).toBeNull();
+});
+
+test("claude-code is unavailable when tmux is missing, with the install hint", async () => {
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+  process.env.AGETOR_TMUX_BIN = "definitely-not-tmux-xyz123";
+  const status = await checkAgent("claude-code");
+  expect(status.available).toBe(false);
+  expect(status.reason).toContain("tmux");
+  expect(status.installHint).toContain("tmux");
+});
+
+test("returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_CODEX_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("codex");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("codex");
+});
+
+test("returns available=true with version for a real gemini binary (no tmux dependency, like codex)", async () => {
+  process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(true);
+  expect(status.path).toBe("/bin/echo");
+  expect(status.reason).toBeNull();
+});
+
+test("gemini returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_GEMINI_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("gemini");
+});
+
+/**
+ * Plant a fake native-install layout on PATH so the probe finds a working
+ * `claude` binary at <sandbox>/system/.local/bin/claude. Returns the harness
+ * config-dir root the alias under test will use.
+ *
+ * Shape mirrors the real install:
+ *   <sandbox>/system/.local/share/claude/versions/<v>   (binary file)
+ *   <sandbox>/system/.local/bin/claude                  (symlink → version)
+ */
+function plantFakeNativeClaude(): { harnessHome: string } {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-"));
+  const systemHome = path.join(sandbox, "system");
+  const versionsDir = path.join(systemHome, ".local", "share", "claude", "versions");
+  const sysBinDir = path.join(systemHome, ".local", "bin");
+  mkdirSync(versionsDir, { recursive: true });
+  mkdirSync(sysBinDir, { recursive: true });
+  const realBinary = path.join(versionsDir, "9.9.9");
+  writeFileSync(realBinary, "#!/bin/sh\necho 9.9.9 (fake)\n", { mode: 0o755 });
+  symlinkSync(realBinary, path.join(sysBinDir, "claude"));
+  process.env.PATH = `${sysBinDir}:${process.env.PATH}`;
+  // tmux probe needs to pass — point at any binary that exits 0 on --version.
+  process.env.AGETOR_TMUX_BIN = "/bin/echo";
+
+  const harnessHome = path.join(sandbox, "harness");
+  mkdirSync(harnessHome, { recursive: true });
+  return { harnessHome };
+}
+
+test("claude-code alias with a CLAUDE_CONFIG_DIR override is available without pre-linking the harness home", async () => {
+  // Regression: previously we set HOME=<harness home> on spawn and so had to
+  // pre-link <harness home>/.local/bin/claude to satisfy claude's native-
+  // install integrity check. After switching to CLAUDE_CONFIG_DIR=<home> the
+  // user's real $HOME is unchanged, the integrity check resolves against the
+  // system install, and no per-harness symlink is required.
+  const { harnessHome } = plantFakeNativeClaude();
+  const alias: Harness = {
+    id: "claude-alt",
+    kind: "claude-code",
+    label: "Claude (alt)",
+    isBuiltin: false,
+    home: harnessHome,
+    bin: null,
+    env: {},
+    enabled: true,
+  };
+
+  const status = await checkHarness(alias);
+  expect(status.available).toBe(true);
+  expect(status.reason).toBeNull();
+});
+
+// --- fx --------------------------------------------------------------------
+// fx's probe is the only one with a second, help-text stage: the bare name
+// `fx` collides with a popular npm JSON-viewer CLI, so a `--version`
+// exit-status check alone can't distinguish them — checkHarness additionally
+// probes `--help` and looks for a marker string unique to Vercel's fx
+// ("coding agent"). See agent-status.ts's probeHelp/FX_HELP_MARKER.
+
+test("fx returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_FX_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("fx.sh");
+});
+
+/**
+ * Plant a fake `fx` binary at <dir>/fx that answers `--version` with exit 0
+ * plus a version string, and `--help` with `helpText` on stdout — mirroring
+ * the dual-probe contract `checkHarness` runs for kind `"fx"`
+ * (probeVersion, then probeHelp gated on a non-null version). Returns the
+ * fake binary's absolute path; registers the containing dir in `sandbox` so
+ * `afterEach` cleans it up.
+ */
+function plantFakeFxBin(helpText: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "0.0.4"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "${helpText}"; exit 0; fi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("fx returns available=true when --version succeeds and --help contains the 'coding agent' marker", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxBin("Fast, native coding agent for the terminal");
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.4");
+  expect(status.reason).toBeNull();
+  expect(status.installHint).toBeNull();
+});
+
+test("fx returns available=false with the wrong-binary hint when --help lacks the marker (e.g. the npm JSON-viewer 'fx')", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxBin("Terminal JSON viewer");
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.version).toBe("0.0.4");
+  expect(status.reason).toContain("doesn't look like Vercel fx");
+  expect(status.installHint).toContain("fx.sh");
+});
+
+// --- fx login pre-flight (probeStatus / `fx status --json`) ----------------
+// Only reached once the --version/--help dual-probe above already identifies
+// the binary as real fx. `probeStatus` is strictly FAIL-OPEN: only a
+// positively-parsed `auth === "missing"` counts as logged out; anything else
+// (empty output, non-JSON, non-zero exit, an unrecognized shape) must degrade
+// to `loggedIn: null`, never a false "logged out" — see agent-status.ts's
+// probeStatus doc comment.
+
+/**
+ * Plant a fake `fx` binary that satisfies the --version/--help dual probe
+ * (so `checkHarness` actually reaches probeStatus) and additionally answers
+ * `status <anything>` (covers the real `status --json` invocation) per the
+ * `statusBody` shell snippet supplied by the caller — e.g. `echo '...'; exit
+ * 0` or just `exit 1`. Registers the containing dir in `sandbox` for cleanup.
+ */
+function plantFakeFxStatusBin(statusBody: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-status-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "0.0.6"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then\n  ${statusBody}\nfi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("fx status --json auth:missing with auth_help -> loggedIn:false, authHelp verbatim, available stays true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"missing","auth_help":"Run fx login"}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe("Run fx login");
+});
+
+test("fx status --json auth:missing without auth_help -> fallback authHelp text", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '{"auth":"missing"}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  // Exact fallback string from probeStatus (agent-status.ts) — asserted
+  // verbatim so a future copy edit there is caught here too.
+  expect(status.authHelp).toBe("Run fx login to sign in.");
+});
+
+test("fx status --json auth:ok (any non-'missing' value) -> loggedIn:true, authHelp:null", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '{"auth":"ok","plan":"pro"}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json prints nothing -> fail-open (loggedIn:null, authHelp:null), available still true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBeNull();
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json prints non-JSON -> fail-open (loggedIn:null, authHelp:null)", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo 'not json at all'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBeNull();
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json exits non-zero (even with parseable JSON on stdout) -> fail-open (loggedIn:null)", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '{"auth":"missing"}'\n  exit 1`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBeNull();
+  expect(status.authHelp).toBeNull();
+});
+
+test("a non-fx kind never populates loggedIn/authHelp (stays null even when available)", async () => {
+  process.env.AGETOR_CODEX_BIN = "/bin/echo";
+  const status = await checkAgent("codex");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBeNull();
+  expect(status.authHelp).toBeNull();
+});
+
+// --- fx status --json expired-login gate (0.0.7+) ---------------------------
+// New in 0.0.7: a login-style `auth` value (not "missing", not an env-key
+// value) can also read as logged-out when `auth_expired === true` AND
+// `auth_refreshable === false` — both strict booleans. Every other shape
+// (absent fields, a refreshable expiry, or a non-boolean value on either
+// field) stays fail-open (loggedIn:true), exactly as pre-0.0.7. Env-key auth
+// (`AI_GATEWAY_API_KEY`/`VERCEL_OIDC_TOKEN`) is exempt from this gate
+// entirely — see agent-status.ts's probeStatus doc comment.
+
+test("fx status --json expired + non-refreshable login, no auth_help -> loggedIn:false, fallback expired-login text", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  // Exact fallback string from probeStatus (agent-status.ts) — asserted
+  // verbatim so a future copy edit there is caught here too.
+  expect(status.authHelp).toBe("fx login has expired — run fx login to sign in again.");
+});
+
+test("fx status --json expired + non-refreshable login, with auth_help -> authHelp verbatim from fx", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":false,"auth_help":"custom fx text"}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe("custom fx text");
+});
+
+test("fx status --json expired but still refreshable -> stays fail-open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":true}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json 0.0.6-shaped payload (auth_expired/auth_refreshable absent entirely) -> loggedIn:true (pre-0.0.7 regression)", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '{"auth":"fx login"}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json auth_expired is a non-boolean string ("yes") -> fails open, loggedIn:true', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":"yes","auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth_expired is a non-boolean number (1) -> fails open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":1,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json auth_refreshable is a non-boolean string ("false") -> fails open, loggedIn:true', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":"false"}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth_refreshable is a non-boolean number (0) -> fails open, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"fx login","auth_expired":true,"auth_refreshable":0}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:AI_GATEWAY_API_KEY is exempt from the expired-login gate -> always loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"AI_GATEWAY_API_KEY","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:VERCEL_OIDC_TOKEN is exempt from the expired-login gate -> always loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(
+    `echo '{"auth":"VERCEL_OIDC_TOKEN","auth_expired":true,"auth_refreshable":false}'\n  exit 0`,
+  );
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+/**
+ * A realistic full 0.0.7 `status --json` payload — the additive fields real
+ * fx 0.0.7 emits (`mcp`, `mcp_config_warning`, `team`, plus ordinary account/
+ * config metadata) alongside the fields probeStatus actually reads (`auth`,
+ * `auth_help`, `auth_expired`, `auth_refreshable`). Every unread field must be
+ * silently ignored (probeStatus's unknown-fields-are-fine contract) rather
+ * than causing a parse failure or a fail-open result.
+ */
+function fullFxStatusPayload(authRefreshable: boolean): string {
+  return JSON.stringify({
+    version: "0.0.7",
+    auth: "fx login",
+    auth_help: null,
+    auth_expired: true,
+    auth_refreshable: authRefreshable,
+    team: "acme",
+    account: "user@example.com",
+    default_model: "zai/glm-5.3-flash",
+    config_path: "/home/user/.fx/config.json",
+    log_file: "/home/user/.fx/logs/fx.log",
+    sandbox: "none",
+    updated_at: "2026-08-31T00:00:00Z",
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    mcp_config_warning: null,
+  });
+}
+
+test("fx status --json full realistic 0.0.7 payload (mcp/team/etc additive fields) with auth_refreshable:true -> parses fine, loggedIn:true", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '${fullFxStatusPayload(true)}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json full realistic 0.0.7 payload with auth_refreshable:false -> parses fine, loggedIn:false", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBin(`echo '${fullFxStatusPayload(false)}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  // auth_help is explicitly `null` in this payload (a real fx omitting a
+  // string there), so probeStatus's fallback text kicks in.
+  expect(status.authHelp).toBe("fx login has expired — run fx login to sign in again.");
+});
+
+// --- fx status --json 0.0.8 real-payload fixtures --------------------------
+// Copied verbatim (workspace path genericized) from a live binary probe of
+// fx 0.0.8 (build_revision 43c11dcc34a9, 2026-09-08) — see
+// docs/plans/fx-0.0.8-compat.md TT3 and its §2 evidence. probeStatus's own
+// doc comment already notes the `status --json` builder is byte-identical to
+// 0.0.7, so these are non-regression fixtures pinning the exact 0.0.8 field
+// set (no top-level `version`; no `auth_expired` on a non-expired probe)
+// against production code that reads only `auth`/`auth_help`/`auth_expired`/
+// `auth_refreshable`.
+
+function fx008StatusPayload(auth: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    kind: "status",
+    model: "moonshotai/kimi-k3",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "43c11dcc34a9",
+    auth,
+    auth_refreshable: false,
+    permission_mode: "auto",
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    ...extra,
+  });
+}
+
+/**
+ * Same shape as `plantFakeFxStatusBin` above, but with a caller-supplied
+ * `--version` string instead of the hardcoded "0.0.6" — needed to assert
+ * `checkHarness` reports the 0.0.8 stub's version verbatim.
+ */
+function plantFakeFxStatusBinVersioned(version: string, statusBody: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-008-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "${version}"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then\n  ${statusBody}\nfi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("fx status --json realistic 0.0.8 payload (AI_GATEWAY_API_KEY, no top-level version, no auth_expired) -> loggedIn:true, authHelp:null; stub reports version 0.0.8", async () => {
+  const payload = fx008StatusPayload("AI_GATEWAY_API_KEY");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.8");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+describe("fx upgrade notice (fx < 0.0.15)", () => {
+  test.each([
+    ["0.0.14", true],
+    ["0.0.8", true],
+    ["0.0.15", false],
+    ["0.0.16", false],
+    ["0.0.15-rc1", false],
+    ["fx dev build", false],
+  ])("fx --version %p -> notice %p", async (version, expected) => {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned(version, `echo '${fx008StatusPayload("fx login")}'\n  exit 0`);
+    const status = await checkAgent("fx");
+    expect(status.available).toBe(true);
+    if (expected) expect(status.notices).toEqual([FX_UPGRADE_NOTICE]);
+    else expect(status.notices).toBeUndefined();
+  });
+});
+
+test('fx status --json auth:"host managed" (FX_AUTH_MODE=host-managed, an embedding-host feature agetor never sets) -> fail-open fallthrough, loggedIn:true, authHelp:null', async () => {
+  const payload = fx008StatusPayload("host managed");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json auth:missing with fx 0.0.8's real auth_help sentence -> loggedIn:false, authHelp verbatim", async () => {
+  const payload = fx008StatusPayload("missing", {
+    auth_help:
+      "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe(
+    "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  );
+});
+
+// --- fx status --json 0.0.10 real-payload fixtures -------------------------
+// Copied verbatim (workspace path genericized) from a live binary probe of
+// fx 0.0.10 (build_revision 1210c2756ea8, 2026-09-14) — see
+// docs/plans/fx-0.0.10-compat.md TT3 and §2; the builder is byte-identical
+// to 0.0.8 (output_contracts.zig) — same field set (no top-level `version`;
+// no `auth_expired` on a non-expired probe), so these are non-regression
+// fixtures pinning the exact 0.0.10 field set (`build_revision` bumped to
+// "1210c2756ea8") against production code that reads only
+// `auth`/`auth_help`/`auth_expired`/`auth_refreshable` (plus
+// `permission_mode`, read since the 0.0.14 work — see below).
+
+function fx010StatusPayload(auth: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    kind: "status",
+    model: "moonshotai/kimi-k3",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "1210c2756ea8",
+    auth,
+    auth_refreshable: false,
+    permission_mode: "auto",
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: {
+      connection_check: "not_checked",
+      servers: [],
+      configuration_issues: [],
+      inspection_error: null,
+    },
+    ...extra,
+  });
+}
+
+test("fx status --json realistic 0.0.10 payload (AI_GATEWAY_API_KEY, build_revision 1210c2756ea8) -> loggedIn:true, authHelp:null; stub reports version 0.0.10", async () => {
+  const payload = fx010StatusPayload("AI_GATEWAY_API_KEY");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.10");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test('fx status --json 0.0.10 auth:"host managed" (FX_AUTH_MODE=host-managed) -> fail-open fallthrough, loggedIn:true, authHelp:null', async () => {
+  const payload = fx010StatusPayload("host managed");
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+});
+
+test("fx status --json 0.0.10 auth:missing with fx 0.0.10's real auth_help sentence -> loggedIn:false, authHelp verbatim", async () => {
+  const payload = fx010StatusPayload("missing", {
+    auth_help:
+      "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe(
+    "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+  );
+});
+
+test("fx status --json 0.0.10 payload with permission_mode:\"yolo\" (the live full-access probe's on-wire value, full-access -> yolo) -> surfaced as fxProfilePermissionMode, loggedIn unaffected", async () => {
+  const payload = fx010StatusPayload("AI_GATEWAY_API_KEY", { permission_mode: "yolo" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.10", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("yolo");
+});
+
+// --- fx status --json 0.0.14: permission_mode -> fxProfilePermissionMode ----
+// 0.0.14's `status --json` reports `permission_mode` as the
+// FX_PERMISSION_MODE env override, else the saved `~/.fx/settings.json`
+// profile value, else "auto" (plan P5). The probe strips FX_PERMISSION_MODE
+// so the field reflects the profile, and the value drives the "fx starts in
+// Ask" hint. The payload below is the 0.0.10 field set plus the four fields
+// 0.0.14 adds (mode, modes, effort, ultrafast_requested); their values are
+// illustrative — production code never reads them.
+
+function fx014StatusPayload(extra: Record<string, unknown> = {}): string {
+  const payload: Record<string, unknown> = {
+    kind: "status",
+    model: "spacexai/grok-4.7",
+    update_channel: "stable",
+    build_channel: "stable",
+    build_revision: "1a070af32cdf",
+    auth: "AI_GATEWAY_API_KEY",
+    auth_refreshable: false,
+    permission_mode: "auto",
+    mode: "auto",
+    modes: ["ask", "auto", "full-access"],
+    effort: "auto",
+    ultrafast_requested: false,
+    workspace: "/Users/dev/project",
+    history_turns: 0,
+    session_permission_grants: 0,
+    agent_step_limit: 0,
+    mcp: { connection_check: "not_checked", servers: [], configuration_issues: [], inspection_error: null },
+    ...extra,
+  };
+  for (const [k, v] of Object.entries(payload)) if (v === undefined) delete payload[k];
+  return JSON.stringify(payload);
+}
+
+test('fx 0.0.14 status --json permission_mode:"ask" -> fxProfilePermissionMode "ask", login state unaffected', async () => {
+  const payload = fx014StatusPayload({ permission_mode: "ask", mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.14");
+  expect(status.loggedIn).toBe(true);
+  expect(status.authHelp).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test('fx 0.0.14 status --json permission_mode:"auto" -> fxProfilePermissionMode "auto"', async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${fx014StatusPayload()}'\n  exit 0`);
+  expect((await checkAgent("fx")).fxProfilePermissionMode).toBe("auto");
+});
+
+test("fx status --json without permission_mode (absent field) -> fxProfilePermissionMode null", async () => {
+  const payload = fx014StatusPayload({ permission_mode: undefined });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(true);
+  expect(status.fxProfilePermissionMode).toBeNull();
+});
+
+test("fx status --json permission_mode that isn't a non-empty string -> fxProfilePermissionMode null", async () => {
+  for (const value of ["", 42, null, ["ask"]]) {
+    __testing.clearStatusCache();
+    const payload = fx014StatusPayload({ permission_mode: value });
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+    expect((await checkAgent("fx")).fxProfilePermissionMode).toBeNull();
+  }
+});
+
+test("fx status --json failed probes (empty, non-JSON, non-zero exit) -> fxProfilePermissionMode null, loggedIn still fail-open null", async () => {
+  const askPayload = fx014StatusPayload({ permission_mode: "ask" });
+  for (const body of [`exit 0`, `echo 'not json'\n  exit 0`, `echo '${askPayload}'\n  exit 1`]) {
+    __testing.clearStatusCache();
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", body);
+    const status = await checkAgent("fx");
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+    expect(status.authHelp).toBeNull();
+    expect(status.fxProfilePermissionMode).toBeNull();
+  }
+});
+
+test("fx status --json with an unparseable auth still reports permission_mode, and login stays fail-open (null)", async () => {
+  const payload = fx014StatusPayload({ auth: undefined, permission_mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBeNull();
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test("fx status --json auth:missing still carries permission_mode beside the logged-out state", async () => {
+  const payload = fx014StatusPayload({ auth: "missing", auth_help: "Run fx login", permission_mode: "ask" });
+  process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.14", `echo '${payload}'\n  exit 0`);
+  const status = await checkAgent("fx");
+  expect(status.loggedIn).toBe(false);
+  expect(status.authHelp).toBe("Run fx login");
+  expect(status.fxProfilePermissionMode).toBe("ask");
+});
+
+test("fx status probe runs WITHOUT FX_PERMISSION_MODE, even when both agetor's env and the harness env map set it", async () => {
+  // The stub records its env, then answers like real 0.0.14 would: the env
+  // override when FX_PERMISSION_MODE is set, else the saved profile ("ask").
+  const envDir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-env-"));
+  const envFile = path.join(envDir, "status-env");
+  const prevProcessMode = process.env.FX_PERMISSION_MODE;
+  process.env.FX_PERMISSION_MODE = "yolo";
+  try {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned(
+      "0.0.14",
+      `env > "${envFile}"\n`
+        + `  mode="\${FX_PERMISSION_MODE:-ask}"\n`
+        + `  printf '{"auth":"AI_GATEWAY_API_KEY","permission_mode":"%s"}\\n' "$mode"\n`
+        + `  exit 0`,
+    );
+    const harness: Harness = {
+      ...builtin("fx"),
+      id: "fx-env-strip",
+      env: { FX_PERMISSION_MODE: "yolo", AGETOR_TEST_MARKER: "kept" },
+    };
+    const status = await checkHarness(harness);
+    expect(status.loggedIn).toBe(true);
+    expect(status.fxProfilePermissionMode).toBe("ask");
+    const recorded = readFileSync(envFile, "utf8").split("\n");
+    expect(recorded.some((line) => line.startsWith("FX_PERMISSION_MODE="))).toBe(false);
+    // Only that one variable is stripped — the rest of the harness env still
+    // reaches the probe.
+    expect(recorded).toContain("AGETOR_TEST_MARKER=kept");
+  } finally {
+    if (prevProcessMode === undefined) delete process.env.FX_PERMISSION_MODE;
+    else process.env.FX_PERMISSION_MODE = prevProcessMode;
+    rmSync(envDir, { recursive: true, force: true });
+  }
+});
+
+test("a non-fx kind reports fxProfilePermissionMode null", async () => {
+  process.env.AGETOR_CODEX_BIN = "/bin/echo";
+  const status = await checkAgent("codex");
+  expect(status.available).toBe(true);
+  expect(status.fxProfilePermissionMode).toBeNull();
+});
+
+test("a wrong 'fx' binary (fails the --help marker) reports fxProfilePermissionMode null even when status --json answers", async () => {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-wrong-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "1.0.0"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "a JSON viewer"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then echo '{"auth":"ok","permission_mode":"ask"}'; exit 0; fi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  process.env.AGETOR_FX_BIN = bin;
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.fxProfilePermissionMode).toBeNull();
+});
+
+// --- fx status cache (getCachedStatus / statusCache in agent-status.ts) ----
+// `checkHarness`'s fx-only auth pre-flight spawns `fx status --json`. Without
+// memoization the 15s `/harnesses` poll (App.tsx's checkAllHarnesses) would
+// re-spawn it on every tick forever, for every fx harness. These tests count
+// spawns via a fake binary that appends a line to a counter file each time
+// `status` is invoked, rather than asserting on wall-clock timing.
+
+/**
+ * Plant a fake `fx` binary that satisfies the --version/--help dual probe and
+ * answers `status <anything>` with a fixed `{"auth":"ok","permission_mode":"ask"}`, appending one line
+ * to `counterFile` per invocation so tests can assert spawn counts.
+ */
+function plantFakeFxStatusCountingBin(counterFile: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-cache-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "0.0.6"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi\n`
+      + `if [ "$1" = "status" ]; then\n  echo x >> "${counterFile}"\n  echo '{"auth":"ok","permission_mode":"ask"}'\n  exit 0\nfi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+function countInvocations(counterFile: string): number {
+  try {
+    return readFileSync(counterFile, "utf8").split("\n").filter((l) => l.length > 0).length;
+  } catch {
+    return 0;
+  }
+}
+
+test("checkHarness memoizes fx status --json: a second call within the TTL doesn't re-spawn", async () => {
+  const counterDir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-counter-"));
+  const counterFile = path.join(counterDir, "count");
+  try {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusCountingBin(counterFile);
+    const harness = builtin("fx");
+
+    const first = await checkHarness(harness);
+    expect(first.loggedIn).toBe(true);
+    expect(first.fxProfilePermissionMode).toBe("ask");
+    const second = await checkHarness(harness);
+    expect(second.loggedIn).toBe(true);
+    // The cached value carries the permission mode too.
+    expect(second.fxProfilePermissionMode).toBe("ask");
+
+    expect(countInvocations(counterFile)).toBe(1);
+  } finally {
+    rmSync(counterDir, { recursive: true, force: true });
+  }
+});
+
+test("checkHarness({ freshAuth: true }) bypasses the cache and re-spawns status --json every call", async () => {
+  const counterDir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-counter-"));
+  const counterFile = path.join(counterDir, "count");
+  try {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusCountingBin(counterFile);
+    const harness = builtin("fx");
+
+    await checkHarness(harness, { freshAuth: true });
+    await checkHarness(harness, { freshAuth: true });
+
+    expect(countInvocations(counterFile)).toBe(2);
+  } finally {
+    rmSync(counterDir, { recursive: true, force: true });
+  }
+});
+
+// --- upgradeHintFor (path-aware upgrade command, review finding #5) --------
+// Used with NON-EXISTENT paths throughout so realpathSync throws and the
+// literal path is judged instead — this keeps results machine-independent
+// (no dependency on what's actually installed under /opt/homebrew or
+// /usr/local on the machine running the tests).
+
+describe("upgradeHintFor", () => {
+  test("codex under /opt/homebrew -> brew upgrade codex", () => {
+    expect(upgradeHintFor("codex", "/opt/homebrew/bin/codex-x")).toBe("brew upgrade codex");
+  });
+
+  test("codex under a Cellar path -> brew upgrade codex", () => {
+    expect(upgradeHintFor("codex", "/usr/local/Cellar/codex/1/bin/codex-x")).toBe("brew upgrade codex");
+  });
+
+  test("codex under /usr/local/bin (not Homebrew-managed) -> npm install hint", () => {
+    expect(upgradeHintFor("codex", "/usr/local/bin/codex-x")).toBe("npm i -g @openai/codex");
+  });
+
+  test("codex with a null path -> npm install hint", () => {
+    expect(upgradeHintFor("codex", null)).toBe("npm i -g @openai/codex");
+  });
+
+  test("claude-code under a brew path -> brew upgrade claude-code", () => {
+    expect(upgradeHintFor("claude-code", "/opt/homebrew/bin/claude-x")).toBe("brew upgrade claude-code");
+  });
+
+  test("claude-code under a non-brew path -> claude update (self-updater)", () => {
+    expect(upgradeHintFor("claude-code", "/usr/local/bin/claude-x")).toBe("claude update");
+  });
+
+  test("claude-code with a null path -> claude update (self-updater)", () => {
+    expect(upgradeHintFor("claude-code", null)).toBe("claude update");
+  });
+
+  test("gemini under a brew path -> brew upgrade gemini-cli", () => {
+    expect(upgradeHintFor("gemini", "/opt/homebrew/bin/gemini-x")).toBe("brew upgrade gemini-cli");
+  });
+
+  test("gemini under a non-brew path -> npm install hint (gemini isn't in BREW_PACKAGES' claude/cursor-style fallback)", () => {
+    expect(upgradeHintFor("gemini", "/usr/local/bin/gemini-x")).toBe(INSTALL_HINTS.gemini);
+  });
+
+  test("cursor under a brew-looking path still -> cursor-agent update (cursor isn't Homebrew-distributed)", () => {
+    expect(upgradeHintFor("cursor", "/opt/homebrew/bin/cursor-agent-x")).toBe("cursor-agent update");
+  });
+
+  test("cursor with a null path -> cursor-agent update", () => {
+    expect(upgradeHintFor("cursor", null)).toBe("cursor-agent update");
+  });
+
+  test("fx under any path -> fx's own `fx upgrade`", () => {
+    expect(upgradeHintFor("fx", "/opt/homebrew/bin/fx-x")).toBe("fx upgrade");
+  });
+
+  test("fx with a null path -> fx upgrade", () => {
+    expect(upgradeHintFor("fx", null)).toBe("fx upgrade");
+  });
+
+  test("INSTALL_HINTS.codex is the npm install command (the fallback upgradeHintFor uses for a non-brew codex)", () => {
+    expect(INSTALL_HINTS.codex).toBe("npm i -g @openai/codex");
+  });
+});
+
+test("checkHarness re-probes once the cached entry's TTL has expired (stale-cache-then-fresh)", async () => {
+  const counterDir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-counter-"));
+  const counterFile = path.join(counterDir, "count");
+  try {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusCountingBin(counterFile);
+    const harness = builtin("fx");
+
+    await checkHarness(harness);
+    expect(countInvocations(counterFile)).toBe(1);
+
+    // Still within the TTL: cache hit, no second spawn.
+    await checkHarness(harness);
+    expect(countInvocations(counterFile)).toBe(1);
+
+    // Jump the clock past the 60s TTL — the next call must re-probe.
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      await checkHarness(harness);
+      expect(countInvocations(counterFile)).toBe(2);
+    } finally {
+      setSystemTime(); // restore real time for subsequent tests
+    }
+  } finally {
+    rmSync(counterDir, { recursive: true, force: true });
+  }
+});
+
+// --- opencode: hints, notices, version cache --------------------------------
+
+const OPENCODE_FIXTURES = path.join(import.meta.dir, "fixtures", "opencode");
+const fixture = (name: string) => readFileSync(path.join(OPENCODE_FIXTURES, name), "utf8");
+
+describe("opencode install / upgrade hints", () => {
+  test("install hint is the Homebrew formula", () => {
+    expect(INSTALL_HINTS.opencode).toBe("brew install opencode");
+  });
+  test("a Homebrew install upgrades through brew", () => {
+    expect(upgradeHintFor("opencode", "/opt/homebrew/bin/opencode-x")).toBe("brew upgrade opencode");
+  });
+  test("any other install (or an unknown path) uses opencode's own updater", () => {
+    expect(upgradeHintFor("opencode", "/usr/local/bin/opencode-x")).toBe("opencode upgrade");
+    expect(upgradeHintFor("opencode", null)).toBe("opencode upgrade");
+  });
+});
+
+describe("parseOpencodeAuthList", () => {
+  test("v2 JSON: [] is empty, a connection list is not, garbage is unknown", () => {
+    expect(parseOpencodeAuthList(fixture("v2-auth-list-empty.json"), 2)).toBe(true);
+    expect(parseOpencodeAuthList(fixture("v2-auth-list-env.json"), 2)).toBe(false);
+    expect(parseOpencodeAuthList("No authenticated integrations", 2)).toBeNull();
+    expect(parseOpencodeAuthList('{"a":1}', 2)).toBeNull();
+  });
+  test("v1 text (ANSI): 0 credentials and no env line is empty; an env variable is not", () => {
+    expect(parseOpencodeAuthList(fixture("v1-auth-list-empty.txt"), 1)).toBe(true);
+    expect(parseOpencodeAuthList(fixture("v1-auth-list-env.txt"), 1)).toBe(false);
+    expect(parseOpencodeAuthList("\u001b[0m└  2 credentials", 1)).toBe(false);
+    expect(parseOpencodeAuthList("nothing recognisable", 1)).toBeNull();
+  });
+});
+
+/**
+ * A stub `opencode`: logs every argv line to `<dir>/calls`, answers
+ * `--version` from `<dir>/version`, and `auth list` from `<dir>/auth-v2` (only
+ * with `--standalone`, like a real v2) or `<dir>/auth-v1` (only without it,
+ * like a real v1, which rejects `--standalone`). A missing answer file means
+ * exit 1.
+ */
+function plantFakeOpencode(dir: string, opts: { version: string; authV2?: string; authV1?: string }): string {
+  writeFileSync(path.join(dir, "version"), `${opts.version}\n`);
+  if (opts.authV2 !== undefined) writeFileSync(path.join(dir, "auth-v2"), opts.authV2);
+  if (opts.authV1 !== undefined) writeFileSync(path.join(dir, "auth-v1"), opts.authV1);
+  const bin = path.join(dir, "opencode-stub");
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+D='${dir}'
+echo "$@" >> "$D/calls"
+case "$1" in
+  --version) cat "$D/version" ;;
+  auth)
+    case "$*" in
+      "auth list --standalone --format json") [ -f "$D/auth-v2" ] && cat "$D/auth-v2" || exit 1 ;;
+      "auth list") [ -f "$D/auth-v1" ] && cat "$D/auth-v1" || exit 1 ;;
+      *) echo "unknown option" >&2; exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+function opencodeHarness(bin: string, id = "opencode"): Harness {
+  return { id, kind: "opencode", label: "OpenCode", isBuiltin: true, home: null, bin, env: {}, enabled: true };
+}
+
+const callLines = (dir: string): string[] => {
+  try {
+    return readFileSync(path.join(dir, "calls"), "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
+describe("opencode status notices", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-opencode-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("v2 with no credentials: neutral login hint, loggedIn stays null, no upgrade note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-empty.json") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.available).toBe(true);
+    expect(status.version).toBe("opencode v2.1.3");
+    expect(status.loggedIn).toBeNull();
+    expect(status.notices).toEqual(["No OpenCode credentials found — run `opencode auth login`"]);
+    // Only the standalone JSON form ran: the v1 text form would start v2's service.
+    expect([...callLines(dir)].sort()).toEqual(["--version", "auth list --standalone --format json"]);
+    expect(callLines(dir)).not.toContain("auth list");
+  });
+
+  test("v2 auth probe losing the cold-home db race is retried once (live W4 smoke)", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-empty.json") });
+    // First standalone call fails the way a real v2 does when a concurrent
+    // `--standalone` probe is still creating a fresh home's opencode.db.
+    const flaky = path.join(dir, "opencode-flaky");
+    writeFileSync(
+      flaky,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ ! -f '${dir}/once' ]; then : > '${dir}/once'; echo "$@" >> '${dir}/calls'; echo 'Error: Standalone server exited before reporting readiness' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(flaky, "oc-cold"));
+    expect(status.notices).toEqual(["No OpenCode credentials found — run `opencode auth login`"]);
+    expect(callLines(dir).filter((l) => l === "auth list --standalone --format json")).toHaveLength(2);
+    expect(callLines(dir)).not.toContain("auth list");
+  });
+
+  test("v2 with a credential: no notices at all", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-env.json") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.notices).toBeUndefined();
+    expect(status.loggedIn).toBeNull();
+  });
+
+  test("v1 with 0 credentials: falls back to the text form, adds the login hint and the OpenCode 2 note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-empty.txt") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.version).toBe("1.19.4");
+    expect(status.notices).toEqual([
+      "No OpenCode credentials found — run `opencode auth login`",
+      "OpenCode 2 is available: `opencode upgrade --major`",
+    ]);
+    expect(callLines(dir)).toContain("auth list");
+  });
+
+  test("v1 sharing a home with OpenCode 2's opencode.db: the shared-data-dir notice replaces the credentials one (live W4 smoke)", async () => {
+    // ANSI-wrapped, on stderr, exit 1 — the way v1 reports it.
+    const bin = plantFakeOpencode(dir, { version: "1.19.4" });
+    const conflicting = path.join(dir, "opencode-conflict");
+    writeFileSync(
+      conflicting,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ "$2" = list ] && [ "$3" != --standalone ]; then echo "$@" >> '${dir}/calls'; printf '\\033[91m\\033[1mError: \\033[0mUnexpected error\\nDatabase is not empty and has no session table\\n' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(conflicting, "oc-v1-shared"));
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+    expect(status.notices).toEqual([
+      "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses",
+      "OpenCode 2 is available: `opencode upgrade --major`",
+    ]);
+  });
+
+  test("v1 with an environment key: only the upgrade note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-env.txt") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.notices).toEqual(["OpenCode 2 is available: `opencode upgrade --major`"]);
+  });
+
+  test("a failing auth probe gives no credential notice and never blocks (v2 and v1)", async () => {
+    const v2 = plantFakeOpencode(dir, { version: "opencode v2.1.3" });
+    const s2 = await checkHarness(opencodeHarness(v2, "oc-v2"));
+    expect(s2.available).toBe(true);
+    expect(s2.loggedIn).toBeNull();
+    expect(s2.notices).toBeUndefined();
+
+    const v1 = plantFakeOpencode(dir, { version: "1.19.4" });
+    const s1 = await checkHarness(opencodeHarness(v1, "oc-v1"));
+    expect(s1.loggedIn).toBeNull();
+    expect(s1.notices).toEqual(["OpenCode 2 is available: `opencode upgrade --major`"]);
+  });
+
+  test("the auth probe is cached for 60s per harness+path, then re-run", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: "[]" });
+    const harness = opencodeHarness(bin);
+    const authCalls = () => callLines(dir).filter((l) => l.startsWith("auth")).length;
+
+    await checkHarness(harness);
+    await checkHarness(harness);
+    expect(authCalls()).toBe(1);
+
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      await checkHarness(harness);
+      expect(authCalls()).toBe(2);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a harness whose home changed re-probes credentials instead of reusing the cached answer", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: "[]" });
+    const authCalls = () => callLines(dir).filter((l) => l.startsWith("auth")).length;
+    await checkHarness(opencodeHarness(bin));
+    expect(authCalls()).toBe(1);
+    const homed = { ...opencodeHarness(bin), home: path.join(dir, "acct-b") };
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
+  });
+
+  test("non-opencode kinds never get notices", async () => {
+    process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+    expect((await checkAgent("gemini")).notices).toBeUndefined();
+  });
+});
+
+describe("cachedCliVersion", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-opencode-ver-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const versionCalls = () => callLines(dir).filter((l) => l === "--version").length;
+
+  test("memoizes the version for 60s, then re-probes", async () => {
+    const harness = opencodeHarness(plantFakeOpencode(dir, { version: "opencode v2.1.3" }));
+    expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    expect(versionCalls()).toBe(1);
+
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+      expect(versionCalls()).toBe(2);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("checkHarness primes it: no extra --version spawn afterwards", async () => {
+    const harness = opencodeHarness(plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-empty.txt") }));
+    await checkHarness(harness);
+    expect(versionCalls()).toBe(1);
+    expect(await cachedCliVersion(harness)).toBe("1.19.4");
+    expect(versionCalls()).toBe(1);
+  });
+
+  test("a missing binary or a failed probe is null and not cached", async () => {
+    expect(await cachedCliVersion(opencodeHarness("definitely-not-a-real-binary-xyz123"))).toBeNull();
+    const bin = path.join(dir, "flaky");
+    writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const harness = opencodeHarness(bin, "flaky");
+    expect(await cachedCliVersion(harness)).toBeNull();
+    writeFileSync(bin, "#!/bin/sh\necho 1.2.3\n", { mode: 0o755 });
+    expect(await cachedCliVersion(harness)).toBe("1.2.3");
+  });
+
+  test("a failed re-probe returns the last version the binary reported, not null (null would read as v2)", async () => {
+    const bin = path.join(dir, "flaky-later");
+    writeFileSync(bin, "#!/bin/sh\necho 1.19.4\n", { mode: 0o755 });
+    const harness = opencodeHarness(bin, "flaky-later");
+    expect(await cachedCliVersion(harness)).toBe("1.19.4");
+    writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      expect(await cachedCliVersion(harness)).toBe("1.19.4");
+      // Not re-cached as fresh: once the binary answers again, its new
+      // version wins on the very next call.
+      writeFileSync(bin, "#!/bin/sh\necho opencode v2.1.3\n", { mode: 0o755 });
+      expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("probes OpenCode with OPENCODE_DISABLE_AUTOUPDATE=1 unless the harness env sets it", async () => {
+    const bin = path.join(dir, "env-echo");
+    writeFileSync(bin, `#!/bin/sh\necho "v-$OPENCODE_DISABLE_AUTOUPDATE"\n`, { mode: 0o755 });
+    expect(await cachedCliVersion(opencodeHarness(bin, "env-a"))).toBe("v-1");
+    const own: Harness = { ...opencodeHarness(bin, "env-b"), isBuiltin: false, env: { OPENCODE_DISABLE_AUTOUPDATE: "0" } };
+    expect(await cachedCliVersion(own)).toBe("v-0");
+    expect((await checkHarness(opencodeHarness(bin, "env-c"))).version).toBe("v-1");
+  });
+});

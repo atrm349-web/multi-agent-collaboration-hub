@@ -1,0 +1,11 @@
+{
+  "README.md": "eb4c35a71015561b5b7205bafac1d16d60a8ca3d84d0ab062dba4e18da90ba75",
+  "source/workspace.ts": "52635240139c1f92b5ee4d7200a58409a0a45d1cadb038dfe6a1ecd92176390d",
+  "source/http.ts": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
+  "source/hub-http.test.ts": "6d11381a669a5959e0f4bba802ed9c6ce998bc96c5285eb0b295044862ab6564",
+  "source/hub-planner.test.ts": "0f4eb9a53a81259ed323dd6932f1f31a5293b8954f1f720f588c470781067fdb",
+  "source/frontend.ts": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+  "source/hub-frontend.test.ts": "81d988a734936bc2086b6ad795f014f20be398ac8213eee8e5515c7564f310f8",
+  "source/hub-workspace.test.ts": "d753634b50dcecc826a67dc922105c3d5e55503bdd65ddbef83d037b29a1f0f8",
+  "source/planner.ts": "b00a27eb34a261a3f75717229b7636c2757ba4835b8fac7c45c7a2c086b4e8ab"
+}

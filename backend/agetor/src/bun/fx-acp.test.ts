@@ -1,0 +1,3200 @@
+import { describe, test, expect, beforeAll } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+// fx-acp.ts (unlike cursor-tmux.ts / gemini-tmux.ts) does NOT import
+// db.ts/dataDir — it's a plain Bun.spawn driver over stdio with no on-disk
+// NDJSON log of its own (fx writes its own --log-file, which this driver
+// never reads). So there is no AGETOR_DATA_DIR-before-import dance needed
+// here; confirmed by reading fx-acp.ts's imports (node:fs, node:path, "bun",
+// ../shared/types.ts, and a TYPE-ONLY import from ./claude-tmux.ts that is
+// erased at compile time and never pulls db.ts in at runtime).
+import {
+  dropFxSession,
+  FX_STEER_DROPPED_STATUS,
+  fxSessionActive,
+  fxSessionNotFoundStatus,
+  fxSpeedNotOfferedLine,
+  parseFxEffortOption,
+  reapLiveFxProcs,
+  spawnFxViaAcp,
+  type FxLaunchOptions,
+  type FxMode,
+} from "./fx-acp.ts";
+import {
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  SESSION_DIED_STATUS_PREFIX,
+  type RunEventStream,
+} from "../shared/types.ts";
+// fx-acp.ts's own permission driving is the thing under test here, but the
+// tests themselves need to reach into the SAME in-memory registry the driver
+// awaits on — there is no other way to answer a carded fx_permission request
+// from outside the driver (that's the whole point of the registry: it's the
+// seam `POST /fx-permissions/:id/answer` uses in the real app). interactions.ts
+// has no db.ts import (verified above the fake-server block already covers
+// fx-acp.ts's own import graph) so pulling it in here doesn't need an
+// AGETOR_DATA_DIR dance either.
+import { answerFxPermission, listPendingForTask, type FxPermissionRequest } from "./interactions.ts";
+import { deriveTodoProgress } from "../shared/todo-progress.ts";
+import { FX_PAUSED_SUMMARY_SUFFIX } from "../shared/fx-recovery.ts";
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Fake `fx acp` server: a real child process that speaks newline-delimited
+ * JSON-RPC 2.0 over stdio, scenario-controlled via FX_FAKE_SCENARIO. Written
+ * once to a mkdtemp dir at module load and reused (via argv + env) across
+ * every test — no loose fixture files land in the repo.
+ *
+ * Every inbound message the fake receives (requests, notifications, and the
+ * driver's own replies to server-initiated requests like
+ * session/request_permission) is appended as one JSON line to
+ * FX_FAKE_CAPTURE_FILE, `{label, msg}`, so tests can assert on what the
+ * driver actually sent without race-prone stdout scraping.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const FAKE_ACP_SERVER_SRC = [
+  'import { appendFileSync } from "node:fs";',
+  "",
+  'const scenario = process.env.FX_FAKE_SCENARIO || "happy";',
+  'const captureFile = process.env.FX_FAKE_CAPTURE_FILE || "";',
+  "",
+  "function capture(label, msg) {",
+  "  if (!captureFile) return;",
+  "  try {",
+  '    appendFileSync(captureFile, JSON.stringify({ label: label, msg: msg }) + "\\n");',
+  "  } catch (e) {",
+  "    // best effort",
+  "  }",
+  "}",
+  "",
+  "function send(obj) {",
+  '  process.stdout.write(JSON.stringify(obj) + "\\n");',
+  "}",
+  "",
+  "function ok(id, result) {",
+  '  send({ jsonrpc: "2.0", id: id, result: result });',
+  "}",
+  "",
+  "function fail(id, code, message) {",
+  '  send({ jsonrpc: "2.0", id: id, error: { code: code, message: message } });',
+  "}",
+  "",
+  "function notify(method, params) {",
+  '  send({ jsonrpc: "2.0", method: method, params: params });',
+  "}",
+  "",
+  "// Test hygiene: collapses the repeated",
+  "// setTimeout(function () { ok(id, { stopReason: X }) }, N) shape that used",
+  "// to be duplicated per scenario. `reason` defaults to \"end_turn\".",
+  "function endTurn(id, ms, reason) {",
+  "  setTimeout(function () {",
+  '    ok(id, { stopReason: reason || "end_turn" });',
+  "  }, ms);",
+  "}",
+  "",
+  "// Same shape as endTurn, but the session/prompt result also carries fx",
+  "// >=0.0.8's `usage` object (0.0.7 responses never have this field).",
+  "function endTurnWithUsage(id, ms, reason, usage) {",
+  "  setTimeout(function () {",
+  '    ok(id, { stopReason: reason || "end_turn", usage: usage });',
+  "  }, ms);",
+  "}",
+  "",
+  "// fx >=0.0.9's `configOptions[{id:\"effort\"}]` shape (TT1) — a real",
+  "// `session/new`/`resume`/`load` result carries this entry only when the",
+  "// active model advertises efforts (see docs/plans/fx-0.0.10-compat.md §3,",
+  "// the zai/glm-5.3-flash row: [max, high, low, auto]); the fake always",
+  "// offers auto/low/high/max in that order (matching the plan's example",
+  "// breadcrumb text 'offers: auto, low, high, max') so every TT1 scenario's",
+  "// expected text is stable regardless of which currentValue it starts at.",
+  "function effortOption(currentValue) {",
+  "  return {",
+  '    id: "effort",',
+  '    name: "Reasoning Effort",',
+  '    description: "Controls how much the model thinks before responding",',
+  '    category: "thought_level",',
+  '    type: "select",',
+  "    currentValue: currentValue,",
+  "    options: [",
+  '      { value: "auto", name: "default" },',
+  '      { value: "low", name: "low" },',
+  '      { value: "high", name: "high" },',
+  '      { value: "max", name: "max" }',
+  "    ]",
+  "  };",
+  "}",
+  "",
+  "// fx >=0.0.13/0.0.14 speed lanes (`configOptions[{id:\"fast\"}]` /",
+  "// `[{id:\"ultrafast\"}]`, currentValue \"true\"/\"false\"). FX_FAKE_SPEED_OPTS",
+  "// is a JSON object naming which lanes the model offers and their starting",
+  "// values, e.g. {\"fast\":\"false\",\"ultrafast\":\"true\"}; unset = no lanes",
+  "// (the 0.0.10 / no-fast-lane-model shape). FX_FAKE_SPEED_ERROR names a",
+  "// configId whose set call fails with fx's own -32602 text.",
+  "const speedState = process.env.FX_FAKE_SPEED_OPTS ? JSON.parse(process.env.FX_FAKE_SPEED_OPTS) : null;",
+  "function speedEntries() {",
+  "  if (!speedState) return [];",
+  "  const out = [];",
+  '  ["fast", "ultrafast"].forEach(function (lane) {',
+  "    if (Object.prototype.hasOwnProperty.call(speedState, lane)) {",
+  '      out.push({ id: lane, name: lane, category: "model", type: "select", currentValue: speedState[lane], options: [{ value: "false", name: "off" }, { value: "true", name: "on" }] });',
+  "    }",
+  "  });",
+  "  return out;",
+  "}",
+  "function withSpeed(result) {",
+  "  const extra = speedEntries();",
+  "  if (extra.length === 0) return result;",
+  "  result.configOptions = (result.configOptions || []).concat(extra);",
+  "  return result;",
+  "}",
+  "",
+  "// fx 0.0.14's mode block: auto/ask/full-access, currentModeId real.",
+  "function modesBlock() {",
+  '  return { currentModeId: "auto", availableModes: [{ id: "auto", name: "Auto" }, { id: "ask", name: "Ask" }, { id: "full-access", name: "Full access" }] };',
+  "}",
+  "",
+  'process.on("SIGTERM", function () {',
+  '  capture("sigterm", {});',
+  "  process.exit(0);",
+  "});",
+  "",
+  'let buf = "";',
+  "let promptId = null;",
+  "let cancelPromptResponded = false;",
+  "let sessionCounter = 0;",
+  "",
+  "function streamHappyUpdates() {",
+  '  notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello " } } });',
+  '  notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } });',
+  '  notify("session/update", { update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking..." } } });',
+  '  notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-42", title: "Run ls", kind: "execute", rawInput: { cmd: "ls" } } });',
+  '  notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-42", status: "completed", rawOutput: { stdout: "a.txt" } } });',
+  "}",
+  "",
+  "function handleInitialize(id, params) {",
+  '  capture("initialize", params);',
+  '  if (scenario === "unauth") {',
+  '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "unauth-die-race") {',
+  '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
+  "    process.exit(1);",
+  "    return;",
+  "  }",
+  '  if (scenario === "initialize-error-mimics-timeout") {',
+  "    // A REAL fx protocol error whose message happens to start with the",
+  '    // exact wording our own RpcTimeoutError uses ("timed out waiting for").',
+  "    // Regression: this must be classified by error CLASS, not by matching",
+  "    // that text, or the driver would misreport this as a generic",
+  "    // session-died sentinel instead of surfacing fx's actual message.",
+  '    fail(id, -32000, "timed out waiting for gateway upstream");',
+  "    return;",
+  "  }",
+  "  // fx >=0.0.13 advertises steering here; every steer-* scenario but",
+  "  // steer-unsupported (the 0.0.10 shape: no _meta at all) gets it.",
+  '  if (scenario.indexOf("steer-") === 0 && scenario !== "steer-unsupported") {',
+  "    ok(id, { agentCapabilities: { _meta: { fx: { steering: true } } } });",
+  "    return;",
+  "  }",
+  "  ok(id, {});",
+  "}",
+  "",
+  "// Steering (fx 0.0.14 server.zig handleSteeringPrompt /",
+  "// publishSteeringOutcomes): a session/prompt carrying _meta.fx.steer while",
+  "// the main prompt runs joins the turn and its reply is DEFERRED until the",
+  "// turn ends, written right after the main prompt's response. In the steer-*",
+  "// scenarios the main prompt holds until a steer arrives (then ends 30ms",
+  "// later) or, if none does, for STEER_IDLE_MS; steer-cancel holds until",
+  "// session/cancel.",
+  "const STEER_IDLE_MS = 600;",
+  "let steerIds = [];",
+  "let steerTurnEnded = false;",
+  "function steerScenarioPrompt(id) {",
+  '  if (scenario === "steer-cancel") return;',
+  "  setTimeout(function () { finishSteerTurn(id); }, STEER_IDLE_MS);",
+  "}",
+  "function finishSteerTurn(mainId) {",
+  "  if (steerTurnEnded) return;",
+  "  steerTurnEnded = true;",
+  '  const cancelled = scenario === "steer-cancel";',
+  '  ok(mainId, { stopReason: cancelled ? "cancelled" : "end_turn" });',
+  "  steerIds.forEach(function (sid) {",
+  '    if (scenario === "steer-absorbed") {',
+  "      // Late (but inside the driver's grace) so the test proves the driver",
+  "      // waits for the deferred reply instead of reading it as unanswered.",
+  "      setTimeout(function () {",
+  '        ok(sid, { stopReason: "end_turn", _meta: { fx: { steering: "absorbed" } } });',
+  "      }, 100);",
+  '    } else if (scenario === "steer-dropped") {',
+  '      fail(sid, -32600, "Steering prompt was not delivered because the turn ended first; send it as a new prompt");',
+  '    } else if (scenario === "steer-cancel") {',
+  '      ok(sid, { stopReason: "cancelled", _meta: { fx: { steering: "dropped" } } });',
+  "    }",
+  "    // steer-silent: never answered.",
+  "  });",
+  "}",
+  "function handleSteer(id, params) {",
+  '  capture("steer", params);',
+  "  steerIds.push(id);",
+  '  if (scenario === "steer-die") { process.exit(1); return; }',
+  '  if (scenario === "steer-cancel") return;',
+  "  const mainId = promptId;",
+  "  setTimeout(function () { finishSteerTurn(mainId); }, 30);",
+  "}",
+  "",
+  "function handleSessionNew(id, params) {",
+  '  capture("session/new", params);',
+  "  sessionCounter = sessionCounter + 1;",
+  '  const sessionId = "sess-" + scenario + "-" + sessionCounter;',
+  "  const result = { sessionId: sessionId, modes: modesBlock() };",
+  '  if (scenario === "provider") {',
+  '    result.configOptions = [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }];',
+  "  }",
+  "  if (scenario === \"effort-set\" || scenario === \"effort-auto-default\" || scenario === \"effort-not-offered\" || scenario === \"effort-set-error\") {",
+  '    result.configOptions = [effortOption("auto")];',
+  "  }",
+  "  // \"effort-option-absent\" and everything else deliberately get no",
+  "  // configOptions field at all — the 0.0.8-shaped result parseFxEffortOption",
+  "  // must read as \"no effort entry\" (returns null).",
+  "  if (scenario === \"effort-option-empty\") {",
+  "    // Phase 5 review fix: a PRESENT effort entry with an empty options",
+  '    // list — genuinely-offered-but-nothing-to-offer — must be treated the',
+  '    // same as an absent entry by applyFxEffort, not routed into the',
+  '    // "isn\'t offered (offers: )" breadcrumb.',
+  "    result.configOptions = [{",
+  '      id: "effort",',
+  '      name: "Reasoning Effort",',
+  '      description: "Controls how much the model thinks before responding",',
+  '      category: "thought_level",',
+  '      type: "select",',
+  '      currentValue: "auto",',
+  "      options: []",
+  "    }];",
+  "  }",
+  "  ok(id, withSpeed(result));",
+  "}",
+  "",
+  "function handleSessionResume(id, params) {",
+  '  capture("session/resume", params);',
+  '  if (scenario === "resume-fallback") {',
+  '    fail(id, -32601, "Method not found (fake, forcing fallback)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-fallback-32602") {',
+  '    fail(id, -32602, "Invalid params (fake, forcing fallback)");',
+  "    return;",
+  "  }",
+  "  // fx 0.0.15: a session whose first turn never began was never saved.",
+  '  if (scenario === "session-not-found") {',
+  '    fail(id, -32602, "Session not found");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-auth-error" || scenario === "resume-auth-error-load-ok") {',
+  '    fail(id, -32600, "Fx needs a Codex subscription login to continue. Run fx login codex.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "provider") {',
+  '    ok(id, { configOptions: [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }] });',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replays-paused" || scenario === "resume-replays-paused-prompt-fails" || scenario === "resume-continue-repause") {',
+  "    // fx replays the session's prior history — including a still-paused",
+  "    // recovery checkpoint — onto the NEW run BEFORE the resume response",
+  "    // itself resolves (TT3 scenario 5; also shared by the finding #4",
+  "    // prompt-error variant and the finding #2 dedupe-reset scenario, both",
+  "    // of which need the identical replay to set up their own case).",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-resume") {',
+  "    // Persisted currentValue from a prior turn — TT1 scenario 6 (and its",
+  '    // effort-auto-reset variant) reuse this one server-side shape.',
+  '    ok(id, { configOptions: [effortOption("high")] });',
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // Force the session/load fallback so the effort option is applied",
+  "    // from the LOAD result instead of resume's (TT1 scenario 7).",
+  '    fail(id, -32602, "Invalid params (fake, forcing fallback for effort-on-load)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Phase 5 review fix: pumpStdout drains a whole stdout chunk",
+  "    // synchronously (handleLine called for every complete line in it)",
+  "    // before the driver's `await sendRpc(..., \"session/resume\")` ever",
+  "    // resumes as a microtask — so a session/update that fx writes into",
+  "    // the SAME chunk as the resume response must be judged by the line",
+  "    // ORDER within that chunk, not by whether the awaiting code has run",
+  "    // yet. One raw process.stdout.write call, three newline-terminated",
+  "    // JSON lines: a replayed tool_call (still inside the replay window —",
+  "    // must be dropped), the session/resume response itself (closes the",
+  "    // window), then a live agent_message_chunk (must NOT be dropped).",
+  "    var sameChunkToolCall = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"tool_call\", toolCallId: \"same-chunk-hist-1\", name: \"shell\", title: \"Run ls (replayed)\", kind: \"execute\", status: \"pending\", rawInput: { command: \"ls\" } } } });",
+  "    var sameChunkResponse = JSON.stringify({ jsonrpc: \"2.0\", id: id, result: {} });",
+  "    var sameChunkLiveUpdate = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"agent_message_chunk\", messageId: \"same-chunk-msg\", content: { type: \"text\", text: \"same-chunk live text\" } } } });",
+  '    process.stdout.write(sameChunkToolCall + "\\n" + sameChunkResponse + "\\n" + sameChunkLiveUpdate + "\\n");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // TT1 scenario 9: 0.0.9+ structured replay of a paused checkpoint —",
+  "    // real tool_call/tool_call_update frames plus assistant text and a",
+  "    // title update, all sent BEFORE the resume response itself, while",
+  "    // the driver's `state.replaying` window is open.",
+  '    notify("session/update", { update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "replayed user text" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "hist-1", name: "shell", title: "Run ls", kind: "execute", status: "pending", rawInput: { command: "ls" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "hist-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "hist-msg", content: { type: "text", text: "partial answer" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Replayed title" } });',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
+  "  ok(id, withSpeed({ modes: modesBlock() }));",
+  "}",
+  "",
+  "function handleSessionLoad(id, params) {",
+  '  capture("session/load", params);',
+  '  if (scenario === "session-not-found") {',
+  '    fail(id, -32602, "Session not found");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-fallback") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "REPLAYED must be discarded" } } });',
+  "    setTimeout(function () { ok(id, withSpeed({})); }, 15);",
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-auth-error") {',
+  "    // A DIFFERENT message than session/resume's, so a test asserting on",
+  "    // this text can prove it's session/load's response that decided the",
+  "    // outcome, not resume's.",
+  '    fail(id, -32600, "Fx still needs a Codex subscription login after session/load. Run fx login codex.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-auth-error-load-ok") {',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // TT1 scenario 7: the effort option arrives on the LOAD result (not",
+  "    // resume's, which failed above), currentValue still at fx's default.",
+  '    ok(id, { configOptions: [effortOption("auto")] });',
+  "    return;",
+  "  }",
+  "  ok(id, {});",
+  "}",
+  "",
+  "function handlePrompt(id, params) {",
+  "  if (params && params._meta && params._meta.fx && params._meta.fx.steer === true) {",
+  "    handleSteer(id, params);",
+  "    return;",
+  "  }",
+  "  promptId = id;",
+  '  capture("session/prompt", params);',
+  '  if (scenario.indexOf("steer-") === 0) {',
+  "    steerScenarioPrompt(id);",
+  "    return;",
+  "  }",
+  '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback" || scenario === "resume-replays-paused") {',
+  "    streamHappyUpdates();",
+  '    endTurn(id, 20, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-auth-error") {',
+  '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-other-error") {',
+  '    fail(id, -32603, "Internal error (fake)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "permission") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "need permission" } } });',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-1",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-perm-1", title: "Run something", kind: "execute" },',
+  "        options: [",
+  '          { optionId: "allow-always", kind: "allow_always" },',
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-stop") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "need permission" } } });',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-stop",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-perm-stop", title: "Run something", kind: "execute" },',
+  "        options: [",
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-empty") {',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-empty",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-empty", title: "Run something", kind: "execute" },',
+  "        options: []",
+  "      }",
+  "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-die") {',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-die",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-die", title: "Run something", kind: "execute" },',
+  "        options: [",
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  '    setTimeout(function () { process.exit(1); }, 20);',
+  "    return;",
+  "  }",
+  '  if (scenario === "plan-update") {',
+  '    notify("session/update", { update: { sessionUpdate: "plan", entries: [',
+  '      { content: "Write tests", status: "completed", priority: "high" },',
+  '      { content: "", status: "pending" },',
+  '      { content: "Fix bug", status: "bogus-status", priority: "low" },',
+  '      { content: "Ship it", status: "in_progress" }',
+  "    ] } });",
+  '    notify("session/update", { update: { sessionUpdate: "plan", entries: [] } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "usage-update") {',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 100, size: 1000, cost: { amount: 0.05, currency: "USD" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 200, size: 1000, cost: { amount: 0.1 } } });',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: "not-a-number", size: 1000 } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-refusal") {',
+  '    endTurn(id, 10, "refusal");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-cancelled") {',
+  '    endTurn(id, 10, "cancelled");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-refused") {',
+  '    endTurn(id, 10, "refused");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-max-output-tokens") {',
+  '    endTurn(id, 10, "max_output_tokens");',
+  "    return;",
+  "  }",
+  '  if (scenario === "stopreason-max-model-turns") {',
+  '    endTurn(id, 10, "max_model_turns");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-usage") {',
+  "    // Non-numeric cacheReadTokens and the unknown `bogus` key must be",
+  "    // dropped by the driver, keeping only inputTokens/outputTokens.",
+  '    endTurnWithUsage(id, 15, "end_turn", { inputTokens: 42, outputTokens: 7, cacheReadTokens: "x", bogus: 1 });',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-usage-empty") {',
+  '    endTurnWithUsage(id, 15, "end_turn", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "usage-update-then-prompt-usage") {',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 1234, size: 128000 } });',
+  '    endTurnWithUsage(id, 15, "end_turn", { inputTokens: 1, outputTokens: 2 });',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-split") {',
+  "    // Two different messageIds, no intervening non-text chunk — the",
+  "    // coalescer must split these into two assistant events on messageId",
+  "    // change alone.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "First message" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m2", content: { type: "text", text: "Second message" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-same") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "Hello " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "m1", content: { type: "text", text: "world" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "message-id-none") {',
+  "    // Legacy (pre-0.0.8) shape: no messageId field at all on either delta.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "tool-call-name") {',
+  "    // First: fx >=0.0.8 shape (real name + rawInput + a title distinct",
+  "    // from the name). Second: legacy shape (title/kind only, no name).",
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-name-1", name: "shell", title: "Run ls", kind: "execute", rawInput: { command: "ls" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-name-2", title: "Run ls", kind: "execute", rawInput: { command: "ls" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "session-title") {',
+  "    // Placeholder (skipped), a real title (emitted), a repeat of the same",
+  "    // title (deduped), then a pre-0.0.8-shaped update with no title at all",
+  "    // (ignored) — exactly one status chunk should result.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Untitled session", updatedAt: "2026-09-08T00:00:00Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Explain the repo", updatedAt: "2026-09-08T00:00:01Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Explain the repo", updatedAt: "2026-09-08T00:00:02Z" } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: true } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "tool-meta") {',
+  "    // fx >=0.0.14: a structured notice, an internal discovery call, an",
+  "    // MCP call (identity meta rides the tool_call only), and a steered",
+  "    // user echo, which the mapper must keep silent.",
+  '    notify("session/update", { update: { sessionUpdate: "notice", severity: "warning", title: "e2e notice" } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-internal", name: "capability_search", title: "Search capabilities", kind: "search", status: "pending", rawInput: { query: "x" }, _meta: { fx: { toolCall: { internal: true } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-internal", status: "completed", content: [{ type: "content", content: { type: "text", text: "found" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-mcp", name: "mcp_e2e-mcp_lookup", title: "Lookup", kind: "other", status: "pending", rawInput: { q: "y" }, _meta: { fx: { toolCall: { internal: false, mcp: { server: "e2e-mcp", tool: "lookup" } } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "tc-mcp", status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "user_message_chunk", messageId: "steer-1", content: { type: "text", text: "steered echo" }, _meta: { fx: { steering: "absorbed" } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "kill-cancel") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
+  "    return;",
+  "  }",
+  '  if (scenario === "cancel-permission-race") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
+  "    return;",
+  "  }",
+  '  if (scenario === "context-diagnostic") {',
+  "    // fx 0.0.7 ships its context-budget warnings as the turn's first",
+  "    // agent_message_chunk — one chunk, one [context] line per warning.",
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "[context] skill description \\"appstore-review\\" truncated: observed=1040 bytes effective=1024 bytes\\n[context] skill catalog omitted 2 entries\\n" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hi " } } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "there" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "die-mid-turn-text") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } } });',
+  "    setTimeout(function () { process.exit(1); }, 20);",
+  "    return;",
+  "  }",
+  '  if (scenario === "die-mid-turn") {',
+  "    setTimeout(function () { process.exit(1); }, 20);",
+  "    return;",
+  "  }",
+  '  if (scenario === "malformed-line") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "before" } } });',
+  '    process.stdout.write("not json at all, this line should be skipped\\n");',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "after" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "missing-tool-call-id") {',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Run", kind: "execute", rawInput: {} } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", status: "completed", rawOutput: {} } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "recovery") {',
+  "    // TT3 scenario 1: 429 storm — two updates for attempt 1 (with/without",
+  "    // delaySeconds, mirroring fx's real per-attempt double-send), attempt",
+  "    // 2, then a terminal paused update, then a refused stopReason with an",
+  '    // empty usage object (fx\'s real shape on a refused turn).',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, delaySeconds: 1, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request in 1s · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 2, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 2/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue") {',
+  "    // TT3 scenario 2: continueRecovery turn — fx resumes the paused",
+  "    // checkpoint and it succeeds on the first attempt.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "recovered", kind: "auto_recovered", attempt: 1, attemptLimit: 10, durable: true, message: "✓ recovered · succeeded on attempt 1/10" } } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue-rejected") {',
+  "    // TT3 scenario 3: fx's own -32602 validation error for a second",
+  "    // continue against an already-consumed checkpoint.",
+  '    fail(id, -32602, "No paused model response to continue");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-invalid-params") {',
+  "    // TT3 scenario 6: a normal (non-continueRecovery) -32602 must NOT get",
+  "    // the continueRecovery-only verbatim treatment — still wrapped.",
+  '    fail(id, -32602, "Invalid params (fake, no continueRecovery carve-out)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replays-paused-prompt-fails") {',
+  "    // Finding #4 regression: the NORMAL prompt that would otherwise",
+  "    // consume the replayed checkpoint fails at the transport level",
+  "    // instead of resolving — the cleared sentinel must NOT fire, since",
+  "    // fx never actually got to run the prompt that clears its checkpoint.",
+  '    fail(id, -32602, "Invalid params (fake, replayed-paused prompt error)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-continue-repause") {',
+  "    // Finding #2 regression: the continueRecovery turn immediately",
+  "    // re-pauses with a payload BYTE-IDENTICAL to the one just replayed",
+  "    // by session/resume above — without resetting the dedupe key at the",
+  "    // close of the replay window, this live update would be silently",
+  "    // swallowed as a duplicate of the replay.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "stall-for-drop") {',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Everything this scenario needs to prove was already sent, in one",
+  "    // stdout chunk, from handleSessionResume above — just end the turn so",
+  "    // the coalescer flushes and the run settles.",
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // The LIVE half of TT1 scenario 9 — a real tool call/result pair and",
+  "    // assistant text sent AFTER session/resume resolved (state.replaying",
+  "    // is false by now), which must reach onChunk normally.",
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "live-1", name: "shell", title: "Run pwd", kind: "execute", status: "pending", rawInput: { command: "pwd" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "live-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "/tmp" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "live-msg", content: { type: "text", text: "live answer" } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  "  streamHappyUpdates();",
+  '  endTurn(id, 20, "end_turn");',
+  "}",
+  "",
+  "function handleSetConfigOption(id, params) {",
+  '  capture("session/set_config_option", params);',
+  '  if (params.configId === "fast" || params.configId === "ultrafast") {',
+  "    if (process.env.FX_FAKE_SPEED_ERROR === params.configId) {",
+  '      fail(id, -32602, (params.configId === "fast" ? "Fast" : "Ultrafast") + " mode is not available for model \\"fake/model\\"");',
+  "      return;",
+  "    }",
+  "    // fx makes the lanes exclusive: turning one on turns the other off.",
+  "    speedState[params.configId] = params.value;",
+  '    const other = params.configId === "fast" ? "ultrafast" : "fast";',
+  '    if (params.value === "true" && Object.prototype.hasOwnProperty.call(speedState, other)) speedState[other] = "false";',
+  "    ok(id, { configOptions: speedEntries() });",
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-set-error") {',
+  '    fail(id, -32602, "Reasoning effort is not available for the active model");',
+  "    return;",
+  "  }",
+  "  ok(id, { configOptions: [effortOption(params.value)] });",
+  "}",
+  "",
+  "function handleCancel(params) {",
+  '  capture("session/cancel", params);',
+  '  if (scenario === "steer-cancel" && promptId !== null) {',
+  "    const respondId = promptId;",
+  "    setTimeout(function () { finishSteerTurn(respondId); }, 10);",
+  "  }",
+  '  if (scenario === "kill-cancel" && promptId !== null && !cancelPromptResponded) {',
+  "    cancelPromptResponded = true;",
+  "    const respondId = promptId;",
+  '    endTurn(respondId, 10, "cancelled");',
+  "  }",
+  '  if (scenario === "permission-stop" && promptId !== null && !cancelPromptResponded) {',
+  "    cancelPromptResponded = true;",
+  "    const respondId = promptId;",
+  '    endTurn(respondId, 15, "cancelled");',
+  "  }",
+  '  if (scenario === "cancel-permission-race") {',
+  "    // A permission request racing the client's cancel: sent AFTER the",
+  "    // client's session/cancel arrived, while the prompt is still pending.",
+  "    // The driver must answer it cancelled, never via the allow policy.",
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-race",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  "        options: [",
+  '          { optionId: "allow-always", kind: "allow_always" },',
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  "  }",
+  "}",
+  "",
+  "function handleReply(msg) {",
+  '  capture("reply", msg);',
+  '  if (msg.id === "perm-1" && promptId !== null) {',
+  '    endTurn(promptId, 10, "end_turn");',
+  "  }",
+  '  if (msg.id === "perm-empty" && promptId !== null) {',
+  '    endTurn(promptId, 10, "end_turn");',
+  "  }",
+  '  if (msg.id === "perm-race" && promptId !== null) {',
+  "    const respondId = promptId;",
+  '    endTurn(respondId, 10, "cancelled");',
+  "  }",
+  "}",
+  "",
+  "function handleMethodMessage(msg) {",
+  "  const id = msg.id;",
+  "  const method = msg.method;",
+  "  const params = msg.params;",
+  '  if (method === "initialize") { handleInitialize(id, params); return; }',
+  "  // steer-handshake: a slow session/new, so a steer offered right after",
+  "  // spawn lands before the main prompt is in flight.",
+  '  if (method === "session/new" && scenario === "steer-handshake") {',
+  "    setTimeout(function () { handleSessionNew(id, params); }, 300);",
+  "    return;",
+  "  }",
+  '  if (method === "session/new") { handleSessionNew(id, params); return; }',
+  '  if (method === "session/resume") { handleSessionResume(id, params); return; }',
+  '  if (method === "session/load") { handleSessionLoad(id, params); return; }',
+  "  // fx 0.0.14: an unknown mode id is rejected; a known one would be saved",
+  "  // into the user's ~/.fx/settings.json. Captured so tests can assert the",
+  "  // driver never sends it.",
+  '  if (method === "session/set_mode") {',
+  '    capture("session/set_mode", params);',
+  '    if (["auto", "ask", "full-access"].indexOf(params && params.modeId) === -1) { fail(id, -32602, "Unknown mode"); return; }',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
+  '  if (method === "session/set_config_option") { handleSetConfigOption(id, params); return; }',
+  '  if (method === "session/prompt") { handlePrompt(id, params); return; }',
+  '  if (method === "session/cancel") { handleCancel(params); return; }',
+  '  fail(id, -32601, "method not found (fake): " + method);',
+  "}",
+  "",
+  "function onLine(line) {",
+  "  let msg;",
+  "  try {",
+  "    msg = JSON.parse(line);",
+  "  } catch (e) {",
+  '    capture("malformed-inbound", line);',
+  "    return;",
+  "  }",
+  "  const isReply = msg.id !== undefined && (Object.prototype.hasOwnProperty.call(msg, \"result\") || Object.prototype.hasOwnProperty.call(msg, \"error\"));",
+  "  if (isReply) {",
+  "    handleReply(msg);",
+  "    return;",
+  "  }",
+  "  if (msg.method) {",
+  "    handleMethodMessage(msg);",
+  "  }",
+  "}",
+  "",
+  'process.stdin.on("data", function (chunk) {',
+  '  buf += chunk.toString("utf8");',
+  "  let nl;",
+  '  while ((nl = buf.indexOf("\\n")) >= 0) {',
+  "    const line = buf.slice(0, nl);",
+  "    buf = buf.slice(nl + 1);",
+  "    if (line.trim().length > 0) onLine(line);",
+  "  }",
+  "});",
+  "",
+].join("\n");
+
+let fakeScriptPath: string;
+let scratchDir: string;
+
+beforeAll(() => {
+  scratchDir = mkdtempSync(path.join(tmpdir(), "agetor-fx-acp-test-"));
+  fakeScriptPath = path.join(scratchDir, "fake-fx-acp.mjs");
+  writeFileSync(fakeScriptPath, FAKE_ACP_SERVER_SRC);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Test helpers.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
+
+async function waitFor(predicate: () => boolean, timeoutMs = 4000, intervalMs = 15): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+function readCaptured(captureFile: string): Array<{ label: string; msg: unknown }> {
+  if (!existsSync(captureFile)) return [];
+  return readFileSync(captureFile, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l));
+}
+
+function spawnFake(
+  scenario: string,
+  opts: {
+    mode?: FxMode;
+    resumeSessionId?: string;
+    env?: Record<string, string>;
+    continueRecovery?: boolean;
+    /** Agetor's stored effort id for the task — threaded straight through to
+     *  `FxLaunchOptions.effort` (TT1). `null` is a distinct, intentional
+     *  value from `undefined` (both mean "no RPC", but tests exercise both
+     *  spellings — see the "effort-null" describe block). */
+    effort?: string | null;
+    /** `FxLaunchOptions.model` — the fake's argv carries no `--model` flag
+     *  (unlike a real launch via `buildCommand`), so any test that asserts
+     *  on `applyFxEffort`'s breadcrumb text must pass this explicitly or
+     *  the breadcrumb falls back to the generic "the active model" phrase. */
+    model?: string;
+    /** `FxLaunchOptions.speed`. */
+    speed?: FxLaunchOptions["speed"];
+    /** `FxLaunchOptions.profileMcpServers`. */
+    profileMcpServers?: boolean;
+    /** `FxLaunchOptions.steerSettleGraceMs` (test-only override). */
+    steerSettleGraceMs?: number;
+    /** What `onSteerDropped` reports back (whether the caller queued the
+     *  text). Defaults to true, the orchestrator's answer outside a teardown. */
+    steerQueued?: boolean;
+  } = {},
+) {
+  const chunks: Chunk[] = [];
+  const onChunk: FxLaunchOptions["onChunk"] = (stream, data, lineUuid) => chunks.push({ stream, data, lineUuid });
+  const sessionIds: string[] = [];
+  /** Texts handed back via `onSteerDropped`, plus a shared event log so a
+   *  test can assert they arrived before `done` resolved. */
+  const droppedSteers: string[] = [];
+  const order: string[] = [];
+  const taskId = `task-${randomUUID()}`;
+  const runId = `run-${randomUUID()}`;
+  const captureFile = path.join(scratchDir, `capture-${runId}.jsonl`);
+
+  const agent = spawnFxViaAcp({
+    taskId,
+    runId,
+    argv: [process.execPath, fakeScriptPath],
+    env: { FX_FAKE_SCENARIO: scenario, FX_FAKE_CAPTURE_FILE: captureFile, ...(opts.env ?? {}) },
+    cwd: tmpdir(),
+    promptText: "hello fx",
+    mode: opts.mode ?? "auto",
+    resumeSessionId: opts.resumeSessionId,
+    continueRecovery: opts.continueRecovery,
+    effort: opts.effort,
+    model: opts.model,
+    speed: opts.speed,
+    profileMcpServers: opts.profileMcpServers,
+    onChunk,
+    onSessionId: (id) => sessionIds.push(id),
+    onSteerDropped: (text) => {
+      droppedSteers.push(text);
+      order.push("steer-dropped");
+      return opts.steerQueued ?? true;
+    },
+    steerSettleGraceMs: opts.steerSettleGraceMs,
+  });
+  void agent.done.then(() => order.push("done"));
+
+  return { agent, chunks, sessionIds, taskId, runId, captureFile, droppedSteers, order };
+}
+
+/** Poll the shared interactions registry until an `fx_permission` card shows
+ *  up for this task, then return it. Mirrors how the real UI would discover
+ *  a card via `GET /tasks/:id/events` replay / SSE — there is no push hook
+ *  in this test file, so we poll the same registry the route handler reads. */
+async function waitForFxPermissionCard(taskId: string, timeoutMs = 4000): Promise<FxPermissionRequest> {
+  let found: FxPermissionRequest | undefined;
+  await waitFor(() => {
+    found = listPendingForTask(taskId).find((r) => r.kind === "fx_permission") as FxPermissionRequest | undefined;
+    return found !== undefined;
+  }, timeoutMs);
+  return found!;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 1. Happy path — first turn.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("happy path (first turn)", () => {
+  test(
+    "streams assistant/thinking/tool chunks with correctly-shaped line_uuids, fires onSessionId, resolves ok, and reaps the child",
+    async () => {
+      const { agent, chunks, sessionIds, taskId, runId, captureFile } = spawnFake("happy");
+
+      expect(fxSessionActive(taskId)).toBe(true);
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // Session id surfaced exactly once, from session/new.
+      expect(sessionIds).toEqual([`sess-happy-1`]);
+
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      const thinkingChunks = chunks.filter((c) => c.stream === "thinking");
+      const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+      const toolResultChunks = chunks.filter((c) => c.stream === "tool_result");
+
+      // The two "Hello " / "world" deltas arrive as ONE assistant event
+      // (closed by the thought chunk that follows them), carrying the first
+      // delta's uuid — the second delta's seq (1) is consumed but unused.
+      expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+      expect(assistantChunks.map((c) => c.lineUuid)).toEqual([`fx:${runId}:0`]);
+
+      expect(thinkingChunks).toHaveLength(1);
+      expect(thinkingChunks[0]?.data).toBe("thinking...");
+      expect(thinkingChunks[0]?.lineUuid).toBe(`fx:${runId}:2`);
+
+      expect(toolUseChunks).toHaveLength(1);
+      expect(toolUseChunks[0]?.lineUuid).toBe("fx:tool:tc-42:use");
+      expect(JSON.parse(toolUseChunks[0]!.data)).toMatchObject({
+        id: "tc-42",
+        name: "Run ls (execute)",
+        input: { cmd: "ls" },
+        serverSide: false,
+      });
+
+      expect(toolResultChunks).toHaveLength(1);
+      expect(toolResultChunks[0]?.lineUuid).toBe("fx:tool:tc-42:result");
+      expect(JSON.parse(toolResultChunks[0]!.data)).toMatchObject({
+        toolUseId: "tc-42",
+        content: { stdout: "a.txt" },
+        isError: false,
+      });
+
+      // No leak: the in-memory session is gone post-settlement...
+      expect(fxSessionActive(taskId)).toBe(false);
+      // ...and the child process was actually torn down (SIGTERM observed by
+      // the fake), not merely forgotten about in the map.
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "sigterm"));
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 2. Resume — follow-up turn.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("resume turn", () => {
+  test(
+    "sends session/resume with the prior session id and does not re-fire onSessionId",
+    async () => {
+      const resumeId = "resume-existing-id-1";
+      const { agent, sessionIds, captureFile } = spawnFake("resume", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+      expect(sessionIds).toEqual([]); // not re-announced on resume
+
+      const entries = readCaptured(captureFile);
+      const resumeReq = entries.find((e) => e.label === "session/resume");
+      expect(resumeReq).toBeDefined();
+      expect((resumeReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3. Resume fallback: session/resume -32601 → session/load, discarding
+ *    anything replayed as session/update before the load response.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("resume fallback (session/load)", () => {
+  test(
+    "falls back to session/load on -32601 and discards replayed session/update history",
+    async () => {
+      const resumeId = "resume-existing-id-2";
+      const { agent, chunks, captureFile } = spawnFake("resume-fallback", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      const loadReq = entries.find((e) => e.label === "session/load");
+      expect(loadReq).toBeDefined();
+      expect((loadReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
+
+      // The replayed chunk sent by the fake WHILE session/load was pending
+      // must never reach onChunk.
+      expect(chunks.some((c) => c.data.includes("REPLAYED"))).toBe(false);
+
+      // The turn still proceeds normally after the fallback completes.
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "also falls back to session/load on -32602 (invalid params) — same tolerance as -32601",
+    async () => {
+      const resumeId = "resume-existing-id-32602";
+      const { agent, chunks, captureFile } = spawnFake("resume-fallback-32602", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      const loadReq = entries.find((e) => e.label === "session/load");
+      expect(loadReq).toBeDefined();
+      expect((loadReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
+
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("resume of a session fx never saved (fx 0.0.15)", () => {
+  test(
+    "resume and load both answer Session not found → a fresh session/new, a status line, the new id recorded, and the prompt runs there",
+    async () => {
+      const resumeId = "never-saved-id";
+      const { agent, chunks, captureFile, sessionIds } = spawnFake("session-not-found", { resumeSessionId: resumeId });
+
+      expect(await agent.done).toBe(0);
+
+      const labels = readCaptured(captureFile).map((e) => e.label);
+      expect(labels.indexOf("session/resume")).toBeLessThan(labels.indexOf("session/load"));
+      expect(labels.indexOf("session/load")).toBeLessThan(labels.indexOf("session/new"));
+      const prompt = readCaptured(captureFile).find((e) => e.label === "session/prompt");
+      expect((prompt!.msg as { sessionId?: string }).sessionId).toBe("sess-session-not-found-1");
+      expect(sessionIds).toEqual(["sess-session-not-found-1"]);
+
+      expect(chunks).toContainEqual(expect.objectContaining({ stream: "status", data: fxSessionNotFoundStatus(resumeId) }));
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "a continue-recovery turn does not start over — it fails with the resume error",
+    async () => {
+      const { agent, chunks, captureFile } = spawnFake("session-not-found", {
+        resumeSessionId: "never-saved-id",
+        continueRecovery: true,
+      });
+
+      expect(await agent.done).not.toBe(0);
+      const labels = readCaptured(captureFile).map((e) => e.label);
+      expect(labels).not.toContain("session/new");
+      expect(labels).not.toContain("session/prompt");
+      expect(chunks.some((c) => c.data.includes("failed to resume session never-saved-id") && c.data.includes("Session not found"))).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3b. Resume credential re-check failure (-32600) — falls through to
+ *     session/load exactly like -32601/-32602, since -32600 is JSON-RPC's
+ *     generic "Invalid Request" code, not auth-specific — fx merely reuses it
+ *     for credential failures.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("resume credential re-check failure (-32600)", () => {
+  test(
+    "attempts session/load after a resume -32600 (not an early exit); when load also answers -32600, fx's verbatim load-response text is what surfaces — not resume's — with no wrapper and no '(code -32600)' suffix",
+    async () => {
+      const resumeId = "resume-auth-err-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-auth-error", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // Settled exactly once: failTurn emits exactly one status chunk before
+      // settleFx, and settleFx's own `state.resolved` guard means a second
+      // failure path (were one to race in) could never emit a second.
+      expect(statusChunks).toHaveLength(1);
+      // Byte-identical to session/load's error message (RpcError.rawMessage,
+      // not `message`) — no "session/resume failed:" / "fx acp: failed to
+      // resume session ...:" wrapper, and no trailing "(code -32600)". The
+      // fake gives session/load a DIFFERENT auth-error string than
+      // session/resume's, so this also proves it's load's response deciding
+      // the outcome, not resume's.
+      expect(statusChunks[0]!.data).toBe(
+        "Fx still needs a Codex subscription login after session/load. Run fx login codex.",
+      );
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      // The fix under test: -32600 on resume no longer skips the
+      // session/load fallback the way -32601/-32602 never did.
+      expect(entries.some((e) => e.label === "session/load")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(false);
+
+      // The child process was actually torn down (SIGTERM observed by the
+      // fake), not merely forgotten about in the map.
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "sigterm"));
+    },
+    10_000,
+  );
+
+  test(
+    "when session/load succeeds after a resume -32600, the turn proceeds normally — session/prompt runs and the response streams as usual",
+    async () => {
+      const resumeId = "resume-auth-err-load-ok-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-auth-error-load-ok", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/load")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+      // No spurious credential-failure status chunk leaked through.
+      expect(chunks.some((c) => c.stream === "status" && c.data.includes("Codex subscription"))).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3c. Prompt credential re-check failure (-32600) vs. every other prompt
+ *      error (kept wrapped, unchanged behavior).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("prompt credential re-check failure (-32600)", () => {
+  test(
+    "fails the turn with fx's byte-identical message (via RpcError.rawMessage — no 'session/prompt failed:' wrapper and no trailing '(code -32600)'), once",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-auth-error");
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");
+      expect(statusChunks[0]!.data.startsWith("fx acp: session/prompt failed:")).toBe(false);
+      expect(statusChunks[0]!.data.endsWith("(code -32600)")).toBe(false);
+    },
+    10_000,
+  );
+});
+
+describe("prompt non-auth error keeps the existing wrapper", () => {
+  test(
+    "a non -32600 session/prompt error (e.g. -32603) is still wrapped as 'fx acp: session/prompt failed: ...' — unchanged from before RpcError existed",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-other-error");
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("fx acp: session/prompt failed: Internal error (fake) (code -32603)");
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3d. Provider sentinel — `configOptions` on session/new / session/resume.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("provider sentinel (configOptions)", () => {
+  test(
+    "session/new configOptions with a provider entry emits exactly one FX_PROVIDER_STATUS_PREFIX status chunk, carrying a unique line_uuid",
+    async () => {
+      const { agent, chunks } = spawnFake("provider");
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const providerChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX),
+      );
+      expect(providerChunks).toHaveLength(1);
+      expect(providerChunks[0]!.data).toBe(FX_PROVIDER_STATUS_PREFIX + "gateway");
+      expect(providerChunks[0]!.lineUuid).toBeTruthy();
+
+      // Unique among every line_uuid this turn emitted — the dedup gate in
+      // `emit()` never had to drop a second identical provider chunk.
+      const allLineUuids = chunks.map((c) => c.lineUuid).filter((u): u is string => Boolean(u));
+      expect(new Set(allLineUuids).size).toBe(allLineUuids.length);
+    },
+    10_000,
+  );
+
+  test(
+    "a second (resumed) turn on the same session emits the provider sentinel again — once per turn, not once per run",
+    async () => {
+      // Each turn is its own spawned process (see the file header: fx-acp.ts
+      // has no persistent session across turns, only the sessionId carries
+      // continuity) — so this spawns a second, independent fake server
+      // process with resumeSessionId set, mirroring how the orchestrator
+      // would drive a real follow-up turn.
+      const firstTurn = spawnFake("provider");
+      const firstCode = await firstTurn.agent.done;
+      expect(firstCode).toBe(0);
+      const firstSessionId = firstTurn.sessionIds[0]!;
+
+      const secondTurn = spawnFake("provider", { resumeSessionId: firstSessionId });
+      const secondCode = await secondTurn.agent.done;
+      expect(secondCode).toBe(0);
+
+      const providerChunks = secondTurn.chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX),
+      );
+      expect(providerChunks).toHaveLength(1);
+      expect(providerChunks[0]!.data).toBe(FX_PROVIDER_STATUS_PREFIX + "gateway");
+
+      // Confirms the resume path (not session/new) is what produced it this
+      // time — no sessionId re-announcement on a resumed turn.
+      expect(secondTurn.sessionIds).toEqual([]);
+      const entries = readCaptured(secondTurn.captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("provider sentinel absent", () => {
+  test("no configOptions on session/new produces no provider status chunk at all", async () => {
+    const { agent, chunks } = spawnFake("happy");
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX))).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4. Permission policy.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session/request_permission auto-answer policy", () => {
+  /** Shared by every mode that answers `session/request_permission`
+   *  SYNCHRONOUSLY — yolo (allow) and any unknown/future mode id (fail-closed
+   *  reject) — neither ever surfaces a card, so this also asserts
+   *  `listPendingForTask` stays empty for both callers. */
+  async function permissionOutcomeFor(mode: FxMode): Promise<{ outcome: string; optionId?: string }> {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode });
+    const code = await agent.done;
+    expect(code).toBe(0);
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toBeDefined();
+    return result!.outcome!;
+  }
+
+  test("auto mode registers a card, and the driver's reply echoes whatever the card is answered with", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "auto" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.taskId).toBe(taskId);
+    expect(card.mode).toBe("auto");
+    expect(card.toolCall).toEqual({ toolCallId: "tc-perm-1", title: "Run something", kind: "execute" });
+    // Every option lacks a `name` on the wire (see the fake's "permission"
+    // scenario) — the driver falls back to `optionId` for each.
+    expect(card.options).toEqual([
+      { optionId: "allow-always", name: "allow-always", kind: "allow_always" },
+      { optionId: "allow-once", name: "allow-once", kind: "allow_once" },
+      { optionId: "reject-once", name: "reject-once", kind: "reject_once" },
+    ]);
+
+    expect(answerFxPermission(card.id, { optionId: "allow-once" })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+
+    // The card is gone from the registry once answered.
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+  }, 10_000);
+
+  test("yolo mode answers allow_once with no card ever registered", async () => {
+    const outcome = await permissionOutcomeFor("yolo");
+    expect(outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+  }, 10_000);
+
+  test("ask mode registers a card, and answering it reject-once flows through to fx", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "ask" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.mode).toBe("ask");
+
+    expect(answerFxPermission(card.id, { optionId: "reject-once" })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "reject-once" });
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+  }, 10_000);
+
+  test("a card answered cancelled replies with outcome cancelled", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "ask" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(answerFxPermission(card.id, { cancelled: true })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0); // the fake resolves end_turn on any reply to perm-1
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+  }, 10_000);
+
+  test("kill() while a card is open resolves the card (registry empties) and fx receives outcome cancelled", async () => {
+    const { agent, chunks, taskId, captureFile } = spawnFake("permission-stop", { mode: "auto" });
+
+    await waitFor(() => chunks.some((c) => c.stream === "assistant" && c.data === "need permission"));
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.mode).toBe("auto");
+
+    agent.kill();
+
+    // The card must resolve out of the registry promptly, driven by
+    // cancelFxTurn's drain loop — not left dangling until the process dies.
+    await waitFor(() => listPendingForTask(taskId).length === 0);
+
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-stop");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+  }, 10_000);
+
+  test("empty options auto-cancels with no card ever registered, and emits a status chunk saying so", async () => {
+    const { agent, chunks, taskId, captureFile } = spawnFake("permission-empty", { mode: "auto" });
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-empty");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("no options"))).toBe(true);
+  }, 10_000);
+
+  test("process death while a card is open removes it from the registry (settleFx's sweep) and fails the turn", async () => {
+    const { agent, chunks, taskId } = spawnFake("permission-die", { mode: "auto" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.toolCall.toolCallId).toBe("tc-die");
+
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    // settleFx's card sweep resolved it — never left dangling past death.
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(true);
+  }, 10_000);
+
+  test("unknown/future mode id fails closed to reject_once", async () => {
+    // "weird-unknown" isn't a real FxMode, but the driver's policy switch
+    // takes the reject arm for anything that isn't "yolo"/"auto" — cast past
+    // the type to exercise that fail-closed default the same way an
+    // unreleased mode id passed through verbatim from buildCommand would.
+    const outcome = await permissionOutcomeFor("weird-unknown" as FxMode);
+    expect(outcome).toEqual({ outcome: "selected", optionId: "reject-once" });
+  }, 10_000);
+
+  test("a permission request arriving AFTER cancel is answered cancelled, not via the allow policy", async () => {
+    // Regression for the cancel-window race: kill() sends session/cancel,
+    // and the fake replies by sending a session/request_permission (with
+    // allow options) — i.e. a request racing the cancellation. Even in
+    // permissive "auto" mode the driver must answer it with outcome
+    // "cancelled": an allow here would authorize fx to START a new tool
+    // action in the middle of a user-initiated Stop.
+    const { agent, chunks, captureFile } = spawnFake("cancel-permission-race", { mode: "auto" });
+    // The fake's streamed "working..." delta stays buffered in the
+    // coalescer until settlement, so wait for the prompt to have reached
+    // the fake instead — that's the "turn in flight" signal.
+    await waitFor(() => readCaptured(captureFile).some((e) => e.label === "session/prompt"));
+    agent.kill();
+    const code = await agent.done;
+    expect(code).toBe(1);
+    // The partial prose was flushed at settlement, not lost to the cancel.
+    expect(chunks.some((c) => c.stream === "assistant" && c.data === "working...")).toBe(true);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-race");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4b. `plan` → synthetic TodoWrite tool_use.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("plan session/update → TodoWrite tool_use", () => {
+  test(
+    "coerces entries (blank content dropped, bogus status → pending, priority dropped) and a later empty-entries plan clears it",
+    async () => {
+      const { agent, chunks } = spawnFake("plan-update");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+      expect(toolUseChunks).toHaveLength(2);
+
+      const first = JSON.parse(toolUseChunks[0]!.data);
+      expect(first.name).toBe("TodoWrite");
+      // "Write tests" (completed), the blank-content entry dropped, "Fix bug"
+      // (bogus status → pending, priority dropped), "Ship it" (in_progress).
+      expect(first.input.todos).toEqual([
+        { content: "Write tests", status: "completed" },
+        { content: "Fix bug", status: "pending" },
+        { content: "Ship it", status: "in_progress" },
+      ]);
+
+      const second = JSON.parse(toolUseChunks[1]!.data);
+      expect(second.name).toBe("TodoWrite");
+      expect(second.input.todos).toEqual([]);
+
+      // deriveTodoProgress reads the LAST TodoWrite snapshot — the explicit
+      // empty clear — so it must report null (no usable state), not the
+      // first snapshot's counts.
+      const progress = deriveTodoProgress(chunks.map((c) => ({ stream: c.stream, data: c.data })));
+      expect(progress).toBeNull();
+    },
+    10_000,
+  );
+
+  test("deriveTodoProgress over just the first snapshot reports 1/3 completed", async () => {
+    // Re-derive over a prefix of the same event stream (everything up to and
+    // including the first plan's tool_use) to assert the {completed,total}
+    // shape independent of the second (clearing) snapshot.
+    const { agent, chunks } = spawnFake("plan-update");
+    await agent.done;
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    const firstIndex = chunks.indexOf(toolUseChunks[0]!);
+    const prefix = chunks.slice(0, firstIndex + 1).map((c) => ({ stream: c.stream, data: c.data }));
+
+    const progress = deriveTodoProgress(prefix);
+    expect(progress).not.toBeNull();
+    expect(progress!.completed).toBe(1);
+    expect(progress!.total).toBe(3);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4c. `usage_update` → FX_USAGE_STATUS_PREFIX status chunk.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("usage_update session/update → status chunk", () => {
+  test(
+    "valid used/size/cost emits a chunk; a malformed cost drops only cost; non-numeric used/size drops the whole update",
+    async () => {
+      const { agent, chunks } = spawnFake("usage-update");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const usageChunks = chunks
+        .filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))
+        .map((c) => JSON.parse(c.data.slice(FX_USAGE_STATUS_PREFIX.length)));
+
+      // Only two of the three fake updates should have produced a chunk —
+      // the third (non-numeric `used`) is silently dropped in full.
+      expect(usageChunks).toHaveLength(2);
+      expect(usageChunks[0]).toEqual({ used: 100, size: 1000, cost: { amount: 0.05, currency: "USD" } });
+      // Malformed cost (missing `currency`) is dropped on its own —
+      // used/size still emit with no `cost` key at all.
+      expect(usageChunks[1]).toEqual({ used: 200, size: 1000 });
+      expect("cost" in usageChunks[1]).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4d. `session/prompt` result `usage` (fx >=0.0.8) → the `turn` half of the
+ *     FX_USAGE_STATUS_PREFIX sentinel, emitted before settlement.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session/prompt usage → FX_USAGE_STATUS_PREFIX turn sentinel", () => {
+  test(
+    "emits exactly one turn sentinel, dropping the non-numeric and unknown-key fields, before the run settles",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-usage");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const usageChunks = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX));
+      expect(usageChunks).toHaveLength(1);
+      expect(JSON.parse(usageChunks[0]!.data.slice(FX_USAGE_STATUS_PREFIX.length))).toEqual({
+        turn: { inputTokens: 42, outputTokens: 7 },
+      });
+
+      // "Before settlement" — this chunk must be observable on the run, i.e.
+      // it isn't the last thing the driver ever emits after resolving; the
+      // done promise having already resolved above is the settlement signal,
+      // and the chunk is present in the collected list regardless, so this
+      // also pins that maybeEmitPromptUsage doesn't run AFTER the process is
+      // torn down (it wouldn't be captured at all if so).
+      expect(usageChunks[0]!.lineUuid).toBeTruthy();
+    },
+    10_000,
+  );
+
+  test("an empty usage object ({}) emits no usage sentinel at all", async () => {
+    const { agent, chunks } = spawnFake("prompt-usage-empty");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4e. Both usage sources in one turn — a `usage_update` notification during
+ *     the turn AND the terminal `session/prompt` result's `usage` — must
+ *     produce two separate sentinels, in wire order, never merged/clobbered.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("usage_update notification + session/prompt usage in the same turn", () => {
+  test("emits two usage sentinels in order: the usage_update payload, then the turn payload", async () => {
+    const { agent, chunks } = spawnFake("usage-update-then-prompt-usage");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const usageChunks = chunks
+      .filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))
+      .map((c) => JSON.parse(c.data.slice(FX_USAGE_STATUS_PREFIX.length)));
+
+    expect(usageChunks).toEqual([{ used: 1234, size: 128000 }, { turn: { inputTokens: 1, outputTokens: 2 } }]);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4f. `agent_message_chunk.messageId` (fx >=0.0.8) coalescer split rule.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("agent_message_chunk messageId coalescer split", () => {
+  test("two different messageIds with no intervening non-text chunk split into two separate assistant events", async () => {
+    const { agent, chunks } = spawnFake("message-id-split");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["First message", "Second message"]);
+    // Distinct line_uuids — two real events, not one over-flushed one.
+    expect(assistantChunks[0]!.lineUuid).not.toBe(assistantChunks[1]!.lineUuid);
+
+    // The onChunk contract is (stream, data, lineUuid) — messageId is never
+    // forwarded to it, so a persisted chunk can never carry the field.
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+
+  test("the same messageId across deltas stays one concatenated assistant event", async () => {
+    const { agent, chunks } = spawnFake("message-id-same");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+
+  test("no messageId on either delta falls back to the legacy stream-switch-only rule — still one event", async () => {
+    const { agent, chunks } = spawnFake("message-id-none");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+    expect(assistantChunks.map((c) => c.data)).toEqual(["Hello world"]);
+    for (const c of chunks) expect("messageId" in c).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4g. `tool_call.name` (fx >=0.0.8) preferred over the `title (kind)`
+ *     synthesis, with `title` carried alongside only when it adds
+ *     information.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("tool_call name / title", () => {
+  test("fx >=0.0.8 shape: name wins as the tool_use name, and a distinct title rides alongside it", async () => {
+    const { agent, chunks } = spawnFake("tool-call-name");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    expect(toolUseChunks).toHaveLength(2);
+
+    const withName = JSON.parse(toolUseChunks[0]!.data);
+    expect(withName).toEqual({
+      id: "tc-name-1",
+      name: "shell",
+      input: { command: "ls" },
+      serverSide: false,
+      title: "Run ls",
+    });
+  }, 10_000);
+
+  test("legacy shape (no name): falls back to the `title (kind)` synthesis and carries no `title` key", async () => {
+    const { agent, chunks } = spawnFake("tool-call-name");
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    const legacy = JSON.parse(toolUseChunks[1]!.data);
+    expect(legacy).toEqual({
+      id: "tc-name-2",
+      name: "Run ls (execute)",
+      input: { command: "ls" },
+      serverSide: false,
+    });
+    expect("title" in legacy).toBe(false);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4h. `session_info_update {title, updatedAt}` (fx >=0.0.8) → the
+ *     FX_SESSION_TITLE_STATUS_PREFIX sentinel, deduped per turn.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session_info_update → FX_SESSION_TITLE_STATUS_PREFIX sentinel", () => {
+  test(
+    "placeholder title skipped, a real title emitted once, a repeat deduped, and a title-less update ignored",
+    async () => {
+      const { agent, chunks } = spawnFake("session-title");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const titleChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX),
+      );
+      expect(titleChunks).toHaveLength(1);
+      expect(titleChunks[0]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Explain the repo");
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 5. stopReason mapping.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("stopReason mapping", () => {
+  test(
+    "refusal fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-refusal");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: refusal")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "cancelled (via server-reported stopReason, not a kill) settles the turn as failed with no extra status noise",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-cancelled");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      // The driver leaves cancelled-vs-failed classification to the
+      // orchestrator's own `handle.cancelled` flag — no status chunk here.
+      expect(chunks.filter((c) => c.stream === "status")).toHaveLength(0);
+    },
+    10_000,
+  );
+
+  // fx's REAL wire strings (types.zig StopReason, byte-identical 0.0.7 and
+  // 0.0.8) are `refused`, `max_output_tokens`, `max_model_turns` — not the
+  // ACP-canonical `refusal`/`max_tokens`/`max_turn_requests` the switch used
+  // to check alone. These three pin the driver actually matching fx's real
+  // strings, on top of "stopreason-refusal" above pinning the ACP-canonical
+  // name is still accepted for forward compat.
+
+  test(
+    "refused (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-refused");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: refused")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "max_output_tokens (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-max-output-tokens");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: max_output_tokens")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "max_model_turns (fx's real wire string) fails the turn and emits a status chunk naming it",
+    async () => {
+      const { agent, chunks } = spawnFake("stopreason-max-model-turns");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "fx turn ended: max_model_turns")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 6. Unauthenticated initialize.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("unauthenticated fx binary", () => {
+  test(
+    "surfaces the actionable Vercel AI Gateway message as a status chunk and fails the turn",
+    async () => {
+      const { agent, chunks } = spawnFake("unauth");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data.includes("Fx needs access to Vercel AI Gateway"))).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 6.5. RpcTimeoutError classification — regression.
+ *
+ * `isTimeoutError` distinguishes "we gave up waiting" (our own RpcTimeoutError
+ * class, thrown only by `withTimeout`'s internal timer) from a real fx error
+ * whose message happens to start with the identical wording. If that
+ * distinction were ever done by string-matching instead of `instanceof`, a
+ * real fx protocol error reading "timed out waiting for X" would be
+ * misreported as the generic SESSION_DIED_STATUS_PREFIX sentinel instead of
+ * fx's own actionable message.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("RpcTimeoutError classification", () => {
+  test(
+    "a real fx error whose message starts with 'timed out waiting for' is surfaced verbatim, never reclassified as SESSION_DIED",
+    async () => {
+      const { agent, chunks } = spawnFake("initialize-error-mimics-timeout");
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      // Verbatim fx error text (plus the driver's own "(code N)" suffix from
+      // errMessage/handleLine) — not the synthetic "fx did not respond to
+      // initialize within 30000ms" wording `isTimeoutError`'s true branch
+      // would have produced had it string-matched instead of class-checked.
+      expect(statusChunks[0]!.data).toBe("timed out waiting for gateway upstream (code -32000)");
+      expect(statusChunks[0]!.data.startsWith("timed out waiting for")).toBe(true);
+      expect(statusChunks[0]!.data.startsWith(SESSION_DIED_STATUS_PREFIX)).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 7. Kill / cancel.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("kill() during an in-flight turn", () => {
+  test(
+    "sends session/cancel, the fake resolves with stopReason cancelled, and done resolves promptly (no hang on the grace period)",
+    async () => {
+      const { agent, chunks, captureFile } = spawnFake("kill-cancel");
+
+      // Wait until the turn is actually in flight (the fake has received
+      // the prompt) before cancelling, so session/cancel has a live prompt
+      // to interrupt. The fake's streamed "working..." delta can't be that
+      // signal any more — the coalescer holds it until settlement.
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "session/prompt"));
+
+      const killedAt = Date.now();
+      agent.kill();
+      const code = await agent.done;
+      const elapsedMs = Date.now() - killedAt;
+
+      expect(code).toBe(1);
+      // The partial prose was flushed at settlement, not lost to the cancel.
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "working...")).toBe(true);
+      // Well under CANCEL_WAIT_MS (3000ms) plus KILL_GRACE_MS (2000ms) — the
+      // fake answers session/cancel almost immediately, so this proves the
+      // driver didn't fall through to the force-kill timeout.
+      expect(elapsedMs).toBeLessThan(2000);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/cancel")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 8. Death.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("process death", () => {
+  test(
+    "an unexpected mid-turn exit with no prompt response emits the SESSION_DIED sentinel and fails the turn",
+    async () => {
+      const { agent, chunks } = spawnFake("die-mid-turn");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "prose streamed before a mid-turn death is flushed AHEAD of the session-died status, not lost",
+    async () => {
+      const { agent, chunks } = spawnFake("die-mid-turn-text");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const textAt = chunks.findIndex((c) => c.stream === "assistant" && c.data === "partial answer");
+      const diedAt = chunks.findIndex((c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX));
+      expect(textAt).toBeGreaterThanOrEqual(0);
+      expect(diedAt).toBeGreaterThan(textAt);
+    },
+    10_000,
+  );
+
+  test(
+    "an actionable initialize error that arrives just before the process exits wins over the generic session-died sentinel",
+    async () => {
+      const { agent, chunks } = spawnFake("unauth-die-race");
+      const code = await agent.done;
+      expect(code).toBe(1);
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // The actionable auth message must be present...
+      expect(statusChunks.some((c) => c.data.includes("Fx needs access to Vercel AI Gateway"))).toBe(true);
+      // ...and the generic death sentinel must NOT have clobbered it (the
+      // driver settles on the first failure, so only one status chunk should
+      // exist at all).
+      expect(statusChunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 9. Malformed line mid-stream.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("malformed stdout line", () => {
+  test(
+    "a non-JSON line is skipped without interrupting subsequent chunks or the turn",
+    async () => {
+      const { agent, chunks } = spawnFake("malformed-line");
+      const code = await agent.done;
+      expect(code).toBe(0);
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      // Two events, not one: the malformed-line status emitted between them
+      // is a non-text chunk, so it closes "before" ahead of itself and
+      // "after" opens a fresh message that settlement flushes.
+      expect(assistantChunks.map((c) => c.data)).toEqual(["before", "after"]);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 9b. fx `[context]` diagnostics + delta coalescing, end-to-end through emit.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("[context] diagnostics and delta coalescing", () => {
+  test(
+    "a [context]-only chunk lands as one status line per warning, and the deltas after it land as ONE assistant event",
+    async () => {
+      const { agent, chunks, runId } = spawnFake("context-diagnostic");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const statusLines = chunks.filter((c) => c.stream === "status" && c.data.startsWith("[context] "));
+      expect(statusLines.map((c) => c.data)).toEqual([
+        '[context] skill description "appstore-review" truncated: observed=1040 bytes effective=1024 bytes',
+        "[context] skill catalog omitted 2 entries",
+      ]);
+
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.map((c) => c.data)).toEqual(["Hi there"]);
+
+      // Every line_uuid is run-scoped and distinct — the seq counter
+      // advanced once per status line and once per delta.
+      const uuids = [...statusLines, ...assistantChunks].map((c) => c.lineUuid);
+      for (const u of uuids) expect(u).toStartWith(`fx:${runId}:`);
+      expect(new Set(uuids).size).toBe(uuids.length);
+
+      // Wire order preserved: the diagnostics precede the prose.
+      expect(chunks.indexOf(statusLines[1]!)).toBeLessThan(chunks.indexOf(assistantChunks[0]!));
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 10. tool_call_update with a missing toolCallId.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("tool_call_update with no toolCallId", () => {
+  test(
+    "is dropped rather than emitted as an orphan tool_result",
+    async () => {
+      const { agent, chunks } = spawnFake("missing-tool-call-id");
+      const code = await agent.done;
+      expect(code).toBe(0);
+      expect(chunks.filter((c) => c.stream === "tool_use")).toHaveLength(1);
+      expect(chunks.filter((c) => c.stream === "tool_result")).toHaveLength(0);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 11. dropFxSession.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("dropFxSession", () => {
+  test(
+    "kills a live turn's process and clears the in-memory session",
+    async () => {
+      const { agent, sessionIds, taskId, captureFile } = spawnFake("stall-for-drop");
+
+      // Wait until the session is actually live (session/new resolved) before
+      // dropping it, so this exercises tearing down a real in-flight turn
+      // rather than one that never got that far.
+      await waitFor(() => sessionIds.length === 1);
+      expect(fxSessionActive(taskId)).toBe(true);
+
+      dropFxSession(taskId);
+
+      expect(fxSessionActive(taskId)).toBe(false);
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "sigterm"));
+    },
+    10_000,
+  );
+
+  test("is a safe no-op when no session exists for the task", () => {
+    expect(() => dropFxSession(`task-nonexistent-${randomUUID()}`)).not.toThrow();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 12. reapLiveFxProcs.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("reapLiveFxProcs", () => {
+  test(
+    "SIGKILLs every live fx child directly (no signal sent to the test process itself) and the turn settles failed once the exit is observed",
+    async () => {
+      const { agent, sessionIds, taskId, captureFile } = spawnFake("stall-for-drop");
+
+      // Wait until the session is actually live before reaping, so this
+      // exercises tearing down a real in-flight turn.
+      await waitFor(() => sessionIds.length === 1);
+      expect(fxSessionActive(taskId)).toBe(true);
+
+      // reapLiveFxProcs() only ever calls proc.kill("SIGKILL") on the tracked
+      // children — it never delivers a signal to this test process, so no
+      // SIGINT/SIGTERM/SIGHUP handler runs and bun's own test process stays
+      // untouched.
+      reapLiveFxProcs();
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+      // The exit watcher (proc.exited.then(...)) observes the SIGKILL exit,
+      // fails the turn with the SESSION_DIED sentinel, and settleFx clears
+      // the in-memory session — same end state as dropFxSession, reached via
+      // a different (signal-handler) entry point.
+      expect(fxSessionActive(taskId)).toBe(false);
+
+      // SIGKILL bypasses the fake's own SIGTERM handler entirely — no
+      // "sigterm" capture line is ever written. This distinguishes
+      // reapLiveFxProcs's hard kill from dropFxSession/killProc's graceful
+      // SIGTERM-then-SIGKILL sequence (asserted in the sibling test above).
+      expect(readCaptured(captureFile).some((e) => e.label === "sigterm")).toBe(false);
+    },
+    10_000,
+  );
+
+  test("is a safe no-op when no fx child is currently live", () => {
+    expect(() => reapLiveFxProcs()).not.toThrow();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 13. Signal-handler registration (module-load side effect).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("signal handlers", () => {
+  test("SIGINT/SIGTERM/SIGHUP reap handlers are installed once fx-acp.ts has been imported", () => {
+    // fx-acp.ts is imported at the top of this file, so its top-level
+    // `for (const [sig] of FX_REAP_SIGNALS) process.on(sig, ...)` loop has
+    // already run by the time this test executes — verified by presence,
+    // not by re-importing (Bun's module cache means a second import
+    // wouldn't re-run the registration anyway).
+    expect(process.listenerCount("SIGINT")).toBeGreaterThanOrEqual(1);
+    expect(process.listenerCount("SIGTERM")).toBeGreaterThanOrEqual(1);
+    expect(process.listenerCount("SIGHUP")).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 14. Model-response-recovery channel (`_meta.fx.modelResponseRecovery`) —
+ *     docs/plans/fix-fx-harness-rate-limit.md TT3.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("recovery storm → paused → refused (scenario 1)", () => {
+  test(
+    "emits one FX_RECOVERY_STATUS_PREFIX sentinel per distinct payload (4, no dupes), exactly one paused summary line, and an enriched refused status; done=1",
+    async () => {
+      const { agent, chunks } = spawnFake("recovery");
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as Record<string, unknown>,
+      );
+      // Exactly one sentinel per distinct payload — the two attempt-1
+      // updates differ only by delaySeconds, so both emit (not deduped).
+      expect(payloads.map((p) => [p.state, p.attempt, p.delaySeconds ?? null])).toEqual([
+        ["active", 1, null],
+        ["active", 1, 1],
+        ["active", 2, null],
+        ["paused", 10, null],
+      ]);
+      expect(new Set(recoveryChunks.map((c) => c.data)).size).toBe(recoveryChunks.length);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      const summaryLines = statusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
+      expect(summaryLines).toHaveLength(1);
+      expect(summaryLines[0]!.data).toBe(
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts"
+          + FX_PAUSED_SUMMARY_SUFFIX,
+      );
+
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery — resumes a paused checkpoint without a new prompt (scenario 2)", () => {
+  test(
+    "sends session/prompt with an empty prompt array and continueRecovery:true (no text block); recovered sentinel + its plain summary; no cleared sentinel; done=0",
+    async () => {
+      const resumeId = "resume-continue-1";
+      const { agent, chunks, captureFile } = spawnFake("continue", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      const promptReq = entries.find((e) => e.label === "session/prompt");
+      expect(promptReq).toBeDefined();
+      // Exact captured session/prompt params for the continue turn — no
+      // `text` content block, matching fx's documented continueRecovery
+      // shape verbatim.
+      expect(promptReq!.msg).toEqual({
+        sessionId: resumeId,
+        prompt: [],
+        _meta: { fx: { continueRecovery: true } },
+      });
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      expect(recoveryChunks).toHaveLength(1);
+      const payload = JSON.parse(recoveryChunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string };
+      expect(payload.state).toBe("recovered");
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "✓ recovered · succeeded on attempt 1/10")).toBe(true);
+
+      // No `{"state":"cleared"}` sentinel — this run's session/resume never
+      // replayed a paused checkpoint (a plain `ok(id, {})`, no recovery
+      // -shaped session/update during the resume window), so the
+      // pre-prompt "consume the checkpoint" branch has nothing to clear.
+      const clearedJson = `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify({ state: "cleared" })}`;
+      expect(chunks.some((c) => c.data === clearedJson)).toBe(false);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery rejected by fx (-32602) (scenario 3)", () => {
+  test("surfaces fx's exact message verbatim — no 'fx acp: session/prompt failed:' wrapper, no '(code -32602)' suffix", async () => {
+    const resumeId = "resume-continue-rejected-1";
+    const { agent, chunks } = spawnFake("continue-rejected", { resumeSessionId: resumeId, continueRecovery: true });
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe("No paused model response to continue");
+  }, 10_000);
+});
+
+describe("continueRecovery without a prior session id (scenario 4)", () => {
+  test(
+    "fails immediately with a dedicated status message, before any RPC traffic — the fake server dispatches no session/resume|load|prompt call",
+    async () => {
+      // The scenario name is irrelevant here: runFxTurn's continueRecovery
+      // guard runs before the process ever writes a single JSON-RPC message
+      // to the child's stdin, so no scenario branch is ever reached.
+      const { agent, chunks, captureFile } = spawnFake("happy", { continueRecovery: true });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("fx acp: continueRecovery requires a prior session id");
+
+      // The fake's `handleInitialize` never calls `capture(...)` (only
+      // resume/load/prompt/reply/sigterm do), so "the fake server never
+      // received `initialize`" isn't independently observable through this
+      // harness. What IS observable, and asserted here: no RPC method that
+      // DOES capture itself (session/resume, session/load, session/prompt,
+      // a reply to a server-initiated request) ever appears — proving the
+      // driver never got far enough to send a prompt or handshake. (A
+      // "sigterm" capture line is NOT waited on here — settleFx's killProc
+      // fires within milliseconds of spawn, frequently before the freshly
+      // -spawned child has finished loading this script and installed its
+      // own SIGTERM handler, so the OS's default SIGTERM-terminates
+      // behavior can win the race and no "sigterm" line is ever written;
+      // that race is a fake-harness artifact of this specific fast-fail
+      // scenario, not something the driver's behavior depends on.)
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => ["session/resume", "session/load", "session/prompt", "reply"].includes(e.label))).toBe(
+        false,
+      );
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replays a paused checkpoint onto a NEW run (scenario 5)", () => {
+  test(
+    "the replayed paused sentinel carries replayed:true and its terminal summary line is suppressed; a NORMAL follow-up prompt emits a `cleared` sentinel — but only AFTER session/prompt resolves, so it lands after the turn's own content chunks, not before the RPC is sent (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused", { resumeSessionId: resumeId });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // The replayed paused sentinel, then the cleared sentinel emitted
+      // once the subsequent normal prompt has resolved.
+      expect(payloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      // Finding #8: the replayed sentinel is marked; the cleared one (a
+      // LIVE, driver-synthesized event, not replayed history) is not.
+      expect(payloads[0]!.replayed).toBe(true);
+      expect(payloads[1]!.replayed).toBeUndefined();
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // The paused terminal-summary PLAIN line must NOT reappear — it
+      // already reached the transcript on the run where the pause genuinely
+      // happened; a resume replay must not re-fire it.
+      expect(statusChunks.some((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX))).toBe(false);
+
+      // The turn proceeded normally afterwards (the fake's shared "happy"
+      // response stream).
+      const assistantIndex = chunks.findIndex((c) => c.stream === "assistant" && c.data === "Hello world");
+      expect(assistantIndex).toBeGreaterThanOrEqual(0);
+
+      // Finding #4, directly observable now (previously the cleared
+      // sentinel fired BEFORE session/prompt was even sent, so it always
+      // preceded the turn's content by construction): the cleared sentinel
+      // is emitted only once session/prompt RESOLVES with a result — i.e.
+      // strictly AFTER every content chunk the fake streamed during that
+      // same prompt call, since those arrive as notifications on the wire
+      // before the RPC's own response line.
+      const clearedIndex = chunks.findIndex(
+        (c) => c.stream === "status" && c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+      );
+      expect(clearedIndex).toBeGreaterThan(assistantIndex);
+      // ...and it's the LAST recovery sentinel for the turn.
+      expect(recoveryChunks[recoveryChunks.length - 1]).toBe(chunks[clearedIndex]);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "a NORMAL prompt after a replayed paused that fails with a -32602 (or any transport-level) prompt error emits NO cleared sentinel — the checkpoint is still intact in fx, so the Resume affordance must not vanish (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-prompt-fails-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused-prompt-fails", {
+        resumeSessionId: resumeId,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // Only the replayed paused sentinel — no cleared sentinel, because the
+      // prompt call itself never resolved with a result.
+      expect(payloads.map((p) => p.state)).toEqual(["paused"]);
+      expect(payloads[0]!.replayed).toBe(true);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(
+        statusChunks.some(
+          (c) => c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+        ),
+      ).toBe(false);
+      // fx's own -32602 text surfaces verbatim (existing wrapper behavior
+      // for a normal, non-continueRecovery turn — see scenario 6 above).
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx acp: session/prompt failed: Invalid params (fake, replayed-paused prompt error) (code -32602)",
+        ),
+      ).toBe(true);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("replay-seeded dedupe reset (finding #2): a live re-pause right after the replay window is not swallowed by the replayed one", () => {
+  test(
+    "session/resume replays a paused checkpoint, then the continueRecovery prompt immediately pushes a byte-identical LIVE paused update and answers refused — the live update still emits its own sentinel, summary line, and enriched refused status (not deduped against the replay)",
+    async () => {
+      const resumeId = "resume-continue-repause-1";
+      const { agent, chunks } = spawnFake("resume-continue-repause", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) =>
+          JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as {
+            state: string;
+            attempt?: number;
+            replayed?: boolean;
+          },
+      );
+      // Two DISTINCT-by-source sentinels, both "paused", byte-identical
+      // apart from the replay marker — without the dedupe-key reset at
+      // replay close, the second (live) one would have been silently
+      // swallowed and this array would have length 1.
+      expect(payloads).toHaveLength(2);
+      expect(payloads.every((p) => p.state === "paused" && p.attempt === 10)).toBe(true);
+      expect(payloads[0]!.replayed).toBe(true); // the replayed checkpoint
+      expect(payloads[1]!.replayed).toBeUndefined(); // the LIVE re-pause
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // Exactly one persisted paused summary line (FX_PAUSED_SUMMARY_SUFFIX) —
+      // from the LIVE update only (replay summary lines stay suppressed).
+      const summaryLines = statusChunks.filter((c) => c.data.endsWith(FX_PAUSED_SUMMARY_SUFFIX));
+      expect(summaryLines).toHaveLength(1);
+
+      // The enriched refused status line — proves ctx.lastRecovery got set
+      // from the LIVE paused update (not left stale/undefined by the
+      // dedupe bug), so `fxRefusedStatusLine` had a payload to enrich with.
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/prompt -32602 without continueRecovery keeps the existing wrapper (scenario 6)", () => {
+  test("wraps the message as 'fx acp: session/prompt failed: ...' — the continueRecovery-only verbatim carve-out doesn't apply to a normal turn", async () => {
+    const { agent, chunks } = spawnFake("prompt-invalid-params");
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe(
+      "fx acp: session/prompt failed: Invalid params (fake, no continueRecovery carve-out) (code -32602)",
+    );
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * TT1 (docs/plans/fx-0.0.10-compat.md §5) — fx 0.0.9+ reasoning-effort
+ * config option and the 0.0.9+ structured session/resume replay. Every
+ * `effort-*` scenario below models the 0.0.10 `session/new`/`resume`/`load`
+ * result's `configOptions[{id:"effort"}]` entry via the fake server's
+ * `effortOption(currentValue)` helper (auto/low/high/max, in that order —
+ * see its own comment), and threads `opts.effort`/`opts.model` through
+ * `spawnFake` into `FxLaunchOptions.effort`/`.model` so `applyFxEffort`'s
+ * breadcrumb text names a real model instead of falling back to the
+ * generic "the active model" phrase.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("applyFxEffort — session/new applies the task's stored effort (TT1 scenario 1)", () => {
+  test("sends exactly one session/set_config_option before session/prompt; no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "high" });
+
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(promptIndex).toBeGreaterThan(setIndex);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort 'auto' matches currentValue 'auto' (TT1 scenario 2)", () => {
+  test("no RPC, no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-auto-default", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort not in the offered list (TT1 scenario 3)", () => {
+  test("emits one breadcrumb naming the offers, sends no RPC, and the turn still completes normally", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-not-offered", {
+      effort: "medium",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) =>
+        c.data ===
+        "fx: effort medium isn't offered for zai/glm-5.3-flash (offers: auto, low, high, max) — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries no effort entry at all (0.0.8-shaped result / no-effort model, TT1 scenario 4)", () => {
+  test("effort set → one breadcrumb naming the model, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — the model can't even set one, so auto needs no nudge", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries a PRESENT-but-EMPTY effort entry (Phase 5 review fix)", () => {
+  test("effort set → the same 'exposes no reasoning-effort setting' breadcrumb as an absent entry, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+    // Regression guard: before the fix, a present-but-empty `values` list
+    // fell into the "isn't offered" breadcrumb instead, which would read
+    // "(offers: )" here.
+    expect(statusChunks.some((c) => c.data.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — same as an absent entry", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/set_config_option RPC error degrades to a breadcrumb (TT1 scenario 5)", () => {
+  test("carries fx's own error message verbatim; session/prompt is still sent and the turn completes", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set-error", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(true);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) =>
+          c.data ===
+          "fx: couldn't set effort high — Reasoning effort is not available for the active model — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/resume result carries the persisted effort (TT1 scenario 6)", () => {
+  test("stored effort already matches the persisted currentValue 'high' → no RPC", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-1",
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+  }, 10_000);
+
+  test("variant effort-auto-reset: stored effort 'auto' differs from the persisted 'high' → one set call resetting to auto", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-2",
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "auto" });
+  }, 10_000);
+});
+
+describe("applyFxEffort — resume falls back to session/load; effort applied from load's result (TT1 scenario 7)", () => {
+  test("one set call after load, before prompt", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-load", {
+      resumeSessionId: "resume-effort-load-1",
+      effort: "max",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "max" });
+
+    const loadIndex = entries.findIndex((e) => e.label === "session/load");
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(loadIndex).toBeGreaterThanOrEqual(0);
+    expect(setIndex).toBeGreaterThan(loadIndex);
+    expect(promptIndex).toBeGreaterThan(setIndex);
+  }, 10_000);
+});
+
+describe("applyFxEffort — no stored effort at all (TT1 scenario 8)", () => {
+  test("effort: null → no RPC, no breadcrumb, even though the option is present", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: null,
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+
+  test("effort: undefined (never threaded) → same as null", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+});
+
+describe("parseFxEffortOption — pure helper matrix", () => {
+  test("null configOptions / non-array → null", () => {
+    expect(parseFxEffortOption(undefined)).toBeNull();
+    expect(parseFxEffortOption(null)).toBeNull();
+    expect(parseFxEffortOption("not an array")).toBeNull();
+    expect(parseFxEffortOption({})).toBeNull();
+  });
+
+  test("array with no id:'effort' entry → null", () => {
+    expect(
+      parseFxEffortOption([{ id: "provider", currentValue: "gateway" }, { id: "mode", currentValue: "code" }]),
+    ).toBeNull();
+  });
+
+  test("present entry → current + values, non-string option values dropped", () => {
+    expect(
+      parseFxEffortOption([
+        {
+          id: "effort",
+          currentValue: "high",
+          options: [{ value: "auto" }, { value: "low" }, { value: 7 }, "not-an-object", { value: "high" }],
+        },
+      ]),
+    ).toEqual({ current: "high", values: ["auto", "low", "high"] });
+  });
+
+  test("non-string currentValue reads as null; missing/non-array options reads as []", () => {
+    expect(parseFxEffortOption([{ id: "effort", currentValue: 7 }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort" }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto", options: "nope" }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+  });
+});
+
+describe("session/resume structured replay (0.0.9+) is suppressed except session_info_update (TT1 scenario 9)", () => {
+  test(
+    "replayed tool_call/tool_call_update/assistant content never reach onChunk; the recovery (replayed:true) and title sentinels do; the live turn's own tool call and assistant text after session/prompt arrive normally",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-replay-structured", {
+        resumeSessionId: "resume-replay-structured-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // Nothing from the replayed history reached onChunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:result")).toBe(false);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("partial answer"))).toBe(false);
+
+      // The recovery sentinel DID arrive, marked replayed — followed by the
+      // live "cleared" sentinel once the normal follow-up prompt resolves
+      // (same two-sentinel shape as the existing "resume-replays-paused"
+      // scenario above — see finding #4/#8 in the file header).
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const recoveryPayloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      expect(recoveryPayloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      expect(recoveryPayloads[0]!.replayed).toBe(true);
+      expect(recoveryPayloads[1]!.replayed).toBeUndefined();
+
+      // The title sentinel arrived too, exactly once.
+      const titleChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX),
+      );
+      expect(titleChunks).toHaveLength(1);
+      expect(titleChunks[0]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Replayed title");
+
+      // The LIVE tool call/result pair (sent after session/prompt, once
+      // state.replaying is back to false) DID arrive.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:use")).toBe(true);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:result")).toBe(true);
+
+      // The LIVE assistant text DID arrive.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "live answer")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replay window closes on the reply LINE, not on the awaiting microtask (Phase 5 review fix)", () => {
+  test(
+    "a live update in the SAME stdout chunk as the resume response reaches onChunk; a replayed update earlier in that same chunk is still dropped",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-same-chunk-update", {
+        resumeSessionId: "resume-same-chunk-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // The replayed tool_call, written BEFORE the resume response in the
+      // same raw stdout.write call, is still inside the replay window by
+      // line order and must be dropped exactly as it would be if it had
+      // arrived in its own separate chunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:result")).toBe(false);
+
+      // The live agent_message_chunk, written AFTER the resume response in
+      // that SAME chunk, must reach onChunk as an assistant event — this is
+      // the regression the fix closes: before it, `state.replaying` was
+      // only cleared once `runFxTurn`'s `await sendRpc(...)` resumed as a
+      // microtask, which happens strictly after pumpStdout finishes
+      // draining every line already in the buffer, so this line would have
+      // been wrongly dropped as replay too.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "same-chunk live text")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * fx 0.0.14 (docs/plans/fx-0.0.14-and-cursor-updates.md §3.2, U-F1): no
+ * `session/set_mode` ever, the profile-MCP `_meta` on every handshake, the
+ * `session.notices` client capability, notices + tool identity meta through
+ * the live driver, and `applyFxSpeed`'s lane reconciliation.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("session/set_mode is never sent (fx 0.0.14 would save it into the user's ~/.fx/settings.json)", () => {
+  for (const mode of ["yolo", "auto", "ask"] as const) {
+    test(`mode ${mode}: neither session/new nor session/resume is followed by a set_mode call`, async () => {
+      const fresh = spawnFake("happy", { mode });
+      expect(await fresh.agent.done).toBe(0);
+      const freshEntries = readCaptured(fresh.captureFile);
+      expect(freshEntries.some((e) => e.label === "session/new")).toBe(true);
+      expect(freshEntries.some((e) => e.label === "session/set_mode")).toBe(false);
+
+      const resumed = spawnFake("resume", { mode, resumeSessionId: `resume-no-set-mode-${mode}` });
+      expect(await resumed.agent.done).toBe(0);
+      const resumedEntries = readCaptured(resumed.captureFile);
+      expect(resumedEntries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(resumedEntries.some((e) => e.label === "session/set_mode")).toBe(false);
+    }, 10_000);
+  }
+});
+
+describe("profile MCP servers `_meta.fx.profileMcpServers` (fx ≥0.0.13)", () => {
+  const META = { fx: { profileMcpServers: true } };
+
+  test("undefined (default) and true: session/new carries the _meta", async () => {
+    for (const profileMcpServers of [undefined, true]) {
+      const { agent, captureFile } = spawnFake("happy", { profileMcpServers });
+      expect(await agent.done).toBe(0);
+      const newReq = readCaptured(captureFile).find((e) => e.label === "session/new");
+      expect((newReq!.msg as { _meta?: unknown })._meta).toEqual(META);
+      expect((newReq!.msg as { mcpServers?: unknown }).mcpServers).toEqual([]);
+    }
+  }, 10_000);
+
+  test("on: session/resume carries the _meta", async () => {
+    const { agent, captureFile } = spawnFake("resume", { resumeSessionId: "resume-meta-on" });
+    expect(await agent.done).toBe(0);
+    const req = readCaptured(captureFile).find((e) => e.label === "session/resume");
+    expect(req!.msg).toEqual({ sessionId: "resume-meta-on", _meta: META });
+  }, 10_000);
+
+  test("on: the session/load fallback carries the _meta too", async () => {
+    const { agent, captureFile } = spawnFake("resume-fallback", { resumeSessionId: "resume-meta-load" });
+    expect(await agent.done).toBe(0);
+    const entries = readCaptured(captureFile);
+    expect((entries.find((e) => e.label === "session/resume")!.msg as { _meta?: unknown })._meta).toEqual(META);
+    expect((entries.find((e) => e.label === "session/load")!.msg as { _meta?: unknown })._meta).toEqual(META);
+  }, 10_000);
+
+  test("false: the _meta key is omitted entirely on session/new, session/resume and session/load", async () => {
+    const fresh = spawnFake("happy", { profileMcpServers: false });
+    expect(await fresh.agent.done).toBe(0);
+    const newReq = readCaptured(fresh.captureFile).find((e) => e.label === "session/new");
+    expect("_meta" in (newReq!.msg as object)).toBe(false);
+
+    const fallback = spawnFake("resume-fallback", { resumeSessionId: "resume-meta-off", profileMcpServers: false });
+    expect(await fallback.agent.done).toBe(0);
+    const entries = readCaptured(fallback.captureFile);
+    expect("_meta" in (entries.find((e) => e.label === "session/resume")!.msg as object)).toBe(false);
+    expect("_meta" in (entries.find((e) => e.label === "session/load")!.msg as object)).toBe(false);
+  }, 10_000);
+});
+
+describe("initialize advertises clientCapabilities.session.notices (fx ≥0.0.14)", () => {
+  test("keeps the existing fs/terminal fields and adds session.notices", async () => {
+    const { agent, captureFile } = spawnFake("happy");
+    expect(await agent.done).toBe(0);
+    const init = readCaptured(captureFile).find((e) => e.label === "initialize");
+    expect((init!.msg as { clientCapabilities?: unknown }).clientCapabilities).toEqual({
+      fs: { readTextFile: false, writeTextFile: false },
+      terminal: false,
+      session: { notices: {} },
+    });
+    expect((init!.msg as { protocolVersion?: unknown }).protocolVersion).toBe(1);
+  }, 10_000);
+});
+
+describe("notice + tool identity meta through the live driver (fx ≥0.0.14)", () => {
+  test("a notice becomes a status line; an internal call's use/result are stamped; an MCP call is labelled server · tool", async () => {
+    const { agent, chunks } = spawnFake("tool-meta");
+    expect(await agent.done).toBe(0);
+
+    expect(chunks.filter((c) => c.stream === "status").map((c) => c.data)).toContain("⚠ fx: e2e notice");
+
+    const internalUse = chunks.find((c) => c.lineUuid === "fx:tool:tc-internal:use");
+    const internalResult = chunks.find((c) => c.lineUuid === "fx:tool:tc-internal:result");
+    expect(JSON.parse(internalUse!.data).internal).toBe(true);
+    expect(JSON.parse(internalResult!.data).internal).toBe(true);
+
+    const mcpUse = JSON.parse(chunks.find((c) => c.lineUuid === "fx:tool:tc-mcp:use")!.data);
+    expect(mcpUse.name).toBe("e2e-mcp · lookup");
+    expect(mcpUse.mcp).toEqual({ server: "e2e-mcp", tool: "lookup" });
+    expect("internal" in mcpUse).toBe(false);
+    const mcpResult = JSON.parse(chunks.find((c) => c.lineUuid === "fx:tool:tc-mcp:result")!.data);
+    expect("internal" in mcpResult).toBe(false);
+
+    // The steered user echo fx sends after delivering a steer emits nothing.
+    expect(chunks.some((c) => c.data.includes("steered echo"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxSpeed — fast/ultrafast configOptions reconciliation (fx ≥0.0.13)", () => {
+  const speedCalls = (captureFile: string) =>
+    readCaptured(captureFile)
+      .filter((e) => e.label === "session/set_config_option")
+      .map((e) => e.msg as { configId: string; value: string })
+      .filter((m) => m.configId === "fast" || m.configId === "ultrafast")
+      .map((m) => `${m.configId}=${m.value}`);
+  const statusLines = (chunks: Chunk[]) => chunks.filter((c) => c.stream === "status").map((c) => c.data);
+  const MODEL = "openai/gpt-6.1-sol";
+
+  test("speed null / undefined → no speed RPC and no breadcrumb, even with lanes on", async () => {
+    for (const speed of [null, undefined]) {
+      const { agent, chunks, captureFile } = spawnFake("happy", {
+        speed,
+        model: MODEL,
+        env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+      });
+      expect(await agent.done).toBe(0);
+      expect(speedCalls(captureFile)).toEqual([]);
+      expect(statusLines(chunks).some((d) => d.includes("Fast") || d.includes("Ultrafast"))).toBe(false);
+    }
+  }, 10_000);
+
+  test("fast, both lanes present and off → one fast=true call, before session/prompt, silent", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    const entries = readCaptured(captureFile);
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    expect(entries.findIndex((e) => e.label === "session/prompt")).toBeGreaterThan(setIndex);
+    expect(statusLines(chunks).some((d) => d.includes("Fast"))).toBe(false);
+  }, 10_000);
+
+  test("ultrafast with fast currently on → ultrafast=true only (fx's reply already shows fast off); order ultrafast before fast", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "ultrafast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=true"]);
+    expect(statusLines(chunks).some((d) => d.includes("Fast") || d.includes("Ultrafast"))).toBe(false);
+  }, 10_000);
+
+  test("fast with ultrafast currently on → ultrafast=false first, then fast=true", async () => {
+    const { agent, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=false", "fast=true"]);
+  }, 10_000);
+
+  test("off with a lane on → that lane is turned off; off with lanes already off → no RPC", async () => {
+    const on = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true", ultrafast: "false" }) },
+    });
+    expect(await on.agent.done).toBe(0);
+    expect(speedCalls(on.captureFile)).toEqual(["fast=false"]);
+
+    const off = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await off.agent.done).toBe(0);
+    expect(speedCalls(off.captureFile)).toEqual([]);
+  }, 10_000);
+
+  test("fast already on → silent, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual([]);
+    expect(statusLines(chunks).some((d) => d.includes("Fast"))).toBe(false);
+  }, 10_000);
+
+  test("no lanes offered: fast/ultrafast → exactly one 'isn't offered' breadcrumb, no RPC; off → silent", async () => {
+    for (const [speed, expected] of [
+      ["fast", fxSpeedNotOfferedLine("fast", "deepseek/deepseek-v4-flash")],
+      ["ultrafast", fxSpeedNotOfferedLine("ultrafast", "deepseek/deepseek-v4-flash")],
+    ] as const) {
+      const { agent, chunks, captureFile } = spawnFake("happy", { speed, model: "deepseek/deepseek-v4-flash" });
+      expect(await agent.done).toBe(0);
+      expect(speedCalls(captureFile)).toEqual([]);
+      expect(statusLines(chunks).filter((d) => d === expected)).toHaveLength(1);
+    }
+    const off = spawnFake("happy", { speed: "off", model: "deepseek/deepseek-v4-flash" });
+    expect(await off.agent.done).toBe(0);
+    expect(statusLines(off.chunks).some((d) => d.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("ultrafast wanted but only a fast lane exists → fast is turned off and the Ultrafast breadcrumb fires", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "ultrafast",
+      model: "openai/gpt-5.2",
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "true" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=false"]);
+    expect(statusLines(chunks)).toContain(fxSpeedNotOfferedLine("ultrafast", "openai/gpt-5.2"));
+  }, 10_000);
+
+  test("a set_config_option error degrades to a breadcrumb carrying fx's message; the turn still succeeds", async () => {
+    const { agent, chunks, captureFile } = spawnFake("happy", {
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false" }), FX_FAKE_SPEED_ERROR: "fast" },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    expect(readCaptured(captureFile).some((e) => e.label === "session/prompt")).toBe(true);
+    expect(statusLines(chunks)).toContain(
+      'fx: couldn\'t set Fast — Fast mode is not available for model "fake/model" — running without it',
+    );
+  }, 10_000);
+
+  test("an error turning a lane OFF says so without claiming the run is without it", async () => {
+    const { agent, chunks } = spawnFake("happy", {
+      speed: "off",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ ultrafast: "true" }), FX_FAKE_SPEED_ERROR: "ultrafast" },
+    });
+    expect(await agent.done).toBe(0);
+    expect(statusLines(chunks)).toContain(
+      'fx: couldn\'t turn off Ultrafast — Ultrafast mode is not available for model "fake/model"',
+    );
+  }, 10_000);
+
+  test("session/resume: lanes are reconciled from the resume result", async () => {
+    const { agent, captureFile } = spawnFake("resume", {
+      resumeSessionId: "resume-speed-1",
+      speed: "ultrafast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false", ultrafast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["ultrafast=true"]);
+  }, 10_000);
+
+  test("session/load fallback: lanes are reconciled from the load result, after load and before prompt", async () => {
+    const { agent, captureFile } = spawnFake("resume-fallback", {
+      resumeSessionId: "resume-speed-load",
+      speed: "fast",
+      model: MODEL,
+      env: { FX_FAKE_SPEED_OPTS: JSON.stringify({ fast: "false" }) },
+    });
+    expect(await agent.done).toBe(0);
+    expect(speedCalls(captureFile)).toEqual(["fast=true"]);
+    const entries = readCaptured(captureFile);
+    const loadIndex = entries.findIndex((e) => e.label === "session/load");
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    expect(setIndex).toBeGreaterThan(loadIndex);
+    expect(entries.findIndex((e) => e.label === "session/prompt")).toBeGreaterThan(setIndex);
+  }, 10_000);
+});
+
+describe("steering (fx ≥0.0.13 _meta.fx.steer)", () => {
+  const steerReqs = (captureFile: string) => readCaptured(captureFile).filter((e) => e.label === "steer");
+  const droppedLines = (chunks: Chunk[]) =>
+    chunks.filter((c) => c.stream === "status" && c.data === FX_STEER_DROPPED_STATUS);
+  const promptSent = (captureFile: string) => readCaptured(captureFile).some((e) => e.label === "session/prompt");
+
+  test("absorbed: the steer carries _meta.fx.steer, the driver waits for its late reply, nothing is handed back", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-absorbed");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("also add tests")).toBe(true);
+    expect(await agent.done).toBe(0);
+
+    const reqs = steerReqs(captureFile);
+    expect(reqs).toHaveLength(1);
+    expect(reqs[0]!.msg).toEqual({
+      sessionId: "sess-steer-absorbed-1",
+      prompt: [{ type: "text", text: "also add tests" }],
+      _meta: { fx: { steer: true } },
+    });
+    // The absorbed reply lands 100ms after the main one — had the driver
+    // not waited for it, it would have read the steer as unanswered.
+    expect(droppedSteers).toEqual([]);
+    expect(droppedLines(chunks)).toHaveLength(0);
+    // A steer RPC never counts as a turn error.
+    expect(chunks.some((c) => c.stream === "status" && c.data.includes("session/prompt failed"))).toBe(false);
+  }, 10_000);
+
+  test("dropped via -32600: onSteerDropped(text) fires before done, plus one status line; the turn still succeeds", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-dropped");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("late message")).toBe(true);
+    expect(await agent.done).toBe(0);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["late message"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+    expect(chunks.some((c) => c.data.includes("Steering prompt was not delivered"))).toBe(false);
+  }, 10_000);
+
+  test("dropped but not queued by the caller (a teardown): handed back, but no 'sending it as the next turn' line", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-dropped", { steerQueued: false });
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("discarded message")).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(droppedSteers).toEqual(["discarded message"]);
+    expect(droppedLines(chunks)).toHaveLength(0);
+  }, 10_000);
+
+  test("two steers on one turn: each dropped one is handed back once, with one status line each", async () => {
+    const { agent, chunks, captureFile, droppedSteers } = spawnFake("steer-dropped");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("first")).toBe(true);
+    expect(agent.steer!("second")).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(droppedSteers).toEqual(["first", "second"]);
+    expect(droppedLines(chunks)).toHaveLength(2);
+  }, 10_000);
+
+  test("cancelled turn: the steer comes back steering:dropped and is handed back before done", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-cancel");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("stop and do this")).toBe(true);
+    await waitFor(() => steerReqs(captureFile).length === 1);
+    agent.kill();
+    expect(await agent.done).toBe(1);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["stop and do this"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+    // Once Stop is requested, a further steer is declined (the caller queues).
+    expect(agent.steer!("after stop")).toBe(false);
+  }, 10_000);
+
+  test("never answered within the grace: dropped once the grace elapses", async () => {
+    const { agent, chunks, captureFile, droppedSteers, order } = spawnFake("steer-silent", { steerSettleGraceMs: 250 });
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("anyone there?")).toBe(true);
+    const started = Date.now();
+    expect(await agent.done).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(200);
+    await waitFor(() => order.includes("done"));
+
+    expect(droppedSteers).toEqual(["anyone there?"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+    expect(droppedLines(chunks)).toHaveLength(1);
+  }, 10_000);
+
+  test("the process dies with a steer pending: handed back exactly once, before done", async () => {
+    const { agent, captureFile, droppedSteers, order } = spawnFake("steer-die");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("lost in a crash?")).toBe(true);
+    expect(await agent.done).toBe(1);
+    await waitFor(() => order.includes("done"));
+    // Give any late outcome callback a chance to (wrongly) report again.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(droppedSteers).toEqual(["lost in a crash?"]);
+    expect(order).toEqual(["steer-dropped", "done"]);
+  }, 10_000);
+
+  test("unsupported (no capability advertised): steer() returns false and sends nothing", async () => {
+    const { agent, captureFile, droppedSteers } = spawnFake("steer-unsupported");
+    await waitFor(() => promptSent(captureFile));
+    expect(agent.steer!("hello?")).toBe(false);
+    expect(await agent.done).toBe(0);
+    expect(steerReqs(captureFile)).toHaveLength(0);
+    expect(droppedSteers).toEqual([]);
+  }, 10_000);
+
+  test("over 64 KiB of UTF-8: steer() returns false; exactly 64 KiB is sent", async () => {
+    const { agent, captureFile } = spawnFake("steer-absorbed");
+    await waitFor(() => promptSent(captureFile));
+    // 3 bytes per char: 21846 chars = 65538 bytes > 65536.
+    expect(agent.steer!("€".repeat(21_846))).toBe(false);
+    expect(agent.steer!("")).toBe(false);
+    expect(steerReqs(captureFile)).toHaveLength(0);
+    expect(agent.steer!("a".repeat(64 * 1024))).toBe(true);
+    expect(await agent.done).toBe(0);
+    expect(steerReqs(captureFile)).toHaveLength(1);
+  }, 10_000);
+
+  test("during the handshake (main prompt not yet sent): steer() returns false", async () => {
+    const { agent, captureFile } = spawnFake("steer-handshake");
+    await waitFor(() => readCaptured(captureFile).some((e) => e.label === "initialize"));
+    expect(promptSent(captureFile)).toBe(false);
+    expect(agent.steer!("too early")).toBe(false);
+    expect(await agent.done).toBe(0);
+    // After settlement it is declined too.
+    expect(agent.steer!("too late")).toBe(false);
+    expect(steerReqs(captureFile)).toHaveLength(0);
+  }, 10_000);
+});

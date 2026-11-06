@@ -1,0 +1,825 @@
+import { test, expect, describe } from "bun:test";
+import {
+  AGENT_OPTIONS,
+  CURSOR_MODEL_SPECS,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  EFFORT_OPTIONS,
+  MODEL_EFFORT_SUPPORT,
+  MODEL_MIN_CLI_VERSION,
+  cursorModelArg,
+  cursorModelIdCoveredByCatalog,
+  cursorModelSupportsFast,
+  cursorModelSupportsMaxMode,
+  retainableEfforts,
+  supportedEfforts,
+  supportedModes,
+  type AgentOption,
+} from "../shared/types.ts";
+import type { ModelOption } from "../shared/model-options.ts";
+
+test("claude haiku-5.5 exposes exactly max/xhigh/high/medium/low (no none row)", () => {
+  const ids = supportedEfforts("claude-code", "haiku-5.5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+  expect(ids).not.toContain("none");
+});
+
+test("claude sonnet-5.5 exposes exactly max/xhigh/high/medium/low (no none row)", () => {
+  const ids = supportedEfforts("claude-code", "sonnet-5.5").map((o) => o.id);
+  // Exact match is deliberate: there is no `none` row because thinking can't
+  // be disabled on Sonnet 5.5 (plan §2).
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("claude opus-5.5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-5.5").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
+test("claude opus-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
+test("claude opus-4.8 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-4.8").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
+test("claude opus-4.7 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-4.7").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
+test("claude sonnet-4.6 supports max but not xhigh (per API docs)", () => {
+  const ids = supportedEfforts("claude-code", "sonnet-4.6").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+  expect(ids).not.toContain("xhigh");
+});
+
+test("claude sonnet-5 supports xhigh + max (first Sonnet tier with xhigh)", () => {
+  const ids = supportedEfforts("claude-code", "sonnet-5").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
+test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)", () => {
+  const ids = supportedEfforts("claude-code", "haiku-4.5").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("claude null model falls back to DEFAULT_MODEL support set (opus-5.5)", () => {
+  // No model specified → use the agent's default model's support set. Since
+  // claude-code's DEFAULT_MODEL is opus-5.5, xhigh + max are both available.
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-5.5");
+  const ids = supportedEfforts("claude-code", null).map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+  expect(ids).toContain("high");
+});
+
+test("claude fable-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "fable-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude mythos-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude fable-5.1 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "fable-5.1").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude mythos-5.1 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5.1").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("codex DEFAULT_MODEL is GPT-6.1 Sol", () => {
+  // Owner decision 2026-09-30 (docs/plans/add-gpt-6-1-sol.md D1): GPT-6.1 Sol
+  // supersedes GPT-6 Sol (2026-09-22, docs/plans/add-gpt-6-sol-and-luna.md D1)
+  // as codex's recommended daily driver.
+  expect(DEFAULT_MODEL.codex).toBe("gpt-6.1-sol");
+});
+
+test("codex DEFAULT_EFFORT is high (ultra deliberately not the default)", () => {
+  expect(DEFAULT_EFFORT.codex).toBe("high");
+});
+
+test("codex GPT-6 Astra + Aeon support ultra through low, no none", () => {
+  for (const model of ["gpt-6-astra", "gpt-6-astra-aeon"]) {
+    const ids = supportedEfforts("codex", model).map((o) => o.id);
+    expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+  }
+});
+
+test("codex GPT-5.6 Cyber/Sol/Terra support ultra through none", () => {
+  for (const model of ["gpt-5.6-cyber", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+    const ids = supportedEfforts("codex", model).map((o) => o.id);
+    expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+  }
+});
+
+test("codex GPT-5.6 Luna supports max through none, no ultra (catalog doesn't offer it there)", () => {
+  const ids = supportedEfforts("codex", "gpt-5.6-luna").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex GPT-6.1 Sol supports ultra through low, no none (live 400 on 0.159.2)", () => {
+  // docs/plans/add-gpt-6-1-sol.md (2026-09-30): unlike GPT-6 Sol, the 6.1
+  // catalog entry rejects `none` with a live 400 on codex 0.159.2.
+  const ids = supportedEfforts("codex", "gpt-6.1-sol").map((o) => o.id);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+});
+
+test("codex GPT-6.1 Terra supports ultra through none (none + ultra live on 0.162.1; minimal 400s)", () => {
+  // docs/plans/add-gpt-6-1-terra.md (2026-10-26): unlike 6.1 Sol, Terra accepts
+  // `none`; `minimal` answers a live 400, so it is not offered.
+  const ids = supportedEfforts("codex", "gpt-6.1-terra").map((o) => o.id);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex GPT-6 Sol supports ultra through none", () => {
+  const ids = supportedEfforts("codex", "gpt-6-sol").map((o) => o.id);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex GPT-6 Luna supports max through none, no ultra (catalog doesn't offer it there)", () => {
+  const ids = supportedEfforts("codex", "gpt-6-luna").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
+});
+
+test("codex model picker lists the full 12-model order (GPT-6.1 Terra right after GPT-6.1 Sol)", () => {
+  const ids = AGENT_OPTIONS.codex.models.map((m) => m.id);
+  expect(ids).toEqual([
+    "gpt-6-astra",
+    "gpt-6-astra-aeon",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-cyber",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5-codex",
+    "gpt-5",
+  ]);
+});
+
+test("codex gpt-5.5 is retired: no codex row, no codex effort key, while the Cursor gpt-5.5 spec stays", () => {
+  // docs/plans/add-gpt-6-1-terra.md D2 (2026-10-26): codex retired GPT-5.5 on
+  // 2026-10-14 and migration 075 moves its rows to GPT-6.1 Sol. Cursor still
+  // lists its own gpt-5.5 variants.
+  expect(AGENT_OPTIONS.codex.models.map((m) => m.id)).not.toContain("gpt-5.5");
+  expect(MODEL_EFFORT_SUPPORT.codex?.["gpt-5.5"]).toBeUndefined();
+  expect(CURSOR_MODEL_SPECS["gpt-5.5"]).toBeDefined();
+});
+
+test("codex gpt-5 / gpt-5-codex support xhigh through low, no max/ultra/none (unchanged)", () => {
+  for (const model of ["gpt-5", "gpt-5-codex"]) {
+    const ids = supportedEfforts("codex", model).map((o) => o.id);
+    expect(ids).toEqual(["xhigh", "high", "medium", "low"]);
+  }
+});
+
+test("unknown model falls back to the agent's DEFAULT_MODEL support set (6.1 Sol's)", () => {
+  // codex's default is now gpt-6.1-sol, so pasted future ids inherit its
+  // range — ultra through low. `none` is no longer in the fallback set
+  // (docs/plans/add-gpt-6-1-sol.md, 2026-09-30).
+  const ids = supportedEfforts("codex", "future-codex-9000").map((o) => o.id);
+  expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+});
+
+describe("MODEL_MIN_CLI_VERSION", () => {
+  test("only codex and copilot have entries; codex has exactly the six GPT-6-family ids, each floor major.minor.patch and each id a real codex model", () => {
+    expect(Object.keys(MODEL_MIN_CLI_VERSION).sort()).toEqual(["codex", "copilot"]);
+    const codexFloors = MODEL_MIN_CLI_VERSION.codex ?? {};
+    expect(Object.keys(codexFloors).sort()).toEqual(
+      ["gpt-6-astra", "gpt-6-astra-aeon", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"].sort(),
+    );
+    expect(codexFloors).toEqual({
+      "gpt-6.1-sol": "0.159.0",
+      "gpt-6.1-terra": "0.159.0",
+      "gpt-6-sol": "0.155.0",
+      "gpt-6-luna": "0.155.0",
+      "gpt-6-astra": "0.153.0",
+      "gpt-6-astra-aeon": "0.153.0",
+    });
+    const codexModelIds = new Set(AGENT_OPTIONS.codex.models.map((m) => m.id));
+    for (const [id, floor] of Object.entries(codexFloors)) {
+      expect(codexModelIds.has(id)).toBe(true);
+      expect(floor).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+  });
+});
+
+test("ordered highest → lowest (no placeholder at the top)", () => {
+  const ids = supportedEfforts("claude-code", "opus-4.7").map((o) => o.id);
+  expect(ids[0]).toBe("max");
+  const expectedOrder = ["max", "xhigh", "high", "medium", "low"];
+  const filteredExpected = expectedOrder.filter((id) => ids.includes(id));
+  expect(ids).toEqual(filteredExpected);
+});
+
+test("EFFORT_OPTIONS lists ultra first (Codex's top tier)", () => {
+  expect(EFFORT_OPTIONS[0]?.id).toBe("ultra");
+});
+
+test("ultra is Codex-only — never offered on claude-code, cursor, gemini, or fx", () => {
+  // Confirm these are real, currently-supported model ids (not vacuously
+  // true because the id doesn't exist in the table at all).
+  expect(AGENT_OPTIONS["claude-code"].models.map((m) => m.id)).toContain("opus-5");
+  expect(AGENT_OPTIONS.cursor.models.map((m) => m.id)).toContain("cursor-grok-4.6");
+
+  expect(supportedEfforts("claude-code", "opus-5").map((o) => o.id)).not.toContain("ultra");
+  expect(supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id)).not.toContain("ultra");
+  for (const model of AGENT_OPTIONS.gemini.models) {
+    expect(supportedEfforts("gemini", model.id).map((o) => o.id)).not.toContain("ultra");
+  }
+  for (const model of AGENT_OPTIONS.fx.models) {
+    expect(supportedEfforts("fx", model.id).map((o) => o.id)).not.toContain("ultra");
+  }
+});
+
+// docs/plans/fx-0.0.10-compat.md §3 — `auto` ("Model default") is the one
+// EFFORT_OPTIONS row every kind but fx must never offer, mirroring the
+// ultra/Codex-only test above.
+test("auto is fx-only — never offered on claude-code, codex, cursor, or gemini", () => {
+  expect(supportedEfforts("claude-code", "opus-5").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("codex", "gpt-6-astra").map((o) => o.id)).not.toContain("auto");
+  expect(supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id)).not.toContain("auto");
+  for (const model of AGENT_OPTIONS.gemini.models) {
+    expect(supportedEfforts("gemini", model.id).map((o) => o.id)).not.toContain("auto");
+  }
+});
+
+// GitHub Copilot is the second kind (after fx) that offers `auto` ("Model
+// default"); `ultra` stays Codex-only for it too.
+test("copilot offers auto on every curated model and never ultra", () => {
+  for (const model of AGENT_OPTIONS.copilot.models) {
+    const ids = supportedEfforts("copilot", model.id).map((o) => o.id);
+    expect(ids).toContain("auto");
+    expect(ids).not.toContain("ultra");
+  }
+});
+
+test("copilot: curated tables for representative models", () => {
+  expect(supportedEfforts("copilot", "auto").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"]);
+  expect(supportedEfforts("copilot", "claude-opus-5.5").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "auto"]);
+  expect(supportedEfforts("copilot", "gpt-6-luna").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "none", "auto"]);
+  expect(supportedEfforts("copilot", "kimi-k3").map((o) => o.id)).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("copilot: a discovered-only model id falls back to the auto row's full set", () => {
+  expect(supportedEfforts("copilot", "gpt-5.4-mini").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"]);
+});
+
+describe("copilot discovered efforts", () => {
+  test("a discovered auto id is kept (copilot is in MODEL_DEFAULT_EFFORT_KINDS)", () => {
+    const ids = supportedEfforts("copilot", "gpt-6.1-sol", ["auto", "high", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low", "auto"]);
+  });
+
+  test("retainableEfforts keeps auto for copilot", () => {
+    expect(retainableEfforts("copilot", "claude-opus-5.5", ["low"]).has("auto")).toBe(true);
+  });
+});
+
+describe("supportedEfforts with discovered efforts", () => {
+  test("a non-empty discovered list wins outright, returned in canonical order", () => {
+    const ids = supportedEfforts("codex", "gpt-6-astra", ["low", "high"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low"]);
+  });
+
+  test("discovered ids unknown to agetor fall back to the curated table", () => {
+    const withUnknownDiscovery = supportedEfforts("codex", "gpt-6-astra", ["turbo"]).map((o) => o.id);
+    const curated = supportedEfforts("codex", "gpt-6-astra").map((o) => o.id);
+    expect(withUnknownDiscovery).toEqual(curated);
+  });
+
+  test("null / undefined / empty discovered efforts behave exactly like the two-arg call", () => {
+    const curated = supportedEfforts("codex", "gpt-5.6-sol").map((o) => o.id);
+    expect(supportedEfforts("codex", "gpt-5.6-sol", null).map((o) => o.id)).toEqual(curated);
+    expect(supportedEfforts("codex", "gpt-5.6-sol", undefined).map((o) => o.id)).toEqual(curated);
+    expect(supportedEfforts("codex", "gpt-5.6-sol", []).map((o) => o.id)).toEqual(curated);
+  });
+
+  test("a discovered set can add none to Astra even though the curated table lacks it", () => {
+    const ids = supportedEfforts("codex", "gpt-6-astra", [
+      "ultra", "max", "xhigh", "high", "medium", "low", "none",
+    ]).map((o) => o.id);
+    expect(ids).toContain("none");
+  });
+
+  test("a discovered set can drop none from Sol even though the curated table has it", () => {
+    const ids = supportedEfforts("codex", "gpt-5.6-sol", [
+      "ultra", "max", "xhigh", "high", "medium", "low",
+    ]).map((o) => o.id);
+    expect(ids).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+    expect(ids).not.toContain("none");
+  });
+
+  test("discovered efforts on an unknown codex id win over the default-model fallback", () => {
+    const ids = supportedEfforts("codex", "gpt-9-test", ["low", "medium"]).map((o) => o.id);
+    expect(ids).toEqual(["medium", "low"]);
+  });
+
+  test("a non-codex kind with a discovered list also honours it (the function is kind-agnostic)", () => {
+    const ids = supportedEfforts("claude-code", "opus-5", ["low", "medium"]).map((o) => o.id);
+    expect(ids).toEqual(["medium", "low"]);
+  });
+
+  test("cursor unknown-id guard runs before the discovered branch — a discovered list can't re-open efforts for an unknown cursor id", () => {
+    // cursor encodes effort in the model id itself (cursorModelArg); an
+    // unknown id has no way to receive an effort no matter what a harness
+    // "discovered" for it. If the discovered short-circuit ran first, this
+    // would incorrectly return ["high", "low"].
+    expect(supportedEfforts("cursor", "cursor-unknown-9", ["low", "high"])).toEqual([]);
+  });
+
+  test("cursor unknown-id guard only affects unknown ids — a known cursor id still honours a discovered list", () => {
+    const ids = supportedEfforts("cursor", "cursor-grok-4.6", ["low"]).map((o) => o.id);
+    expect(ids).toEqual(["low"]);
+  });
+
+  test("auto is dropped from a non-fx kind's discovered set — a discovered 'auto' never surfaces Model default on codex", () => {
+    const ids = supportedEfforts("codex", "gpt-6-astra", ["auto", "high", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low"]);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("auto-only discovery on a non-fx kind falls back to the curated table (nothing known after the drop)", () => {
+    const ids = supportedEfforts("claude-code", "opus-5", ["auto"]).map((o) => o.id);
+    const curated = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
+    expect(ids).toEqual(curated);
+    expect(ids).not.toContain("auto");
+  });
+
+  test("fx keeps a discovered auto id", () => {
+    const ids = supportedEfforts("fx", "zai/glm-5.3-flash", ["auto", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["low", "auto"]);
+  });
+});
+
+// docs/plans/add-opencode-harness.md D-6 — OpenCode's own branch.
+describe("supportedEfforts('opencode', …)", () => {
+  const ids = (os: AgentOption[]) => os.map((o) => o.id);
+
+  test("the sentinel (and a null model) offers no effort, whatever discovery says", () => {
+    expect(supportedEfforts("opencode", "opencode-default")).toEqual([]);
+    expect(supportedEfforts("opencode", "opencode-default", ["high"])).toEqual([]);
+    expect(supportedEfforts("opencode", null)).toEqual([]);
+    expect(supportedEfforts("opencode", null, ["low"])).toEqual([]);
+  });
+
+  test("a model discovered with no variants offers no effort", () => {
+    expect(supportedEfforts("opencode", "opencode/big-pickle", [])).toEqual([]);
+  });
+
+  test("a model with no discovery entry offers only Model default", () => {
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle"))).toEqual(["auto"]);
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle", null))).toEqual(["auto"]);
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle", undefined))).toEqual(["auto"]);
+  });
+
+  test("discovered variants follow Model default, in reported order (not canonical order)", () => {
+    expect(ids(supportedEfforts("opencode", "opencode/deepseek-v4.1-flash-free", ["low", "high", "max"])))
+      .toEqual(["auto", "low", "high", "max"]);
+  });
+
+  test("known variant ids reuse the EFFORT_OPTIONS rows; unknown ones get a synthesized {id, label: id} row", () => {
+    const rows = supportedEfforts("opencode", "anthropic/claude-x", ["high", "thinking"]);
+    expect(rows[0]).toBe(EFFORT_OPTIONS.find((o) => o.id === "auto") as AgentOption);
+    expect(rows[1]).toBe(EFFORT_OPTIONS.find((o) => o.id === "high") as AgentOption);
+    expect(rows[2]).toEqual({ id: "thinking", label: "thinking" });
+  });
+
+  test("a discovered auto, duplicates and blanks are not repeated", () => {
+    expect(ids(supportedEfforts("opencode", "x/y", ["auto", "high", "high", " ", "none"])))
+      .toEqual(["auto", "high", "none"]);
+  });
+
+  test("retainableEfforts equals the discovery answer (no curated table to union with)", () => {
+    expect([...retainableEfforts("opencode", "x/y", ["low", "thinking"])]).toEqual(["auto", "low", "thinking"]);
+    expect([...retainableEfforts("opencode", "x/y", [])]).toEqual([]);
+    expect([...retainableEfforts("opencode", "x/y")]).toEqual(["auto"]);
+    expect([...retainableEfforts("opencode", "opencode-default", ["high"])]).toEqual([]);
+  });
+
+  test("DEFAULT_MODEL.opencode / DEFAULT_EFFORT.opencode are the sentinel and auto", () => {
+    expect(DEFAULT_MODEL.opencode).toBe("opencode-default");
+    expect(DEFAULT_EFFORT.opencode).toBe("auto");
+  });
+});
+
+describe("AgentOption / ModelOption efforts field placement", () => {
+  test("AgentOption has no efforts field (moved to ModelOption, see mergeModelOptions rule 8)", () => {
+    const opt: AgentOption = { id: "x", label: "X" };
+    expect("efforts" in opt).toBe(false);
+  });
+
+  test("ModelOption (mergeModelOptions' output shape) is where efforts lives", () => {
+    const opt: ModelOption = { id: "x", label: "X", efforts: ["low", "high"] };
+    expect(opt.efforts).toEqual(["low", "high"]);
+  });
+});
+
+describe("retainableEfforts", () => {
+  test("union: Sol + discovered without none still retains none", () => {
+    const retained = retainableEfforts("codex", "gpt-5.6-sol", [
+      "ultra", "max", "xhigh", "high", "medium", "low",
+    ]);
+    // The offered (discovered-wins) picker set drops none...
+    expect(
+      supportedEfforts("codex", "gpt-5.6-sol", ["ultra", "max", "xhigh", "high", "medium", "low"]).map((o) => o.id),
+    ).not.toContain("none");
+    // ...but the retainable union still keeps it, from the curated side.
+    expect(retained.has("none")).toBe(true);
+  });
+
+  test("union: Astra + discovered with none retains none even though curated lacks it", () => {
+    const retained = retainableEfforts("codex", "gpt-6-astra", [
+      "ultra", "max", "xhigh", "high", "medium", "low", "none",
+    ]);
+    expect(retained.has("none")).toBe(true);
+  });
+
+  test("null discovered equals the curated ids", () => {
+    const retained = retainableEfforts("codex", "gpt-5.6-sol", null);
+    const curated = new Set(supportedEfforts("codex", "gpt-5.6-sol").map((o) => o.id));
+    expect(retained).toEqual(curated);
+  });
+
+  test("unknown codex id includes both the discovered ids and Astra's fallback set", () => {
+    const retained = retainableEfforts("codex", "gpt-9-test", ["low", "none"]);
+    // Astra's curated fallback set (gpt-9-test is unknown to MODEL_EFFORT_SUPPORT).
+    for (const id of ["ultra", "max", "xhigh", "high", "medium", "low"]) {
+      expect(retained.has(id)).toBe(true);
+    }
+    // "none" isn't in Astra's curated set — it's retained only because the
+    // discovered list carried it.
+    expect(retained.has("none")).toBe(true);
+  });
+});
+
+// --- gemini: no per-invocation effort flag -------------------------------------
+
+test("gemini gemini-4-argon exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-4-argon").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("gemini gemini-3.8-flash exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-3.8-flash").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("gemini gemini-3.8-flash-cyber exposes no effort options (same CLI, no effort flag)", () => {
+  expect(supportedEfforts("gemini", "gemini-3.8-flash-cyber").map((o) => o.id)).toEqual([]);
+});
+
+test("gemini default model gemini-3.1-pro-preview exposes no effort options", () => {
+  expect(supportedEfforts("gemini", "gemini-3.1-pro-preview").map((o) => o.id)).toEqual([]);
+  expect(supportedEfforts("gemini", null).map((o) => o.id)).toEqual([]);
+});
+
+// --- cursor: model thinking modes + fast variants -----------------------------
+
+test("cursor DEFAULT_MODEL is Grok 4.7 (explicit flagship pin, not cursor-agent's 'auto')", () => {
+  expect(DEFAULT_MODEL.cursor).toBe("grok-4.7");
+});
+
+test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
+  expect(DEFAULT_EFFORT.cursor).toBe("high");
+});
+
+test("cursor model catalog includes the screenshot/default surface", () => {
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  // The recommended default tops the list (same convention as codex/gemini).
+  expect(ids[0]).toBe("grok-4.7");
+  // The previous default stays one click away, right below the new one.
+  expect(ids[1]).toBe("cursor-grok-4.6");
+  expect(ids).toContain("auto");
+  expect(ids).toContain("gpt-5.3-codex");
+  expect(ids).toContain("cursor-grok-4.5");
+  expect(ids).toContain("composer-2.5");
+  expect(ids).toContain("claude-opus-5-5");
+  expect(ids).toContain("claude-sonnet-5-5");
+  expect(ids).toContain("claude-haiku-5-5");
+  expect(ids).toContain("claude-opus-5");
+  expect(ids).toContain("claude-opus-4-7");
+  expect(ids).toContain("gpt-5.6-sol");
+  expect(ids).toContain("gpt-5.6-terra");
+  expect(ids).toContain("gemini-3.1-pro");
+  expect(ids).toContain("glm-5.2");
+});
+
+test("cursor Auto model reports zero efforts", () => {
+  expect(supportedEfforts("cursor", "auto")).toEqual([]);
+});
+
+test("cursor null model resolves to the Grok 4.7 default effort surface", () => {
+  expect(supportedEfforts("cursor", null).map((o) => o.id)).toEqual(["xhigh", "high", "medium", "low"]);
+});
+
+test("cursor Grok 4.7 exposes Extra High but no Max or Max Mode (ids verified via `cursor-agent models`, CLI 2026.09.18)", () => {
+  const ids = supportedEfforts("cursor", "grok-4.7").map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("grok-4.7")).toBe(false);
+  for (const effort of ids) expect(cursorModelSupportsFast("grok-4.7", effort)).toBe(true);
+});
+
+test("cursor Grok 4.6 exposes Extra High but no Max (ids verified via `cursor-agent models`)", () => {
+  const ids = supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("cursor-grok-4.6")).toBe(false);
+});
+
+test("cursor Opus 4.8 and GPT-5.6 Sol expose Max", () => {
+  expect(supportedEfforts("cursor", "claude-opus-4-8").map((o) => o.id)).toContain("max");
+  expect(supportedEfforts("cursor", "gpt-5.6-sol").map((o) => o.id)).toContain("max");
+});
+
+test("cursor GPT-5.4 exposes Extra High but not Max", () => {
+  const ids = supportedEfforts("cursor", "gpt-5.4").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).not.toContain("max");
+});
+
+test("cursor Gemini 3.6 Flash exposes Minimal", () => {
+  expect(supportedEfforts("cursor", "gemini-3.6-flash").map((o) => o.id)).toContain("minimal");
+});
+
+test("cursor Gemini 3.8 Flash and 3.7 Flash expose exactly High/Medium/Low — no Minimal (unlike 3.6), verified via `cursor-agent models` 2026-09-02", () => {
+  for (const id of ["gemini-3.8-flash", "gemini-3.7-flash"]) {
+    expect(supportedEfforts("cursor", id).map((o) => o.id)).toEqual(["high", "medium", "low"]);
+    expect(cursorModelSupportsMaxMode(id)).toBe(false);
+    expect(cursorModelSupportsFast(id, "high")).toBe(false);
+  }
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  expect(ids.indexOf("gemini-3.8-flash")).toBeLessThan(ids.indexOf("gemini-3.7-flash"));
+  expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
+});
+
+test("cursor Gemini 4 Argon exposes exactly High/Medium/Low and composes <base>-<effort> (no fast, no Max Mode), listed above 3.8 Flash", () => {
+  expect(supportedEfforts("cursor", "gemini-4-argon").map((o) => o.id)).toEqual(["high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("gemini-4-argon")).toBe(false);
+  expect(cursorModelSupportsFast("gemini-4-argon", "high")).toBe(false);
+  expect(cursorModelArg("gemini-4-argon", "medium", false)).toBe("gemini-4-argon-medium");
+  // No effort, fast and Max Mode requested: both are ignored, default tier.
+  expect(cursorModelArg("gemini-4-argon", null, true, true)).toBe("gemini-4-argon-high");
+  expect(cursorModelIdCoveredByCatalog("gemini-4-argon-low")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("gemini-4-argon-low-fast")).toBe(true);
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  expect(ids.indexOf("gemini-4-argon")).toBeGreaterThanOrEqual(0);
+  expect(ids.indexOf("gemini-4-argon")).toBeLessThan(ids.indexOf("gemini-3.8-flash"));
+  expect(ids.indexOf("gemini-3.8-flash")).toBeLessThan(ids.indexOf("gemini-3.7-flash"));
+  expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
+});
+
+// --- antigravity: effort rides in the model id, no --effort flag ----------------
+
+test("antigravity exposes no effort options for any curated model (effort is the id suffix)", () => {
+  for (const m of AGENT_OPTIONS.antigravity.models) {
+    expect(supportedEfforts("antigravity", m.id)).toEqual([]);
+  }
+});
+
+test("antigravity discovered-only / unknown ids and null fall back to the default model's empty set", () => {
+  expect(supportedEfforts("antigravity", "some-discovered-id")).toEqual([]);
+  expect(supportedEfforts("antigravity", null)).toEqual([]);
+});
+
+test("DEFAULT_EFFORT.antigravity stays a valid EFFORT_OPTIONS id (symmetry pin; unused at runtime)", () => {
+  expect(EFFORT_OPTIONS.map((o) => o.id)).toContain(DEFAULT_EFFORT.antigravity);
+});
+
+test("cursor unknown model id reports zero efforts (effort rides in the id, so a pick would be inert)", () => {
+  expect(supportedEfforts("cursor", "cursor-mystery-9000")).toEqual([]);
+});
+
+test("cursor fast support is model and effort specific", () => {
+  expect(cursorModelSupportsFast("gpt-5.6-sol", "max")).toBe(true);
+  expect(cursorModelSupportsFast("gpt-5.4", "low")).toBe(false);
+  expect(cursorModelSupportsFast("composer-2.5", null)).toBe(true);
+  expect(cursorModelSupportsFast("claude-sonnet-5", "max")).toBe(false);
+});
+
+test("cursor Max Mode support is a context-level model capability", () => {
+  expect(cursorModelSupportsMaxMode("gpt-5.6-sol")).toBe(true);
+  expect(cursorModelSupportsMaxMode("claude-opus-4-8")).toBe(true);
+  expect(cursorModelSupportsMaxMode("claude-opus-4-7")).toBe(true);
+  expect(cursorModelSupportsMaxMode("composer-2.5")).toBe(false);
+  expect(cursorModelSupportsMaxMode("auto")).toBe(false);
+});
+
+test("cursorModelArg composes known model, effort, and fast variants", () => {
+  expect(cursorModelArg("gpt-5.5", "xhigh", false)).toBe("gpt-5.5-extra-high");
+  expect(cursorModelArg("gpt-5.5", "xhigh", true)).toBe("gpt-5.5-extra-high-fast");
+  expect(cursorModelArg("composer-2.5", null, true)).toBe("composer-2.5-fast");
+  expect(cursorModelArg("gpt-5.6-sol", "high", true, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
+  expect(cursorModelArg("gpt-5.6-sol", "high", false, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=false]");
+  expect(cursorModelArg("unknown-model", "max", true)).toBe("unknown-model");
+  // Grok 4.6: DEFAULT_EFFORT ("high") fills a null effort; fast suffixes apply
+  // across the whole ladder; no Max-Mode bracket syntax (no 1M variant).
+  expect(cursorModelArg("cursor-grok-4.6", null, false)).toBe("cursor-grok-4.6-high");
+  expect(cursorModelArg("cursor-grok-4.6", "xhigh", true)).toBe("cursor-grok-4.6-xhigh-fast");
+  expect(cursorModelArg("cursor-grok-4.6", "low", false)).toBe("cursor-grok-4.6-low");
+  // Grok 4.7: same ladder, but cursor-agent's ids carry no `cursor-` prefix.
+  expect(cursorModelArg("grok-4.7", null, false)).toBe("grok-4.7-high");
+  expect(cursorModelArg("grok-4.7", "xhigh", true)).toBe("grok-4.7-xhigh-fast");
+  expect(cursorModelArg("grok-4.7", "low", false)).toBe("grok-4.7-low");
+  // No Max-Mode bracket syntax — maxMode is ignored, fast still applies.
+  expect(cursorModelArg("grok-4.7", "medium", true, true)).toBe("grok-4.7-medium-fast");
+});
+
+test("cursor Fable 5.1 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-fable-5-1").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Fable 5.1 efforts with no -fast variant (catalog has none)", () => {
+  expect(cursorModelArg("claude-fable-5-1", "xhigh", false)).toBe("claude-fable-5-1-xhigh");
+  // fast never composes for this model — no fastEfforts entry in the catalog.
+  expect(cursorModelArg("claude-fable-5-1", "high", true)).toBe("claude-fable-5-1-high");
+  expect(cursorModelSupportsFast("claude-fable-5-1", "high")).toBe(false);
+  // Max-Mode bracket syntax omits `fast=` since fastEfforts is absent.
+  expect(cursorModelArg("claude-fable-5-1", "xhigh", false, true)).toBe("claude-fable-5-1[context=1m,effort=xhigh]");
+});
+
+test("cursorModelIdCoveredByCatalog recognizes a Fable 5.1 effort variant", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-fable-5-1-high")).toBe(true);
+});
+
+test("cursor Opus 5.5 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-opus-5-5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Opus 5.5 efforts with -fast on every tier and the max-mode bracket", () => {
+  expect(cursorModelArg("claude-opus-5-5", "xhigh", false)).toBe("claude-opus-5-5-xhigh");
+  expect(cursorModelArg("claude-opus-5-5", "high", true)).toBe("claude-opus-5-5-high-fast");
+  expect(cursorModelSupportsFast("claude-opus-5-5", "max")).toBe(true);
+  expect(cursorModelArg("claude-opus-5-5", "xhigh", true, true)).toBe("claude-opus-5-5[context=1m,effort=xhigh,fast=true]");
+  expect(cursorModelArg("claude-opus-5-5", "medium", false, true)).toBe("claude-opus-5-5[context=1m,effort=medium,fast=false]");
+  expect(cursorModelSupportsMaxMode("claude-opus-5-5")).toBe(true);
+});
+
+test("cursorModelIdCoveredByCatalog recognizes Opus 5.5 effort variants (base, -fast) but not a -thinking- form", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-medium")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-max-fast")).toBe(true);
+  // No such Cursor id — Opus 5.5 has no -thinking- variants (unlike Opus 5).
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-5-thinking-high")).toBe(false);
+  // The Opus 5 spec still uses -thinking- ids — unaffected by the Opus 5.5 spec.
+  expect(cursorModelIdCoveredByCatalog("claude-opus-5-thinking-high")).toBe(true);
+});
+
+test("cursor Sonnet 5.5 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-sonnet-5-5").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Sonnet 5.5 efforts but never -fast or the max-mode bracket", () => {
+  expect(cursorModelArg("claude-sonnet-5-5", "xhigh", false)).toBe("claude-sonnet-5-5-xhigh");
+  // No fastEfforts on the spec — fast never composes.
+  expect(cursorModelArg("claude-sonnet-5-5", "high", true)).toBe("claude-sonnet-5-5-high");
+  expect(cursorModelSupportsFast("claude-sonnet-5-5", "max")).toBe(false);
+  expect(cursorModelSupportsMaxMode("claude-sonnet-5-5")).toBe(false);
+  // Max mode never emits the bracket: cursor-agent 2026.09.26 has no 1M row
+  // for Sonnet 5.5 and rejected the `[context=1m,…]` bracket in a live probe
+  // (docs/plans/add-claude-sonnet-5-5.md §8 A1).
+  expect(cursorModelArg("claude-sonnet-5-5", "xhigh", false, true)).toBe("claude-sonnet-5-5-xhigh");
+});
+
+test("cursorModelArg composes Haiku 5.5 THINKING variants but never -fast or the max-mode bracket", () => {
+  expect(cursorModelArg("claude-haiku-5-5", "low", false)).toBe("claude-haiku-5-5-thinking-low");
+  // fast never appends -fast.
+  expect(cursorModelArg("claude-haiku-5-5", "high", true)).toBe("claude-haiku-5-5-thinking-high");
+  expect(cursorModelSupportsFast("claude-haiku-5-5", "max")).toBe(false);
+  expect(cursorModelSupportsMaxMode("claude-haiku-5-5")).toBe(false);
+  // No [context=1m,…] bracket.
+  expect(cursorModelArg("claude-haiku-5-5", "xhigh", false, true)).toBe("claude-haiku-5-5-thinking-xhigh");
+  expect(supportedEfforts("cursor", "claude-haiku-5-5").map((o) => o.id)).toEqual([
+    "max", "xhigh", "high", "medium", "low",
+  ]);
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-thinking-medium")).toBe(true);
+  // The No Thinking form is deliberately uncovered.
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-medium")).toBe(false);
+  // Generic `${variant}-fast` coverage rule.
+  expect(cursorModelIdCoveredByCatalog("claude-haiku-5-5-thinking-medium-fast")).toBe(true);
+});
+
+test("cursorModelIdCoveredByCatalog recognizes Sonnet 5.5 effort variants but not a -thinking- form", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-medium")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-max")).toBe(true);
+  // Generic `${variant}-fast` coverage rule — no such Cursor id exists today
+  // for Sonnet 5.5, but covering it is harmless.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-medium-fast")).toBe(true);
+  // No such Cursor id — Sonnet 5.5 has no -thinking- variants.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-5-thinking-high")).toBe(false);
+  // The Sonnet 5 spec is unaffected by the Sonnet 5.5 spec.
+  expect(cursorModelIdCoveredByCatalog("claude-sonnet-5-max")).toBe(true);
+});
+
+// These are the ids migration 055 folds into base id + effort + fast — a
+// discovered `cursor-agent models` row for any of them must stay hidden.
+test("cursorModelIdCoveredByCatalog recognizes every Grok 4.7 variant, fast forms included", () => {
+  for (const tier of ["xhigh", "high", "medium", "low"]) {
+    expect(cursorModelIdCoveredByCatalog(`grok-4.7-${tier}`)).toBe(true);
+    expect(cursorModelIdCoveredByCatalog(`grok-4.7-${tier}-fast`)).toBe(true);
+  }
+  expect(cursorModelIdCoveredByCatalog("grok-4.7")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("grok-4.7-max")).toBe(false);
+});
+
+// Ids verified against `cursor-agent --list-models` (2026.10.22-27dcf5f,
+// 2026-10-26) — docs/plans/add-gpt-6-1-terra.md D1.
+test("cursor Muse Spark 1.3 exposes max..low plus minimal, Max Mode, no fast", () => {
+  const ids = supportedEfforts("cursor", "muse-spark-1.3").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "minimal"]);
+  expect(cursorModelSupportsMaxMode("muse-spark-1.3")).toBe(true);
+  for (const effort of ids) expect(cursorModelSupportsFast("muse-spark-1.3", effort)).toBe(false);
+  expect(cursorModelArg("muse-spark-1.3", "high", false)).toBe("muse-spark-1.3-high");
+  expect(cursorModelArg("muse-spark-1.3", "minimal", false)).toBe("muse-spark-1.3-minimal");
+  // Max Mode bracket omits `fast=` since the spec has no fastEfforts.
+  expect(cursorModelArg("muse-spark-1.3", "high", false, true)).toBe("muse-spark-1.3[context=1m,effort=high]");
+  // Fast never composes.
+  expect(cursorModelArg("muse-spark-1.3", "high", true)).toBe("muse-spark-1.3-high");
+});
+
+test("cursor Muse Wonder 1.0 exposes max..low plus minimal, no Max Mode, no fast", () => {
+  const ids = supportedEfforts("cursor", "muse-wonder-1.0").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "minimal"]);
+  expect(cursorModelSupportsMaxMode("muse-wonder-1.0")).toBe(false);
+  for (const effort of ids) expect(cursorModelSupportsFast("muse-wonder-1.0", effort)).toBe(false);
+  expect(cursorModelArg("muse-wonder-1.0", "xhigh", false)).toBe("muse-wonder-1.0-xhigh");
+  // Max Mode + fast requested: neither composes (null effort falls back to high).
+  expect(cursorModelArg("muse-wonder-1.0", null, true, true)).toBe("muse-wonder-1.0-high");
+  expect(cursorModelArg("muse-wonder-1.0", "high", true, true)).toBe("muse-wonder-1.0-high");
+});
+
+test("cursor DeepSeek V4.1 Flash 1017 exposes max/high/medium/low/none, no Max Mode, no fast", () => {
+  const ids = supportedEfforts("cursor", "deepseek-v41-flash-1017").map((o) => o.id);
+  expect(ids).toEqual(["max", "high", "medium", "low", "none"]);
+  expect(cursorModelSupportsMaxMode("deepseek-v41-flash-1017")).toBe(false);
+  for (const effort of ids) expect(cursorModelSupportsFast("deepseek-v41-flash-1017", effort)).toBe(false);
+  expect(cursorModelArg("deepseek-v41-flash-1017", "none", false)).toBe("deepseek-v41-flash-1017-none");
+  expect(cursorModelArg("deepseek-v41-flash-1017", "max", true, true)).toBe("deepseek-v41-flash-1017-max");
+});
+
+test("cursorModelIdCoveredByCatalog recognizes all 17 Muse / DeepSeek V4.1 Flash variant ids", () => {
+  const variants = [
+    ...["max", "xhigh", "high", "medium", "low", "minimal"].map((t) => `muse-spark-1.3-${t}`),
+    ...["max", "xhigh", "high", "medium", "low", "minimal"].map((t) => `muse-wonder-1.0-${t}`),
+    ...["max", "high", "medium", "low", "none"].map((t) => `deepseek-v41-flash-1017-${t}`),
+  ];
+  expect(variants).toHaveLength(17);
+  for (const id of variants) expect(cursorModelIdCoveredByCatalog(id)).toBe(true);
+});
+
+test("cursor model catalog appends Muse Wonder, Muse Spark and DeepSeek V4.1 Flash right after glm-5.2", () => {
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  const glm = ids.indexOf("glm-5.2");
+  expect(glm).toBeGreaterThanOrEqual(0);
+  expect(ids.slice(glm + 1, glm + 4)).toEqual(["muse-wonder-1.0", "muse-spark-1.3", "deepseek-v41-flash-1017"]);
+});
+
+test("cursor supportedModes returns auto/plan/ask (no per-model mode carve-outs)", () => {
+  const ids = supportedModes("cursor", null).map((o) => o.id);
+  expect(ids).toEqual(["auto", "plan", "ask"]);
+  expect(supportedModes("cursor", "grok-4.7").map((o) => o.id)).toEqual(["auto", "plan", "ask"]);
+});

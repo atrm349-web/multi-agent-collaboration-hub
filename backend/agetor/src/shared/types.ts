@@ -1,0 +1,6264 @@
+import { OPENCODE_DEFAULT_MODEL } from "./opencode.ts";
+
+export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | "done";
+
+/**
+ * The exact `HarnessStatus.reason` string the server emits when claude-code
+ * is otherwise available but tmux can't be found. Shared so the UI can
+ * detect tmux-missing without string-matching the user-facing copy — both
+ * sides import this constant.
+ */
+export const TMUX_MISSING_REASON = "tmux is required to drive claude-code interactively";
+
+/**
+ * Sentinel prefix for the `status` chunk a driver emits when it detects that a
+ * *running* task's tmux session has died unexpectedly mid-turn (crash, external
+ * kill, tmux server gone). The orchestrator's chunk handler pattern-matches this
+ * prefix to flip the card to `blocked` and settle the run, mirroring the
+ * claude API-error path. Lives here (not in a driver file) because BOTH the
+ * claude and codex drivers emit it and the orchestrator consumes it. */
+export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
+
+/**
+ * Sentinel prefix for the `status` chunk the turn-stall watchdog emits when
+ * a turn is in flight but the JSONL transcript has been silent past
+ * `AGETOR_TURN_STALL_MS` (default 10 min) with no subagent activity either —
+ * the signature of an interactive TUI dialog the pane scraper's matchers
+ * don't know (an unrecognized modal can freeze a turn indefinitely while
+ * the card still shows a healthy "running"). Unlike the death/API-error
+ * sentinels this does NOT settle the turn or move the card — the session is
+ * alive, just possibly wedged — it only marks the task "may be stuck"
+ * (orchestrator's stall registry → `Task.stalledSince` → amber card state)
+ * until activity resumes or the turn ends. */
+export const TURN_STALLED_STATUS_PREFIX = "turn stalled: ";
+
+/**
+ * Companion sentinel to {@link TURN_STALLED_STATUS_PREFIX}: emitted when
+ * transcript activity resumes while the same turn is still in flight, so the
+ * orchestrator clears the stall mark without waiting for the turn to end.
+ * (A turn that ends while marked is cleared by the done handler instead —
+ * no resume event is emitted after the fact.) */
+export const TURN_STALL_RESUMED_STATUS_PREFIX = "turn resumed: ";
+
+/**
+ * Sentinel prefix for the `status` chunk claude-tmux emits whenever the
+ * JSONL reports a permission-mode change (plan/auto/acceptEdits/…). Emitted
+ * only on change (not per-line), so the run panel's mode chip can derive its
+ * current value by scanning `displayedEvents` for the latest match instead
+ * of a dedicated API. Follows the `SESSION_DIED_STATUS_PREFIX` sentinel-chunk
+ * convention.
+ */
+export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
+
+/**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `usage_update` notification. Payload is JSON: `{used, size, cost?:
+ * {amount, currency}}` (verbatim ACP shape — `used`/`size` are token counts,
+ * `cost` is present only when fx reports one; fx 0.0.14 dropped `cost` from
+ * `usage_update` altogether, so it stays optional for older binaries only).
+ * RunPanel suppresses this prefix from the transcript's status dividers (same
+ * as `PERMISSION_MODE_STATUS_PREFIX` — that suppression is load-bearing, not
+ * dead code) and instead derives the latest value into a small usage chip on
+ * the run's summary row.
+ *
+ * Despite the `fx-` name the sentinel is harness-neutral: the cursor driver
+ * reuses it for cursor-agent's `result.usage` (a `{turn: {...}}` body with
+ * input/output/cache token counts), since every surface already suppresses
+ * and parses it (docs/plans/fx-0.0.14-and-cursor-updates.md §3.3 D24).
+ */
+export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
+
+/**
+ * JSON body carried after `FX_USAGE_STATUS_PREFIX`. Additive over the fx
+ * 0.0.7 `{used, size, cost?}` shape — every field is optional so a
+ * previously-persisted 0.0.7 sentinel still parses. `used`/`size`/`cost`
+ * come from the ACP `usage_update` notification (live as of fx 0.0.8, fired
+ * once per completed turn); `turn` comes from the `session/prompt` result's
+ * `usage` object (fx ≥0.0.8), also once per turn. The two halves can arrive
+ * as separate sentinel chunks on the same run — RunPanel shallow-merges
+ * every `fx-usage: ` sentinel it sees per run (`{...prev, ...next}`), so
+ * order between them doesn't matter and either half can be absent.
+ */
+export interface FxUsagePayload {
+  /** Context tokens used / window size — ACP `usage_update` (fx ≥0.0.8). */
+  used?: number;
+  size?: number;
+  /** fx 0.0.8–0.0.13 only — fx 0.0.14 no longer sends `cost`. */
+  cost?: { amount: number; currency: string };
+  /** Per-turn token counts from the `session/prompt` result (fx ≥0.0.8), or
+   *  cursor-agent's `result.usage` (no `reasoningTokens` there). */
+  turn?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    reasoningTokens?: number;
+  };
+}
+
+/**
+ * The exact key set of `FxUsagePayload.turn`, as one shared tuple — the
+ * driver (`src/bun/fx-acp.ts`) uses it to pick fields out of fx's
+ * `session/prompt` result and the webview parser (`src/mainview/lib/
+ * fx-usage.ts`) uses it to validate the sentinel, so producer and consumer
+ * cannot drift. The `satisfies` clause below is the exhaustiveness check:
+ * adding a field to `turn` without listing it here fails typecheck.
+ */
+export const FX_TURN_KEYS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
+] as const satisfies ReadonlyArray<keyof NonNullable<FxUsagePayload["turn"]>>;
+// Every key of `turn` must appear in FX_TURN_KEYS (the `satisfies` above
+// guarantees the converse), so the Exclude below is `never` iff the list is
+// exhaustive — and `true` is only assignable when it is.
+type _FxTurnKeysExhaustive =
+  Exclude<keyof NonNullable<FxUsagePayload["turn"]>, (typeof FX_TURN_KEYS)[number]> extends never ? true : never;
+const _fxTurnKeysExhaustive: _FxTurnKeysExhaustive = true;
+void _fxTurnKeysExhaustive;
+
+/**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits once per turn with
+ * the provider fx reports in its `session/new` / resume `configOptions`
+ * (`{id:"provider", currentValue:"gateway"|"codex"|"grok"}` — fx ≥0.0.5
+ * multi-provider auth; the same `configOptions` array also carries `model`
+ * and `mode` entries on the wire, confirmed live on fx 0.0.7+ — agetor reads
+ * only `provider`). Payload is the bare provider value. Suppressed from
+ * transcripts via `isInternalStatusSentinel`; RunPanel derives a small
+ * run-row chip from the latest one.
+ */
+export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
+
+/**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits from a
+ * `session_info_update` notification (`{title, updatedAt}`, fx ≥0.0.8),
+ * fired at lifecycle points and after every turn. Payload is the plain-text
+ * title (no JSON) — emitted only when it is non-empty, not fx's
+ * "Untitled session" placeholder, and different from the last title emitted
+ * this turn. Suppressed from transcripts via `isInternalStatusSentinel`;
+ * RunPanel derives a run-row chip from the latest one, rendered beside the
+ * provider chip. Must never reach the transcript, CLI `agetor logs`, or the
+ * TUI dashboard.
+ */
+export const FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: ";
+
+/**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `session_info_update` notification carrying `_meta.fx.modelResponseRecovery`
+ * — fx's retry-progress channel for a model call that hit a transient
+ * failure (rate limit, dropped connection, provider timeout, …), live since
+ * fx 0.0.7. One update is emitted per Gateway retry attempt, one more for the
+ * terminal paused state if fx exhausts its retry budget, one for a recovered
+ * state if a retry succeeds, and a final one when fx clears the checkpoint
+ * (`modelResponseRecovery: null`). Payload is JSON: `FxRecoveryPayload`.
+ * Suppressed from transcripts via `isInternalStatusSentinel`; RunPanel
+ * derives a live progress notice plus a Resume affordance from it, CLI
+ * `agetor logs` prints the active-state progress lines, and the TUI
+ * dashboard shows the latest one.
+ */
+export const FX_RECOVERY_STATUS_PREFIX = "fx-recovery: ";
+
+/** The lifecycle states fx reports on its recovery channel — see
+ *  {@link FxRecoveryPayload}. `"cleared"` is agetor's own label for a wire
+ *  `modelResponseRecovery: null` (fx has dropped the checkpoint), not a
+ *  state fx itself names. */
+export type FxRecoveryState = "active" | "paused" | "recovered" | "failed" | "cleared";
+
+/**
+ * JSON body carried after `FX_RECOVERY_STATUS_PREFIX`. Mirrors fx's own
+ * `_meta.fx.modelResponseRecovery` wire shape (see `FX_RECOVERY_STATUS_PREFIX`
+ * for when it's emitted); every field beyond `state` is optional so a
+ * terse or forward-compat update still parses.
+ */
+export interface FxRecoveryPayload {
+  /** `"active"` while fx is mid-retry, `"paused"` once fx gives up and the
+   *  checkpoint is resumable, `"recovered"` once a retry succeeds, `"failed"`
+   *  (fx ≥0.0.14: `kind == terminal_provider_error` without a pause — fx
+   *  stopped retrying and there is nothing to resume), or `"cleared"` for the
+   *  wire's `modelResponseRecovery: null` (checkpoint dropped — e.g. consumed
+   *  by a normal follow-up prompt). */
+  state: FxRecoveryState;
+  /** Verbatim fx enum tags (forward-compat: unknown values pass through and
+   *  render as-is). `kind` distinguishes e.g. `auto_retry` from
+   *  `terminal_provider_error` from `auto_recovered`. */
+  kind?: string;
+  /** Why this attempt is happening, e.g. `rate_limited`, `network_interrupted`,
+   *  `response_interrupted`, `provider_stream_timeout`, `provider_unavailable`,
+   *  `system_resumed`, `authentication`, `request_limit_reached`, and (fx
+   *  0.0.14) `connectivity_lost`, `compaction_prepared`. */
+  cause?: string;
+  /** What fx is doing about it, e.g. `retrying_request`, `continuing_response`,
+   *  `regenerating_tool`, `continuing_after_tool`, `reconciling_tool`,
+   *  `waiting_for_connectivity`, `paused`, and (fx 0.0.14) `checking_liveness`,
+   *  `delivering_response`. */
+  action?: string;
+  /** Set only on a `paused` update: what the caller needs to do next, e.g.
+   *  `continue_later` (Resume applies), `inspect_uncertain_tool`,
+   *  `change_request`, `surface_stall` (fx 0.0.14; not resumable). */
+  requiredAction?: string;
+  /** 1-based retry attempt number and the configured cap for this recovery
+   *  episode (fx's `10/10` in "recovery paused after 10/10 attempts"). */
+  attempt?: number;
+  attemptLimit?: number;
+  /** Backoff delay in seconds before the next retry, when fx reports one. */
+  delaySeconds?: number;
+  /** Whether this checkpoint survives an `fx acp` process restart (true for
+   *  every update observed live) — informational only, agetor doesn't branch
+   *  on it. */
+  durable?: boolean;
+  /** fx's own human-readable label, verbatim, e.g. "⚠ Rate limited · HTTP
+   *  429 · rate_limit_exceeded: … · retrying request in 8s · attempt 5/10". */
+  message?: string;
+  /** Stamped by fx-acp.ts (never by fx — it is not a wire field) on every
+   *  sentinel emitted while `session/resume` was replaying the prior turn's
+   *  history onto the NEW run. Progress renderers (RunPanel's live notice,
+   *  `agetor logs`, the TUI) skip replayed entries so a stale "attempt 10/10"
+   *  never reads as live; `latestFxRecoveryByRun`/`isFxRecoveryResumable`
+   *  deliberately still honor a replayed `paused` (a resume run that died
+   *  before continuing leaves fx's checkpoint intact, so Resume stays
+   *  offered). Absent on live sentinels and on every pre-existing row. */
+  replayed?: boolean;
+}
+
+/**
+ * True for `status`-stream chunks that are UI-internal sentinel channels, not
+ * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
+ * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
+ * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip),
+ * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip),
+ * and `FX_RECOVERY_STATUS_PREFIX` (feeds the live recovery notice, the
+ * paused/Resume affordance, and CLI/TUI progress lines) — four fx sentinels
+ * in all. Every renderer of raw status events — RunPanel's status dividers,
+ * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
+ * this ONE predicate instead of maintaining its own prefix list, so a new
+ * sentinel can't silently leak verbatim into one surface while another
+ * suppresses it.
+ */
+export function isInternalStatusSentinel(data: string): boolean {
+  return (
+    data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
+    data.startsWith(FX_USAGE_STATUS_PREFIX) ||
+    data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||
+    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX) ||
+    data.startsWith(FX_RECOVERY_STATUS_PREFIX)
+  );
+}
+
+/**
+ * The Settings section name where per-host git credentials live, interpolated
+ * into the server-side credential-error hints (github.ts `privateRepoHint`,
+ * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
+ * `Settings → ${GIT_HOST_TOKENS_SECTION}`, and reused as the section's own
+ * label (GitHubTokensSection.tsx). The webview pattern-matches that same
+ * phrase to recognize a credential error and swap the bare error row for an
+ * actionable explainer panel (GitHubDialog.tsx / credential-error.ts). This
+ * constant keeps those three — server hints, the section label, and the
+ * webview's detection — in sync; it does NOT guarantee a full rename, since
+ * the setup guide (GitHubSetupDialog) still names the section in informal
+ * prose that won't follow a change here. */
+export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
+
+export const COLUMNS: { id: ColumnId; label: string }[] = [
+  { id: "backlog", label: "Backlog" },
+  { id: "ready", label: "Ready" },
+  { id: "running", label: "Running" },
+  { id: "blocked", label: "Blocked" },
+  { id: "review", label: "Review" },
+  { id: "done", label: "Done" },
+];
+
+/**
+ * Heuristic patterns we use to detect "the agent is waiting on the user" from
+ * its stdout/stderr stream. Match is case-insensitive. Currently only run
+ * against codex output — interactive claude (the new default) doesn't surface
+ * permission prompts through stdout; they pop up inside the TUI, and the
+ * orchestrator skips this check for claude-code.
+ *
+ * Kept in shared/types so both the orchestrator (detect + flip column) and
+ * tests (assert on the same patterns) point at the same source of truth.
+ */
+export const APPROVAL_PROMPT_PATTERNS: RegExp[] = [
+  /\bdo you want (?:me )?to\b/i,
+  /\bproceed\?/i,
+  /\bapproval (?:required|needed)\b/i,
+  /\bplease confirm\b/i,
+  /\bwaiting for (?:your )?approval\b/i,
+  /\bwould you like (?:me )?to\b/i,
+  /\(y\/n\)/i,
+  /\[y\/n\]/i,
+  /\byes\/no\b/i,
+];
+
+export function isApprovalPrompt(text: string): boolean {
+  return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
+}
+
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity" | "opencode" | "copilot";
+
+/**
+ * Which OpenCode server an `opencode` task's turns run against
+ * (`docs/plans/add-opencode-harness.md` D-4, G3–G3c). `"shared"` (default)
+ * reuses OpenCode 2's background service, so sessions show up in the user's
+ * own OpenCode apps; `"standalone"` passes `--standalone` for a private,
+ * per-turn server. Stored on `tasks.opencode_server` /
+ * `agent_profiles.opencode_server`; non-OpenCode tasks store and ignore it,
+ * the way `maxMode` works. The value a turn actually uses comes from
+ * `effectiveOpencodeServer` in `./opencode.ts` (null on v1, always
+ * standalone for a harness with a home).
+ */
+export type OpencodeServerMode = "shared" | "standalone";
+export const OPENCODE_SERVER_MODES = ["shared", "standalone"] as const satisfies readonly OpencodeServerMode[];
+
+/**
+ * Built-in harness kinds turned on once, automatically, the first time their
+ * CLI is found installed (`docs/plans/add-opencode-harness.md` D-14, G8). A
+ * manual Off afterwards sticks — `src/bun/harness-auto-enable.ts` records
+ * each row in `harness_auto_enabled` the first time it acts on it.
+ * claude-code, antigravity and copilot are absent because they already ship enabled.
+ */
+export const AUTO_ENABLE_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>([
+  "codex",
+  "cursor",
+  "gemini",
+  "fx",
+  "opencode",
+]);
+
+/**
+ * A "harness" is the user-facing name for an agent configuration. Built-in
+ * harnesses (`claude-code`, `codex`, `cursor`, `gemini`, `fx`, `antigravity`, `copilot`) wrap each CLI directly;
+ * user-created harnesses are *aliases* that wrap the same underlying `kind`
+ * with extra env, an alternate `bin` path, or a per-account `home` override
+ * so the CLI's login/config writes to a separate dir (multi-account support).
+ *
+ * `tasks.agent` (free-form TEXT) stores the harness id — for built-ins the
+ * id equals the kind, so legacy rows resolve without any backfill.
+ */
+export interface Harness {
+  /** Slug used as the row id and as the value stored on `tasks.agent`. */
+  id: string;
+  kind: AgentKind;
+  label: string;
+  isBuiltin: boolean;
+  /** Optional per-harness config root.
+   *  - claude-code: emitted as CLAUDE_CONFIG_DIR=<home> (treated by claude as
+   *    the `.claude/` equivalent). HOME is deliberately NOT overridden — on
+   *    macOS that would point claude's keychain lookup at a non-existent
+   *    `<home>/Library/Keychains/login.keychain-db` and surface as
+   *    "Not logged in" even with valid tokens.
+   *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
+   *    use the macOS keychain, so re-homing it is safe).
+   *  - cursor: emitted as a plain HOME=<home> override — `cursor-agent` has
+   *    no documented dedicated config-dir env var, so isolating an
+   *    additional account's login/config means re-homing the whole process
+   *    (cursor doesn't touch the macOS keychain either, so this is safe).
+   *  - gemini: emitted as GEMINI_CLI_HOME=<home>. Gemini CLI has its own
+   *    dedicated home-override env var (verified in its bundled source —
+   *    `homedir()` returns `process.env.GEMINI_CLI_HOME || os.homedir()`,
+   *    and every gemini state dir — `.gemini/`, session chats, OAuth creds —
+   *    is joined onto that), so unlike codex there's no need to touch the
+   *    real `HOME` at all.
+   *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
+   *    config-dir env var (verified against fx v0.0.4 and v0.0.6, re-verified
+   *    0.0.8 (2026-09-08) and 0.0.9/0.0.10 (2026-09-14) — no FX_HOME or
+   *    FX_CONFIG_DIR among all 60 FX_* env vars, identical across
+   *    0.0.8/0.0.9/0.0.10), and its state lives hardcoded at
+   *    `~/.fx/*`, so isolating an additional account's login/config means
+   *    re-homing the whole process, same approach as cursor.
+   *  - opencode: emitted as HOME=<home> plus XDG_CONFIG_HOME / XDG_DATA_HOME /
+   *    XDG_STATE_HOME / XDG_CACHE_HOME under it — OpenCode keeps its config,
+   *    sessions and credentials under the XDG dirs. A harness with a home
+   *    always runs `--standalone` on v2 (`effectiveOpencodeServer`): the
+   *    shared background service binds a fixed port that HOME/XDG can't
+   *    isolate.
+   *  - copilot: emitted as COPILOT_HOME=<home>. GitHub Copilot CLI has a
+   *    dedicated state-dir env var (config, logins, session state and
+   *    `session-state/<id>/plan.md` all live under it), so like gemini there
+   *    is no need to touch the real `HOME`. The driver always pins
+   *    COPILOT_HOME per spawn (harness env, then this home, then the process
+   *    env, then `~/.copilot`) so the tmux server's env can't leak another
+   *    account's dir.
+   *  NULL means "inherit the agetor process env". */
+  home: string | null;
+  /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
+   *  env var (back-compat), then to the kind's default name on PATH. */
+  bin: string | null;
+  /** Arbitrary key/value env vars merged on top of the kind's defaults and
+   *  the home-derived block. Power-user surface. */
+  env: Record<string, string>;
+  /** Soft-delete flag. Disabled harnesses are hidden from the New Task
+   *  picker, the default-harness selector, and the window topbar, but the
+   *  row stays in the DB so historical `tasks.agent = <id>` references
+   *  keep resolving. The orchestrator refuses to start new runs on a
+   *  disabled harness; in-flight runs are unaffected. Built-ins are
+   *  toggleable too — this is the one carve-out from the built-in
+   *  immutability rule. */
+  enabled: boolean;
+  /** fx only (`harnesses.profile_mcp_servers`, migration 073): when on, the
+   *  fx driver asks fx (0.0.13 or later) to load the user's own fx profile
+   *  MCP servers into each ACP session (`_meta.fx.profileMcpServers: true` on
+   *  `session/new`/`resume`/`load`). Absent ⇒ on; meaningless for other
+   *  kinds. */
+  profileMcpServers?: boolean;
+}
+
+/** A user-global reusable prompt snippet — not tied to any task or project. */
+export interface SavedPrompt {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Speed tier a task or agent profile runs at. `fast` replaced the old
+ *  cursor-only boolean; `ultrafast` is fx's faster Gateway lane. See
+ *  `./speed.ts` for the pure helpers (`supportedSpeeds`, `resolveSpeedInput`). */
+export type Speed = "off" | "fast" | "ultrafast";
+export const SPEEDS = ["off", "fast", "ultrafast"] as const satisfies readonly Speed[];
+
+/**
+ * A reusable, named bundle of harness + model + effort + mode + speed/maxMode
+ * + free-text instructions + skills, picked on task launch instead of
+ * choosing each field by hand. Persisted in the `agent_profiles` table
+ * (`src/bun/db.ts`'s `agentProfiles` module); names are unique
+ * case-insensitively (trimmed). A task created from a profile copies these
+ * fields onto its own row and keeps a point-in-time {@link AgentProfileSnapshot}
+ * — see `Task.agentProfileId` / `Task.agentProfile` below and
+ * `docs/plans/agent-profiles.md` for the full freeze-at-first-run design.
+ */
+export interface AgentProfile {
+  id: string; // uuid
+  name: string; // unique, trimmed, case-insensitive
+  harness: string; // harness id (Task.agent semantics)
+  model: string;
+  effort: string | null;
+  mode: string | null; // null ⇒ defaultModeFor(kind) at spawn
+  /** Speed tier (`supportedSpeeds` in `./speed.ts` says which tiers a
+   *  kind/model offers). Stored in `agent_profiles.speed` (migration 072). */
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
+  maxMode: boolean; // cursor only
+  /** opencode only (`agent_profiles.opencode_server`): which OpenCode server
+   *  a task launched from this profile runs against. Stored and ignored for
+   *  other kinds, like `maxMode`. See {@link OpencodeServerMode}. */
+  opencodeServer: OpencodeServerMode;
+  instructions: string; // may be ""
+  skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Number of tasks currently BOUND to this profile — `tasks.agent_profile_id
+   * = this.id`, every column including archived. Server-derived on every
+   * `/agent-profiles*` HTTP response (`src/bun/server.ts`'s `withTaskCount`/
+   * `withTaskCounts`, backed by `agentProfiles.taskCount`/`taskCounts` in
+   * `src/bun/db.ts`); optional at the type level only because raw db-layer
+   * callers (`agentProfiles.list`/`get`/`insert`/`update` themselves) don't
+   * populate it. Detaching a task (`DELETE /tasks/:id/agent-profile`) or
+   * deleting the task lowers this automatically — a task that only keeps a
+   * frozen `agentProfile` snapshot after detaching is not counted.
+   */
+  taskCount?: number;
+}
+
+/**
+ * What a task keeps: the {@link AgentProfile} as it was when captured, plus
+ * the resolved harness identity (`harnessKind`/`harnessLabel`) so a task
+ * whose profile — or whose profile's harness — has since been deleted can
+ * still render its chip and re-inject its preamble without any lookups.
+ */
+export interface AgentProfileSnapshot {
+  id: string;
+  name: string;
+  harness: string;
+  harnessKind: AgentKind;
+  harnessLabel: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  speed: Speed;
+  /** Derived `speed !== "off"`, kept for older readers of the frozen
+   *  snapshot JSON — never read by agetor code (legacy `{fast}` snapshots are
+   *  read through `speedFromFast` in `src/bun/db.ts`). */
+  fast?: boolean;
+  maxMode: boolean;
+  /** Absent in snapshots captured before OpenCode support — read as
+   *  `"shared"` (`parseAgentProfileSnapshot` in `src/bun/db.ts`). */
+  opencodeServer?: OpencodeServerMode;
+  instructions: string;
+  skills: string[];
+  capturedAt: number;
+}
+
+/**
+ * One node in a {@link PipelineGraph} — a named, agent-profile-bound unit of
+ * work. `name` is unique per pipeline (case-insensitive, trimmed): the
+ * agent's handoff `next` field targets a step by this name (or by an edge
+ * label), so renaming a step is how you'd break a running pipeline's
+ * in-flight `next` resolution — `resolveNextSteps` in `src/shared/
+ * pipeline.ts` is where that matching happens. `id` is a stable uuid that
+ * survives renames and is what edges/`startStepId`/handoff history actually
+ * reference. See `docs/plans/pipelines.md` (D3/D4) for the full design.
+ */
+export interface PipelineStep {
+  id: string;
+  name: string;
+  /** Step-specific prompt text, composed into the launch prompt by
+   *  `composeStepPrompt` alongside the pipeline goal and prior handoffs. */
+  instructions: string;
+  /** {@link AgentProfile} this step's task launches from, or null (the run
+   *  refuses to start a step with no profile — `profile-missing`). */
+  agentProfileId: string | null;
+  /** Canvas coordinates in the React Flow editor. Purely presentational. */
+  position: { x: number; y: number };
+  /** Agent profiles this step's agent may delegate to as subagents, plus an
+   *  optional cap on how many it may spawn (`null` = no limit). */
+  subagents: { profileIds: string[]; cap: number | null };
+  /** After this step settles: `"choose"` — the agent's handoff `next` field
+   *  picks exactly one outgoing edge (ignored when there's only one edge).
+   *  `"all"` — every outgoing step starts in parallel (fan-out), regardless
+   *  of `next`. */
+  transition: "choose" | "all";
+  /** How this step starts when it has multiple incoming edges: `"any"`
+   *  (default) — every arrival starts a new execution (how cycles work).
+   *  `"all"` — starts once every distinct incoming source has arrived in
+   *  this generation (fan-in / join), receiving all their handoffs. */
+  join: "any" | "all";
+}
+
+/** A directed connection between two {@link PipelineStep}s by id.
+ *  `label` is shown on the canvas and is one of the ways a `"choose"` step's
+ *  handoff `next` can target this edge's `to` step. */
+export interface PipelineEdge {
+  id: string;
+  from: string;
+  to: string;
+  label: string;
+}
+
+/** The full graph a {@link Pipeline} is built from. `startStepId` is the
+ *  editor-marked entry point; when unset, `resolveStartStep` falls back to
+ *  the unique step with no incoming edges. */
+export interface PipelineGraph {
+  steps: PipelineStep[];
+  edges: PipelineEdge[];
+  startStepId: string | null;
+}
+
+/**
+ * A named, reusable graph of steps (see {@link PipelineGraph}) — the
+ * template a pipeline task is launched from. Persisted in the `pipelines`
+ * table (`src/bun/db.ts`'s `pipelines` module); names are unique
+ * case-insensitively (trimmed), mirroring {@link AgentProfile}. Running a
+ * pipeline snapshots this graph (plus every referenced agent profile) onto
+ * the launched task's `pipelineRun.snapshot` at first Run — later edits to
+ * the pipeline never affect an already-started run (see D8,
+ * `docs/plans/pipelines.md`).
+ */
+export interface Pipeline {
+  id: string;
+  name: string;
+  description: string;
+  graph: PipelineGraph;
+  /** Cap on executions per run (1..200, default 25) — guards against a
+   *  runaway cycle. A run that would exceed it goes Blocked (`step-cap`). */
+  maxSteps: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Number of parent pipeline tasks currently bound to this pipeline
+   *  (`tasks.pipeline_id = this.id`, every column including archived).
+   *  Server-derived like {@link AgentProfile.taskCount} — optional at the
+   *  type level only because raw db-layer callers don't populate it. */
+  taskCount?: number;
+}
+
+/** Body of `POST /pipelines` / `PATCH /pipelines/:id`. */
+export interface PipelineInput {
+  name: string;
+  description?: string;
+  graph: PipelineGraph;
+  maxSteps?: number;
+}
+
+/**
+ * The structured JSON a step's agent is asked to emit at the end of its
+ * final message, wrapped in a `<handoff>…</handoff>` tag (see {@link
+ * HANDOFF_TAG} in `src/shared/pipeline.ts`) — how one step tells the runner
+ * what it did and which step should run next. Parsed by `parseHandoff`.
+ */
+export interface Handoff {
+  schemaVersion: 1;
+  /** The overall task's purpose, restated — keeps a long-running pipeline
+   *  anchored to its original goal across many steps. */
+  purpose: string;
+  /** What this step did or found. */
+  summary: string;
+  /** Why the step is handing off now (done, or blocked and can't continue),
+   *  and what the next step should do with `summary`. */
+  reason: string;
+  /** Name of the next step to run (matched case-insensitively against a
+   *  step name, then a step id, then an edge label by `resolveNextSteps`),
+   *  or null when there's nothing left to hand off to (terminal step, or a
+   *  `transition: "all"` fan-out, where `next` is ignored entirely). */
+  next: string | null;
+  /** Paths or URLs the next step (or the user) may want to look at. */
+  artifacts: string[];
+  /** Unresolved questions the next step or the user should address. */
+  openQuestions: string[];
+  /** Optional outcome hint distinct from `reason`'s prose — `"blocked"`
+   *  signals the step could not complete even though it produced a
+   *  (possibly partial) handoff. */
+  status?: "done" | "blocked";
+}
+
+/** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
+ *  pipeline task's board column. */
+export type PipelineRunStatus = "idle" | "running" | "blocked" | "done" | "cancelled";
+
+/** Why a pipeline execution is Blocked — surfaced per-entry in
+ *  {@link PipelineRunState.blocked} and as the parent task's `column`
+ *  transition `reason` (`"pipeline"`). */
+export type PipelineBlockKind =
+  | "step-failed"
+  | "step-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "step-cap"
+  | "profile-missing"
+  | "join-incomplete";
+
+/** One currently-active step execution within a {@link PipelineRunState} —
+ *  a hidden step task whose turn is running or blocked. Several can coexist
+ *  after a `transition: "all"` fan-out. */
+export interface PipelineActiveStep {
+  stepId: string;
+  taskId: string;
+  /** This execution's position in `history` / overall step-cap accounting
+   *  (1-based, monotonically increasing per run). */
+  seq: number;
+}
+
+/** One incoming arrival recorded against a `join: "all"` step while it
+ *  waits for every distinct incoming source to arrive in the current
+ *  generation. See {@link PipelineRunState.joins}. */
+export interface PipelineJoinArrival {
+  fromStepId: string;
+  seq: number;
+  handoff: Handoff | null;
+}
+
+/** A single blocked pipeline execution (or a run-level block whose
+ *  `taskId`/`stepId` are null) awaiting either a fix (e.g. re-sending the
+ *  step so it emits a valid handoff) or a manual advance. */
+export interface PipelineBlock {
+  taskId: string | null;
+  stepId: string | null;
+  kind: PipelineBlockKind;
+  message: string;
+  /** The run-level launch (re-attempting a step, or advancing past a step
+   *  cap) this block is waiting to retry — populated only on a run-level
+   *  block (`taskId` on the block is null: `step-cap`/`profile-missing`/
+   *  `join-incomplete`), so a Retry action can re-attempt the exact same
+   *  launch instead of re-deriving it. `stepId` on the block itself is
+   *  always set for these blocks (the step the pending launch targets, same
+   *  value as `pending.stepId` here); `arrivals` is the join state (if any)
+   *  it would launch with. */
+  pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
+}
+
+/**
+ * A frozen copy of the {@link PipelineGraph} plus every agent profile it
+ * references, captured onto {@link PipelineRunState.snapshot} the moment a
+ * pipeline task first runs (D8, `docs/plans/pipelines.md`). Later edits to
+ * the live pipeline or its profiles never affect an already-started run.
+ */
+export interface PipelineRunSnapshot {
+  graph: PipelineGraph;
+  maxSteps: number;
+  /** Keyed by `AgentProfile.id` — every profile referenced by any step's
+   *  `agentProfileId` or `subagents.profileIds` at capture time. */
+  profiles: Record<string, AgentProfileSnapshot>;
+  capturedAt: number;
+}
+
+/**
+ * How a step execution's final response classified, per {@link
+ * classifyStepResponse} in `src/shared/pipeline.ts` — `"handoff"` (a valid,
+ * non-`blocked` handoff), `"handoff-blocked"` (a valid handoff whose own
+ * `status` is `"blocked"`), `"handoff-missing"` (no `<handoff>` tag at all),
+ * `"handoff-invalid"` (a tag whose body didn't parse), `"user-ask"` (the
+ * step's task has a pending interaction — the agent is waiting on the user,
+ * never a format failure), `"error"` (the run failed), or `"cancelled"` (the
+ * run was cancelled or orphaned).
+ */
+export type StepResponseKind =
+  | "handoff"
+  | "handoff-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "user-ask"
+  | "error"
+  | "cancelled";
+
+/**
+ * Records the single automatic follow-up the runner sends to a step whose
+ * final response was `"handoff-missing"`, `"handoff-invalid"`, or a parsed
+ * handoff whose `next` didn't resolve to a real outgoing step
+ * (`"handoff-next-unknown"`, from `resolveNextSteps`'s `"ambiguous"`/
+ * `"unknown"` outcomes) — one reminder max per execution; a second bad
+ * response blocks instead of reminding again. See `composeHandoffReminder`
+ * in `src/shared/pipeline.ts`.
+ */
+export interface PipelineStepReminder {
+  at: number;
+  reason: "handoff-missing" | "handoff-invalid" | "handoff-next-unknown";
+  runId: string | null;
+  /** The parser error / short reason the reminder was sent for. */
+  detail: string;
+  /** Whether the reminder message was actually delivered to the agent (a
+   *  `sendInput` call that succeeds). `false` is never persisted today — the
+   *  runner only records a reminder once it has been sent — but the field is
+   *  required rather than defaulted so a future delivery-failure path can
+   *  record an honest `false` without a schema change, and so any UI reading
+   *  this record doesn't have to assume delivery. */
+  delivered: boolean;
+}
+
+/**
+ * One completed (or cancelled) step execution, appended to {@link
+ * PipelineRunState.history} once its task settles. `nextStepIds` records
+ * what `resolveNextSteps` actually started from this execution's handoff —
+ * empty for a terminal step, a failed/cancelled execution, or one still
+ * awaiting resolution.
+ */
+export interface PipelineStepRecord {
+  seq: number;
+  stepId: string;
+  taskId: string;
+  startedAt: number;
+  endedAt: number | null;
+  outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | null;
+  handoff: Handoff | null;
+  nextStepIds: string[];
+  /** How this execution's final response classified — see {@link
+   *  StepResponseKind}. Optional/additive: absent on a record written before
+   *  this field existed, and never set for an execution still awaiting
+   *  resolution. */
+  responseKind?: StepResponseKind | null;
+  /** The one automatic handoff-format reminder sent for this execution, if
+   *  any — one reminder max per execution (see {@link
+   *  PipelineStepReminder}). Optional/additive. */
+  reminder?: PipelineStepReminder | null;
+  /** Id of the run whose final response supplied the handoff this execution
+   *  used (`null`: none supplied one, a manual advance, or a record written
+   *  before this field existed). Optional/additive. */
+  handoffRunId?: string | null;
+  /** True when {@link handoffRunId} is not the run whose settle advanced or
+   *  recorded the step — i.e. the handoff was found on a different run of the
+   *  same step task (a reminder or background-task continuation raced the
+   *  original run). Absent/false on a record written before this field
+   *  existed. Optional/additive. */
+  handoffFromOtherRun?: boolean;
+  /** Timestamp of the last successful Retry start of this execution (`null`/
+   *  absent: never retried). The attempt window that bounds the handoff
+   *  look-back is `max(startedAt, attemptStartedAt ?? 0)` — a Retry resets
+   *  it, so a handoff from before the Retry can't satisfy the new attempt,
+   *  while a user's own follow-up message does not touch it. Optional/
+   *  additive. */
+  attemptStartedAt?: number | null;
+  /** When this one execution was stopped on its own — a Stop pressed on the
+   *  step task's own panel (its run settled `cancelled`, or a held step was
+   *  stopped) rather than the pipeline's Stop (`PipelineRunState.
+   *  stopRequestedAt`). While set, no settle of the execution gets the
+   *  release grace or the automatic handoff reminder, and an automatic
+   *  continuation that starts on it is cancelled. Cleared when a turn the
+   *  user started begins on the step, and on Retry. `null`/absent: not
+   *  stopped. Optional/additive. */
+  stoppedAt?: number | null;
+  /** The step task's run the latest Stop applied to — the run a `cancelled`
+   *  settle recorded, the current run of a held step that was stopped, or the
+   *  current run when the pipeline's own Stop was pressed. Only meaningful
+   *  while the execution or its run is stopped: a `running` column event for
+   *  any OTHER run is a turn that began after the Stop (the runner decides
+   *  whether the user started it); the same run — a parked card pulled back,
+   *  or the stopped run's own row before its kill lands — never resumes the
+   *  step. `null`/absent: unknown (a row written before this field), where
+   *  the runner falls back to "the current run is still running". Cleared
+   *  with `stoppedAt`. Optional/additive. */
+  stoppedRunId?: string | null;
+}
+
+/**
+ * Server-managed run state for a pipeline task, persisted on `Task.pipelineRun`
+ * (`tasks.pipeline_run`, written only by `tasks.setPipelineRun`'s targeted
+ * UPDATE — never patchable, excluded from the generic `tasks.update` SET
+ * clause). `snapshot` is null until the first Run (see {@link
+ * PipelineRunSnapshot}); every other field tracks the run's live progress —
+ * `active` holds one entry per currently-running/blocked step execution
+ * (several after a fan-out), `joins` holds partial fan-in state keyed by
+ * step id, and `blocked` holds one entry per execution that needs attention
+ * (or a run-level block with null ids).
+ */
+export interface PipelineRunState {
+  pipelineId: string;
+  pipelineName: string;
+  snapshot: PipelineRunSnapshot | null;
+  status: PipelineRunStatus;
+  active: PipelineActiveStep[];
+  joins: Record<string, { arrivals: PipelineJoinArrival[] }>;
+  blocked: PipelineBlock[];
+  history: PipelineStepRecord[];
+  /** Total executions started this run — what `maxSteps` caps. */
+  stepCount: number;
+  startedAt: number | null;
+  endedAt: number | null;
+  /** Times a `step-cap` block has been extended via Retry. Each extension
+   *  doubles the running allowance: the effective cap is
+   *  `snapshot.maxSteps * (1 + capExtensions)` — see {@link
+   *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
+   *  first extension. */
+  capExtensions?: number;
+  /** When the user stopped the whole run (`cancelPipelineRun` only — a Stop
+   *  on one step's own panel is {@link PipelineStepRecord.stoppedAt}, and an
+   *  orphaned settle is neither) — the durable "this run is stopped" fact.
+   *  While set, `deriveRunStatus` reads `cancelled` unless something is
+   *  blocked, and no settle may remind, block or launch off it. Cleared by a
+   *  Retry, an Advance, a Restart, and a turn the user starts on one of the
+   *  run's steps. `null` when not stopped; absent only on a row written
+   *  before the marker existed (read as stopped when it is `cancelled`). */
+  stopRequestedAt?: number | null;
+}
+
+/** Field length/count caps enforced by both the server routes and the
+ *  pipeline editor UI — mirrors {@link AGENT_PROFILE_LIMITS}'s role for
+ *  agent profiles. */
+export const PIPELINE_LIMITS = {
+  name: 80,
+  description: 2000,
+  steps: 50,
+  edges: 200,
+  stepName: 60,
+  instructions: 20_000,
+  maxStepsDefault: 25,
+  maxStepsMax: 200,
+  handoffInlineMaxBytes: 16_384,
+  handoffField: 8_000,
+  handoffArray: 50,
+  /** Hard bound on the JSON byte size of ONE normalized {@link Handoff} as
+   *  persisted into `PipelineRunState.history[].handoff` /
+   *  `joins[].arrivals[].handoff` — `normalizeHandoff` trims the arrays
+   *  first, then the string fields, until the whole object fits. Per-field
+   *  (`handoffField`) and per-array (`handoffArray`) caps alone still allowed
+   *  ~850 KB per handoff (7 × 8 KB fields + 2 × 50 × 8 KB entries). */
+  handoffTotalBytes: 65_536,
+  /** `parseHandoff` only ever scans the trailing `handoffScanTailBytes`
+   *  UTF-16 code units of a step's assistant text for its `<handoff>` block
+   *  — the contract says the block ENDS the final message, so anything
+   *  further back is prose, and bounding the scan keeps a pathological
+   *  transcript (e.g. 50k unclosed open tags) linear in the tail, not the
+   *  whole text. */
+  handoffScanTailBytes: 262_144,
+  /** Max `PipelineRunState.capExtensions` the run-state sanitizer accepts
+   *  (and `effectiveStepCap` scales by) — a Retry only ever increments by
+   *  one, so a stored value past this is corruption, not a real run. */
+  capExtensionsMax: 100,
+  /** Max length of an edge's display `label`. */
+  edgeLabel: 120,
+  /** Max length of a step or edge `id`. */
+  id: 128,
+  /** Max entries in a step's `subagents.profileIds`. */
+  subagentProfiles: 20,
+  /** Max value of a step's `subagents.cap`. */
+  subagentCap: 1000,
+  /** Max absolute value of a step's canvas `position.x`/`.y` — out-of-range
+   *  or non-finite values are clamped into `[-positionAbs, positionAbs]`
+   *  rather than rejected. */
+  positionAbs: 1_000_000,
+} as const;
+
+export interface HarnessUsage {
+  /** Harness id this usage report is for. */
+  harnessId: string;
+  /** Task ids currently in column='running' that reference this harness.
+   *  Surfaced in the disable-confirmation dialog so the user knows what's
+   *  in flight before they hide the harness from the picker. */
+  runningTaskIds: string[];
+  /** Total number of tasks (any column) referencing this harness — used
+   *  to communicate the soft-delete blast radius. */
+  totalTaskCount: number;
+}
+
+/**
+ * The identity block of a logged-in Claude account, read from the account's
+ * `.claude.json` (`oauthAccount`). Deliberately excludes `accountUuid` and
+ * anything token-shaped — this crosses the API boundary to the webview and
+ * must stay safe to display.
+ */
+export interface ClaudeAccount {
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+}
+
+/**
+ * An existing Claude config dir found on disk that no registered harness
+ * points at yet — surfaced in the Add-harness picker so a second account
+ * (`~/.claude-adevinta` style) is one click instead of a hand-typed path.
+ */
+export interface DiscoveredAccount {
+  /** Absolute path to the config dir (would become `Harness.home`). */
+  configDir: string;
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+  /** Slug derived from the dir name; the UI may bump it on collision. */
+  suggestedHarnessId: string;
+}
+
+/** Aggregated token counts for one time window of one account. */
+export interface TokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+
+/**
+ * Per-account LOCAL token-usage rollup attached to a claude-code harness's
+ * status — fed by an incremental scan of the account's own
+ * `<configDir>/projects/**\/*.jsonl` transcripts (src/bun/account-usage.ts),
+ * so it survives claude's own transcript retention deleting the raw files.
+ * Keyed by config dir, not harness id — two harnesses sharing a `home` share
+ * one account, and the numbers include the user's direct CLI sessions too
+ * (the budget shown is the account's, not agetor's). This is a historical,
+ * purely-local, no-network token count — not a live quota/limit meter.
+ */
+export interface AccountUsageSummary {
+  configDir: string;
+  today: TokenTotals;
+  last7d: TokenTotals;
+}
+
+export interface HarnessStatus {
+  /** The harness this status is for. */
+  harnessId: string;
+  /** Underlying CLI kind — useful for the UI to render the right icon. */
+  kind: AgentKind;
+  /** The binary the probe tried to invoke (post override). */
+  bin: string;
+  available: boolean;
+  path: string | null;
+  version: string | null;
+  /** Short, user-facing reason when `available` is false. */
+  reason: string | null;
+  /** Suggested install command when missing. */
+  installHint: string | null;
+  /** Logged-in account identity (claude-code only; null for other kinds,
+   *  for a logged-out account, or an unreadable config blob). */
+  account: ClaudeAccount | null;
+  /** Local historical token-usage rollup for the harness's account
+   *  (claude-code only; null for other kinds). See {@link AccountUsageSummary}. */
+  usage: AccountUsageSummary | null;
+  /**
+   * Login state, when the kind's probe can determine it cheaply and without
+   * side effects — today only fx (`fx status --json` reports `auth`). Strictly
+   * fail-open: `false` ONLY when the probe positively reported `auth:
+   * "missing"`, or (fx 0.0.7+) an expired non-refreshable login
+   * (`auth_expired === true && auth_refreshable === false`); `true` for any
+   * other reported value — including fx 0.0.8's `auth: "host managed"`
+   * (`FX_AUTH_MODE=host-managed`), which the same fail-open fallthrough
+   * tolerates as logged-in rather than gaining a dedicated branch; the
+   * `status --json` field set and this `auth` vocabulary are unchanged
+   * through 0.0.9 and 0.0.10 (re-verified 2026-09-14); `null`
+   * when the kind has no login probe, the probe failed, or its output
+   * wasn't parseable — `null` must never block a run.
+   */
+  loggedIn: boolean | null;
+  /** Login guidance when `loggedIn === false`: fx's own `auth_help` when the
+   *  probe supplies one, else one of agetor's two synthesized fallback hints
+   *  (missing credentials vs. an expired login); otherwise null. */
+  authHelp: string | null;
+  /** fx only: the permission mode fx's own saved profile starts in
+   *  (`fx status --json` `permission_mode`, reported since fx 0.0.8; probed
+   *  WITHOUT `FX_PERMISSION_MODE` so the env override can't mask it). `"ask"`
+   *  drives the Settings / `agetor harness ls` hint. `null` (or absent) when
+   *  the kind isn't fx, the field is absent, or the probe failed. */
+  fxProfilePermissionMode?: string | null;
+  /** Neutral, non-blocking lines about this harness, rendered in Settings →
+   *  Harnesses (`harness-status-notice`), the Onboarding checklist and
+   *  `agetor harness ls` — e.g. OpenCode's "No OpenCode credentials found —
+   *  run `opencode auth login`" and its v1 "OpenCode 2 is available" hint
+   *  (`docs/plans/add-opencode-harness.md` D-16). Never gates a run (that is
+   *  `loggedIn`'s job). Absent or empty when there is nothing to say. */
+  notices?: string[];
+}
+
+/**
+ * Where a `HarnessQuota` snapshot's data came from:
+ *  - "api"    — fetched live from the provider's (undocumented) usage endpoint.
+ *  - "cache"  — read from an on-disk file the CLI itself maintains (e.g.
+ *               `.claude.json`'s `cachedUsageUtilization`, a codex sessions
+ *               JSONL's `rate_limits`), used when the live fetch is unavailable.
+ *  - "scrape" — reconstructed from a browser/IDE session (e.g. Cursor's web
+ *               cookie), the most fragile source.
+ */
+export type QuotaSource = "api" | "cache" | "scrape";
+
+/**
+ * Outcome of the most recent attempt to fetch a harness's quota:
+ *  - "ok"          — we have live or cached meters to show.
+ *  - "unavailable" — the provider has no obtainable usage data for this
+ *                     harness/account (e.g. no Cursor cookie, a Gemini
+ *                     individual-tier account) — not an error, just nothing
+ *                     to show.
+ *  - "error"       — a fetch or parse attempt failed (network, auth, shape
+ *                     change). `HarnessQuota.reason` carries detail for the UI.
+ */
+export type QuotaStatus = "ok" | "error" | "unavailable";
+
+/**
+ * One usage bar within a `HarnessQuota` snapshot — e.g. "5-hour session",
+ * "weekly", "Opus", "credits". Providers report different meters, so this
+ * shape is deliberately minimal and provider-agnostic.
+ */
+export interface QuotaMeter {
+  /** Stable id within the snapshot (e.g. "five_hour", "seven_day_opus"). */
+  id: string;
+  /** User-facing label for the meter. */
+  label: string;
+  /** 0..100, how much of this meter's allotment has been used. */
+  usedPercent: number;
+  /** Epoch ms when this meter resets, or null if the provider didn't report one. */
+  resetsAtMs: number | null;
+  /** Optional model/window scope this meter applies to (e.g. "Opus", "Sonnet"). */
+  scope?: string;
+}
+
+/**
+ * Normalized per-harness usage/quota snapshot, as surfaced by the topbar
+ * usage tracker (`GET /usage`, `harness_usage` AppEvent). Distinct from
+ * `HarnessUsage` above — that type is task-count blast radius for the
+ * disable-confirmation dialog and is unrelated to this feature.
+ *
+ * `meters` is intentionally dynamic: each provider returns a different set
+ * (Claude may report session/weekly/Opus/Sonnet/routines/extra-credit;
+ * Codex session/weekly/credits; Cursor plan/on-demand) and the UI renders
+ * whatever's present rather than assuming a fixed list.
+ */
+export interface HarnessQuota {
+  /** Harness id this snapshot is for. */
+  harnessId: string;
+  /** Underlying CLI kind — useful for the UI to render the right icon. */
+  kind: AgentKind;
+  /** Provider-reported plan/tier name, when known (e.g. "Pro", "Team"). */
+  planType: string | null;
+  status: QuotaStatus;
+  source: QuotaSource;
+  /** Epoch ms when this snapshot was produced (fetched or read from cache). */
+  fetchedAtMs: number;
+  meters: QuotaMeter[];
+  /** User-facing explanation when `status` isn't "ok" — null when it is. */
+  reason: string | null;
+}
+
+/**
+ * Pre-canned configurations the Add-harness form offers as starting points.
+ * Templates live in code (not the DB) — picking one only pre-fills the form;
+ * the user can tweak any field before save. The `id` here is the template's
+ * identifier in the picker, not the harness id that will be stored.
+ */
+export interface HarnessTemplate {
+  id: string;
+  label: string;
+  description: string;
+  kind: AgentKind;
+  /** Suggested harness id slug. UI may tweak before save. */
+  suggestedHarnessId: string;
+  /** Suggested HOME override. The `~` prefix is resolved client-side
+   *  against `GET /defaults`. NULL means "no HOME override". */
+  home: string | null;
+  bin: string | null;
+  env: Record<string, string>;
+}
+
+export const HARNESS_TEMPLATES: HarnessTemplate[] = [
+  // `{dataDir}` is a placeholder substituted in the Settings dialog before
+  // the editor opens — resolves to ~/.agetor for the packaged .app or
+  // ~/.agetor-dev under `bun run dev`, so the suggested HOME tracks whichever
+  // tree agetor is actually using. The value stored on the harness row is
+  // the resolved absolute path.
+  {
+    id: "claude-code-additional",
+    label: "Additional Claude Code",
+    description:
+      "Another claude-code harness with its own CLAUDE_CONFIG_DIR so login, history, and config live separately from the built-in.",
+    kind: "claude-code",
+    suggestedHarnessId: "claude-2",
+    home: "{dataDir}/harnesses/claude-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "codex-additional",
+    label: "Additional Codex",
+    description:
+      "Another codex harness with its own CODEX_HOME so login and history are isolated from the built-in.",
+    kind: "codex",
+    suggestedHarnessId: "codex-2",
+    home: "{dataDir}/harnesses/codex-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "cursor-additional",
+    label: "Additional Cursor",
+    description:
+      "Another cursor-agent harness with its own HOME override so login and config are isolated from the built-in — cursor-agent has no dedicated config-dir env var, so a full HOME override is how accounts are separated.",
+    kind: "cursor",
+    suggestedHarnessId: "cursor-2",
+    home: "{dataDir}/harnesses/cursor-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "gemini-additional",
+    label: "Additional Gemini",
+    description:
+      "Another gemini harness with its own GEMINI_CLI_HOME so login and session history are isolated from the built-in.",
+    kind: "gemini",
+    suggestedHarnessId: "gemini-2",
+    home: "{dataDir}/harnesses/gemini-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "fx-additional",
+    label: "Additional fx",
+    description:
+      "Another fx harness with its own HOME override so login and config are isolated from the built-in — fx has no dedicated config-dir env var, so a full HOME override is how accounts are separated.",
+    kind: "fx",
+    suggestedHarnessId: "fx-2",
+    home: "{dataDir}/harnesses/fx-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "opencode-additional",
+    label: "Additional OpenCode",
+    description:
+      "Another OpenCode harness with its own HOME and XDG dirs so login, sessions and config are isolated from the built-in. It always runs OpenCode 2 turns with --standalone, since the shared background service can't be separated per account.",
+    kind: "opencode",
+    suggestedHarnessId: "opencode-2",
+    home: "{dataDir}/harnesses/opencode-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "copilot-additional",
+    label: "Additional GitHub Copilot",
+    description:
+      "Another GitHub Copilot harness with its own COPILOT_HOME so login, config and session history are isolated from the built-in. After saving, sign the new account in by running COPILOT_HOME=<path> copilot login in a terminal.",
+    kind: "copilot",
+    suggestedHarnessId: "copilot-2",
+    home: "{dataDir}/harnesses/copilot-2",
+    bin: null,
+    env: {},
+  },
+];
+
+export type Isolation = "worktree" | "none";
+
+/**
+ * High-level classification of a task. Cosmetic only — drives the icon and
+ * left-border color on the kanban card and the picker in NewTaskForm. Has no
+ * effect on agent invocation, scheduling, or orchestration. New rows default
+ * to "task"; legacy rows are backfilled by migration 020.
+ */
+export type TaskType = "task" | "bug" | "spike";
+
+export interface TaskTypeMeta {
+  id: TaskType;
+  label: string;
+  hint: string;
+  /** Lucide icon name — resolved in the UI to the actual component. */
+  icon: "Inbox" | "Bug" | "FlaskConical";
+  /** Tailwind class fragments used to paint the icon (text-) and the card's
+   *  left border (border-l-). Kept as fragments rather than full class names
+   *  so the consumer composes them with `cn(...)`. */
+  iconClass: string;
+  borderClass: string;
+}
+
+// Task-type coloring rides the shared semantic tokens (index.css /
+// tailwind.config.js) rather than literal palette classes, per the UI
+// convention below. "bug" maps cleanly onto --danger (both are "something's
+// wrong", same red/rose family as the literal it replaces) and "task" maps
+// cleanly onto --info (its original literal was already sky, --info's own
+// hue family) — genuine status-token reuse, not a stretch. "spike" has no
+// clean status-token equivalent (it's a category, not a status), so it gets
+// its own --spike token (violet) rather than being forced onto an existing
+// one — see the --spike comment in index.css for why that isn't --merged.
+export const TASK_TYPES: TaskTypeMeta[] = [
+  {
+    id: "task",
+    label: "Task",
+    hint: "Standard work item.",
+    icon: "Inbox",
+    iconClass: "text-info",
+    borderClass: "border-l-info",
+  },
+  {
+    id: "bug",
+    label: "Bug",
+    hint: "Defect to investigate or fix.",
+    icon: "Bug",
+    iconClass: "text-danger",
+    borderClass: "border-l-danger",
+  },
+  {
+    id: "spike",
+    label: "Spike",
+    hint: "Exploratory / research task.",
+    icon: "FlaskConical",
+    iconClass: "text-spike",
+    borderClass: "border-l-spike",
+  },
+];
+
+export const DEFAULT_TASK_TYPE: TaskType = "task";
+
+export function taskTypeMeta(t: TaskType | null | undefined): TaskTypeMeta {
+  return TASK_TYPES.find((x) => x.id === t) ?? TASK_TYPES[0]!;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Branch nomenclature (per project)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * How agetor names the git branch it creates for a worktree-isolated task.
+ * One rule per {@link TaskType}, so "feature"/"bug"/"spike" work can land on
+ * differently-prefixed branches.
+ */
+export interface BranchNamingRule {
+  /**
+   * Leading segment of the branch, typically ending in "/" (e.g. `"feature/"`).
+   * Fully customizable; validated to git-legal characters. May be empty.
+   */
+  prefix: string;
+}
+
+/**
+ * Per-project branch nomenclature. Stored on the project row (JSON); a project
+ * with no stored config falls back to {@link DEFAULT_BRANCH_CONFIG}.
+ */
+export interface BranchNamingConfig {
+  /** Per-task-type prefix. Every {@link TaskType} id must have an entry. */
+  rules: Record<TaskType, BranchNamingRule>;
+  /** When true, the card title (slugified) forms the branch body. */
+  includeSlug: boolean;
+}
+
+/**
+ * Built-in defaults. The existing task types (task | bug | spike) map to the
+ * conventional feature/ | fix/ | spike/ prefixes.
+ */
+export const DEFAULT_BRANCH_CONFIG: BranchNamingConfig = {
+  rules: {
+    task: { prefix: "feature/" },
+    bug: { prefix: "fix/" },
+    spike: { prefix: "spike/" },
+  },
+  includeSlug: true,
+};
+
+/**
+ * Prefix of the pre-nomenclature branch scheme (`agetor/<short-id>-<slug>`).
+ * Still emitted by `branchName()` as a legacy fallback, used to hide
+ * agetor-managed branches from the base-ref picker, and treated as "no
+ * meaningful prefix" by {@link branchCommitType}. Lives in shared so the one
+ * magic prefix has a single definition rather than a copy per call site.
+ */
+export const LEGACY_BRANCH_PREFIX = "agetor/";
+
+/** Max length of the slug portion of a branch body. */
+const BRANCH_SLUG_MAX = 40;
+
+/**
+ * Turn arbitrary text into a git-legal, kebab-cased branch segment: lowercased,
+ * every run of non-alphanumerics collapsed to a single "-", leading/trailing
+ * "-" trimmed, length capped. Returns "" when the input has no usable
+ * characters (callers supply a fallback such as a short id token).
+ */
+export function slugifyBranch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, BRANCH_SLUG_MAX)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * A template tag the branch-name field recognizes and substitutes. Purely
+ * descriptive metadata — {@link BRANCH_TEMPLATE_TAGS} drives the helper text
+ * shown under the Branch name field; the substitution logic itself lives in
+ * {@link renderBranchTemplate}.
+ */
+export interface BranchTemplateTag {
+  /** The literal tag text, e.g. `"<slug>"`. */
+  tag: string;
+  /** One-line human description shown alongside the tag in the UI. */
+  description: string;
+}
+
+/** Ordered list used by the UI helper text under the Branch name field. */
+export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
+  { tag: "<slug>", description: "Task title, slugified (short id when empty)" },
+  { tag: "<project_name>", description: "Project folder name, slugified" },
+  { tag: "<type>", description: "Task type (task, bug, or spike)" },
+  { tag: "<date>", description: "Creation date (YYYY-MM-DD)" },
+  { tag: "<timestamp>", description: "Creation timestamp (YYYYMMDD-HHmmss)" },
+  { tag: "<token>", description: "Short unique id" },
+];
+
+/**
+ * The tags that carry the branch *body* (its per-task uniqueness). A rule
+ * value containing one of these is a full template, so {@link branchPattern}
+ * appends nothing to it; the other tags are decoration and don't suppress the
+ * appended body.
+ */
+export const BRANCH_BODY_TAGS = ["<slug>", "<token>"] as const;
+
+/** Inputs {@link renderBranchTemplate} substitutes into a template string. */
+export interface BranchTemplateContext {
+  title: string;
+  /** Raw project folder name; the renderer slugifies it. */
+  projectName: string;
+  taskType: TaskType;
+  /** Short unique token, e.g. 6 chars of the task id. */
+  token: string;
+  /** Injected for deterministic tests/previews; defaults to `new Date()`. */
+  now?: Date;
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+/** Local-time `YYYY-MM-DD`. */
+function formatBranchDate(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Local-time `YYYYMMDD-HHmmss`. */
+function formatBranchTimestamp(d: Date): string {
+  const date = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+  const time = `${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  return `${date}-${time}`;
+}
+
+/**
+ * True iff `value` contains at least one KNOWN template tag, i.e. one listed
+ * in {@link BRANCH_TEMPLATE_TAGS}. An unknown `<...>` sequence does not count
+ * — {@link renderBranchTemplate} passes those through literally, so a string
+ * containing only unrecognized angle-bracket text is not "templated" from the
+ * caller's point of view.
+ */
+export function hasBranchTemplateTags(value: string): boolean {
+  return BRANCH_TEMPLATE_TAGS.some(({ tag }) => value.includes(tag));
+}
+
+/**
+ * Render a branch-name template by substituting every known tag
+ * ({@link BRANCH_TEMPLATE_TAGS}) with its resolved value:
+ * - `<slug>` → the slugified title, falling back to `ctx.token` so it can
+ *   never render empty (which would otherwise leave a dangling `feature/`).
+ * - `<project_name>` → the slugified project name, falling back to
+ *   `"project"`.
+ * - `<type>` → `ctx.taskType` verbatim.
+ * - `<date>` / `<timestamp>` → local-time formatted from `ctx.now` (defaults
+ *   to `new Date()`); callers inject `now` for deterministic previews/tests.
+ * - `<token>` → `ctx.token` verbatim.
+ *
+ * Unknown `<...>` sequences (e.g. a stray `<foo>`) are left untouched — git
+ * allows `<`/`>` in ref names, so there's no need to reject or strip them.
+ * A tag-free string is returned unchanged (identity); this is what lets a
+ * plain literal branch name — the pre-template back-compat path — flow
+ * through {@link renderBranchTemplate} unmodified.
+ */
+export function renderBranchTemplate(template: string, ctx: BranchTemplateContext): string {
+  const now = ctx.now ?? new Date();
+  const slug = slugifyBranch(ctx.title) || ctx.token;
+  const projectSlug = slugifyBranch(ctx.projectName) || "project";
+  return template
+    .split("<slug>").join(slug)
+    .split("<project_name>").join(projectSlug)
+    .split("<type>").join(ctx.taskType)
+    .split("<date>").join(formatBranchDate(now))
+    .split("<timestamp>").join(formatBranchTimestamp(now))
+    .split("<token>").join(ctx.token);
+}
+
+/**
+ * The stable, tag-containing branch-name pattern for a task type — what the
+ * New Task form shows before the user edits the field, and what the server
+ * renders against at creation time when no override is supplied. Resolves the
+ * per-type rule via the fallback chain (per-type rule → default config's rule
+ * for that type → empty prefix), then returns the un-rendered template
+ * (`<slug>`/`<token>`, `<date>`, `<type>`, …).
+ *
+ * If `rule.prefix` already contains a body tag (`<slug>` or `<token>`), it is
+ * treated as a full template and returned verbatim — an explicit `<slug>` in
+ * the prefix wins even when `config.includeSlug` is false, and nothing is
+ * appended (that would double the tag). Otherwise the body tag
+ * (`config.includeSlug ? "<slug>" : "<token>"`) is appended to the prefix as
+ * before. Non-body tags (`<date>`, `<type>`, `<project_name>`, `<timestamp>`)
+ * do not suppress the append — only `<slug>`/`<token>` count as a body.
+ */
+export function branchPattern(config: BranchNamingConfig, taskType: TaskType): string {
+  const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
+  if (BRANCH_BODY_TAGS.some((tag) => rule.prefix.includes(tag))) return rule.prefix;
+  return `${rule.prefix}${config.includeSlug ? "<slug>" : "<token>"}`;
+}
+
+/**
+ * Validate a full git branch name against the same rules as
+ * `git check-ref-format refs/heads/<name>`. Returns the offending reason on
+ * failure so the UI can explain why an override was rejected. Note: underscore
+ * is allowed; backslash is not.
+ */
+export function validateBranchName(
+  name: string,
+): { ok: true } | { ok: false; reason: string } {
+  if (!name) return { ok: false, reason: "Branch name is empty." };
+  if (name.startsWith("/") || name.endsWith("/")) {
+    return { ok: false, reason: "Cannot start or end with '/'." };
+  }
+  if (name.endsWith(".")) return { ok: false, reason: "Cannot end with '.'." };
+  if (name.includes("//")) return { ok: false, reason: "Cannot contain '//'." };
+  if (name.includes("..")) return { ok: false, reason: "Cannot contain '..'." };
+  if (name.includes("@{")) return { ok: false, reason: "Cannot contain '@{'." };
+  if (name === "@") return { ok: false, reason: "Cannot be a single '@'." };
+  // Control chars (incl. DEL), space, and ~ ^ : ? * [ \ are all forbidden.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f ~^:?*[\\]/.test(name)) {
+    return {
+      ok: false,
+      reason: "Contains a disallowed character (space, ~, ^, :, ?, *, [, \\, or a control char).",
+    };
+  }
+  for (const seg of name.split("/")) {
+    if (seg === "") continue; // empty segments are caught by the "//" check above
+    if (seg.startsWith(".")) return { ok: false, reason: "A path segment cannot start with '.'." };
+    if (seg.endsWith(".lock")) return { ok: false, reason: "A path segment cannot end with '.lock'." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a whole {@link BranchNamingConfig}: every task type must have a
+ * string prefix that composes into a legal branch. Used by the settings dialog
+ * (client) and the persist route (server) so a bad prefix can't be saved.
+ */
+export function validateBranchConfig(
+  config: BranchNamingConfig,
+): { ok: true } | { ok: false; reason: string } {
+  for (const t of TASK_TYPES) {
+    const rule = config.rules[t.id];
+    if (!rule || typeof rule.prefix !== "string") {
+      return { ok: false, reason: `Missing prefix for "${t.label}".` };
+    }
+    // Render the type's pattern through the authoritative template path so a
+    // bare "feature/" passes but "feat ure/" (space) or "/x" (leading slash)
+    // is rejected.
+    const sample = renderBranchTemplate(branchPattern(config, t.id), {
+      title: "example task",
+      projectName: "project",
+      taskType: t.id,
+      token: "abc123",
+    });
+    const v = validateBranchName(sample);
+    if (!v.ok) return { ok: false, reason: `"${rule.prefix}" is not a valid prefix — ${v.reason}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Conventional-commit type suggested for a task's commit message, derived from
+ * its {@link TaskType}. Keeps the "Commit & push" message consistent with the
+ * branch nomenclature scheme (bug → fix, spike → chore, everything else feat).
+ */
+export function conventionalCommitType(t: TaskType | null | undefined): string {
+  switch (t) {
+    case "bug":
+      return "fix";
+    case "spike":
+      return "chore";
+    default:
+      return "feat";
+  }
+}
+
+/**
+ * Commit-message type for a task, derived from its actual branch so the commit
+ * matches the branch nomenclature: the branch's prefix with the trailing slash
+ * removed (e.g. `"feature/add-login"` → `"feature"`, `"hotfix/nav"` → `"hotfix"`).
+ * Because the branch body is always a single slash-free segment (slugify strips
+ * slashes; the token has none), everything before the final `/` is exactly the
+ * configured prefix. Used by the "Commit & push" action.
+ *
+ * Falls back to {@link conventionalCommitType} when the branch carries no
+ * meaningful prefix:
+ *  - no `/` at all — a slash-less manual override, or isolation off (no branch);
+ *  - the legacy `agetor/` scheme (`agetor/<id>-<slug>`, pre-nomenclature rows),
+ *    whose prefix is an internal implementation detail, not a commit type.
+ */
+export function branchCommitType(
+  branch: string | null | undefined,
+  taskType: TaskType | null | undefined,
+): string {
+  if (branch && !branch.startsWith(LEGACY_BRANCH_PREFIX)) {
+    const i = branch.lastIndexOf("/");
+    if (i > 0) return branch.slice(0, i);
+  }
+  return conventionalCommitType(taskType);
+}
+
+export interface Task {
+  id: string;
+  title: string;
+  prompt: string;
+  column: ColumnId;
+  /**
+   * Harness id this task runs under. Free-form string at the schema level;
+   * resolved at spawn time against the `harnesses` table. For back-compat
+   * `"claude-code"` and `"codex"` are seeded as built-in harness ids, so
+   * any legacy row continues to resolve.
+   */
+  agent: string;
+  workdir: string;
+  /** "worktree" runs the agent in a per-task git worktree off `workdir`. "none" runs directly in `workdir`. */
+  isolation: Isolation;
+  /**
+   * Cosmetic classification — drives the icon + left-border color on the
+   * kanban card. No effect on orchestration. Persisted rows always carry a
+   * value (default "task"; migration 020 backfills legacy rows).
+   */
+  taskType: TaskType;
+  /** Branch name created for this task. Set after the worktree is first materialized. */
+  branch: string | null;
+  /**
+   * "created" when agetor minted a fresh branch off `baseRef` (the default
+   * for every task). "existing" when the task was pinned to a pre-existing
+   * branch (e.g. a PR's head branch via `existingBranch` at create time) —
+   * teardown paths must never `git branch -D` that branch. Migration 028
+   * backfills legacy rows to "created".
+   */
+  branchSource: "created" | "existing";
+  /** Absolute path to the per-task worktree. Set after the worktree is first materialized. */
+  worktreePath: string | null;
+  /**
+   * Resolved sha that the worktree was (or will be) created from. Pinned at
+   * create time so re-runs share a stable starting commit even after the
+   * source repo's HEAD moves. Null when the workdir wasn't a git repo at
+   * create time (no isolation possible).
+   */
+  baseRef: string | null;
+  /**
+   * URL of the pull request opened for this task's branch, or null if none
+   * has been created yet. Set server-side, atomically with creation, by
+   * `POST /github/pull-create` when the request carries this task's id —
+   * never patchable directly (kept out of the PATCH allow-list, same
+   * treatment as `branch`/`worktreePath`/`baseRef`). Once set, the UI shows
+   * a durable "View PR" link instead of re-offering "Open PR".
+   */
+  prUrl: string | null;
+  /**
+   * URL of the issue this task was created from, or null. Set only at create
+   * time by `createTask` (validated with `parseIssueUrl` and same-repo-
+   * checked against the workdir's remote); never patchable (kept out of the
+   * PATCH allow-list). Optional at the type level only for fixture
+   * compatibility (same reason as `unread`/`hasAssistantMessages`) —
+   * `toTask` always sets it.
+   */
+  issueUrl?: string | null;
+  /**
+   * Id of the {@link AgentProfile} this task was launched from, or null.
+   * Set only at create time by `createTask` from `POST /tasks`'s
+   * `agentProfileId` (400 on an unknown id); never patchable (kept out of
+   * `ALLOWED_PATCH_FIELDS` — `PATCH /tasks/:id` instead 409s when it would
+   * touch agent/mode/model/effort/speed/maxMode while this is set). Refreshed
+   * — together with `agentProfile` and the six copied fields — by
+   * `startTask`, but only before the task's first run (the "live-until-
+   * first-run" rule: a not-yet-started task tracks live profile edits,
+   * including a harness change; once a run exists the task is frozen to its
+   * snapshot). Cleared (set to null, alongside `agentProfile`) by
+   * `DELETE /tasks/:id/agent-profile` (archived-guarded). Both this field and
+   * `agentProfile` are written only by `tasks.setAgentProfile` — a targeted
+   * `UPDATE` that never bumps `updated_at` — and are skipped by the generic
+   * `tasks.update` SET clause, same treatment as `sentFiles`/`fxRecovery`.
+   * Optional at the type level only for fixture compatibility (same reason
+   * as `issueUrl`) — `toTask` always sets it.
+   */
+  agentProfileId?: string | null;
+  /**
+   * Point-in-time capture of the profile named by `agentProfileId`, taken
+   * the moment it was bound to this task (see {@link AgentProfileSnapshot}).
+   * This is what the task actually launches with once it has run at least
+   * once — edits or deletion of the live profile afterward have no effect.
+   * Kept in lockstep with `agentProfileId` by the same `tasks.setAgentProfile`
+   * targeted UPDATE (never patchable, excluded from the generic `tasks.update`
+   * SET clause). Null whenever `agentProfileId` is null. Optional at the type
+   * level only for fixture compatibility (same reason as `issueUrl`) —
+   * `toTask` always sets it.
+   */
+  agentProfile?: AgentProfileSnapshot | null;
+  /**
+   * Id of the {@link Pipeline} this task is the parent run of, or null for
+   * an ordinary task. Set only at create time (`POST /tasks`'s
+   * `pipelineId`); never patchable. A task with this set is a **pipeline
+   * task** — the board card shows a Pipeline badge with step progress, and
+   * clicking it opens the full-page run view instead of the run panel. See
+   * `docs/plans/pipelines.md` (D1/D5).
+   */
+  pipelineId?: string | null;
+  /**
+   * Server-managed run state for this pipeline task — null until the first
+   * Run, then tracks the whole run's progress (active step executions,
+   * partial joins, blocks, history). Written only by
+   * `tasks.setPipelineRun`'s targeted UPDATE (never bumps `updated_at`,
+   * skipped by the generic `tasks.update` SET clause, never patchable — same
+   * treatment as `sentFiles`/`fxRecovery`/`agentProfileId`). Always null for
+   * a task that isn't a pipeline task (`pipelineId` null).
+   *
+   * **`GET /tasks` (the board's 2s poll) ships a TRIMMED variant** of this
+   * state: every `history[].handoff` and `joins[].arrivals[].handoff` is
+   * `null` and `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
+   * need `snapshot.graph`, `status`, `active`, `blocked`, the history
+   * outcomes and `stepCount` (step progress, blocked banner, history
+   * length), and shipping every persisted handoff for every pipeline task
+   * on every poll was unbounded payload. The full state comes from
+   * `GET /tasks/:id` or `GET /tasks/:id/pipeline`; the server's own
+   * `tasks.list()`/`tasks.get()` reads are never trimmed.
+   */
+  pipelineRun?: PipelineRunState | null;
+  /**
+   * Id of the parent pipeline task this row is a hidden **step task** of, or
+   * null for an ordinary (including pipeline-parent) task. Step tasks are
+   * normal `tasks` rows in every other respect — RunPanel, ask cards, diff,
+   * backlog, CLI `show` all work unchanged — but are filtered out of the
+   * board and `agetor ls`/TUI by default (D11), can't be deleted/archived
+   * individually (409 — the parent owns their lifecycle), and share the
+   * parent's worktree rather than materializing their own (D2). Set only at
+   * insert time; never patchable.
+   */
+  pipelineParentId?: string | null;
+  /**
+   * Id of the {@link PipelineStep} this step task executes, or null for a
+   * non-step task. Set only at insert time; never patchable.
+   */
+  pipelineStepId?: string | null;
+  /**
+   * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
+   * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
+   * agent's hands-off default" (back-compat: --dangerously-skip-permissions
+   * for claude-code, --full-auto for codex).
+   */
+  mode: string | null;
+  /**
+   * Friendly model id ("opus-4.8", "sonnet-4.6", "haiku-4.5", "gpt-5", …).
+   * Mapped to a `--model <name>` flag in `src/bun/agents.ts`. NULL means
+   * "use the agent's default model" (no flag passed).
+   */
+  model: string | null;
+  /**
+   * Reasoning effort knob ("minimal" | "low" | "medium" | "high" for codex's
+   * reasoning models). NULL means "use the agent's default" (no flag passed).
+   * Currently only consumed by codex (`-c model_reasoning_effort=…`);
+   * claude-code stores it for symmetry but doesn't translate it yet.
+   */
+  effort: string | null;
+  /**
+   * Speed tier — `off | fast | ultrafast` (`tasks.speed`, migration 072).
+   * Cursor folds Fast into the model id (`cursorModelArg`); fx sets its ACP
+   * `fast`/`ultrafast` session options. Other kinds only offer `off`
+   * (`supportedSpeeds` in `./speed.ts`).
+   */
+  speed: Speed;
+  /** Derived `speed !== "off"`, emitted for older clients (D13) — never read
+   *  by agetor code. */
+  fast?: boolean;
+  /**
+   * Cursor Max Mode / large-context toggle. This is intentionally separate
+   * from effort="max", which means maximum reasoning/thinking effort.
+   * Non-Cursor harnesses ignore it.
+   */
+  maxMode: boolean;
+  /**
+   * opencode only (`tasks.opencode_server`, default `"shared"`): which
+   * OpenCode server this task's turns run against — see
+   * {@link OpencodeServerMode}. Patchable; a change between turns applies on
+   * the next turn, and an agent switch resets it to `"shared"`. Other kinds
+   * store and ignore it, like `maxMode`.
+   */
+  opencodeServer: OpencodeServerMode;
+  /**
+   * Path-only references the user attached at task creation (files and
+   * folders on the user's machine). Empty list when none. Inlined into the
+   * launch prompt as text — agetor never copies or uploads these.
+   */
+  references: TaskReference[];
+  /**
+   * Saved, not-yet-sent draft messages for this task — a per-task memory of
+   * things the user wants to send later but isn't ready to send now. Ordered
+   * newest-intent-first by array position (the UI lets the user reorder).
+   * Persisted as a JSON column, mirroring `references`. Empty list when none.
+   * Sending a backlog item consumes it (removes it from this list).
+   */
+  backlog: BacklogMessage[];
+  /**
+   * The composer's unsent draft for this task — text plus any attached
+   * references, persisted so closing and reopening the task details modal
+   * (or restarting agetor) doesn't lose in-progress typing. Null when the
+   * composer is empty. Distinct from `backlog`: the draft is implicit,
+   * autosaved state ("what's sitting in the composer right now"), while
+   * backlog items are explicit user-stashed drafts. Cleared when the draft
+   * is sent, stashed via "Save for later" (which moves it into `backlog`),
+   * or emptied by the user.
+   */
+  draft: TaskDraft | null;
+  /**
+   * Cursor plans detected from a run ending on `createPlanToolCall` (the
+   * agent wrote a plan and stopped), plus claude-code plans detected from
+   * `ExitPlanMode` tool_use/tool_result pairs in the chunk handler. Both are
+   * server-managed — detected in `attachDoneHandler` (cursor) or the chunk
+   * handler (claude), mutated only via the plan edit/approve routes for
+   * cursor (claude plans are read-only records — approval stays a live
+   * keystroke flow, not a route), never patchable through the generic task
+   * PATCH. Empty for every task of another kind, and for tasks that haven't
+   * produced a plan yet. At most one entry is ever `pending` at a time (see
+   * {@link TaskPlan.status}).
+   */
+  plans: TaskPlan[];
+  runId: string | null;
+  /**
+   * True when this task has at least one run whose status is
+   * `succeeded`, `running`, or `orphaned`. Used by the kanban card to
+   * swap the primary "Run" button for "Open" — once a task has produced
+   * useful output, the natural next action is to inspect the panel
+   * rather than start over. Failed / cancelled runs don't count: those
+   * are explicit "restart" cases. Server-computed in `tasks.list()` /
+   * `tasks.get()` via an `EXISTS` subquery on the runs table — never
+   * persisted on the row itself.
+   */
+  hasOpenableRun: boolean;
+  /**
+   * Number of pending interactions waiting on the user for this task —
+   * `AskUserQuestion` / `ExitPlanMode` Claude built-ins, tool-call approval
+   * requests, and unstructured in-REPL tmux prompts
+   * (the "CLAUDE IS PAUSED ON A PROMPT" card). Computed in `tasks.list()` /
+   * `tasks.get()` via `countPendingForTask` (interactions live in memory;
+   * not persisted). Drives the kanban card's "Answer →" call-to-action.
+   *
+   * Codex's narrative `column='blocked'` signal is reflected via `task.column`,
+   * not this counter — the card combines both at render time.
+   */
+  pendingInteractionCount: number;
+  /**
+   * Number of live terminal tabs open for this task. Each tab is an
+   * interactive shell spawned via Bun's PTY (`Bun.spawn(..., { terminal })`)
+   * and tracked in-memory by `src/bun/terminals.ts` — never persisted, since
+   * the PTYs die with the app. Computed in `tasks.list()` / `tasks.get()` via
+   * `countTerminals`, exactly like `pendingInteractionCount`. Drives the
+   * kanban card's terminal badge (hidden when zero).
+   */
+  openTerminalCount: number;
+  /**
+   * Board-level TODO/task-tools progress summary — `{ completed, total }`
+   * derived from the task's `TodoWrite`/`TaskCreate`/`TaskUpdate` tool
+   * events via `deriveTodoProgress`/`summarizeTodoProgress`
+   * (`src/shared/todo-progress.ts`) and persisted server-side by the
+   * orchestrator's chunk handler whenever a todo-family chunk lands. Null
+   * (or omitted) when the task has never emitted a todo-family tool call.
+   * Server-managed (not in the PATCH allow-list) — this is what lets the
+   * kanban board show a `3/8` mini-badge without loading per-task events on
+   * every 2s poll.
+   *
+   * Optional (rather than required like `plans`) so the many existing
+   * hand-built `Task` fixtures across `src/bun/*.test.ts` that predate this
+   * field don't all need a mechanical `todoProgress: null` edit — `db.ts`
+   * always populates it on read (`toTask`/`tasks.insert`/`tasks.update`), so
+   * runtime code can treat a missing key the same as `null`.
+   */
+  todoProgress?: { completed: number; total: number } | null;
+  /**
+   * Files delivered to the user via `SendUserFile` (see
+   * `src/shared/sent-files.ts`), persisted server-side by the orchestrator's
+   * chunk handler once a matching tool_result confirms delivery (never on
+   * the tool_use alone — an undelivered request never lands here). Deduped
+   * by path (`mergeSentFiles`) and capped to the most recent
+   * `MAX_SENT_FILES`. Server-managed (not in the PATCH allow-list) and
+   * excluded from the generic `tasks.update` SET clause / `updated_at` bump,
+   * same as the unread watermarks — an unrelated PATCH must not clobber a
+   * concurrent send, and the board must not re-render every task on every
+   * poll. Drives the board card's paperclip badge.
+   *
+   * Optional (rather than required like `plans`) for the same fixture-
+   * compatibility reason as `todoProgress`: the many hand-built `Task`
+   * fixtures across `src/bun/*.test.ts` predate this field — `db.ts` always
+   * populates it on read, so runtime code can treat a missing key the same
+   * as `null`.
+   */
+  sentFiles?: SentFileEntry[] | null;
+  /**
+   * fx's model-response-recovery state for this task, when it is currently
+   * paused on a resumable Gateway checkpoint — see {@link TaskFxRecovery}
+   * and `docs/plans/fx-recovery-follow-ups.md`. Set at settlement of a
+   * failed fx run whose last recovery sentinel (`FX_RECOVERY_STATUS_PREFIX`)
+   * is resumable, via `tasks.setFxRecovery` (a targeted `UPDATE`, no
+   * `updated_at` bump — same pattern as `sentFiles`/the unread watermarks
+   * above), and cleared back to `null` once the pause chain ends (a normal
+   * turn starts, the run recovers, or the row is torn down on
+   * archive/delete/agent-switch). Server-managed: not in
+   * `ALLOWED_PATCH_FIELDS`, and excluded from the generic `tasks.update` SET
+   * clause for the same "an unrelated PATCH must not clobber a live
+   * auto-resume schedule" reason `sent_files` is excluded. `null` for every
+   * task that isn't currently paused — including every task that has never
+   * paused at all.
+   *
+   * Optional (rather than required) for the same fixture-compatibility
+   * reason as `sentFiles`: the many hand-built `Task` fixtures across
+   * `src/bun/*.test.ts` predate this field — `db.ts` always populates it on
+   * read, so runtime code can treat a missing key the same as `null`.
+   */
+  fxRecovery?: TaskFxRecovery | null;
+  /**
+   * The branch name agetor last observed checked out in the task's worktree.
+   * `null` = never observed, or a detached HEAD at the last observation.
+   * `task.branch` stays the task's identity branch; this is where the
+   * worktree actually was, so drift is derived as
+   * `checkoutBranch != null && checkoutBranch !== branch`. Refreshed at run
+   * start, run settle, terminal open and archive (and mirrored onto a
+   * pipeline parent from its step rows) via `tasks.setCheckoutBranch` — a
+   * targeted `UPDATE`, no `updated_at` bump. Server-managed: not in
+   * `ALLOWED_PATCH_FIELDS` and excluded from the generic `tasks.update` SET
+   * clause, same as `fxRecovery`.
+   *
+   * Optional (rather than required) for the same fixture-compatibility
+   * reason as `fxRecovery`: the many hand-built `Task` fixtures predate this
+   * field — `db.ts` always populates it on read, so runtime code can treat a
+   * missing key the same as `null`.
+   */
+  checkoutBranch?: string | null;
+  /**
+   * Provenance for a Claude Code session imported from outside Agetor.
+   * Server-managed: written only by `tasks.setImportedClaude` (a targeted
+   * UPDATE, no `updated_at` bump), skipped by the generic `tasks.update`
+   * SET clause, and absent from `ALLOWED_PATCH_FIELDS`. `null` for every
+   * task that was not imported. See {@link ImportedClaudeSession}.
+   *
+   * Optional for the same fixture-compatibility reason as `checkoutBranch`:
+   * hand-built `Task` fixtures predate this field — `db.ts` always populates
+   * it on read, so runtime code can treat a missing key the same as `null`.
+   */
+  importedClaude?: ImportedClaudeSession | null;
+  /**
+   * Provenance for an OpenCode session imported from outside Agetor
+   * (`tasks.imported_opencode` JSON, `docs/plans/add-opencode-harness.md`
+   * D-13). Server-managed exactly like {@link Task.importedClaude}: written
+   * only by `tasks.setImportedOpencode`, skipped by the generic SET clause,
+   * not patchable; `null` for a task that wasn't imported. Read through
+   * `importedSessionOf` (`./imported-session.ts`), never directly by a gate.
+   * Optional for the same fixture-compatibility reason.
+   */
+  importedOpencode?: ImportedOpencodeSession | null;
+  /**
+   * Whether this task has assistant messages the user hasn't seen yet —
+   * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
+   * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
+   * never stored as its own column. `last_assistant_event_id` is bumped by
+   * the orchestrator's chunk handler on every top-level (non-subagent)
+   * `assistant` stream event; `last_seen_event_id` is bumped by
+   * `POST /tasks/:id/seen` when the run panel opens or closes. Drives the
+   * kanban card's colored corner dot.
+   *
+   * Optional (rather than required) for the same reason as `todoProgress`:
+   * the many hand-built `Task` fixtures in `src/bun/*.test.ts` predate this
+   * field and shouldn't all need a mechanical `unread: false` edit — `db.ts`
+   * always populates it on read, so runtime code can treat a missing key the
+   * same as `false`. Server-managed: not patchable, excluded from
+   * `ALLOWED_PATCH_FIELDS`; the only writers are the chunk handler and the
+   * dedicated mark-seen route.
+   */
+  unread?: boolean;
+  /**
+   * Derived, never stored: `last_assistant_event_id != null` — the task has
+   * observed at least one top-level `assistant` event, so there is something
+   * a "Mark as unread" (`DELETE /tasks/:id/seen`) can honestly re-flag. The
+   * board's task context menu gates that entry on this so the "New messages"
+   * dot is never shown for a task with no assistant messages. Optional and
+   * server-managed for exactly the same reasons as `unread` above.
+   */
+  hasAssistantMessages?: boolean;
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Unix ms timestamp when the task was archived; null when not archived.
+   * Archived tasks remain in their column (always `done` in practice — the
+   * server rejects archive from other columns) but are hidden from the
+   * default kanban filter and rendered read-only in the run panel.
+   */
+  archivedAt: number | null;
+  /** Count of this task's subagents currently `status:"running"`. Derived per
+   *  request by the server (never persisted, never patchable). Absent on payloads
+   *  that don't join the subagents table. */
+  runningSubagents?: number;
+  /**
+   * Transient (in-memory on the server, decorated onto API responses — never
+   * persisted): `Date.now()` when the turn-stall watchdog flagged this
+   * task's in-flight turn as possibly stuck (see
+   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared only when the driver itself
+   * emits the companion "resumed" sentinel (transcript activity picked back
+   * up) — a settled or cancelled turn is not explicitly cleared here; the
+   * mark is transient in-memory state that a server restart also resets by
+   * design, and the watchdog re-fires within one threshold window if the
+   * session is still wedged after a reattach. Null/absent means not
+   * stalled.
+   */
+  stalledSince?: number | null;
+}
+
+/** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
+ *  carry more than one reason at once (e.g. archived AND past the inactivity
+ *  threshold). */
+export type WorktreeStaleReason = "orphaned" | "archived" | "inactive";
+
+/** How long a task can go without an update before its worktree is flagged
+ *  `"inactive"` — 7 days. */
+export const WORKTREE_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/** How long a claude session must sit idle (no in-flight turn, no pending
+ *  interaction, no session activity) before the idle-session reaper kills its
+ *  tmux session to reclaim the REPL's memory. Follow-ups after a reap resume
+ *  via `claude --resume` (spawnResumedSession) instead of a live paste. */
+export const IDLE_SESSION_REAP_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Cadence of the orchestrator's idle-session reap sweep. */
+export const SESSION_REAP_SWEEP_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Cadence of the background per-harness usage/quota poll sweep. */
+export const USAGE_POLL_SWEEP_MS = 10 * 60 * 1000; // 10 minutes
+
+/** Per-harness floor: skip re-fetching a usage snapshot fresher than this.
+ *  A force-refresh (e.g. the popover's Refresh button) bypasses the floor. */
+export const USAGE_MIN_REFRESH_MS = 60 * 1000; // 1 minute
+
+/** `QuotaMeter.usedPercent` at/above which the UI renders amber ("warn"). */
+export const USAGE_WARN_PERCENT = 70;
+
+/** `QuotaMeter.usedPercent` at/above which the UI renders red ("crit"). */
+export const USAGE_CRIT_PERCENT = 90;
+
+/** Agent kinds with a usage provider registered bun-side (the
+ *  `USAGE_PROVIDERS` registry in `src/bun/usage/poller.ts` is typed against
+ *  this list, so the two can't drift). The webview uses it to decide whether
+ *  a chip without a snapshot should say "enable the harness / refresh" vs
+ *  "usage tracking isn't supported for this kind yet" (gemini/grok). */
+export const USAGE_SUPPORTED_KINDS = ["claude-code", "codex", "cursor"] as const satisfies readonly AgentKind[];
+
+/**
+ * A git worktree materialized on disk under `dataDir/worktrees/`, as surfaced
+ * by `GET /worktrees`. One row per directory found on disk — computed live by
+ * `orchestrator.listWorktrees()` from fs + DB signals only (no git
+ * subprocesses in the bulk listing).
+ */
+export interface WorktreeInfo {
+  /** Directory basename under `dataDir/worktrees/` — equal to the owning task's id by construction. */
+  id: string;
+  /** Absolute worktree directory path on disk. */
+  path: string;
+  /** Owning task id, or null for an orphaned dir with no matching task row. */
+  taskId: string | null;
+  /** Owning task's title, or null when orphaned. */
+  taskTitle: string | null;
+  /** Owning task's kanban column, or null when orphaned. */
+  column: ColumnId | null;
+  /** Owning task's `archivedAt`, or null when orphaned or not archived. */
+  archivedAt: number | null;
+  /** Owning task's `updatedAt`, or null when orphaned. */
+  taskUpdatedAt: number | null;
+  /** Owning task's branch, or null when orphaned. */
+  branch: string | null;
+  /** Source repo path — `task.workdir` for an owned worktree; for an orphan, a
+   *  best-effort parse of the `.git` pointer file, or null if unreadable. */
+  workdir: string | null;
+  /** True when the owning task currently has a run in flight. */
+  runActive: boolean;
+  /** True when at least one background agent/workflow (subagent row) for the
+   *  owning task is still `status:"running"`. This is also why an
+   *  old-but-held worktree is not flagged `"inactive"` — see
+   *  {@link WorktreeStaleReason}. Always `false` for orphaned rows (no
+   *  owning task). */
+  heldByBackgroundAgents: boolean;
+  /** True when `staleReasons` is non-empty. */
+  stale: boolean;
+  /** Every reason this worktree is considered stale; empty when not stale. */
+  staleReasons: WorktreeStaleReason[];
+}
+
+/**
+ * Outcome of the worktree teardown an archive triggered, as surfaced by
+ * `POST /tasks/:id/archive` when the caller passes `awaitTeardown: true`.
+ *
+ * Archive normally defers teardown onto a per-workdir background queue and
+ * responds in milliseconds, so the response carries no outcome at all. The
+ * Worktrees page's "Archive & delete" is the one caller that needs to know
+ * whether the directory is *actually* gone before it refreshes the list — it
+ * opts in, and gets this back.
+ *
+ * `reason` is only meaningful when `removed` is false:
+ * - `"dirty"` — the checkout had uncommitted changes and `forceWorktree` was
+ *   not set, so it was deliberately left in place. (`hasUncommittedChanges`
+ *   folds git errors into this too — it returns null on a failing `git
+ *   status`, which the caller treats as "don't touch".)
+ * - `"no-worktree"` / `"already-absent"` — there was nothing to remove. Not a
+ *   failure; callers should treat these as success.
+ * - `"failed"` — removal was attempted and the directory is still there.
+ */
+export interface WorktreeTeardownResult {
+  /** True when the worktree directory is no longer on disk after the teardown. */
+  removed: boolean;
+  /** Why `removed` is false. Absent when `removed` is true. */
+  reason?: "dirty" | "no-worktree" | "already-absent" | "failed";
+}
+
+/**
+ * On-demand live git status for a single worktree, as surfaced by
+ * `GET /worktrees/:id/git-status`. Not part of the bulk `GET /worktrees`
+ * listing — computing this spawns git subprocesses, so it's fetched per row
+ * rather than on every poll.
+ */
+export interface WorktreeGitStatus {
+  /** Working tree has uncommitted changes (staged, unstaged, or untracked). */
+  dirty: boolean;
+  /** Commits on HEAD not yet pushed / ahead of base (see getAheadCount). 0 when unknown. */
+  ahead: number;
+  /** HEAD is an ancestor of the source repo's default branch — its work already
+   *  landed, so the worktree is safe to delete. null when it can't be determined
+   *  (no resolvable default branch, or a git error) — never a false "merged". */
+  merged: boolean | null;
+  /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
+   *  the other fields are not meaningful. */
+  ignored: boolean;
+  /** Live short branch name (`rev-parse --abbrev-ref HEAD`) the worktree has
+   *  checked out right now. null on a detached HEAD or when unknown (including
+   *  `ignored`). Can differ from the task's own branch when the worktree has
+   *  drifted. */
+  branch: string | null;
+}
+
+/**
+ * What `GET /tasks/:id/teardown-preview` returns: the branches deleting the
+ * task would remove, so the delete confirm and `agetor rm` can name them
+ * before anything happens.
+ */
+export interface TaskTeardownPreview {
+  /** Branches delete would remove, after exclusions (the task branch first). */
+  branches: string[];
+  /** The branch currently checked out in the worktree, when readable. */
+  liveBranch: string | null;
+  /** The task's own branch (`task.branch`), null for a non-worktree task. */
+  taskBranch: string | null;
+  /** Where the non-task branch name came from: the live worktree, the last
+   *  observed `checkoutBranch`, only `task.branch`, or nothing to delete. */
+  source: "live" | "last-seen" | "task-branch" | "none";
+  /** Candidates deliberately left alone, with why: the repo's default branch,
+   *  a pull request's head branch, or a branch another task still holds. */
+  excluded: { branch: string; reason: "default-branch" | "pr-head" | "held-by-task" }[];
+}
+
+/**
+ * On-demand live git status for a single *task*, as surfaced by
+ * `GET /tasks/:id/git-status`. Distinct from {@link WorktreeGitStatus} (which
+ * backs the orphan-worktree management UI) — this one drives the run panel's
+ * "Commit & push" and "Open PR" chips.
+ */
+export interface TaskGitStatus {
+  /** Working tree has uncommitted changes (staged, unstaged, or untracked). */
+  hasChanges: boolean;
+  /**
+   * Commits on HEAD not yet pushed, computed against the task's upstream if
+   * one exists, else against the pinned `baseRef` (see `getAheadCount`). `0`
+   * when unknown. This is the "commit & push" ahead count — distinct from
+   * `remoteSynced`'s own upstream-only ahead check below.
+   */
+  ahead: number;
+  /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
+   *  the other fields default to their "nothing to offer" values and shouldn't
+   *  be read as meaningful. */
+  ignored: boolean;
+  /** The task's branch has a configured upstream (i.e. has been pushed at
+   *  least once) — computed locally via `remoteSyncState`, no network call. */
+  hasUpstream: boolean;
+  /**
+   * `hasUpstream && ahead(@{u}..HEAD) === 0` — the branch exists on the
+   * remote and local HEAD has nothing left to push. Gates the "Open PR"
+   * affordance. A remote strictly ahead of local (`behind > 0`) does not
+   * block this — only unpushed local commits do.
+   */
+  remoteSynced: boolean;
+  /**
+   * Short name of the branch the task's dir currently has checked out, or
+   * `null` on a detached HEAD / uninspectable dir. Distinct from
+   * `task.branch`, which is agetor's *worktree-managed* branch and is `null`
+   * for every `isolation: "none"` task — this is the live git answer, and
+   * it's what lets an isolation-none task on the user's own feature branch
+   * still offer "Create PR" (see `prHeadBranch` in `lib/commit-push.ts`).
+   */
+  branch: string | null;
+  /** `branch` is the repo's default branch, so a PR from it would degenerate
+   *  to base == head. `false` also means "couldn't determine" — see
+   *  `HeadBranchState.isDefaultBranch` in `worktree.ts` for why unknown
+   *  resolves to offering the affordance rather than hiding it. */
+  isDefaultBranch: boolean;
+}
+
+/** A live terminal tab for a task. Returned by the terminal REST endpoints;
+ *  state lives only in memory in `src/bun/terminals.ts`. */
+export interface TerminalTab {
+  id: string;
+  taskId: string;
+  /** Display label for the tab (e.g. "Terminal 1"). */
+  title: string;
+  /** Working directory the shell was spawned in (worktree path or workdir). */
+  cwd: string;
+  createdAt: number;
+}
+
+/**
+ * A path reference attached to a task or a follow-up message. We do not copy
+ * or upload the file — only the absolute path is recorded, then inlined into
+ * the prompt / message as plain text so the agent can read it from disk
+ * itself. Folders carry `isDirectory: true` so the prompt formatter can
+ * append a trailing slash (and the UI shows a folder icon).
+ */
+export interface TaskReference {
+  /** Absolute filesystem path. */
+  path: string;
+  /** True for directories — affects icon + trailing slash in prompts. */
+  isDirectory: boolean;
+}
+
+/**
+ * A saved, not-yet-sent draft message parked on a task's backlog. Carries the
+ * same shape a follow-up message assembles from the composer: free-text plus
+ * any attached file/folder references. When the user sends it, the text and
+ * references are inlined (via `appendReferences`) exactly like a normal
+ * follow-up, then the item is removed from the backlog.
+ */
+export interface BacklogMessage {
+  /** Stable id, assigned server-side, used to target edit/delete/reorder/send. */
+  id: string;
+  /** The draft message text. May be empty when the item is references-only. */
+  text: string;
+  /** File/folder references to inline when this draft is eventually sent. */
+  references: TaskReference[];
+  /** Unix ms timestamp when the draft was saved. */
+  createdAt: number;
+}
+
+/**
+ * The composer's single unsent draft for a task — text plus any attached
+ * references, autosaved while the user types and restored on reopen. Unlike
+ * {@link BacklogMessage}, there is at most one per task and it carries no id
+ * or timestamp: it's ephemeral working state, not an explicit stashed item.
+ */
+export type TaskDraft = {
+  /** The draft message text, preserved verbatim (never trimmed). */
+  text: string;
+  /** File/folder references currently attached in the composer. */
+  references: TaskReference[];
+};
+
+/**
+ * A plan Cursor wrote via its `createPlanToolCall` tool and then stopped on
+ * (the common "finished after planning" behavior). Detected server-side in
+ * `attachDoneHandler` when a run resolves `succeeded` and its last `tool_use`
+ * event is `createPlanToolCall`; persisted on `task.plans` so it survives the
+ * 2s `/tasks` poll and restarts. Approving writes the effective content to a
+ * `.plan.md` file inside the task's worktree and auto-sends an approval
+ * message that resumes the agent.
+ */
+export interface TaskPlan {
+  /** 8-char lowercase hex hash of `toolCallId` — safe for filenames/URLs,
+   *  since Cursor's raw call_ids contain embedded newlines. */
+  id: string;
+  /** Raw call_id from the `createPlanToolCall` tool_use event (may contain
+   *  `\n`) — matches the event so the UI can pair a plan record to its card. */
+  toolCallId: string;
+  /** Run whose terminal `tool_use` produced this plan. */
+  runId: string;
+  /** `args.name` from the tool call, or null when Cursor didn't supply one. */
+  name: string | null;
+  /** Original plan markdown, verbatim from `args.plan`. Never mutated after
+   *  creation — edits live in `editedContent` so "Revert Changes" has
+   *  something to revert to. */
+  content: string;
+  /** Unapproved user edits, persisted on explicit Save actions only (no
+   *  autosave — see the StrictMode/flush-on-unmount hazard this sidesteps).
+   *  Null when there is no draft, or when a draft was cleared back to the
+   *  original. The effective plan content is `editedContent ?? content`. */
+  editedContent: string | null;
+  /**
+   * `pending` — awaiting approval, editable, the one plan a task can act on.
+   * `approved` — terminal; the modal becomes read-only.
+   * `superseded` — a newer `createPlanToolCall` run landed while this one was
+   * still pending. Chat turns do NOT supersede a pending plan — only another
+   * detected plan does.
+   * `rejected` — terminal; a claude-code `ExitPlanMode` plan whose matching
+   * tool_result was neither the approval string nor an edited-plan approval
+   * (the user rejected it, or the turn was interrupted before approval).
+   * Cursor plans never land in this state — cursor's approve/edit routes are
+   * the only way a cursor plan resolves.
+   */
+  status: "pending" | "approved" | "superseded" | "rejected";
+  /** Unix ms timestamp when the plan was detected. */
+  createdAt: number;
+  /** Unix ms timestamp when approved, or null while pending/superseded. */
+  approvedAt: number | null;
+  /** True when the approved content came from `editedContent` rather than
+   *  the original `content` — drives the approval message wording. */
+  approvedEdited: boolean;
+  /** Worktree-relative path the effective plan was written to at approval
+   *  time (e.g. `.cursor/plans/<slug>_<id>.plan.md`), or null before
+   *  approval. */
+  filePath: string | null;
+}
+
+/**
+ * Sanitized copy of one item from Claude's structured `toolUseResult.
+ * attachments[]` array (present on a successful `SendUserFile` tool_result,
+ * see `src/shared/sent-files.ts`). Forwarded additively on a `tool_result`
+ * event's `data` as `attachments?: ToolResultAttachment[]` — never present
+ * for an errored result (claude's `toolUseResult` is a bare string then) or
+ * for a tool that doesn't report attachments.
+ */
+export interface ToolResultAttachment {
+  path: string;
+  size: number | null;
+  isImage: boolean | null;
+  mediaType: string | null;
+}
+
+/**
+ * One file Claude (or another harness) delivered to the user via
+ * `SendUserFile` (see `src/shared/sent-files.ts`), recorded on
+ * `task.sentFiles` once the tool_result confirms delivery. `size`/
+ * `mediaType`/`isImage` come from the forwarded {@link ToolResultAttachment}
+ * when available, else null (e.g. a map-miss fallback with no attachments).
+ */
+export interface SentFileEntry {
+  path: string;
+  size: number | null;
+  mediaType: string | null;
+  isImage: boolean | null;
+  /** Unix ms timestamp when delivery was detected. */
+  sentAt: number;
+  /** Run whose tool_result confirmed delivery. */
+  runId: string;
+}
+
+/**
+ * Persisted shape of `task.importedClaude` (`tasks.imported_claude` JSON
+ * column, migration 068). One imported Claude Code session bound to an
+ * in-place task. Written only by `tasks.setImportedClaude`.
+ */
+export interface ImportedClaudeSession {
+  sessionId: string;
+  gitBranch: string | null;
+  importedAt: number;
+  configDir: string;
+  status: "importing" | "ready" | "failed";
+  /** Bytes of the main JSONL already persisted. A restart resumes from here. */
+  backfillOffset: number;
+  error: string | null;
+}
+
+/**
+ * Persisted shape of `task.importedOpencode` (`tasks.imported_opencode` JSON
+ * column). One imported OpenCode session bound to an in-place task. Written
+ * only by `tasks.setImportedOpencode`. Unlike Claude's import there is no
+ * byte offset: one `session export` is read whole and written in slices.
+ */
+export interface ImportedOpencodeSession {
+  /** OpenCode's own session id (`ses_…`). */
+  sessionId: string;
+  /** The OpenCode harness the session was listed and imported under. */
+  harnessId: string;
+  /** The session's directory — the task's in-place `workdir`. */
+  directory: string;
+  importedAt: number;
+  status: "importing" | "ready" | "failed";
+  error: string | null;
+}
+
+/**
+ * One row of `GET /opencode-sessions` — an OpenCode session started outside
+ * Agetor, listed per enabled OpenCode harness × registered project. The
+ * OpenCode counterpart of the Claude list row (`ClaudeSessionListItem` in
+ * `src/mainview/lib/api.ts`).
+ */
+export interface OpencodeSessionListItem {
+  /** OpenCode's own session id (`ses_…`). */
+  sessionId: string;
+  /** The OpenCode harness whose `session list` reported the session. */
+  harnessId: string;
+  harnessLabel: string;
+  /** The session's directory (`session list`'s `directory`). */
+  directory: string;
+  /** `null` when OpenCode 2 reports no title (its table says "Untitled
+   *  session"). */
+  title: string | null;
+  /** Epoch ms (`session list`'s `updated`). */
+  updatedAt: number;
+  /** Epoch ms (`session list`'s `created`). */
+  createdAt: number;
+  /** `blockedReason === null`. */
+  importable: boolean;
+  /** `"missing-folder"`: the directory no longer exists. `"busy"`: OpenCode
+   *  reports the session unfinished AND it was updated within the last 10
+   *  minutes (owner decision on G14a / spike A8(c)); an older unfinished
+   *  session imports with a status line instead. */
+  blockedReason: "missing-folder" | "busy" | null;
+  /** True when the busy check couldn't run (the export failed), shown as a
+   *  warning rather than a block. */
+  busyUnknown?: boolean;
+  /** The Agetor task that already imported this session, when one did. */
+  importedTaskId?: string | null;
+}
+
+/** `GET /opencode-sessions` body. */
+export interface OpencodeSessionList {
+  sessions: OpencodeSessionListItem[];
+}
+
+/**
+ * Preference key for the post-boot Claude session scan
+ * (`docs/plans/import-claude-code-sessions.md` D5). Missing or `"1"` scans;
+ * `"0"` turns the scan off. It does not skip resume of an import left
+ * in `importing` — that runs on every boot, including headless.
+ */
+export const CLAUDE_SESSIONS_LAUNCH_SCAN_PREF = "claudeSessions.launchScan";
+
+/**
+ * How old the liveness behind a Claude session list may be before a client
+ * re-checks. `GET /claude-sessions` serves cached `claude agents --json`
+ * probes and returns `livenessCheckedAt` — the oldest probe's time, or null
+ * when a config dir has none.
+ */
+export const CLAUDE_SESSIONS_LIVENESS_STALE_MS = 60_000;
+
+/**
+ * Persisted shape of `task.fxRecovery` (`tasks.fx_recovery` JSON column,
+ * migration 051) — fx's model-response-recovery state for one task, plus the
+ * orchestrator's own auto-resume schedule/counter layered on top. `"paused"`
+ * is the only state ever stored: the row is `null` (not an object with some
+ * other `state`) whenever the task isn't currently paused, so a consumer
+ * only ever needs to null-check, never switch on `state`. See
+ * `docs/plans/fx-recovery-follow-ups.md` §3 for the full design and
+ * `src/shared/fx-recovery.ts`'s `parseTaskFxRecovery` for the tolerant
+ * parser. Written only by `tasks.setFxRecovery` — see {@link Task.fxRecovery}
+ * for the write-path rules (targeted UPDATE, no `updated_at` bump, not
+ * patchable).
+ */
+export interface TaskFxRecovery {
+  /** The only value ever stored — a non-paused task has a `null` row
+   *  instead of an object with a different `state`. */
+  state: "paused";
+  /** The failed run whose last `FX_RECOVERY_STATUS_PREFIX` sentinel paused
+   *  (the run `resumeFxRecovery` acts on). */
+  runId: string;
+  /** Unix ms timestamp when this pause was recorded. */
+  pausedAt: number;
+  /** Copied verbatim from that sentinel's `FxRecoveryPayload` — see
+   *  {@link FxRecoveryPayload} for what each means. Omitted when the
+   *  sentinel didn't carry them. */
+  cause?: string;
+  attempt?: number;
+  attemptLimit?: number;
+  message?: string;
+  /** The orchestrator's pending auto-resume timer for this pause, or `null`
+   *  when none is scheduled (auto-resume off, the cap was hit, the user
+   *  cancelled it, or a continue-recovery run is currently in flight — see
+   *  `autoResumeStopped`). `at` is the fire time (ms epoch); `attempt` is
+   *  the 1-based auto-resume attempt this timer will fire as; `max` is
+   *  `FX_AUTO_RESUME_MAX` at schedule time; `delaySec` is the preference
+   *  value used to compute `at`, kept alongside it so a countdown can be
+   *  rendered without re-reading preferences. */
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null;
+  /** Automatic resumes already fired in this pause chain (a chain is a
+   *  pause → auto-resume → pause → … run that hasn't yet recovered or been
+   *  cleared). Reset to 0 only when the row itself is cleared — a manual
+   *  Resume that re-pauses continues the same chain's count. */
+  autoResumeCount: number;
+  /** Why no auto-resume timer is currently pending — omitted (not present)
+   *  while one IS pending. `"exhausted"`: the chain hit `FX_AUTO_RESUME_MAX`.
+   *  `"cancelled"`: the user (or an implicit cancel — new message, manual
+   *  Resume, Stop, archive, delete, agent switch) cancelled it.
+   *  `"disabled"`: the `fxAutoResume` preference was off at schedule time.
+   *  `"failed"`: a timer DID fire, but the resume it tried to start
+   *  couldn't (`resumeFxRecovery`'s gate rejected it, or the spawn itself
+   *  threw) — surfaced as the persisted `auto-resume could not start: …`
+   *  status line. Distinct from `"cancelled"`, which is reserved for an
+   *  explicit user/Stop cancel via `cancelFxAutoResume`: a `"failed"` row
+   *  was never cancelled, it tried and couldn't start. */
+  autoResumeStopped?: "exhausted" | "cancelled" | "disabled" | "failed";
+}
+
+/**
+ * Preference key gating fx's automatic-resume engine
+ * (`docs/plans/fx-recovery-follow-ups.md`): value `"on"` (or missing — on by
+ * default) enables it, `"off"` disables it. Read via `parseFxAutoResumePrefs`
+ * in `src/shared/fx-recovery.ts`. Round-tripped by `agetor config` and the
+ * Settings → General switch (`settings-fx-auto-resume`).
+ */
+export const FX_AUTO_RESUME_PREF = "fxAutoResume";
+
+/**
+ * Preference key for the auto-resume delay, in whole seconds, clamped to
+ * `[FX_AUTO_RESUME_MIN_DELAY_SEC, FX_AUTO_RESUME_MAX_DELAY_SEC]`; missing or
+ * unparsable falls back to `FX_AUTO_RESUME_DEFAULT_DELAY_SEC`. Read via
+ * `parseFxAutoResumePrefs`; edited via the Settings → General number input
+ * (`settings-fx-auto-resume-delay`) or `agetor config`.
+ */
+export const FX_AUTO_RESUME_DELAY_PREF = "fxAutoResumeDelaySec";
+
+/** Default `fxAutoResumeDelaySec` when the preference is unset or
+ *  unparsable — chosen from a live smoke where a resume still absorbed
+ *  several more 429s before recovering (see the plan's §2 "Live facts"). */
+export const FX_AUTO_RESUME_DEFAULT_DELAY_SEC = 120;
+
+/** Lower clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MIN_DELAY_SEC = 10;
+
+/** Upper clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MAX_DELAY_SEC = 3600;
+
+/** Maximum automatic resumes fired per pause chain before the orchestrator
+ *  gives up and leaves `autoResumeStopped: "exhausted"` for the user to
+ *  resume manually. */
+export const FX_AUTO_RESUME_MAX = 3;
+
+/**
+ * Preference key for archived-history retention
+ * (`docs/plans/non-blocking-session-restore.md`, decision F/G): the age, in
+ * whole days, after which a task archived that long ago has its bulky
+ * `tool_result` payloads trimmed in place (see
+ * {@link RETENTION_TRIM_BYTES} and `src/shared/tool-result-trim.ts`).
+ * The stored value is `"off"` ({@link ARCHIVED_HISTORY_RETENTION_OFF}) or an
+ * integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`; missing means
+ * {@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS}, while any other value reads
+ * as off (fail closed — the trim is destructive). Read via
+ * {@link parseArchivedHistoryRetentionDays}; written (validated and normalized
+ * through {@link normalizeArchivedHistoryRetentionValue} by
+ * `PUT /preferences/:key`) from Settings → General and `agetor config`.
+ */
+export const ARCHIVED_HISTORY_RETENTION_PREF = "archivedHistoryRetentionDays";
+
+/** Default retention age, in days, when {@link ARCHIVED_HISTORY_RETENTION_PREF}
+ *  is unset (absent, or blank after trimming). */
+export const ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS = 30;
+
+/** The {@link ARCHIVED_HISTORY_RETENTION_PREF} value that disables trimming —
+ *  the canonical spelling every off-word is normalized to on write. */
+export const ARCHIVED_HISTORY_RETENTION_OFF = "off";
+
+/** Spellings (case-insensitive, trimmed) that a user means as "off":
+ *  `agetor config archivedHistoryRetentionDays 0` must never start a trim. */
+export const ARCHIVED_HISTORY_RETENTION_OFF_WORDS: readonly string[] = [
+  ARCHIVED_HISTORY_RETENTION_OFF,
+  "0",
+  "false",
+  "no",
+  "none",
+  "disabled",
+];
+
+/** Upper bound (inclusive) on {@link ARCHIVED_HISTORY_RETENTION_PREF}, ten
+ *  years. Anything larger is refused on write and reads as off. */
+export const ARCHIVED_HISTORY_RETENTION_MAX_DAYS = 3650;
+
+/**
+ * Validate and canonicalize a value about to be written to
+ * {@link ARCHIVED_HISTORY_RETENTION_PREF}: an off-word
+ * ({@link ARCHIVED_HISTORY_RETENTION_OFF_WORDS}, case-insensitive, trimmed) →
+ * `"off"`; a plain integer string in `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]`
+ * (trimmed) → that integer's string; anything else — blank, negative,
+ * fractional, exponent or hex notation, out of range, garbage — → `null`
+ * (refuse the write). `PUT /preferences/archivedHistoryRetentionDays` answers
+ * 400 with {@link ARCHIVED_HISTORY_RETENTION_INVALID_ERROR} on `null`.
+ */
+export function normalizeArchivedHistoryRetentionValue(value: string): string | null {
+  const trimmed = value.trim();
+  if (ARCHIVED_HISTORY_RETENTION_OFF_WORDS.includes(trimmed.toLowerCase())) {
+    return ARCHIVED_HISTORY_RETENTION_OFF;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (n >= 1 && n <= ARCHIVED_HISTORY_RETENTION_MAX_DAYS) return String(n);
+  }
+  return null;
+}
+
+/** The 400 message for a refused {@link ARCHIVED_HISTORY_RETENTION_PREF} write,
+ *  naming every accepted value. */
+export const ARCHIVED_HISTORY_RETENTION_INVALID_ERROR =
+  `${ARCHIVED_HISTORY_RETENTION_PREF} must be "off" (or 0, false, no, none, disabled) ` +
+  `or a whole number of days from 1 to ${ARCHIVED_HISTORY_RETENTION_MAX_DAYS}`;
+
+/**
+ * Parse the raw {@link ARCHIVED_HISTORY_RETENTION_PREF} value into a day count,
+ * or `null` when trimming is turned off. Missing (`null`/`undefined`) or blank
+ * after trimming → the default ({@link ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS});
+ * an off-word ({@link ARCHIVED_HISTORY_RETENTION_OFF_WORDS}, case-insensitive,
+ * trimmed) → `null`; a plain integer string in
+ * `[1, ARCHIVED_HISTORY_RETENTION_MAX_DAYS]` → that number; ANY other value —
+ * negative, fractional, exponent notation, out of range, garbage — → `null`
+ * too. Fails closed on purpose: the trim is one-way, so a value nobody can
+ * read back as a day count must never start one (the write route refuses such
+ * values, so this only matters for rows written before it validated, or by
+ * hand).
+ */
+export function parseArchivedHistoryRetentionDays(value: string | null | undefined): number | null {
+  if (value == null || value.trim() === "") return ARCHIVED_HISTORY_RETENTION_DEFAULT_DAYS;
+  const normalized = normalizeArchivedHistoryRetentionValue(value);
+  if (normalized === null || normalized === ARCHIVED_HISTORY_RETENTION_OFF) return null;
+  return Number(normalized);
+}
+
+/** A `tool_result` payload larger than this many UTF-8 bytes is a retention
+ *  trim candidate, and a trimmed payload's `content` is cut to this budget. */
+export const RETENTION_TRIM_BYTES = 4096;
+
+/**
+ * Seconds of main-thread block per GB of live data (`(page_count −
+ * freelist_count) × page_size`) that `VACUUM` is expected to cost — the
+ * constant behind the "Compact database" estimate. Measured on a 4.2 GB
+ * database (`VACUUM INTO` ≈ 7.3 s/GB, `docs/plans/non-blocking-session-restore.md`
+ * §2.6); re-calibrated against the production copy in that plan's §10.
+ */
+export const DB_COMPACT_SEC_PER_GB = 7.5;
+
+/**
+ * Marker `trimToolResultData` writes as the FIRST key of a trimmed
+ * `tool_result` payload (`{"retention":{...},"toolUseId":…,"content":…}`). Its
+ * being first is what lets the retention SQL skip already-trimmed rows with a
+ * `substr(data, 1, 13) != '{"retention":'` prefilter instead of parsing them,
+ * and lets the renderers show {@link retentionTrimNote} without guessing.
+ */
+export interface ToolResultRetention {
+  trimmed: true;
+  /** UTF-8 byte length of the payload before it was trimmed. */
+  originalBytes: number;
+  /** Unix ms timestamp of the trim. */
+  trimmedAt: number;
+}
+
+/** Local byte formatter for {@link retentionTrimNote}: `B` below 1 KB, then one
+ *  decimal for KB/MB/GB (binary multiples, matching how the DB sizes are shown). */
+function formatRetentionBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB"] as const;
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** The muted one-liner every surface (RunPanel, `agetor logs`, the TUI) shows
+ *  for a retention-trimmed `tool_result`, e.g.
+ *  `trimmed by retention (original 1.2 MB)`. */
+export function retentionTrimNote(r: ToolResultRetention): string {
+  return `trimmed by retention (original ${formatRetentionBytes(r.originalBytes)})`;
+}
+
+/**
+ * `GET /db/stats` response (Settings → General "Archived task history" and
+ * `agetor compact`). Sizes are bytes unless the name says otherwise.
+ */
+export interface DbStats {
+  /** Size of `agetor.sqlite` on disk. */
+  fileBytes: number;
+  /** Size of the `-wal` sidecar (0 when absent). */
+  walBytes: number;
+  /** `PRAGMA page_size`. */
+  pageSize: number;
+  /** `PRAGMA page_count`. */
+  pageCount: number;
+  /** `PRAGMA freelist_count` — pages `VACUUM` could give back. */
+  freelistCount: number;
+  /** `freelistCount × pageSize` — what a Compact would reclaim right now. */
+  reclaimableBytes: number;
+  /** Estimated seconds a Compact blocks the core: live bytes ×
+   *  {@link DB_COMPACT_SEC_PER_GB}. */
+  compactEstimateSec: number;
+  /** Runs in flight (`active` + starting) — Compact is refused while > 0. */
+  activeRunCount: number;
+  retention: {
+    /** Effective retention age in days, `null` when the preference is `off`. */
+    days: number | null;
+    /** Ms epoch the last pass finished, `null` if none has run. */
+    lastRunAt: number | null;
+    /** Bytes the last pass freed (payload bytes, not file size), `null` if none. */
+    lastFreedBytes: number | null;
+    /** Rows the last pass trimmed, `null` if none has run. */
+    lastTrimmedRows: number | null;
+    /** A pass is running right now. */
+    running: boolean;
+  };
+}
+
+/**
+ * Outcome of one archived-history retention pass (`POST /db/retention/run`,
+ * the scheduler's log line, `scripts/measure-restore.ts`). `freedBytes` is
+ * payload bytes removed from `run_events.data`, not file size — the file
+ * only shrinks after a Compact.
+ */
+export interface RetentionPassResult {
+  /** Archived tasks this pass swept — a task whose previous sweep completed
+   *  and that has not changed since (see the `retention_swept_tasks` table) is skipped
+   *  and not counted. */
+  scannedTasks: number;
+  scannedRuns: number;
+  trimmedRows: number;
+  freedBytes: number;
+  durationMs: number;
+  /** The pass stopped early (shutdown / stop requested); a later pass resumes
+   *  where it left off, since trimmed rows are skipped by the marker prefilter. */
+  aborted: boolean;
+}
+
+/** `POST /db/compact` success body (a refusal is a 409 `{ error, activeRunCount }`). */
+export interface DbCompactResult {
+  ok: true;
+  /** `agetor.sqlite` + `-wal` bytes before / after `VACUUM` + `wal_checkpoint(TRUNCATE)`. */
+  beforeBytes: number;
+  afterBytes: number;
+  durationMs: number;
+}
+
+export interface AgentOption {
+  /** Stored on the task and passed to `buildCommand`. */
+  id: string;
+  /** What the UI shows. */
+  label: string;
+  /** One-line hint under the option in the picker. */
+  hint?: string;
+  /**
+   * Offered only when the harness's CLI-discovered catalog positively
+   * contains this id — never on the discovery-empty fallback (unlike an
+   * ordinary curated row, which still shows when discovery has nothing).
+   * Used for fx Gateway rows a standard `fx login` account's catalog lacks
+   * (mostly premium tiers): the Gateway catalog is account-scoped — 230 ids
+   * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
+   * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
+   * (Gateway-side growth, not a binary property); all curated ids present.
+   * 2026-09-14: unauth catalog reads 247 on 0.0.8, 0.0.9 and 0.0.10 alike
+   * (Gateway-side, not client-version-dependent); all 28 curated ids still
+   * present; signed-in view still unverifiable (token expired).
+   * Latest: 2026-10-26 (fx 0.0.14, docs/plans/add-gpt-6-1-terra.md §2b):
+   * unauth catalog reads 262 ids, the owner's signed-in standard `fx login`
+   * catalog 139. All 26 `catalogOnly` curated rows (of 42) are absent from
+   * that signed-in view; 5 standard rows are absent too (zai/glm-5.3-flash,
+   * openai/gpt-5.4-mini, spacexai/grok-4.6, minimax/minimax-m3,
+   * alibaba/qwen3.8-flash) but stay standard. New rows are gated by
+   * absence from the signed-in view.
+   */
+  catalogOnly?: boolean;
+  /**
+   * Always offered, first, whatever discovery, catalog scoping or the login
+   * state say (`mergeModelOptions` rule 9). Used for OpenCode's
+   * "OpenCode default" sentinel row (`OPENCODE_DEFAULT_MODEL`), which no
+   * catalog ever lists because it means "no `-m`".
+   */
+  pinned?: boolean;
+}
+
+export interface AgentOptions {
+  models: AgentOption[];
+  modes: AgentOption[];
+  efforts: AgentOption[];
+}
+
+export interface CursorModelSpec {
+  label: string;
+  hint?: string;
+  /** Whether Cursor accepts a large-context / Max Mode override for this base model. */
+  supportsMaxMode?: boolean;
+  /** Cursor's concrete model ids for each thinking level this base model supports. */
+  effortIds?: Partial<Record<string, string>>;
+  /** Thinking levels that Cursor exposes as a separate Fast variant. */
+  fastEfforts?: string[];
+  /** Fast model id for models with a fast toggle but no thinking levels. */
+  fastId?: string;
+}
+
+/**
+ * Per-kind default model and effort. These are the values the UI pre-selects
+ * for a new task, the migration backfills onto legacy NULL rows, and the
+ * orchestrator falls back to when a `createTask` request omits them. There is
+ * no "let the CLI pick" placeholder anymore — every task carries an explicit
+ * model. The one exception is OpenCode (`docs/plans/add-opencode-harness.md`
+ * G4): its default is the `OPENCODE_DEFAULT_MODEL` sentinel
+ * (`"opencode-default"`), which means "pass no `-m`, run the model OpenCode's
+ * own config names" — OpenCode's providers and models are whatever the user
+ * configured, so there is no model agetor could pin for everyone.
+ *
+ * "Best" here means: most capable model + a sane high-effort default. Picked
+ * deliberately so a run starts with strong reasoning instead of whatever the
+ * CLI happens to default to.
+ */
+export const DEFAULT_MODEL: Record<AgentKind, string> = {
+  // Default to Opus 5.5 — claude CLI 2.1.280 makes it the default Opus model,
+  // and it's $4/$20 per MTok (20% below Opus 5's $5/$25) while landing at
+  // roughly Fable-5.1-level on most work per the announcement. Mythos 5.1 / 5
+  // and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,
+  // so the default stays on the most-capable non-premium tier.
+  "claude-code": "opus-5.5",
+  // Owner decision 2026-09-30 (docs/plans/add-gpt-6-1-sol.md): default to
+  // GPT-6.1 Sol (released 2026-09-29) — the upgrade to GPT-6 Sol at the same
+  // price with near-Astra quality, and codex 0.159.1 made it its own bundled
+  // default. Astra stays one row above it in the picker as the
+  // most-capable-but-heavier tier. This supersedes the 2026-09-22 decision
+  // (docs/plans/add-gpt-6-sol-and-luna.md) that defaulted to GPT-6 Sol, which
+  // stays available. Live spike on 2026-09-30 on a ChatGPT-plan account:
+  // codex-cli 0.147.0 through 0.158.0 all omit gpt-6.1-sol from `model/list`,
+  // and live turns on 0.147.0/0.155.1/0.158.0 answer the misleading "not
+  // supported when using Codex with a ChatGPT account" 400 (the real gate is
+  // the client version — the catalog is `client_version`-gated,
+  // NousResearch/hermes-agent#119412); 0.159.0 and 0.159.2 run it. Hence the 0.159.0 entry in `MODEL_MIN_CLI_VERSION` below
+  // and the `startTask` pre-flight.
+  "codex": "gpt-6.1-sol",
+  // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
+  // flagship model rather than cursor-agent's own "auto". Owner decision
+  // 2026-09-21 (docs/plans/add-grok-4-7.md): 4.7 replaces 4.6, the previous
+  // default, which stays one click away. Note the key is cursor-agent's own
+  // unprefixed base — unlike `cursor-grok-4.6` / `cursor-grok-4.5`.
+  "cursor": "grok-4.7",
+  // gemini-3.1-pro-preview is Google's current flagship Pro. It replaced
+  // gemini-3-pro-preview (agetor's default until 2026-09), which Google shut
+  // down on 2026-03-09 — ai.google.dev/gemini-api/docs/deprecations names
+  // 3.1 Pro preview as the replacement, and the old id is at best a
+  // server-side alias for it now; migration 049 rewrites tasks still pinned
+  // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
+  // internally routes across mixed pro/flash-lite models even for simple
+  // prompts, which fails "always default to the best available model" (root
+  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
+  // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
+  "gemini": "gemini-3.1-pro-preview",
+  // Owner decision 2026-10-22 (docs/plans/fx-0.0.14-and-cursor-updates-grill.md
+  // D21, evidence G2): deepseek/deepseek-v4-flash. The Vercel AI Gateway
+  // catalog is account-scoped, and the owner's signed-in standard `fx login`
+  // catalog (145 ids, measured 2026-10-22) lacks both the previous default
+  // (zai/glm-5.3-flash, owner pick of 2026-08-27, which stays a curated row)
+  // and fx's own compiled default — spacexai/grok-4.7 since fx 0.0.11
+  // (previously moonshotai/kimi-k3), which stays `catalogOnly` for the same
+  // reason. DeepSeek V4 Flash is present in that signed-in catalog and in
+  // fx 0.0.14's 264-id unauthenticated one. Ids are Vercel AI Gateway ids,
+  // passed verbatim. fx is exempt from the "always default to the best
+  // available model" rule above: the Gateway bills per token to the user's
+  // own account, and flagship tiers (the `catalogOnly` rows in
+  // `AGENT_OPTIONS.fx.models`) stay one click away in the picker as
+  // catalog-gated rows — offered only when the signed-in account's catalog
+  // actually contains them (see `AgentOption.catalogOnly`). Migration 074
+  // rewrites the retired fx ids (and a `lastModel:fx` pref on
+  // zai/glm-5.3-flash) to this value; null-model fx tasks resolve to it at
+  // spawn with no data migration.
+  "fx": "deepseek/deepseek-v4-flash",
+  "antigravity": "gemini-3.8-flash-high",
+  // The one sentinel default (see the docblock above): no `-m`.
+  "opencode": OPENCODE_DEFAULT_MODEL,
+  // Owner decision D3 (docs/plans/github-copilot-harness-grill.md): Copilot's
+  // own `auto` router — available on every plan, a 10% credit discount, and it
+  // never picks an org-disabled model. Copilot joins fx as an exemption from
+  // the "always default to the best available model" rule because both bill
+  // per token/credit; the flagships stay one click away in the picker. The
+  // driver reports which model `auto` actually used as a status line (D23).
+  "copilot": "auto",
+};
+
+/**
+ * Kinds whose CLI-discovered model catalog depends on the signed-in account
+ * rather than being a fixed, harness-wide list. For these kinds the picker
+ * renders curated ∩ discovered (plus discovered-only extras) instead of the
+ * usual curated + discovered — see `mergeModelOptions` in
+ * `src/shared/model-options.ts` (added by a sibling task). fx is the only
+ * member today: the Vercel AI Gateway catalog `fx models --json` returns is
+ * scoped to whatever account `fx login` (or `AI_GATEWAY_API_KEY`) is signed
+ * into, so a curated row unconditionally offered here could be a model the
+ * signed-in account can't actually run. opencode joins it: `opencode models`
+ * lists only the providers the harness has credentials for (plus keyless
+ * Zen), so the only unconditional row is its pinned "OpenCode default"
+ * sentinel (`mergeModelOptions` rule 9).
+ */
+export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "opencode"]);
+export const DEFAULT_EFFORT: Record<AgentKind, string> = {
+  "claude-code": "high",
+  // `ultra` (Codex's automatic-sub-agent-delegation tier) is deliberately
+  // not the default — it burns several times Max's usage per turn.
+  "codex": "high",
+  // Models with `effortIds` default to High where they expose it (else their
+  // first available level — e.g. claude-4.6-sonnet only exposes medium).
+  // Models without `effortIds` ("auto", composer-2.5, the Gemini rows, …)
+  // decline effort and store NULL.
+  "cursor": "high",
+  // Gemini has no per-invocation effort/thinking-budget flag (verified via
+  // `gemini --help` on CLI 0.54.0 — thinkingBudget/thinkingLevel are
+  // settings.json-only, not scriptable per-task without a race across
+  // concurrent tasks). MODEL_EFFORT_SUPPORT.gemini is empty for every model
+  // so the picker collapses; this default is unused but kept for symmetry.
+  "gemini": "high",
+  // fx's own default reasoning level (owner decision D1,
+  // docs/plans/fx-0.0.10-compat.md §8): a new fx task runs exactly as fx
+  // itself would — `auto` is what every effort-advertising fx model reports
+  // as `currentValue` on `session/new`, and the driver only sends
+  // `set_config_option effort=auto` when a resumed session's persisted
+  // value has drifted from it. `high`/`max`/… stay one explicit click away
+  // in the picker; this is deliberately not the house `high` convention the
+  // other four kinds use, since that would silently change every fx run's
+  // cost/latency on the owner's rate-limited free-tier Gateway account.
+  "fx": "auto",
+  // Unused, kept for symmetry: effort rides in the antigravity model id and
+  // every MODEL_EFFORT_SUPPORT.antigravity set is empty.
+  "antigravity": "high",
+  // OpenCode's variants are per model and discovered (G5, D-6); "auto"
+  // ("Model default") passes no variant, so a new task runs exactly as
+  // OpenCode itself would.
+  "opencode": "auto",
+  // Like fx: `auto` is "Model default" — the driver omits `--reasoning-effort`
+  // so Copilot runs each model at its own default (owner D7,
+  // docs/plans/github-copilot-harness-grill.md). Explicit levels stay one
+  // click away in the picker.
+  "copilot": "auto",
+};
+
+/**
+ * Minimum harness-CLI version a model needs, per kind, keyed by model id
+ * (semver "major.minor.patch"; compared with `cliVersionSatisfies` in
+ * `src/shared/cli-version.ts`). Pre-flight 1b (`minCliVersionError` in
+ * `src/bun/orchestrator.ts` — `startTask`, every follow-up codex turn, and
+ * the clone route's explainer launch) refuses the launch — before any run
+ * row or worktree exists — when the probed CLI version parses AND is below
+ * the floor; an unparseable/absent version never blocks (fail-open, so
+ * `/bin/echo`-style test overrides and stub binaries are unaffected).
+ * Only codex has entries today: OpenAI's `chatgpt.com/backend-api/codex/models`
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, not the
+ * version. Floors are the lowest versions verified live on 2026-09-22 (a
+ * ChatGPT-plan account): gpt-6-sol/gpt-6-luna — 0.154.0 ✗ / 0.155.1 ✓
+ * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
+ * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra;
+ * gpt-6.1-sol — 0.158.0 ✗ / 0.159.0 ✓ (verified 2026-09-30,
+ * docs/plans/add-gpt-6-1-sol.md; no 0.158.x above .0 exists);
+ * gpt-6.1-terra — 0.158.0 ✗ / 0.159.0 ✓ (verified 2026-10-26,
+ * docs/plans/add-gpt-6-1-terra.md).
+ * The floors were verified on a ChatGPT-plan account; API-key accounts are
+ * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
+ * the override when one isn't.
+ * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ */
+export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
+  codex: {
+    "gpt-6.1-sol": "0.159.0",
+    "gpt-6.1-terra": "0.159.0",
+    "gpt-6-sol": "0.155.0",
+    "gpt-6-luna": "0.155.0",
+    "gpt-6-astra": "0.153.0",
+    "gpt-6-astra-aeon": "0.153.0",
+  },
+  // GitHub Copilot CLI: the first stable release whose bundled changelog
+  // mentions each model (docs/plans/github-copilot-harness.md §2). No match
+  // was found for claude-sonnet-5.5, gemini-3.8-flash, grok-4.7 or
+  // mai-code-1.1-flash, so those carry no floor (fail-open); `auto` never does.
+  copilot: {
+    "kimi-k3": "1.0.79",
+    "claude-fable-5.1": "1.0.83",
+    "gpt-6-astra": "1.0.85",
+    "claude-opus-5.5": "1.0.89",
+    "gpt-6-sol": "1.0.89",
+    "gpt-6-luna": "1.0.89",
+    "gpt-6.1-sol": "1.0.90",
+    "claude-haiku-5.5": "1.0.94",
+    "gemini-4-argon": "1.0.98",
+  },
+};
+
+export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18): grok 4.7 ships
+  // as grok-4.7-{low,medium,high,xhigh} plus -fast variants of all four — NOT
+  // `cursor-` prefixed like 4.6/4.5, and with no bare id, no max tier, no
+  // 1M/Max-Mode variant. Every tier carries its own label ("Grok 4.7 High", …),
+  // so there is no unsuffixed row; High is the default via DEFAULT_EFFORT.
+  // The label mirrors cursor-agent's own unprefixed naming on purpose
+  // ("Grok 4.7 High", not "Cursor Grok 4.7") — don't "fix" it to match 4.6/4.5.
+  "grok-4.7": {
+    label: "Grok 4.7",
+    hint: "Recommended default — Cursor-hosted Grok 4.7. Needs cursor-agent 2026.09.18 or newer; older builds reject the id (pick Cursor Grok 4.6 there).",
+    effortIds: {
+      xhigh: "grok-4.7-xhigh",
+      high: "grok-4.7-high",
+      medium: "grok-4.7-medium",
+      low: "grok-4.7-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.08.11): grok 4.6 ships
+  // as cursor-grok-4.6-{low,medium,high,xhigh} plus -fast variants of all four —
+  // no bare id, no max tier, no 1M/Max-Mode variant. The unsuffixed "Cursor
+  // Grok 4.6" label is the high tier, same convention as 4.5.
+  "cursor-grok-4.6": {
+    label: "Cursor Grok 4.6",
+    hint: "Cursor-hosted Grok 4.6 — the previous default.",
+    effortIds: {
+      xhigh: "cursor-grok-4.6-xhigh",
+      high: "cursor-grok-4.6-high",
+      medium: "cursor-grok-4.6-medium",
+      low: "cursor-grok-4.6-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "auto": { label: "Auto", hint: "Cursor picks the model." },
+  "gpt-5.3-codex": {
+    label: "Codex 5.3",
+    hint: "Cursor-hosted Codex 5.3.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.3-codex-xhigh",
+      high: "gpt-5.3-codex-high",
+      medium: "gpt-5.3-codex",
+      low: "gpt-5.3-codex-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "cursor-grok-4.5": {
+    label: "Cursor Grok 4.5",
+    hint: "Cursor-hosted Grok model.",
+    effortIds: {
+      high: "cursor-grok-4.5-high",
+      medium: "cursor-grok-4.5-medium",
+      low: "cursor-grok-4.5-low",
+    },
+    fastEfforts: ["high", "medium", "low"],
+  },
+  "composer-2.5": {
+    label: "Composer 2.5",
+    hint: "Cursor's own fast agentic model.",
+    fastId: "composer-2.5-fast",
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18-9a7762b, 245
+  // rows, 2026-09-22): claude-opus-5-5-{low,medium,high,xhigh,max}, each with
+  // a -fast variant; the unsuffixed "Claude Opus 5.5 1M" row is the -medium
+  // id (Cursor's own default tier). Unlike claude-opus-5 there are NO
+  // -thinking- variants — same shape as the Opus 4.8 spec below.
+  "claude-opus-5-5": {
+    label: "Opus 5.5",
+    hint: "Anthropic Opus 5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-5-max",
+      xhigh: "claude-opus-5-5-xhigh",
+      high: "claude-opus-5-5-high",
+      medium: "claude-opus-5-5-medium",
+      low: "claude-opus-5-5-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "claude-opus-5": {
+    label: "Opus 5",
+    hint: "Anthropic Opus 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-thinking-max",
+      xhigh: "claude-opus-5-thinking-xhigh",
+      high: "claude-opus-5-thinking-high",
+      medium: "claude-opus-5-thinking-medium",
+      low: "claude-opus-5-thinking-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "claude-opus-4-8": {
+    label: "Opus 4.8",
+    hint: "Anthropic Opus 4.8 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-4-8-max",
+      xhigh: "claude-opus-4-8-xhigh",
+      high: "claude-opus-4-8-high",
+      medium: "claude-opus-4-8-medium",
+      low: "claude-opus-4-8-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-sol": {
+    label: "GPT-5.6 Sol",
+    hint: "Cursor-hosted GPT-5.6 Sol.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-sol-max",
+      xhigh: "gpt-5.6-sol-xhigh",
+      high: "gpt-5.6-sol-high",
+      medium: "gpt-5.6-sol-medium",
+      low: "gpt-5.6-sol-low",
+      none: "gpt-5.6-sol-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "gpt-5.5": {
+    label: "GPT-5.5",
+    hint: "OpenAI GPT-5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.5-extra-high",
+      high: "gpt-5.5-high",
+      medium: "gpt-5.5-medium",
+      low: "gpt-5.5-low",
+      none: "gpt-5.5-none",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low", "none"],
+  },
+  // Ids verified against `cursor-agent models` (2026-09-01); the catalog
+  // exposes no -fast Fable variants (hence no fastEfforts), same shape as
+  // claude-fable-5 below.
+  "claude-fable-5-1": {
+    label: "Fable 5.1",
+    hint: "Anthropic Fable 5.1 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-fable-5-1-max",
+      xhigh: "claude-fable-5-1-xhigh",
+      high: "claude-fable-5-1-high",
+      medium: "claude-fable-5-1-medium",
+      low: "claude-fable-5-1-low",
+    },
+  },
+  "claude-fable-5": {
+    label: "Fable 5",
+    hint: "Anthropic Fable 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-fable-5-max",
+      xhigh: "claude-fable-5-xhigh",
+      high: "claude-fable-5-high",
+      medium: "claude-fable-5-medium",
+      low: "claude-fable-5-low",
+    },
+  },
+  // Measured 2026-10-07 on cursor-agent 2026.10.01: ten rows, no -fast, zero
+  // labels contain "1M". Thinking ids are
+  // claude-haiku-5-5-thinking-{low,medium,high,xhigh,max}. The No Thinking
+  // siblings claude-haiku-5-5-{effort} are intentionally uncovered so they
+  // stay pickable as discovered rows and a stored No Thinking id keeps
+  // launching No Thinking — never put the plain ids in effortIds.
+  "claude-haiku-5-5": {
+    label: "Haiku 5.5",
+    hint: "Anthropic Haiku 5.5 via Cursor.",
+    effortIds: {
+      max: "claude-haiku-5-5-thinking-max",
+      xhigh: "claude-haiku-5-5-thinking-xhigh",
+      high: "claude-haiku-5-5-thinking-high",
+      medium: "claude-haiku-5-5-thinking-medium",
+      low: "claude-haiku-5-5-thinking-low",
+    },
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.09.26-dd393fe, 250
+  // rows, 2026-09-28): claude-sonnet-5-5-{low,medium,high,xhigh,max} — five
+  // effort tiers, no -fast and no -thinking- variants. The rows are labelled
+  // without Cursor's "1M" suffix (unlike every other supportsMaxMode spec's
+  // rows, Sonnet 5's included) and a live `-p` probe rejected the
+  // `[context=1m,…]` bracket, so max mode is deliberately off
+  // (docs/plans/add-claude-sonnet-5-5.md §8 A1).
+  "claude-sonnet-5-5": {
+    label: "Sonnet 5.5",
+    hint: "Anthropic Sonnet 5.5 via Cursor.",
+    effortIds: {
+      max: "claude-sonnet-5-5-max",
+      xhigh: "claude-sonnet-5-5-xhigh",
+      high: "claude-sonnet-5-5-high",
+      medium: "claude-sonnet-5-5-medium",
+      low: "claude-sonnet-5-5-low",
+    },
+  },
+  "claude-sonnet-5": {
+    label: "Sonnet 5",
+    hint: "Anthropic Sonnet 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-sonnet-5-max",
+      xhigh: "claude-sonnet-5-xhigh",
+      high: "claude-sonnet-5-high",
+      medium: "claude-sonnet-5-medium",
+      low: "claude-sonnet-5-low",
+    },
+  },
+  "gpt-5.6-terra": {
+    label: "GPT-5.6 Terra",
+    hint: "Cursor-hosted GPT-5.6 Terra.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-terra-max",
+      xhigh: "gpt-5.6-terra-xhigh",
+      high: "gpt-5.6-terra-high",
+      medium: "gpt-5.6-terra-medium",
+      low: "gpt-5.6-terra-low",
+      none: "gpt-5.6-terra-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "claude-4.6-sonnet": {
+    label: "Sonnet 4.6",
+    hint: "Anthropic Sonnet 4.6 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { medium: "claude-4.6-sonnet-medium" },
+  },
+  "claude-opus-4-7": {
+    label: "Opus 4.7",
+    hint: "Anthropic Opus 4.7 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-4-7-max",
+      xhigh: "claude-opus-4-7-xhigh",
+      high: "claude-opus-4-7-high",
+      medium: "claude-opus-4-7-medium",
+      low: "claude-opus-4-7-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.4": {
+    label: "GPT-5.4",
+    hint: "OpenAI GPT-5.4 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.4-xhigh",
+      high: "gpt-5.4-high",
+      medium: "gpt-5.4-medium",
+      low: "gpt-5.4-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium"],
+  },
+  "claude-4.6-opus": {
+    label: "Opus 4.6",
+    hint: "Anthropic Opus 4.6 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { max: "claude-4.6-opus-max", high: "claude-4.6-opus-high" },
+  },
+  "claude-4.5-opus": {
+    label: "Opus 4.5",
+    hint: "Anthropic Opus 4.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { high: "claude-4.5-opus-high" },
+  },
+  "gpt-5.2": {
+    label: "GPT-5.2",
+    hint: "OpenAI GPT-5.2 via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.2-xhigh",
+      high: "gpt-5.2-high",
+      medium: "gpt-5.2",
+      low: "gpt-5.2-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-luna": {
+    label: "GPT-5.6 Luna",
+    hint: "Cursor-hosted GPT-5.6 Luna.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-luna-max",
+      xhigh: "gpt-5.6-luna-xhigh",
+      high: "gpt-5.6-luna-high",
+      medium: "gpt-5.6-luna-medium",
+      low: "gpt-5.6-luna-low",
+      none: "gpt-5.6-luna-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  // Ids verified against `cursor-agent models` (2026-09-02): Gemini 3.8 / 3.7
+  // Flash ship as gemini-3.{8,7}-flash-{low,medium,high} — no minimal tier
+  // (unlike 3.6), no bare id, no -fast variants, no Max Mode. We map the
+  // unsuffixed label to the high tier — agetor's convention, mirroring 3.6;
+  // Cursor's own listing calls it "Gemini 3.8 Flash High" (cosmetic).
+  // Verified live via `cursor-agent models` on cursor-agent 2026.10.01
+  // (2026-10-14): gemini-4-argon-{low,medium,high} only — no bare id, no
+  // -fast, no minimal tier, no Max Mode (same shape as 3.8 Flash). The
+  // unsuffixed label maps to the high tier (house convention; Cursor's own
+  // listing says "Gemini 4 Argon High"). Migration 064 normalizes stored
+  // variant ids.
+  "gemini-4-argon": {
+    label: "Gemini 4 Argon",
+    hint: "Google Gemini 4 Argon via Cursor.",
+    effortIds: {
+      high: "gemini-4-argon-high",
+      medium: "gemini-4-argon-medium",
+      low: "gemini-4-argon-low",
+    },
+  },
+  "gemini-3.8-flash": {
+    label: "Gemini 3.8 Flash",
+    hint: "Google Gemini 3.8 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.8-flash-high",
+      medium: "gemini-3.8-flash-medium",
+      low: "gemini-3.8-flash-low",
+    },
+  },
+  "gemini-3.7-flash": {
+    label: "Gemini 3.7 Flash",
+    hint: "Google Gemini 3.7 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.7-flash-high",
+      medium: "gemini-3.7-flash-medium",
+      low: "gemini-3.7-flash-low",
+    },
+  },
+  "gemini-3.6-flash": {
+    label: "Gemini 3.6 Flash",
+    hint: "Google Gemini 3.6 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.6-flash-high",
+      medium: "gemini-3.6-flash-medium",
+      low: "gemini-3.6-flash-low",
+      minimal: "gemini-3.6-flash-minimal",
+    },
+  },
+  "gemini-3.1-pro": { label: "Gemini 3.1 Pro", hint: "Google Gemini 3.1 Pro via Cursor." },
+  "gpt-5.4-mini": {
+    label: "GPT-5.4 Mini",
+    hint: "OpenAI GPT-5.4 Mini via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-mini-xhigh",
+      high: "gpt-5.4-mini-high",
+      medium: "gpt-5.4-mini-medium",
+      low: "gpt-5.4-mini-low",
+      none: "gpt-5.4-mini-none",
+    },
+  },
+  "gpt-5.4-nano": {
+    label: "GPT-5.4 Nano",
+    hint: "OpenAI GPT-5.4 Nano via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-nano-xhigh",
+      high: "gpt-5.4-nano-high",
+      medium: "gpt-5.4-nano-medium",
+      low: "gpt-5.4-nano-low",
+      none: "gpt-5.4-nano-none",
+    },
+  },
+  "claude-4.5-sonnet": { label: "Sonnet 4.5", hint: "Anthropic Sonnet 4.5 via Cursor.", supportsMaxMode: true },
+  "gpt-5.1": {
+    label: "GPT-5.1",
+    hint: "OpenAI GPT-5.1 via Cursor.",
+    effortIds: { high: "gpt-5.1-high", medium: "gpt-5.1", low: "gpt-5.1-low" },
+  },
+  "gemini-3-flash": { label: "Gemini 3 Flash", hint: "Google Gemini 3 Flash via Cursor." },
+  "gemini-3.5-flash": { label: "Gemini 3.5 Flash", hint: "Google Gemini 3.5 Flash via Cursor." },
+  "claude-4-sonnet": {
+    label: "Sonnet 4",
+    hint: "Anthropic Sonnet 4 via Cursor.",
+    effortIds: { high: "claude-4-sonnet-thinking", none: "claude-4-sonnet" },
+  },
+  "gpt-5-mini": { label: "GPT-5 Mini", hint: "OpenAI GPT-5 Mini via Cursor." },
+  "kimi-k3": {
+    label: "Kimi K3",
+    hint: "Kimi K3 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { max: "kimi-k3-max", high: "kimi-k3-high", low: "kimi-k3-low" },
+  },
+  "kimi-k2.7-code": { label: "Kimi K2.7 Code", hint: "Kimi K2.7 Code via Cursor." },
+  "glm-5.2": {
+    label: "GLM 5.2",
+    hint: "GLM 5.2 via Cursor.",
+    effortIds: { max: "glm-5.2-max", high: "glm-5.2-high" },
+  },
+  // Ids verified against `cursor-agent --list-models` (2026.10.22-27dcf5f,
+  // 2026-10-26); none has a `-fast` form. No `supportsMaxMode`: the Max Mode
+  // bracket `muse-wonder-1.0[context=1m,effort=high]` was rejected live
+  // ("Cannot use this model"); only `-<effort>` ids run.
+  // docs/plans/add-gpt-6-1-terra.md §2/§3.
+  "muse-wonder-1.0": {
+    label: "Muse Wonder",
+    hint: "Meta Muse Wonder via Cursor.",
+    effortIds: {
+      max: "muse-wonder-1.0-max",
+      xhigh: "muse-wonder-1.0-xhigh",
+      high: "muse-wonder-1.0-high",
+      medium: "muse-wonder-1.0-medium",
+      low: "muse-wonder-1.0-low",
+      minimal: "muse-wonder-1.0-minimal",
+    },
+  },
+  // These rows are labeled "1M" in `--list-models`, and the Max Mode bracket
+  // `muse-spark-1.3[context=1m,effort=high]` was accepted live (rc 0), so
+  // `supportsMaxMode` is on.
+  "muse-spark-1.3": {
+    label: "Muse Spark 1.3",
+    hint: "Meta Muse Spark 1.3 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "muse-spark-1.3-max",
+      xhigh: "muse-spark-1.3-xhigh",
+      high: "muse-spark-1.3-high",
+      medium: "muse-spark-1.3-medium",
+      low: "muse-spark-1.3-low",
+      minimal: "muse-spark-1.3-minimal",
+    },
+  },
+  // No `supportsMaxMode`: the bracket `deepseek-v41-flash-1017[context=1m,
+  // effort=high]` was rejected live. Cursor lists `medium` here although the
+  // Gateway entry for this model does not.
+  "deepseek-v41-flash-1017": {
+    label: "DeepSeek V4.1 Flash 1017",
+    hint: "DeepSeek V4.1 Flash 1017 via Cursor.",
+    effortIds: {
+      max: "deepseek-v41-flash-1017-max",
+      high: "deepseek-v41-flash-1017-high",
+      medium: "deepseek-v41-flash-1017-medium",
+      low: "deepseek-v41-flash-1017-low",
+      none: "deepseek-v41-flash-1017-none",
+    },
+  },
+};
+
+export function cursorModelSupportsFast(model: string | null, effort: string | null): boolean {
+  const spec = CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor];
+  if (!spec) return false;
+  if (spec.fastId && !spec.effortIds) return true;
+  if (!effort) return false;
+  return spec.fastEfforts?.includes(effort) ?? false;
+}
+
+export function cursorModelSupportsMaxMode(model: string | null): boolean {
+  return CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor]?.supportsMaxMode === true;
+}
+
+export function cursorModelIdCoveredByCatalog(id: string): boolean {
+  if (CURSOR_MODEL_SPECS[id]) return true;
+  return Object.values(CURSOR_MODEL_SPECS).some((spec) => {
+    if (spec.fastId === id) return true;
+    return Object.values(spec.effortIds ?? {}).some((variant) => variant === id || `${variant}-fast` === id);
+  });
+}
+
+export function cursorModelArg(model: string, effort: string | null, fast: boolean, maxMode = false): string {
+  const spec = CURSOR_MODEL_SPECS[model];
+  if (!spec) return model;
+  if (!spec.effortIds) {
+    const baseId = fast && spec.fastId ? spec.fastId : model;
+    return maxMode && spec.supportsMaxMode ? `${baseId}[context=1m]` : baseId;
+  }
+  const desiredEffort =
+    effort && spec.effortIds[effort]
+      ? effort
+      : DEFAULT_EFFORT.cursor && spec.effortIds[DEFAULT_EFFORT.cursor]
+        ? DEFAULT_EFFORT.cursor
+        : Object.keys(spec.effortIds)[0];
+  if (!desiredEffort) return model;
+  const baseId = spec.effortIds[desiredEffort] ?? model;
+  if (maxMode && spec.supportsMaxMode) {
+    const params = [`context=1m`, `effort=${desiredEffort}`];
+    if (cursorModelSupportsFast(model, desiredEffort)) params.push(`fast=${fast ? "true" : "false"}`);
+    return `${model}[${params.join(",")}]`;
+  }
+  return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
+}
+
+/**
+ * Maps the prominent two-way "Code vs Plan" UI toggle onto a concrete mode id
+ * per agent. The toggle is the primary mode picker in the UI; the full
+ * per-agent mode dropdown stays accessible behind an "Advanced" disclosure so
+ * niche options (acceptEdits, ask) aren't lost. Codex has no first-class plan
+ * mode — we route Plan to "ask" there since it's the closest "don't auto-act"
+ * posture available.
+ */
+/**
+ * "Code vs Plan" pill posture used by NewTaskForm. Clicking Code flips the
+ * mode dropdown to the agent's most-permissive "let the model act" value;
+ * clicking Plan flips it to the corresponding "describe only" value.
+ *
+ * For claude-code, `Code` resolves to `auto` — claude's real
+ * `--permission-mode auto` where the server-side AI classifier decides
+ * per call. Agetor is non-invasive: it installs no PreToolUse hook and no
+ * MCP server, so AskUserQuestion / ExitPlanMode / tool-permission prompts
+ * all run natively in the tmux pane and are surfaced through the scraper.
+ * `bypass` is the explicit pure `--dangerously-skip-permissions` mode.
+ */
+export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
+  "claude-code": { code: "auto", plan: "plan" },
+  "codex": { code: "auto", plan: "ask" },
+  // cursor-agent has a native read-only planning mode (`--mode plan`,
+  // verified on 2026.10.22 — docs/plans/fx-0.0.14-and-cursor-updates.md
+  // §3.3), so Plan maps to it; approving the plan flips an unbound task to
+  // "auto".
+  // "ask" (`--mode ask`, read-only Q&A) stays an explicit picker choice.
+  "cursor": { code: "auto", plan: "plan" },
+  // Gemini's `--approval-mode plan` is a real read-only mode (verified via
+  // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
+  // codex's read-only-sandbox stand-in — but reuse codex's "ask" id since
+  // AGENT_OPTIONS.gemini.modes below labels it the same "Read-only" way.
+  "gemini": { code: "auto", plan: "ask" },
+  // fx has three of its own permission modes (yolo/auto/ask — see
+  // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
+  // modes[0] — now "yolo" ("Full access"), fx's actual hands-off mode. On a
+  // standard-plan Gateway account fx's hard-wired auto-reviewer
+  // (openai/gpt-5.6-luna) answers 403, so "auto" holds every tool call
+  // instead of reviewing it and the agent replans into the free-tier rate
+  // limit chasing an approval that will never come (see
+  // docs/plans/fix-fx-harness-rate-limit.md). "auto" and "ask" stay reachable
+  // only as explicit picker choices. A `null` stored mode now ALSO spawns as
+  // "yolo" via the shared `defaultModeFor("fx")` (see that function below) —
+  // an owner-requested reversal of the earlier "no silent escalation" rule
+  // (docs/plans/fx-recovery-follow-ups.md §3.6): every fx task, including
+  // ones created before this change, now defaults to Full access unless it
+  // has an explicit stored mode. Plan still resolves to "ask" (only
+  // pre-approved rules run; everything else surfaces as an approval card).
+  "fx": { code: "yolo", plan: "ask" },
+  "antigravity": { code: "auto", plan: "plan" },
+  // OpenCode: Code = the Build agent with `--auto`; Plan = `--agent plan`.
+  "opencode": { code: "auto", plan: "plan" },
+  // Plan is Copilot's own `--mode plan`; approving the plan switches an
+  // unbound task to Auto (D4, D5).
+  "copilot": { code: "auto", plan: "plan" },
+};
+
+/**
+ * Canonical effort levels exposed in the UI, ordered **highest → lowest**,
+ * with one exception: `auto` is off-scale (it doesn't sit on the
+ * high↔low ladder — it means "let the model/gateway decide") and is always
+ * listed last. Not every (agent, model) combo accepts every level — see
+ * `MODEL_EFFORT_SUPPORT` below.
+ *
+ * Mapping per agent (see `src/bun/agents.ts`):
+ *   codex       → `-c model_reasoning_effort=<id>`
+ *   claude-code → thinking-keyword appended to the prompt:
+ *                   low → "think"        medium → "think hard"
+ *                   high → "think harder" xhigh → "think very hard"
+ *                   max → "ultrathink"
+ *   fx          → `session/set_config_option {configId:"effort", value:<id>}`
+ *                   over ACP (fx ≥0.0.9); ids map to fx's own values verbatim.
+ *   opencode    → the model's variant: v2 `-m provider/model#<id>`, v1
+ *                   `-m provider/model --variant <id>` (`opencodeModelArgs`).
+ *
+ * `none` is currently used only by GPT-5.6-family Codex models and by
+ * effort-advertising fx models whose Gateway catalog entry lists it.
+ * `auto` is used only by the `MODEL_DEFAULT_EFFORT_KINDS` (fx, GitHub Copilot
+ * and OpenCode): `MODEL_EFFORT_SUPPORT.fx` and `MODEL_EFFORT_SUPPORT.copilot`
+ * list it, `supportedEfforts("opencode", …)` adds it in front of a model's
+ * discovered variants, and `DEFAULT_EFFORT.fx` / `DEFAULT_EFFORT.copilot` /
+ * `DEFAULT_EFFORT.opencode` are the only defaults that resolve to it. An
+ * OpenCode variant agetor doesn't know (e.g. `thinking`) is offered as a
+ * synthesized `{id, label: id}` row, not one of these.
+ */
+export const EFFORT_OPTIONS: AgentOption[] = [
+  { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
+  { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / Haiku 5.5 / codex." },
+  { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
+  { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
+  { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
+  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where the harness exposes it (Cursor, fx, GitHub Copilot)." },
+  { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx, GitHub Copilot and OpenCode only (fx's `auto`, its 'default' option; Copilot omits --reasoning-effort; OpenCode passes no variant). Limited by construction to the kinds in `MODEL_DEFAULT_EFFORT_KINDS`: curated tables and the discovered branch both keep it off every other kind." },
+];
+
+/**
+ * Per-model effort support. Sourced from official docs:
+ *   - Anthropic effort parameter:
+ *       https://platform.claude.com/docs/en/build-with-claude/effort
+ *     Opus 4.7 → low/medium/high/xhigh/max
+ *     Sonnet 5.5 / 5 → low/medium/high/xhigh/max
+ *     Haiku 5.5 → low/medium/high/xhigh/max
+ *     Sonnet 4.6 → low/medium/high/max
+ *     Haiku 4.5 → effort parameter NOT supported
+ *   - Codex `model_reasoning_effort`:
+ *       https://developers.openai.com/codex/config-advanced
+ *     GPT-5.6 family → none/low/medium/high/xhigh/max
+ *     GPT-6 Sol/Luna → none/low/medium/high/xhigh/max (+ Codex-side ultra on Sol)
+ *     GPT-6.1 Sol → low/medium/high/xhigh/max (+ Codex-side ultra), NO none
+ *     GPT-6.1 Terra → none/low/medium/high/xhigh/max (+ Codex-side ultra)
+ *     gpt-5 / gpt-5-codex → low/medium/high/xhigh
+ *
+ * An empty list means "this model does not accept the effort flag at all"
+ * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
+ * no env var / `-c` flag for that case.
+ */
+export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
+  // Per https://platform.claude.com/docs/en/build-with-claude/effort the
+  // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
+  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5.5 / 5 / Haiku 5.5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Fable-, Mythos-, Opus-, Sonnet-5.5/5- and Haiku-5.5-only; Sonnet 4.6 has no xhigh;
+  // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
+  // accepts more levels but the underlying API request would fail for
+  // unsupported pairs, so we filter at the picker rather than letting the
+  // user fire bad runs.
+  "claude-code": {
+    // Mythos 5.1 shares Fable 5.1's request surface (same underlying model).
+    "mythos-5.1": ["max", "xhigh", "high", "medium", "low"],
+    // Mythos 5 shares Fable 5's request surface (same underlying model).
+    "mythos-5": ["max", "xhigh", "high", "medium", "low"],
+    // Fable 5.1 is the Fable 5 successor with the same effort ladder (per
+    // Anthropic's effort docs).
+    "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
+    // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
+    "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5.5's docs: thinking can't be disabled ({type:"disabled"} and
+    // budget_tokens both 400 per the migration guide), so effort is the only
+    // control and there is deliberately no "none" row. API default is
+    // "medium" (Opus 5's is "high"); agetor still pins
+    // CLAUDE_CODE_EFFORT_LEVEL from DEFAULT_EFFORT at spawn.
+    "opus-5.5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
+    "opus-5": ["max", "xhigh", "high", "medium", "low"],
+    "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
+    "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
+    "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
+    // Sonnet 5.5's docs: like Opus 5.5, thinking can't be disabled
+    // ({type:"disabled"} 400s — the API's between_tools off switch is nothing
+    // agetor ever sends, since effort rides CLAUDE_CODE_EFFORT_LEVEL), so
+    // there is deliberately no "none" row. API default is "high", Claude
+    // Code's own default for this model is "medium"; agetor still pins
+    // CLAUDE_CODE_EFFORT_LEVEL from DEFAULT_EFFORT at spawn.
+    "sonnet-5.5": ["max", "xhigh", "high", "medium", "low"],
+    // Sonnet 5 was the first Sonnet-tier model with xhigh (full low→max range).
+    "sonnet-5": ["max", "xhigh", "high", "medium", "low"],
+    "sonnet-4.6": ["max", "high", "medium", "low"],
+    // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
+    // returns `[]` and the picker disables itself.
+    // Haiku 5.5 is the first Haiku with effort (low→max incl. xhigh). The
+    // Gateway also lists `none` and a thinking toggle for it; both are
+    // deliberately NOT offered on claude-code because CLAUDE_EFFORT_VALUES
+    // would drop `none`.
+    "haiku-5.5": ["max", "xhigh", "high", "medium", "low"],
+    "haiku-4.5": [],
+  },
+  codex: {
+    // Evidence (2026-09-03): the OpenAI model page documents Astra as
+    // low/medium/high/xhigh/max with `none` explicitly unsupported, and the
+    // Codex models page adds an Ultra tier (automatic sub-agent delegation)
+    // on top of that. Aeon (the long-horizon Astra variant) is assumed to
+    // share Astra's set. `codex app-server model/list` on 0.147.0 and
+    // 0.153.0 lists `ultra` for Sol and Terra but not for Luna, and lists
+    // `none` for nobody in this account's catalog — yet a live `codex exec`
+    // accepted `none` on both Sol and Luna, and accepted `ultra` even on
+    // Luna despite Codex's own catalog not offering it there; `max` on
+    // gpt-5.5 was rejected with "Supported values are: 'none', 'low',
+    // 'medium', 'high', and 'xhigh'." So the curated `ultra` rows follow
+    // Codex's offering (not the live-acceptance superset), `none` follows
+    // live acceptance, and Cyber mirrors Sol (assumption — Cyber isn't in
+    // this account's catalog at all). Note: discovered efforts (see
+    // `supportedEfforts`'s third argument) override this table whenever the
+    // CLI itself reports a set for the model.
+    //
+    // 2026-09-22 — `codex app-server` catalog on 0.155.1 lists gpt-6-sol as
+    // low/medium/high/xhigh/max + ultra (default medium) and gpt-6-luna as
+    // low/medium/high/xhigh/max (no ultra, default medium); `none` accepted
+    // live on Luna via `codex exec` (0.155.1), on Sol it rests on OpenAI's
+    // model page ("supports none") + the GPT-5.6 Sol precedent; same rule as
+    // the 5.6 rows — `ultra` follows Codex's offering, `none` follows
+    // live/API acceptance.
+    //
+    // 2026-09-30 — `codex app-server` catalog on 0.159.2 lists gpt-6.1-sol as
+    // low/medium/high/xhigh/max + ultra (default medium). `none` is rejected
+    // live: `codex exec … -c model_reasoning_effort=none` answers 400
+    // "Unsupported value: 'none' is not supported with the 'gpt-6.1-sol'
+    // model. Supported values are: 'low', 'medium', 'high', 'xhigh', and
+    // 'max'." — so unlike every Sol before it, no `none`; `ultra` follows
+    // Codex's offering, as for the other rows.
+    // docs/plans/add-gpt-6-1-sol.md §2.
+    "gpt-6.1-sol": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    // 2026-10-26 — `codex app-server` catalog first lists gpt-6.1-terra on
+    // 0.159.0 as low/medium/high/xhigh/max + ultra (default low). Live
+    // `codex exec` on 0.162.1 accepts `none`, `low` and `ultra`, and rejects
+    // `minimal` with a 400 ("Supported values are: 'none', 'low', 'medium',
+    // 'high', 'xhigh', and 'max'.") — so unlike 6.1 Sol, Terra accepts `none`
+    // (same rule as the other rows: `ultra` follows Codex's offering, `none`
+    // follows live acceptance). docs/plans/add-gpt-6-1-terra.md §2.
+    "gpt-6.1-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5": ["xhigh", "high", "medium", "low"],
+    "gpt-5-codex": ["xhigh", "high", "medium", "low"],
+  },
+  cursor: Object.fromEntries(
+    Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => [
+      id,
+      spec.effortIds ? EFFORT_OPTIONS.map((o) => o.id).filter((effort) => Boolean(spec.effortIds?.[effort])) : [],
+    ]),
+  ) as Record<string, string[]>,
+  // Empty for every model: gemini has no per-invocation effort flag (see
+  // DEFAULT_EFFORT.gemini comment above). supportedEfforts() falls back to
+  // [] for any model key here, which collapses the effort picker in the UI —
+  // the same treatment claude-code's haiku-4.5 gets.
+  gemini: {
+    "gemini-4-argon": [],
+    "gemini-3.1-pro-preview": [],
+    "gemini-2.5-pro": [],
+    "gemini-3.8-flash": [],
+    "gemini-3.8-flash-cyber": [],
+    "gemini-2.5-flash": [],
+  },
+  // fx ≥0.0.9 exposes reasoning effort per ACP session: `session/new`,
+  // `session/resume` and `session/load` results carry a third
+  // `configOptions` entry (`{id:"effort", currentValue, options:[...]}`)
+  // whenever the active model's Gateway catalog entry advertises
+  // `reasoning_options`, and `session/set_config_option
+  // {configId:"effort", value}` sets it — driven by `src/bun/fx-acp.ts`.
+  // This table is the per-model set **live-probed on fx 0.0.10** (spike
+  // `fx-0010-efforts`, 2026-09-14) across all 28 curated ids: 16 models
+  // advertise an effort set (always ending in `auto`, fx's own default —
+  // what every effort-advertising model reports as `currentValue`), 12
+  // advertise none — their Gateway catalog entry carries no
+  // `reasoning_options` at all — and stay `[]`, same treatment as gemini
+  // above (the picker collapses). A 29th id, spacexai/grok-4.7, joined the
+  // no-effort group on 2026-09-21 (see its row below), and a 30th,
+  // anthropic/claude-opus-5.5, joined the effort group on 2026-09-22 on its
+  // Gateway `reasoning_options` alone (not ACP-probed — see its row); a 31st
+  // and 32nd, openai/gpt-6-sol and openai/gpt-6-luna, joined it the same day
+  // on their Gateway `reasoning_options` (none/low/medium/high as measured
+  // 2026-09-22; re-measured none…max on 2026-09-30 and the rows refreshed),
+  // likewise not ACP-probed (see their rows); a 33rd, anthropic/claude-sonnet-5.5, joined
+  // it on 2026-09-28 the same way (see its row); a 34th, openai/gpt-6.1-sol,
+  // joined it on 2026-09-30 the same way (see its row); a 35th,
+  // anthropic/claude-haiku-5.5, joined it on 2026-10-07 the same way (see
+  // its row).
+  // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4
+  // P10/D6/D10): fx 0.0.14's `models --json` now carries each model's
+  // `efforts` (the ACP `effort` option is that list plus `auto`), and 20 of
+  // the curated sets differed from it — those rows were refreshed to the
+  // 0.0.14 catalog (several no-effort rows now advertise a set, and `minimal`
+  // appears for the OpenAI GPT-5.x rows); the other 13 are unchanged.
+  // alibaba/qwen3-coder-plus, mistral/devstral-2 and anthropic/claude-3-haiku
+  // were retired (absent from both the unauthenticated and the owner's
+  // signed-in catalog; migration 074). Discovery is now the first source —
+  // `ModelOption.efforts` from `models[].efforts` wins over this table in
+  // `supportedEfforts` — so this table only matters while discovery is
+  // empty (fx ≤0.0.13, not installed, probe failed). An
+  // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
+  // `supportedEfforts`, and the driver validates at runtime against whatever
+  // `effort` option fx actually returns for that session — so drift between
+  // this curated table and the live Gateway catalog is only a picker-hint
+  // problem, never a failed run (an unoffered value degrades to a status
+  // breadcrumb). Ids map to fx's own values verbatim
+  // (`minimal|low|medium|high|xhigh|max|none|auto`).
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md §2/§2b): nine more ids
+  // joined the effort group — openai/gpt-6.1-terra,
+  // minimax/minimax-m3.1-flash, meta/muse-spark-open, inception/mercury-3,
+  // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
+  // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam (see
+  // their rows below); the §2b re-measure on fx 0.0.14 found no change to any
+  // existing row's set.
+  fx: {
+    "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
+    "zai/glm-5v-turbo": ["high", "medium", "low", "none", "auto"],
+    "zai/glm-4.7": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "openai/gpt-5.1-codex-max": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "spacexai/grok-4.6": ["xhigh", "high", "medium", "low", "auto"],
+    "spacexai/grok-build-0.1": ["high", "medium", "low", "none", "auto"],
+    "moonshotai/kimi-k2.7-code": ["high", "medium", "low", "none", "auto"],
+    "deepseek/deepseek-v4-flash": ["high", "medium", "low", "none", "auto"],
+    "minimax/minimax-m3": [],
+    "alibaba/qwen3.8-flash": ["xhigh", "medium", "low", "auto"],
+    "google/gemini-2.5-flash": ["high", "medium", "low", "none", "auto"],
+    "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "anthropic/claude-sonnet-5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "google/gemini-3.1-pro-preview": ["high", "low", "auto"],
+    "google/gemini-3.8-flash": ["high", "low", "auto"],
+    "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
+    "anthropic/claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "anthropic/claude-haiku-4.5": [],
+    "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "zai/glm-5.3": ["max", "high", "low", "auto"],
+    "deepseek/deepseek-v4-pro": ["max", "high", "low", "none", "auto"],
+    // Added 2026-09-21 as `[]` (docs/plans/add-grok-4-7.md §8 A1); refreshed
+    // 2026-10-22 from fx 0.0.14's `models[].efforts`, same set as
+    // spacexai/grok-4.6.
+    "spacexai/grok-4.7": ["xhigh", "high", "medium", "low", "auto"],
+    // 2026-09-22: not ACP-probed (no fx credentials that pass) — rests on the
+    // public Gateway catalog entry's reasoning_options (effort
+    // low/medium/high/xhigh/max, no none: thinking can't be disabled) plus
+    // fx's always-present auto, identical to the live-probed
+    // anthropic/claude-opus-5 row. docs/plans/add-claude-opus-5-5.md §8 A1.
+    "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // openai/gpt-6-sol + openai/gpt-6-luna: the original 2026-09-22
+    // measurement of the public Gateway catalog's `reasoning_options` was
+    // effort none/low/medium/high for BOTH. Re-measured 2026-09-30, the
+    // catalog reads toggle + effort none/low/medium/high/xhigh/max for both —
+    // now identical to openai/gpt-5.6-sol. Not ACP-probed.
+    // docs/plans/add-gpt-6-1-sol.md §2 (originally
+    // docs/plans/add-gpt-6-sol-and-luna.md §2/§3 D6).
+    "openai/gpt-6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    // 2026-09-28: not ACP-probed (no fx credentials that pass) — rests on the
+    // public Gateway catalog entry's reasoning_options (effort
+    // low/medium/high/xhigh/max — no toggle, no none, no budget_tokens:
+    // thinking can't be disabled) plus fx's always-present auto, the same
+    // shape as the anthropic/claude-opus-5.5 row above.
+    // docs/plans/add-claude-sonnet-5-5.md §8 A2.
+    "anthropic/claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-09-30: not ACP-probed — rests on the public Gateway catalog entry's
+    // reasoning_options (effort low/medium/high/xhigh/max — no toggle, no
+    // none) plus fx's always-present auto, same shape as the
+    // anthropic/claude-opus-5.5 row. docs/plans/add-gpt-6-1-sol.md §3 D3.
+    "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-10-07: not ACP-probed — rests on the public Gateway catalog entry's
+    // reasoning_options (effort low/medium/high/xhigh/max plus none, and a
+    // thinking toggle) plus fx's always-present auto.
+    "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    // 2026-10-14: not ACP-probed — rests on the public Gateway catalog entry
+    // (reasoning_options effort low/medium/high, context_window 1,000,000,
+    // released 2026-10-13, providers google + vertex) plus fx's always-present
+    // auto.
+    "google/gemini-4-argon": ["high", "medium", "low", "auto"],
+    // 2026-10-26: from each id's public Gateway `reasoning_options` plus
+    // `auto`, cross-checked against fx 0.0.14's `models[].efforts` (matched
+    // for all nine, docs/plans/add-gpt-6-1-terra.md §2b); Mercury 3's
+    // `instant` is deliberately omitted (D6). Not ACP-probed.
+    "openai/gpt-6.1-terra": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "minimax/minimax-m3.1-flash": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "meta/muse-spark-open": ["xhigh", "high", "medium", "low", "auto"],
+    "inception/mercury-3": ["high", "medium", "low", "auto"],
+    "moonshotai/kimi-k3.1-pro": ["max", "high", "low", "auto"],
+    "deepseek/deepseek-v4.1-flash-1017": ["max", "high", "low", "none", "auto"],
+    "meta/muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal", "auto"],
+    "mistral/mistral-large-4": ["high", "none", "auto"],
+    "reflection/beam": ["max", "xhigh", "high", "medium", "low", "auto"],
+  },
+  // Effort is encoded in the model-id suffix (<model>-<effort>), and `agy
+  // --effort` accepts only low/medium/high anyway, so the builder never emits
+  // `--effort` (owner D6/D7, docs/plans/add-gemini-4-argon.md). Every set is
+  // empty, so the picker collapses and supportedEfforts() returns [] even for
+  // a discovered-only id (an unknown key falls back to the default model's []).
+  antigravity: {
+    "gemini-4-argon-high": [],
+    "gemini-4-argon-medium": [],
+    "gemini-4-argon-low": [],
+    "gemini-3.8-flash-high": [],
+    "gemini-3.8-flash-medium": [],
+    "gemini-3.8-flash-low": [],
+    "gemini-3.6-flash-high": [],
+    "gemini-3.6-flash-medium": [],
+    "gemini-3.6-flash-low": [],
+    "gemini-3.1-pro-high": [],
+    "gemini-3.1-pro-low": [],
+    "claude-opus-5-5-high": [],
+    "claude-opus-5-5-medium": [],
+    "claude-opus-5-5-low": [],
+    "claude-sonnet-5-5-high": [],
+    "claude-sonnet-5-5-medium": [],
+    "claude-sonnet-5-5-low": [],
+    "gpt-oss-120b-medium": [],
+  },
+  // The sentinel accepts no variant (a variant needs a model). Every other
+  // OpenCode model is discovered, and `supportedEfforts` answers for it
+  // from discovery rather than from this table (D-6).
+  opencode: {
+    [OPENCODE_DEFAULT_MODEL]: [],
+  },
+  // GitHub Copilot's `--reasoning-effort` accepts none|minimal|low|medium|high|
+  // xhigh|max (no `ultra`), and an unsupported level is reported and ignored
+  // rather than failing the run (changelog 1.0.88). Per-model support is
+  // borrowed from agetor's tables for the same model families
+  // (docs/plans/github-copilot-harness.md §3.6, owner D7): claude rows from
+  // claude-code, gpt-6.1-sol / gpt-6-astra from codex minus `ultra`, the
+  // gemini / grok / kimi rows from fx. Copilot-only ids (`auto` itself,
+  // mai-code-1.1-flash) get the full set. Every row ends in `auto` ("Model
+  // default" — the driver omits the flag). A discovered-only id falls back to
+  // the `auto` row's full set.
+  copilot: {
+    "auto": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "gpt-6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "gemini-4-argon": ["high", "medium", "low", "auto"],
+    "gemini-3.8-flash": ["high", "low", "auto"],
+    "grok-4.7": ["xhigh", "high", "medium", "low", "auto"],
+    "kimi-k3": ["max", "high", "low", "auto"],
+    "mai-code-1.1-flash": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  },
+};
+
+/**
+ * Kinds that offer the `auto` ("Model default") effort row: fx (its own
+ * default reasoning option), GitHub Copilot (the driver omits
+ * `--reasoning-effort`) and OpenCode (no variant is passed; `supportedEfforts`
+ * puts `auto` in front of every discovered variant list, D-6). Every other
+ * kind never surfaces `auto`, even when a discovery probe reports it — see
+ * `supportedEfforts`.
+ */
+export const MODEL_DEFAULT_EFFORT_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "copilot", "opencode"]);
+
+/**
+ * Effort options the picker should show for a given (agent, model). Returns
+ * an empty list when the model doesn't accept the effort flag (Haiku 4.5).
+ * Unknown model ids fall back to the agent's `DEFAULT_MODEL` support set so a
+ * user-pasted future model still gets a sensible picker — except for cursor,
+ * where effort is encoded in the model id itself (`cursorModelArg`): an
+ * unknown cursor id passes through verbatim, so any effort picked for it
+ * would silently never reach the CLI. Those report no efforts instead.
+ * Returned in the EFFORT_OPTIONS order (highest → lowest).
+ *
+ * `discoveredEfforts` (optional third arg) is the CLI's own reported effort
+ * set for this exact model, when a caller has one (see `ModelOption.efforts`
+ * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
+ * a non-empty `discoveredEfforts` wins outright — the result is
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order), with
+ * `auto` additionally dropped from the filter for every kind outside
+ * `MODEL_DEFAULT_EFFORT_KINDS` (fx, copilot, opencode — see the `EFFORT_OPTIONS` row
+ * comment — so any other harness that discovers an `auto` id, e.g. codex's
+ * `model/list supportedReasoningEfforts`, must never surface a "Model
+ * default" row) —
+ * unless that leaves none of its ids known to agetor, in which case we fall
+ * through to the curated table below. `undefined`, `null`, or an empty array
+ * behave exactly like the two-argument call (today's curated-table-only
+ * behaviour). The
+ * curated table stays the fallback rather than the source of truth because
+ * discovery is best-effort and account-scoped (a harness may be absent,
+ * unauthenticated, or on an older CLI that can't discover at all): the
+ * curated catalog is what the harness's own UI *offers*, while its API often
+ * *accepts* a superset, so this function only ever narrows what the picker
+ * shows — it never invents an option the harness didn't report.
+ *
+ * OpenCode is answered by its own branch (`docs/plans/add-opencode-harness.md`
+ * D-6), because its variants are per model, discovered, and not limited to
+ * `EFFORT_OPTIONS` ids:
+ *   - the `OPENCODE_DEFAULT_MODEL` sentinel (or a null model) → `[]`;
+ *   - a discovered model that reported no variants (`discoveredEfforts` is
+ *     an empty array — the only kind for which `[]` differs from `null`) →
+ *     `[]`;
+ *   - a discovered model with variants → `auto` first, then the variants in
+ *     the order OpenCode reported them; an id outside `EFFORT_OPTIONS` (e.g.
+ *     `thinking`) gets a synthesized `{id, label: id}` row, which still only
+ *     ever names what the CLI reported;
+ *   - no discovery entry for the model (`null`/`undefined`) → `[auto]`.
+ */
+export function supportedEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): AgentOption[] {
+  // Cursor encodes effort in the model id itself (`cursorModelArg`), so an
+  // unknown cursor id has no way to receive an effort at all — this guard
+  // must run BEFORE the discovered-effort short-circuit below, or a
+  // non-empty `discoveredEfforts` for an unknown cursor id would defeat it
+  // and offer effort choices that would silently never reach the CLI.
+  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
+  if (agent === "opencode") return opencodeEfforts(model, discoveredEfforts);
+  if (discoveredEfforts && discoveredEfforts.length > 0) {
+    const discoveredAllowed = new Set(discoveredEfforts);
+    // `auto` belongs only to `MODEL_DEFAULT_EFFORT_KINDS` (fx, copilot, opencode — see
+    // the EFFORT_OPTIONS row comment): any other harness that happens to
+    // discover an "auto" id (e.g. codex's `model/list supportedReasoningEfforts`)
+    // must not surface a "Model default" row or pass `auto` through to a flag
+    // that doesn't understand it, so it's dropped from the discovered set
+    // before filtering for every other kind.
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
+      discoveredAllowed.has(o.id) && (MODEL_DEFAULT_EFFORT_KINDS.has(agent) || o.id !== "auto"));
+    if (fromDiscovery.length > 0) return fromDiscovery;
+  }
+  const key = model ?? DEFAULT_MODEL[agent];
+  const ids =
+    MODEL_EFFORT_SUPPORT[agent][key]
+    ?? MODEL_EFFORT_SUPPORT[agent][DEFAULT_MODEL[agent]]
+    ?? [];
+  const allowed = new Set(ids);
+  return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
+}
+
+const AUTO_EFFORT_OPTION: AgentOption = EFFORT_OPTIONS.find((o) => o.id === "auto") ?? {
+  id: "auto",
+  label: "Model default",
+};
+
+/** The OpenCode branch of {@link supportedEfforts} (D-6) — see that
+ *  function's doc for the four cases. */
+function opencodeEfforts(model: string | null, discoveredEfforts: readonly string[] | null | undefined): AgentOption[] {
+  if (model === null || model === OPENCODE_DEFAULT_MODEL) return [];
+  if (discoveredEfforts === null || discoveredEfforts === undefined) return [AUTO_EFFORT_OPTION];
+  if (discoveredEfforts.length === 0) return [];
+  const known = new Map(EFFORT_OPTIONS.map((o) => [o.id, o] as const));
+  const out: AgentOption[] = [AUTO_EFFORT_OPTION];
+  const seen = new Set<string>(["auto"]);
+  for (const raw of discoveredEfforts) {
+    const id = raw.trim();
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    out.push(known.get(id) ?? { id, label: id });
+  }
+  return out;
+}
+
+/**
+ * Effort ids a task's CURRENT effort may keep on `model`: the union of the
+ * discovered-wins set (`supportedEfforts` with `discoveredEfforts`) and the
+ * curated set (`supportedEfforts` without it). Consumed only by the
+ * model-change cascades — RunPanel's effort effect and the orchestrator's
+ * `effortFallbackForModelChange` — never by the pickers, which narrow their
+ * rows to the discovered-wins set.
+ *
+ * Why a union: the pickers mirror what the CLI's own menu offers, but a
+ * discovery refresh that omits an id — `none` on GPT-5.6 Sol, which the API
+ * accepts although Codex's `model/list` doesn't list it (live-verified
+ * 2026-09-03) — must not silently PATCH away an effort the user already chose
+ * from the curated table. Only an effort neither source supports cascades to
+ * a fallback. A retained-but-unoffered effort is rendered as an unlisted row
+ * in the effort select (same idea as `mergeModelOptions`' rule 6 for models)
+ * so the control never renders blank.
+ *
+ * OpenCode is the exception: it has no curated table, so its retainable set
+ * is `supportedEfforts("opencode", model, discoveredEfforts)` — plus, while
+ * the model's variants are UNKNOWN (`discoveredEfforts` null/undefined:
+ * discovery hasn't loaded, or its variant probe failed), the task's `current`
+ * effort, since nothing can prove a stored variant wrong yet. Without that a
+ * panel opened before discovery lands would PATCH a chosen variant to `auto`.
+ * A known-empty variant list (`[]`) and the "OpenCode default" sentinel (no
+ * effort reaches the CLI at all) still don't retain it.
+ */
+export function retainableEfforts(
+  agent: AgentKind,
+  model: string | null,
+  discoveredEfforts?: readonly string[] | null,
+  current?: string | null,
+): ReadonlySet<string> {
+  // OpenCode has no curated table to union with (D-6): what discovery says
+  // for this model is the whole answer, once discovery has said anything.
+  if (agent === "opencode") {
+    const ids = new Set(supportedEfforts(agent, model, discoveredEfforts).map((o) => o.id));
+    const unknown = discoveredEfforts === null || discoveredEfforts === undefined;
+    if (unknown && current && model !== null && model !== OPENCODE_DEFAULT_MODEL) ids.add(current);
+    return ids;
+  }
+  const ids = new Set<string>();
+  for (const o of supportedEfforts(agent, model, discoveredEfforts)) ids.add(o.id);
+  for (const o of supportedEfforts(agent, model)) ids.add(o.id);
+  return ids;
+}
+
+/**
+ * Permission modes claude exposes per model. As of claude 2.1.143 (verified
+ * by spawning `claude --model claude-sonnet-4-6 --permission-mode auto -p`
+ * directly) every mode agetor surfaces is universally supported across
+ * claude models, so the deny list is empty. Kept as a structure rather
+ * than removed so the picker stays ready for a future model-specific
+ * carve-out (historic case: `--permission-mode auto` was Opus-4.7-only on
+ * earlier releases). Unknown model ids fall back to the default model's
+ * deny set — better than spawning a CLI-arg error mid-run.
+ */
+const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
+  "claude-code": {
+    "mythos-5.1": [],
+    "mythos-5": [],
+    "fable-5.1": [],
+    "fable-5": [],
+    "opus-5.5": [],
+    "opus-5": [],
+    "opus-4.8": [],
+    "opus-4.7": [],
+    "opus-4.6": [],
+    "sonnet-5.5": [],
+    "sonnet-5": [],
+    "sonnet-4.6": [],
+    "haiku-5.5": [],
+    "haiku-4.5": [],
+  },
+  codex: {},
+  // No per-model mode carve-outs for cursor either — both modes it exposes
+  // (auto/ask) are universally available across its model list.
+  cursor: {},
+  gemini: {},
+  fx: {},
+  antigravity: {},
+  opencode: {},
+  // All three Copilot modes (auto / plan / ask) are universally available.
+  copilot: {},
+};
+
+export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
+  const key = model ?? DEFAULT_MODEL[agent];
+  const deny = new Set(
+    MODEL_MODE_DENY[agent][key]
+    ?? MODEL_MODE_DENY[agent][DEFAULT_MODEL[agent]]
+    ?? [],
+  );
+  return AGENT_OPTIONS[agent].modes.filter((m) => !deny.has(m.id));
+}
+
+/**
+ * The single spawn-time AND picker default for a stored `null` mode — every
+ * kind's `modes[0]` is `"auto"` except fx, whose `modes[0]` is `"yolo"`
+ * ("Full access"; see `AGENT_OPTIONS.fx.modes` and the `CODE_PLAN_MODE.fx`
+ * comment). Used by every spawn branch in `src/bun/agents.ts`'s
+ * `buildCommand`/`spawnAgent`, by `reconcileTaskSession`, by `agetor add`'s
+ * non-interactive default, and by the webview's mode dropdown fallback for a
+ * `null` row (RunPanel's `nullModeFallback`) and its reset on switching a
+ * task's agent kind. `createTask` still stores `null` for an unset mode —
+ * only resolution at spawn/display time changed — so this function, not a
+ * stored value, is the one place "what does null mean" can drift.
+ *
+ * This supersedes the earlier "a stored null still spawns as auto (even for
+ * fx)" rule: the owner explicitly asked for fx's hands-off default to
+ * escalate to Full access (`docs/plans/fx-recovery-follow-ups.md` §3.6),
+ * since fx's `auto` mode blocks on an interactive permission card whenever
+ * its hard-wired reviewer is unreachable (see the fx harness section of
+ * CLAUDE.md) — `auto` is not actually hands-off for fx the way it is for
+ * every other kind.
+ */
+export function defaultModeFor(kind: AgentKind): string {
+  return AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
+}
+
+export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
+  "claude-code": {
+    models: [
+      { id: "mythos-5.1", label: "Mythos 5.1", hint: "Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
+      { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
+      { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
+      { id: "opus-5.5", label: "Opus 5.5", hint: "Default — Fable 5.1-level on most work; API list price $4/$20 per MTok (Opus 5: $5/$25). Thinking is always on; effort is the only control (the model's own default is medium)." },
+      { id: "opus-5", label: "Opus 5", hint: "Prior Opus release ($5/$25 per MTok)." },
+      { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
+      { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
+      { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
+      { id: "sonnet-5.5", label: "Sonnet 5.5", hint: "Faster, lower-cost complement to Opus 5.5 ($2/$10 per MTok) — 30%+ faster than Sonnet 5 on coding/agentic work. Claude Code's own default effort for it is medium." },
+      { id: "sonnet-5", label: "Sonnet 5", hint: "Prior Sonnet release ($2/$10 per MTok)." },
+      { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Prior Sonnet generation." },
+      { id: "haiku-5.5", label: "Haiku 5.5", hint: "Cheapest, fastest Claude ($0.10/$0.50 per MTok up to 100k tokens, $0.50/$2.50 above). 1M context. API default effort is medium." },
+      { id: "haiku-4.5", label: "Haiku 4.5", hint: "Prior Haiku release ($1/$5 per MTok). No effort control." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — claude's auto-mode AI classifier decides per call. Clarifying questions and plan-approval modals route to agetor's UI." },
+      { id: "bypass", label: "Bypass", hint: "Hands-off and silent — no classifier, no clarifying-question channel, no plan-approval modal. Pure --dangerously-skip-permissions. Use when you fully trust the prompt." },
+      { id: "acceptEdits", label: "Accept edits", hint: "Auto-accept file edits, ask for the rest." },
+      { id: "plan", label: "Plan only", hint: "Plan without making changes." },
+      { id: "ask", label: "Ask before changes", hint: "Standard interactive permissions." },
+    ],
+    // The full list lives in `EFFORT_OPTIONS`. We surface every id this agent
+    // can ever produce so legacy rows (e.g. effort="xhigh" set under codex,
+    // then switched to claude-code) still resolve their stored value to a
+    // label rather than displaying a bare id.
+    efforts: EFFORT_OPTIONS,
+  },
+  codex: {
+    models: [
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "OpenAI's most capable model. Needs codex CLI ≥ 0.153 — older CLIs answer a 400 (\"requires a newer version of Codex\")." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same codex CLI ≥ 0.153 floor as Astra." },
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Recommended default — near-Astra performance for complex coding and agentic work at GPT-6 Sol's price; the upgrade from GPT-6 Sol. Needs codex CLI ≥ 0.159 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", hint: "Fast, efficient model for visual reasoning, computer use and clear writing; replaces GPT-5.6 Terra at about half its price. Needs codex CLI ≥ 0.159 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "Previous Sol — still offered; GPT-6.1 Sol is its upgrade. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Fastest, lowest-cost GPT-6 for focused, high-volume tasks; replaces GPT-5.6 Luna. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous-generation flagship — superseded by GPT-6.1 Sol; still works on ChatGPT plans." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6.1 Terra." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model — superseded by GPT-6 Luna." },
+      { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
+      { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto (workspace-write)", hint: "Edit files without approval prompts." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — codex can't modify files (read-only sandbox)." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
+  cursor: {
+    models: Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => ({
+      id,
+      label: spec.label,
+      hint: spec.hint,
+    })),
+    modes: [
+      { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
+      { id: "plan", label: "Plan", hint: "Read-only planning — cursor-agent --mode plan. Approve the plan to implement." },
+      { id: "ask", label: "Read-only", hint: "Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
+  gemini: {
+    // Frontier row first (Gemini 4), then Pro tier, then Flash tier; newest
+    // first within each tier.
+    // gemini-3-pro-preview (the default until 2026-09) was shut down by
+    // Google on 2026-03-09 and is retired here; migration 049 rewrites
+    // tasks still pinned to it to its successor, 3.1 Pro preview. Google
+    // deprecated 3.7 Flash on 2026-10-08 (auto-routed to 3.8) and 3.5 Flash
+    // (to 3.6); those rows are retired here too, and migration 066 rewrites
+    // tasks still pinned to 3.7/3.5 Flash to 3.8 Flash.
+    models: [
+      // GA 2026-10-13 (ai.google.dev model page / changelog). The only
+      // published code — no -preview suffix, no sibling ids. thinking_level
+      // low/medium/high, default medium; 1,048,576-token shared context. Not
+      // on the API free tier. Gemini CLI itself stopped serving Google AI
+      // Pro/Ultra (and free Code Assist for individuals) on 2026-06-18 — only
+      // paid Gemini / Agent Platform API keys and Code Assist Standard/
+      // Enterprise still work (developers.googleblog.com, "transitioning Gemini
+      // CLI to Antigravity CLI") — so the plan-tier gate (Ultra/Enterprise)
+      // lives on the antigravity rows, not here. Gemini CLI 0.64.0 forwards
+      // the id verbatim and gives it the `chat-base` alias config (no thinkingLevel) until upstream PR #29737
+      // lands, so there is deliberately no MODEL_MIN_CLI_VERSION.gemini floor
+      // (owner D2, docs/plans/add-gemini-4-argon-grill.md). Vertex AI / Agent
+      // Platform serve it from the `global` location only — us-central1 404s
+      // — and agetor sets no location.
+      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Newest flagship (GA 2026-10-13) — Google's most capable model for complex coding, agentic, math and science work. Needs a paid Gemini API or Agent Platform key (not the API free tier) — Gemini CLI no longer serves Google AI Pro/Ultra logins, so use the Antigravity harness for those. Runs at Google's default (medium) thinking until Gemini CLI registers the id." },
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Recommended default — current flagship; Google's successor to the retired 3 Pro preview." },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Latest and most capable Flash — built for long-horizon coding and agentic work at Flash cost." },
+      // Fairwind-Program-gated cybersecurity twin of 3.8 Flash (launched 2026-09-02).
+      // Google has published no model code for it — not on the Cyber page, the
+      // Fairwind page, the API models table, the model-card index, or the
+      // Enterprise Agent Platform model list (all checked 2026-09-03) — so this
+      // id follows Google's own suffix convention (gemini-3.1-flash-lite,
+      // gemini-3-pro-image) and OpenAI's gpt-5.6-cyber precedent. Owner-approved
+      // pending a published code; agetor passes it through verbatim, so a
+      // grant that names it differently needs only this literal changed.
+      { id: "gemini-3.8-flash-cyber", label: "Gemini 3.8 Flash Cyber", hint: "Cybersecurity-tuned 3.8 Flash for vulnerability discovery and patching. Requires Fairwind Program access (invite-only). No public model code yet — this id follows Google's naming convention; if your grant names it differently, create the task with `agetor add --model <code>`." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earliest Flash generation offered." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — gemini can't modify files (--approval-mode plan)." },
+    ],
+    // No model in MODEL_EFFORT_SUPPORT.gemini accepts the effort flag, so the
+    // picker collapses for every model — see EFFORT_OPTIONS list comment.
+    efforts: EFFORT_OPTIONS,
+  },
+  fx: {
+    // Vercel AI Gateway ids, passed verbatim. The standard (non-catalogOnly)
+    // rows are drawn from a standard-plan 158-id catalog (measured
+    // 2026-08-27 on fx 0.0.6); the catalogOnly rows below are drawn from the
+    // 230-id unauthenticated catalog and are absent from that 158-id
+    // account, so they're offered only when the signed-in account's own
+    // discovered catalog actually contains them (see
+    // `AgentOption.catalogOnly`, `CATALOG_SCOPED_KINDS`). Discovered-only ids
+    // (neither list) append via `mergeModelOptions`
+    // (`src/shared/model-options.ts`).
+    // Re-verified 2026-08-31 on fx 0.0.7 (unauth view: all 16 standard + the
+    // then-5 catalogOnly ids present, catalog grown to 234; signed-in view
+    // unverifiable this pass — token expired).
+    // 2026-09-02: google/gemini-3.8-flash added from fx 0.0.7's unauthenticated
+    // catalog (`fx models --json` under an expired login); its presence in a
+    // standard signed-in account's catalog is unverified, hence catalogOnly.
+    // 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
+    // (Gateway-side growth, not a binary property); all curated ids present;
+    // signed-in view still unverifiable (token expired). Six more premium
+    // rows added this pass (anthropic/claude-fable-5.1, anthropic/claude-haiku-4.5,
+    // openai/gpt-6-astra, openai/gpt-5.6-sol, zai/glm-5.3, deepseek/deepseek-v4-pro),
+    // bringing catalogOnly to twelve rows total — same "offered only when the
+    // signed-in account's catalog includes it" treatment as the original six.
+    // Latest: 2026-09-14, unauth catalog reads 247 ids on 0.0.8, 0.0.9 and
+    // 0.0.10 alike (Gateway-side, not client-version-dependent); all 28
+    // curated ids (16 standard + 12 catalogOnly) still present; signed-in
+    // view still unverifiable (token expired).
+    // 2026-09-21: spacexai/grok-4.7 (released the same day) added from fx
+    // 0.0.10's unauthenticated catalog; its presence in a standard signed-in
+    // account is unverified (`fx status` reads auth: missing), hence
+    // catalogOnly — thirteen catalogOnly rows, 29 curated ids total. That
+    // catalog reads 246 ids, one fewer than 2026-09-14's 247 despite the
+    // addition: 28 of the 29 curated ids are present, and mistral/devstral-2
+    // is gone from both `fx models --json` and the public Gateway catalog
+    // (Gateway-side retirement). The row is left in place here — retiring a
+    // curated id is its own change (picker + tasks.model + lastModel pref);
+    // the curated ∩ discovered merge already hides it wherever discovery
+    // works.
+    // 2026-09-22: anthropic/claude-opus-5.5 (released the same day) added
+    // from fx 0.0.10's unauthenticated catalog (`fx models --json`, 251 ids,
+    // auth: missing — the -fast twin anthropic/claude-opus-5.5-fast is also
+    // listed and stays discovery-only like claude-opus-5-fast); its presence
+    // in a standard signed-in account is unverified, hence catalogOnly —
+    // fourteen catalogOnly rows, 30 curated ids total. 29 of the 30 are
+    // present; mistral/devstral-2 is still absent (see the 2026-09-21 note).
+    // 2026-09-22: openai/gpt-6-sol and openai/gpt-6-luna (released the same
+    // day) added from fx 0.0.10's unauthenticated catalog (255 ids that day,
+    // up from 246; every prior curated id — opus-5.5 included — still present except
+    // mistral/devstral-2, still gone); signed-in presence unverified, hence
+    // catalogOnly — sixteen catalogOnly rows, 32 curated ids total.
+    // 2026-09-28: anthropic/claude-sonnet-5.5 (released the same day) added
+    // from fx 0.0.10's unauthenticated catalog (`fx models --json`, 256 ids,
+    // up from 255; no -fast twin); signed-in presence unverified, hence
+    // catalogOnly — seventeen catalogOnly rows, 33 curated ids total. Every
+    // prior curated id is still present except mistral/devstral-2, still gone.
+    // 2026-09-30: openai/gpt-6.1-sol (released 2026-09-29) added from fx
+    // 0.0.10's unauthenticated catalog (`fx models --json`, 260 ids, up from
+    // 256; its -fast twin openai/gpt-6.1-sol-fast is also listed and stays
+    // discovery-only; no GPT-6.1 Luna exists); signed-in presence unverified,
+    // hence catalogOnly — eighteen catalogOnly rows, 34 curated ids total.
+    // Every prior curated id is still present except mistral/devstral-2,
+    // still gone.
+    // 2026-10-07: anthropic/claude-haiku-5.5 added from fx 0.0.10's
+    // unauthenticated catalog (`fx models --json`, 259 ids; no -fast twin);
+    // signed-in presence unverified, hence catalogOnly — nineteen catalogOnly
+    // rows, 35 curated ids total. Every prior curated id is still present
+    // except mistral/devstral-2, still gone.
+    // 2026-10-14: google/gemini-4-argon added from fx 0.0.10's unauthenticated
+    // catalog (`fx models --json`, 254 ids; no -fast twin); signed-in presence
+    // unverified, hence catalogOnly — twenty catalogOnly rows, 36 curated ids
+    // total. This pass also found alibaba/qwen3-coder-plus and
+    // anthropic/claude-3-haiku absent from the unauth view (mistral/devstral-2
+    // still gone) — left as-is, see docs/plans/add-gemini-4-argon.md §9.
+    // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4):
+    // the unauthenticated catalog reads 264 ids and the owner's signed-in
+    // standard `fx login` catalog 145. Neither carries
+    // alibaba/qwen3-coder-plus, mistral/devstral-2 or anthropic/claude-3-haiku,
+    // so those three are retired (migration 074 moves fx-kind tasks and
+    // profiles on them to the default) — 13 standard + 20 catalogOnly rows,
+    // 33 curated ids total. The signed-in catalog also lacks
+    // zai/glm-5.3-flash and spacexai/grok-4.7, so the default moved to
+    // deepseek/deepseek-v4-flash (first row; see `DEFAULT_MODEL.fx`);
+    // zai/glm-5.3-flash stays a standard row (not retired, just absent from
+    // that account — the curated ∩ discovered merge hides it there).
+    // 2026-10-26 (fx 0.0.14, docs/plans/add-gpt-6-1-terra.md §2/§2b): the
+    // unauthenticated catalog reads 262 ids and the owner's signed-in
+    // standard `fx login` catalog 139. Nine ids added, all present in the
+    // unauthenticated view; gating follows signed-in presence, so
+    // minimax/minimax-m3.1-flash, meta/muse-spark-open and inception/mercury-3
+    // (signed-in) are standard rows, while openai/gpt-6.1-terra,
+    // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
+    // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam
+    // (absent from the signed-in view) are catalogOnly — 16 standard + 26
+    // catalogOnly rows, 42 curated ids total. deepseek/deepseek-v4.1-flash-1017
+    // sits directly under the default row (a catalogOnly row inside the
+    // standard block; the flag, not the position, decides gating). The five
+    // standard rows absent from signed-in (zai/glm-5.3-flash,
+    // openai/gpt-5.4-mini, spacexai/grok-4.6, minimax/minimax-m3,
+    // alibaba/qwen3.8-flash) are left in place. The -fast / -highspeed /
+    // -free twins stay discovery-only.
+    models: [
+      { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", hint: "Default — 1M context · 384K output. In a standard signed-in Gateway catalog." },
+      { id: "deepseek/deepseek-v4.1-flash-1017", label: "DeepSeek V4.1 Flash 1017", hint: "1M context · 1M output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "1M context · 131K output. Absent from some signed-in standard catalogs." },
+      { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
+      { id: "zai/glm-4.7", label: "GLM 4.7", hint: "200K context · 120K output, prior Z.AI flagship." },
+      { id: "openai/gpt-5.2", label: "GPT-5.2", hint: "400K context · 128K output — top OpenAI tier on a standard Gateway plan; openai/gpt-5.2-fast via discovery." },
+      { id: "openai/gpt-5.1-codex-max", label: "GPT-5.1 Codex Max", hint: "400K context · 128K output, codex-tuned." },
+      { id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini", hint: "400K context · 128K output, newest-gen small model." },
+      { id: "spacexai/grok-4.6", label: "Grok 4.6", hint: "500K context · 500K output." },
+      { id: "spacexai/grok-build-0.1", label: "Grok Build 0.1", hint: "256K context · 256K output, xAI's coding-agent model." },
+      { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", hint: "256K context · 32K output, Moonshot's coding-tuned tier." },
+      { id: "minimax/minimax-m3.1-flash", label: "MiniMax M3.1 Flash", hint: "1M context · 1M output — MiniMax's newest flash tier." },
+      { id: "minimax/minimax-m3", label: "MiniMax M3", hint: "512K context · 512K output." },
+      { id: "alibaba/qwen3.8-flash", label: "Qwen 3.8 Flash", hint: "991K context · 128K output." },
+      { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "1M context · 65K output." },
+      { id: "meta/muse-spark-open", label: "Muse Spark Open", hint: "1M context · 1M output." },
+      { id: "inception/mercury-3", label: "Mercury 3", hint: "1M context · 131K output. fx's Instant effort isn't offered here." },
+      { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "moonshotai/kimi-k3.1-pro", label: "Kimi K3.1 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-fable-5.1", label: "Claude Fable 5.1", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-astra", label: "GPT-6 Astra", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-sol", label: "GPT-6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "google/gemini-4-argon", label: "Gemini 4 Argon", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6.1-terra", label: "GPT-6.1 Terra", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "meta/muse-wonder-1.0", label: "Muse Wonder", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "mistral/mistral-large-4", label: "Mistral Large 4", hint: "512K context · 262K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "reflection/beam", label: "Beam 1.0", hint: "1M context · 131K output, coding model — offered only when this account's catalog includes it.", catalogOnly: true },
+    ],
+    modes: [
+      { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
+      { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
+    ],
+    // 40 of the 42 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx, refreshed 2026-10-22 against fx 0.0.14's
+    // `models[].efforts`; nine rows added 2026-10-26); the other 2
+    // (minimax/minimax-m3, anthropic/claude-haiku-4.5) report an empty set
+    // and the picker collapses for those, same as any other kind's no-effort
+    // models. A discovered `models[].efforts` set wins over the table. Every
+    // id-supported model always includes `auto` (fx's own default) last, per
+    // EFFORT_OPTIONS.
+    efforts: EFFORT_OPTIONS,
+  },
+  antigravity: {
+    models: [
+      // Gemini 4 Argon (GA 2026-10-13). Ids follow Antigravity's own
+      // <model>-<effort> convention (every known agy id and the cortexkit
+      // registry agree) but are unconfirmed against a live `agy models` on an
+      // Ultra account (owner D3/D4). Ultra / eligible-Enterprise only in
+      // Antigravity; discovery still appends whatever `agy models` really
+      // lists.
+      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)", hint: "Gemini 4 Argon with high reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
+      { id: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)", hint: "Gemini 4 Argon with medium reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
+      { id: "gemini-4-argon-low", label: "Gemini 4 Argon (Low)", hint: "Gemini 4 Argon with low reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
+      { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", hint: "Latest Gemini 3.8 Flash with high reasoning effort." },
+      { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)", hint: "Gemini 3.8 Flash with medium reasoning effort." },
+      { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)", hint: "Fast Gemini 3.8 Flash with low reasoning effort." },
+      { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)", hint: "Gemini 3.6 Flash with high reasoning effort." },
+      { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)", hint: "Gemini 3.6 Flash with medium reasoning effort." },
+      { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)", hint: "Gemini 3.6 Flash with low reasoning effort." },
+      { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)", hint: "Flagship Gemini 3.1 Pro with high reasoning effort." },
+      { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)", hint: "Gemini 3.1 Pro with low reasoning effort." },
+      { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)", hint: "Claude Opus 5.5 with high reasoning effort." },
+      { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium)", hint: "Claude Opus 5.5 with medium reasoning effort." },
+      { id: "claude-opus-5-5-low", label: "Claude Opus 5.5 (Low)", hint: "Claude Opus 5.5 with low reasoning effort." },
+      { id: "claude-sonnet-5-5-high", label: "Claude Sonnet 5.5 (High)", hint: "Claude Sonnet 5.5 with high reasoning effort." },
+      { id: "claude-sonnet-5-5-medium", label: "Claude Sonnet 5.5 (Medium)", hint: "Claude Sonnet 5.5 with medium reasoning effort." },
+      { id: "claude-sonnet-5-5-low", label: "Claude Sonnet 5.5 (Low)", hint: "Claude Sonnet 5.5 with low reasoning effort." },
+      { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", hint: "Open weights model with medium reasoning effort." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — auto-approves all tool permissions (--dangerously-skip-permissions)." },
+      { id: "plan", label: "Plan only", hint: "Plan without making changes (--mode plan)." },
+      { id: "ask", label: "Accept edits", hint: "Auto-accept file edits, ask before executing commands (--mode accept-edits)." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
+  opencode: {
+    // The pinned sentinel is the only curated row (D-5): every real model is
+    // `provider/model` from the harness's own `opencode models` catalog,
+    // which depends on the providers the user configured (CATALOG_SCOPED_KINDS).
+    models: [
+      { id: OPENCODE_DEFAULT_MODEL, label: "OpenCode default", hint: "Use the model configured in OpenCode (no -m)", pinned: true },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Build agent; approves every tool call (--auto)" },
+      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits, but shell commands still run; permission asks are rejected" },
+    ],
+    // Variants are discovered per model; `supportedEfforts` adds any variant
+    // id outside EFFORT_OPTIONS as a synthesized row (D-6).
+    efforts: EFFORT_OPTIONS.filter((o) => o.id === "auto"),
+  },
+  copilot: {
+    models: [
+      { id: "auto", label: "Auto", hint: "Default — Copilot's own model router. Available on every plan, a 10% credit discount, and it never picks a model your organisation has disabled. A status line names the model Copilot actually used." },
+      { id: "claude-opus-5.5", label: "Claude Opus 5.5", hint: "Anthropic's Opus 5.5 through Copilot. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Faster, lower-cost complement to Opus 5.5." },
+      { id: "claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Cheapest, fastest Claude. Needs Copilot CLI 1.0.94 or newer." },
+      { id: "claude-fable-5.1", label: "Claude Fable 5.1", hint: "Most capable Claude, above Opus. Needs Copilot CLI 1.0.83 or newer." },
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "OpenAI's GPT-6.1 Sol through Copilot. Needs Copilot CLI 1.0.90 or newer." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Most capable GPT-6 tier, heavier than Sol. Needs Copilot CLI 1.0.85 or newer." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Efficient GPT-6 model. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "GPT-6 Sol, superseded by GPT-6.1 Sol. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Google's Gemini 4 Argon through Copilot. Needs Copilot CLI 1.0.98 or newer." },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Fast Gemini 3.8 Flash for long-horizon coding at Flash cost." },
+      { id: "grok-4.7", label: "Grok 4.7", hint: "xAI's Grok 4.7 through Copilot." },
+      { id: "kimi-k3", label: "Kimi K3", hint: "Moonshot's Kimi K3 through Copilot. Needs Copilot CLI 1.0.79 or newer." },
+      { id: "mai-code-1.1-flash", label: "MAI Code 1.1 Flash", hint: "Microsoft's MAI Code 1.1 Flash — a Copilot-only model." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — allows all tools, paths and URLs and trusts the worktree (--allow-all + COPILOT_ALLOW_ALL)." },
+      { id: "plan", label: "Plan", hint: "Plan without making changes (--mode plan). Approving the plan switches the task to Auto." },
+      { id: "ask", label: "Read-only", hint: "No allow flags — Copilot denies file edits and commands that change files (read-only commands still run), and the run can still report success. Repo MCP servers and hooks stay off (untrusted folder)." },
+    ],
+    // Per-model effort levels live in MODEL_EFFORT_SUPPORT.copilot; the
+    // "Model default" (`auto`) row omits --reasoning-effort.
+    efforts: EFFORT_OPTIONS,
+  },
+};
+
+export type RunStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  /** Run was active when agetor last shut down; reconciled at next boot. */
+  | "orphaned";
+
+export interface Run {
+  id: string;
+  taskId: string;
+  /** Harness id the run launched under. Same semantics as `Task.agent`. */
+  agent: string;
+  status: RunStatus;
+  startedAt: number;
+  endedAt: number | null;
+  exitCode: number | null;
+  /**
+   * Name of the tmux session that hosted this run's REPL (claude-code) or
+   * one-shot `codex exec` turn (codex). For claude it's the same value across
+   * every run for a task (one persistent session); for codex each turn spawns
+   * a fresh session that shares the per-task name. NULL for pre-migration
+   * legacy rows.
+   */
+  tmuxSession: string | null;
+  /**
+   * Claude Code's own per-session uuid (the basename of the JSONL file under
+   * `~/.claude/projects/<encoded-cwd>/<id>.jsonl`). Captured when the tmux
+   * driver discovers the JSONL after spawn. Used to drive `claude --resume`
+   * when the user keeps talking to a task whose original tmux session has
+   * been torn down. NULL for codex and legacy rows.
+   */
+  claudeSessionId: string | null;
+  /**
+   * Codex's own conversation/thread id (the `thread_id` from its `--json`
+   * stream's `thread.started` event). Captured when the codex tmux driver
+   * tails the run's JSONL log. Drives `codex exec resume <thread_id>` for
+   * follow-up turns and is the reattach key for a mid-turn codex run. NULL
+   * for claude-code and legacy rows.
+   */
+  codexSessionId: string | null;
+  /**
+   * Cursor's ACP session id, discovered from `session/new` or `session/load`.
+   * The next turn resumes with `session/load` of this id. A restart orphans
+   * a mid-turn Cursor child and rebuilds any open question from `cursor_asks`.
+   * NULL for every other agent kind and legacy rows.
+   */
+  cursorSessionId: string | null;
+  /**
+   * Gemini CLI's own per-session uuid — self-issued by agetor (not
+   * discovered from the CLI) and passed as `--session-id` on the first turn,
+   * `--resume` on every follow-up. Captured synchronously at spawn time
+   * (mirrors claude's pre-generated-uuid pattern), unlike codex's
+   * discovered-from-an-event `codexSessionId`. NULL for claude-code/codex
+   * and legacy rows.
+   */
+  geminiSessionId: string | null;
+  /**
+   * fx's own conversation/session id — DISCOVERED (not pre-generated), the
+   * ACP `session/new` result's `sessionId`. Captured by the fx-acp driver and
+   * persisted for `session/resume` on follow-up turns, mirroring codex's
+   * discovered-from-an-event `codexSessionId` rather than gemini's
+   * self-issued-uuid pattern. NULL for every other agent kind and legacy rows.
+   */
+  fxSessionId: string | null;
+  /**
+   * Antigravity CLI's own conversation id — DISCOVERED from the `init` event's
+   * `conversation_id`. Captured by the antigravity-tmux driver and persisted
+   * for `--conversation` on follow-up turns. NULL for every other agent kind.
+   */
+  antigravitySessionId?: string | null;
+  /**
+   * OpenCode's own session id (`ses_…`) — DISCOVERED from the first
+   * non-empty `sessionID` in the `run --format json` stream. Captured by the
+   * opencode-tmux driver and replayed as `-s <id>` on follow-up turns.
+   * Optional like `antigravitySessionId`; NULL for every other agent kind.
+   */
+  opencodeSessionId?: string | null;
+  /**
+   * GitHub Copilot CLI's session id — SELF-ISSUED by agetor (a uuid minted
+   * for the first turn and passed as `--session-id`, which creates or resumes
+   * the session), like gemini's, not discovered from an event. Captured by
+   * the copilot-tmux driver and persisted as `runs.copilot_session_id`; a
+   * follow-up turn resumes it only on the same harness id (a different
+   * `COPILOT_HOME` can't see it). NULL for every other agent kind.
+   */
+  copilotSessionId?: string | null;
+  /**
+   * How this run came to exist. `null`/undefined = user-initiated (Run
+   * button, a follow-up message typed into the panel — every run before
+   * this field existed). `"continuation"` = opened automatically by the
+   * orchestrator after the same claude session auto-resumed post `end_turn`
+   * (e.g. it delegated to a background task and later kept talking once
+   * that task finished). Optional so callers that don't pass it (most of
+   * them — only the continuation-run factory sets it) keep compiling
+   * unchanged; DB rows predating migration 023 read back as null.
+   * `"imported"` = the seed run written when a Claude Code session started
+   * outside Agetor was imported (migration 068 does not change the column;
+   * the value is a new application of the existing `origin` text).
+   * `"auto-resume"` = an fx continue-recovery run the auto-resume timer
+   * started (`resumeFxRecovery` with `origin: "auto"`) — no user action; a
+   * manual Resume stays `null`. Same column, a new value.
+   */
+  origin?: "continuation" | "imported" | "auto-resume" | null;
+}
+
+/** One changed file in a task's git diff (worktree vs its pinned base). */
+export interface DiffFile {
+  /** Repo-relative path of the file in its new state. */
+  path: string;
+  /** Previous path for renames; null otherwise. */
+  oldPath: string | null;
+  status: "added" | "modified" | "deleted" | "renamed";
+  /** Lines added (`+`) in this file's hunks. 0 for binary. */
+  additions: number;
+  /** Lines removed (`-`) in this file's hunks. 0 for binary. */
+  deletions: number;
+  /** True when git reports the file as binary (no textual hunks). */
+  binary: boolean;
+  /**
+   * Unified-diff body for this file (the `@@ … @@` hunks, without the
+   * `diff --git` header). Empty for binary files. May be truncated — see
+   * `truncated`.
+   */
+  hunks: string;
+  /** True when `hunks` was cut off because the file's diff was very large. */
+  truncated: boolean;
+}
+
+/**
+ * A task's git diff: everything its worktree changed relative to the pinned
+ * base ref (committed + uncommitted + newly created files). Returned by
+ * `GET /tasks/:id/diff`.
+ */
+export interface TaskDiff {
+  /** Short base sha the diff is computed against, or null when not applicable. */
+  base: string | null;
+  files: DiffFile[];
+  /**
+   * Friendly explanation when there's nothing to show — e.g. the task has no
+   * worktree yet, isolation is off, or the worktree is clean. Absent when
+   * `files` is non-empty.
+   */
+  note?: string;
+}
+
+export type GitHubItemKind = "pulls" | "issues";
+export type GitHubItemState = "open" | "closed" | "all";
+
+export interface GitHubLabel {
+  name: string;
+  color: string | null;
+}
+
+/** A repository label as returned by the labels-management endpoints (carries a
+ *  description, unlike the lighter GitHubLabel embedded in an item). `color` is
+ *  6-hex without a leading `#`. */
+export interface GitHubRepoLabel {
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface GitHubLabelsResult {
+  repo: string;
+  labels: GitHubRepoLabel[];
+}
+
+export interface GitHubUser {
+  login: string;
+  avatarUrl: string | null;
+  htmlUrl: string | null;
+}
+
+export interface GitHubAssigneesResult {
+  repo: string;
+  assignees: GitHubUser[];
+}
+
+export interface GitHubMilestone {
+  number: number;
+  title: string;
+}
+
+/** A repository milestone as returned by the milestone-management endpoints
+ *  (carries state, description, due date and issue counts, unlike the lighter
+ *  GitHubMilestone embedded in an item). `dueOn` is an ISO8601 string or null. */
+export interface GitHubRepoMilestone {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  dueOn: string | null;
+  openIssues: number;
+  closedIssues: number;
+  htmlUrl: string;
+}
+
+export interface GitHubMilestonesResult {
+  repo: string;
+  milestones: GitHubRepoMilestone[];
+}
+
+export interface GitHubListItem {
+  kind: GitHubItemKind;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  draft: boolean;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  assignees: GitHubUser[];
+  milestone: GitHubMilestone | null;
+  body: string;
+  labels: GitHubLabel[];
+  comments: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  /** Set (to a timestamp) only for a merged pull request; null otherwise —
+   *  lets the UI distinguish a merged PR from a closed-unmerged one, which the
+   *  `state: "closed"` value alone conflates. Always null for issues. */
+  mergedAt: string | null;
+  /** Whether the conversation is locked (REST `locked` field). Applies to both
+   *  issues and pull requests — GitHub locks both through the same
+   *  `/issues/:number/lock` endpoint. Defaults to `false` when the source
+   *  response omits the field (some list paths do). */
+  locked: boolean;
+  /** Local filesystem path of the project this item came from (G8, multi-repo
+   *  aggregation). Single-repo listing sets this to that repo's dir; every
+   *  per-item action resolves `item.sourcePath ?? projectPath` so writes land
+   *  on the correct repo even when the list aggregates several. Null only for
+   *  items normalized without a known dir (shouldn't happen in practice —
+   *  every list/action call site threads one through). */
+  sourcePath: string | null;
+}
+
+/** Rate-limit snapshot parsed from a GitHub API response's `x-ratelimit-*`
+ *  headers (see `parseRateLimit` in `src/bun/github.ts`). `resource` is
+ *  GitHub's own bucket name (e.g. "core" or "search" — the Search API has a
+ *  much tighter ~30/min budget than the ~5000/hr core budget). */
+export interface GitHubRateLimit {
+  remaining: number;
+  limit: number;
+  resource: string;
+}
+
+/** The viewer's permission level on a repo, from `GET /repos/:o/:r`'s
+ *  `permissions` object. Drives push-only-control gating (F13) — `push` is
+ *  the one the UI cares about; `admin`/`maintain` ride along for future use.
+ *  Unauthenticated (no token) resolves to all-false rather than erroring,
+ *  mirroring `getGitHubViewer`'s no-token behavior. */
+export interface GitHubRepoPermissions {
+  push: boolean;
+  admin: boolean;
+  maintain: boolean;
+}
+
+export interface GitHubListResult {
+  /** Single-repo mode: "owner/name". Aggregate mode (G8): a display summary
+   *  like "3 repositories" — see `repos` for the actual slugs. */
+  repo: string;
+  /** Null in aggregate mode (G8) — there's no single repo to open. */
+  webUrl: string | null;
+  auth: "token" | "none";
+  items: GitHubListItem[];
+  /** Page number this result represents — mirrors the request's `page`
+   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`.
+   *  Aggregate mode (G8) always reports page 1 — "Load more" is disabled. */
+  page: number;
+  /** True when another page is available beyond this one — derived from the
+   *  REST `link: rel="next"` header, or from the Search API's `total_count`
+   *  (capped at GitHub's 1000-result search ceiling). In aggregate mode (G8)
+   *  this instead means "at least one aggregated repo had more than the
+   *  first page fetched" (the merged list is truncated to one page per repo). */
+  hasMore: boolean;
+  /** Rate-limit snapshot from the headers of the response that produced this
+   *  page, or null when the headers were absent. Aggregate mode (G8) reports
+   *  the tightest-remaining snapshot across the fanned-out per-repo calls. */
+  rateLimit: GitHubRateLimit | null;
+  /** Aggregate mode only (G8): the resolved "owner/name" slug of every repo
+   *  whose fetch succeeded (dirs without a GitHub remote, or that otherwise
+   *  failed, are silently skipped). Undefined in single-repo mode. */
+  repos?: string[];
+}
+
+export interface GitHubComment {
+  id: number;
+  body: string;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitHubPullLineComment extends GitHubComment {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+}
+
+export interface GitHubCommentsResult {
+  repo: string;
+  itemNumber: number;
+  comments: GitHubComment[];
+}
+
+/**
+ * A single issue plus its full comment thread — the payload behind
+ * `GET /github/issue-thread` (`gitHost.issueThread`), consumed by every "new
+ * task from an issue" entry point (dialog, New Task form paste-URL, CLI
+ * `agetor add --issue`) to build both the launch prompt
+ * (`buildIssueTaskPrompt`, `src/shared/issue-task.ts`) and the durable
+ * snapshot file (`renderIssueThreadMarkdown`). `truncated` is set once the
+ * fetch hit its page cap (5×100 comments) — the prompt and snapshot both
+ * surface that instead of silently under-representing the thread.
+ * `refetchCommand` is a one-line `gh`/`glab` invocation the agent can run to
+ * pull the live thread later (null when neither CLI is on PATH, or on
+ * Bitbucket, which has no such CLI).
+ */
+export interface GitHubIssueThreadResult {
+  repo: string;
+  item: GitHubListItem;
+  comments: GitHubComment[];
+  truncated: boolean;
+  refetchCommand: string | null;
+  /** Set when the item itself loaded but its comment thread couldn't be
+   *  fetched (e.g. GitLab answers 401 to anonymous `/notes` even on public
+   *  projects); `comments` is `[]` and `truncated` is `false` in that case.
+   *  Absent/null when comments were fetched (or skipped via
+   *  `includeComments: false`). */
+  commentsError?: string | null;
+}
+
+export type GitHubIssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | { ok: false; error: string };
+
+export interface GitHubPullReviewCommentsResult {
+  repo: string;
+  pullNumber: number;
+  comments: GitHubPullLineComment[];
+}
+
+/** A resolvable review-comment thread (from GraphQL). `rootCommentId` is the
+ *  REST databaseId of the thread's first comment, so the UI can match a thread
+ *  to a comment in the flat review-comments list. */
+export interface GitHubReviewThread {
+  threadId: string;
+  rootCommentId: number;
+  isResolved: boolean;
+  isOutdated: boolean;
+}
+
+export interface GitHubPullReviewThreadsResult {
+  repo: string;
+  pullNumber: number;
+  threads: GitHubReviewThread[];
+  /** True when GitHub reported more than the first page of review threads, so
+   *  the resolve controls only cover the first 100. */
+  truncated: boolean;
+}
+
+export interface GitHubCheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  htmlUrl: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface GitHubChecksResult {
+  repo: string;
+  pullNumber: number;
+  sha: string;
+  checkRuns: GitHubCheckRun[];
+}
+
+/** A single context entry in a commit's combined status (`GET
+ *  /commits/:ref/status`) — the legacy Status API, distinct from the
+ *  check-runs `GitHubChecksResult` above (some CI providers still only post
+ *  through this older API, so both are shown). */
+export interface GitHubCommitStatusContext {
+  context: string;
+  state: string;
+  description: string | null;
+  targetUrl: string | null;
+}
+
+/** Normalized combined-status payload — the shape `normalizeCommitStatus`
+ *  produces from the raw response, before the request-scoped `repo`/`ref`
+ *  are stitched on at the call site (see `GitHubCommitStatusResult`). */
+export interface GitHubCommitStatus {
+  state: "success" | "pending" | "failure" | "error" | "";
+  total: number;
+  statuses: GitHubCommitStatusContext[];
+}
+
+export interface GitHubCommitStatusResult extends GitHubCommitStatus {
+  repo: string;
+  ref: string;
+}
+
+/** A single commit on a pull request, from `GET /pulls/:n/commits`.
+ *  `messageHeadline` is the first line of the commit message; `author` prefers
+ *  the top-level GitHub-user `author` (has a `login`) over the raw git author,
+ *  falling back to null when the commit's author isn't a known GitHub user. */
+export interface GitHubPullCommit {
+  sha: string;
+  messageHeadline: string;
+  author: GitHubUser | null;
+  authoredDate: string;
+  htmlUrl: string;
+}
+
+export interface GitHubPullCommitsResult {
+  repo: string;
+  pullNumber: number;
+  commits: GitHubPullCommit[];
+}
+
+/** A repository release, from `GET /repos/:o/:r/releases` (F18). `body` is
+ *  the release notes markdown; `targetCommitish` is the branch/sha the tag
+ *  was (or will be) cut from. */
+export interface GitHubRelease {
+  id: number;
+  tagName: string;
+  name: string;
+  body: string;
+  draft: boolean;
+  prerelease: boolean;
+  publishedAt: string | null;
+  createdAt: string;
+  htmlUrl: string;
+  targetCommitish: string;
+}
+
+export interface GitHubReleasesResult {
+  repo: string;
+  releases: GitHubRelease[];
+}
+
+/** A repository tag, from `GET /repos/:o/:r/tags` — powers the release
+ *  manager's tag-name datalist (F18). Tags aren't paginated per-repo scope in
+ *  the UI, so this result carries no `repo` field (unlike the other list
+ *  results here). */
+export interface GitHubTag {
+  name: string;
+  commitSha: string;
+}
+
+export interface GitHubTagsResult {
+  tags: GitHubTag[];
+}
+
+/** A single GitHub Actions workflow run, from `GET
+ *  /repos/:o/:r/actions/runs` (F20). `status` is GitHub's coarse run state
+ *  (`queued` | `in_progress` | `completed` | …); `conclusion` is only set
+ *  once `status === "completed"` (`success` | `failure` | `cancelled` |
+ *  `skipped` | `neutral` | `timed_out` | `action_required` | …), null while
+ *  still running. */
+export interface GitHubWorkflowRun {
+  id: number;
+  name: string;
+  displayTitle: string;
+  status: string;
+  conclusion: string | null;
+  event: string;
+  headBranch: string;
+  runNumber: number;
+  htmlUrl: string;
+  createdAt: string;
+  workflowId: number;
+}
+
+export interface GitHubWorkflowRunsResult {
+  repo: string;
+  runs: GitHubWorkflowRun[];
+}
+
+/** A single workflow definition, from `GET /repos/:o/:r/actions/workflows`
+ *  (F20) — powers the "run a workflow" dispatch picker. `state` is
+ *  `active` | `disabled_manually` | … ; only `active` ones are dispatchable. */
+export interface GitHubWorkflow {
+  id: number;
+  name: string;
+  path: string;
+  state: string;
+}
+
+export interface GitHubWorkflowsResult {
+  workflows: GitHubWorkflow[];
+}
+
+/** An issue a pull request will close on merge (GraphQL
+ *  `closingIssuesReferences`), read-only — surfaced as a "Closes: #N" line. */
+export interface GitHubLinkedIssue {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+}
+
+export interface GitHubLinkedIssuesResult {
+  repo: string;
+  pullNumber: number;
+  issues: GitHubLinkedIssue[];
+}
+
+/** A child issue tracked under a parent via GitHub's sub-issues REST API
+ *  (`/issues/:number/sub_issues`). `id` is the child's REST database id —
+ *  distinct from its display `number` — because removing a sub-issue
+ *  (`DELETE /issues/:number/sub_issue`) addresses the child by id, not
+ *  number, so the UI needs it without a second round trip. */
+export interface GitHubSubIssue {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  htmlUrl: string;
+}
+
+export interface GitHubSubIssuesResult {
+  repo: string;
+  issueNumber: number;
+  subIssues: GitHubSubIssue[];
+}
+
+/** A repo-linked GitHub Projects v2 board, from GraphQL
+ *  `repository.projectsV2.nodes` (F21/G11). Projects v2 is GraphQL-only —
+ *  there's no REST equivalent. `number` is the project's board number (used
+ *  in its URL), distinct from the opaque GraphQL `id` every mutation keys on. */
+export interface GitHubProjectV2 {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+}
+
+export interface GitHubProjectsV2Result {
+  projects: GitHubProjectV2[];
+}
+
+/** A single-select field on a project (e.g. "Status"), with its selectable
+ *  options. Non-select fields (text, number, date, iteration…) are not
+ *  represented here — `options` is empty for any field this UI doesn't drive
+ *  a dropdown for. */
+export interface GitHubProjectField {
+  id: string;
+  name: string;
+  options: { id: string; name: string }[];
+}
+
+/** A single item on a project board — an Issue, PullRequest, or DraftIssue
+ *  (GraphQL `content.__typename`), plus its current value for the project's
+ *  "Status" single-select field (if any). `number`/`title` come from the
+ *  underlying content for Issue/PullRequest; a DraftIssue has no `number`
+ *  (null) and its own `title`. `contentType: "other"` covers any future
+ *  content type GraphQL might add that this UI doesn't special-case. */
+export interface GitHubProjectItem {
+  itemId: string;
+  contentType: "Issue" | "PullRequest" | "DraftIssue" | "other";
+  number: number | null;
+  title: string;
+  statusOptionId: string | null;
+  statusOptionName: string | null;
+}
+
+/** `statusField` is the project's field named "Status" (if it's a
+ *  single-select field) — the UI uses its `options` to populate each row's
+ *  status dropdown. Null when the project has no such field, in which case
+ *  the UI hides the status column entirely. */
+export interface GitHubProjectItemsResult {
+  items: GitHubProjectItem[];
+  statusField: GitHubProjectField | null;
+}
+
+/** A GitHub Discussions thread (GraphQL-only — F22/G12). `answered` is derived
+ *  from `isAnswered`/`answerChosenAt` — true once one of the thread's comments
+ *  has been marked the accepted answer. `author` is null for a deleted
+ *  account (GraphQL nulls the field rather than erroring). */
+export interface GitHubDiscussion {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  category: string;
+  author: string | null;
+  createdAt: string;
+  answered: boolean;
+}
+
+/** A Discussions category (e.g. "Q&A", "Announcements") — listed only to
+ *  populate the create-discussion form's category picker. Scope decision A2:
+ *  category *management* (create/edit/delete a category) is out of scope. */
+export interface GitHubDiscussionCategory {
+  id: string;
+  name: string;
+}
+
+/** `auth` mirrors `GitHubListResult.auth`: discussions are readable without a
+ *  token, but the UI gates create/comment/answer on `auth !== "none"` — any
+ *  authenticated user can do those, not just someone with push access (G12
+ *  gating note; distinct from every other manager panel, which gates writes
+ *  on push). */
+export interface GitHubDiscussionsResult {
+  discussions: GitHubDiscussion[];
+  categories: GitHubDiscussionCategory[];
+  auth: "token" | "none";
+}
+
+/** A single comment on a discussion thread. `isAnswer` reflects whether GitHub
+ *  currently has this comment marked as the discussion's accepted answer. */
+export interface GitHubDiscussionComment {
+  id: string;
+  body: string;
+  author: string | null;
+  createdAt: string;
+  isAnswer: boolean;
+}
+
+/** A discussion's full detail — body + comments. `answerable` reflects the
+ *  discussion's *category* (`category.isAnswerable`, e.g. "Q&A" is answerable,
+ *  "Announcements" isn't) — the UI hides the mark/unmark-answer control when
+ *  false regardless of who's viewing. */
+export interface GitHubDiscussionDetail {
+  id: string;
+  title: string;
+  body: string;
+  comments: GitHubDiscussionComment[];
+  answerable: boolean;
+}
+
+/** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
+ *  `mergeable` is null while GitHub computes it in the background (poll again).
+ *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
+ *  behind (base moved) | blocked (required reviews/checks) | unstable (checks
+ *  pending/failing but mergeable) | draft | has_hooks | unknown.
+ *  `autoMerge` reflects the REST `auto_merge` field (non-null once enabled). */
+export interface GitHubPullMergeability {
+  repo: string;
+  pullNumber: number;
+  mergeable: boolean | null;
+  mergeableState: string;
+  rebaseable: boolean | null;
+  merged: boolean;
+  draft: boolean;
+  /** Normalized to `"open" | "closed" | "merged" | "unknown"` — provider
+   *  state vocabularies collapsed onto one small set so callers don't need
+   *  provider-specific branching. */
+  state: string;
+  headRef: string;
+  baseRef: string;
+  headSha: string;
+  autoMerge: boolean;
+  /** Full `owner/name` of the repo the head branch lives in, or null when the
+   *  REST payload omitted `head.repo` (e.g. the fork was deleted). */
+  headRepo: string | null;
+  /** True when the head branch lives on a different repo than the base (a
+   *  fork PR), or when `headRepo` couldn't be determined at all — the
+   *  "Resolve with Agetor" flow only supports same-repo PRs. */
+  crossRepo: boolean;
+}
+
+export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
+
+export interface GitHubActionResult {
+  ok: true;
+  message?: string;
+  commentPosted?: boolean;
+}
+
+export interface GitHubPullMergeResult extends GitHubActionResult {
+  merged: boolean;
+  sha: string | null;
+}
+
+export interface GitHubPullDefaultsResult {
+  repo: string;
+  head: string;
+  base: string;
+}
+
+export type GitHubReactionContent = "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
+
+/** Discriminates which entity a reaction (or reaction list) targets. For `issue`,
+ *  `id` is the issue/PR **number** — issues and PRs share the
+ *  `/issues/:number/reactions` endpoint. `issueComment` / `reviewComment` carry a
+ *  comment's REST id (`/issues/comments/:id` vs `/pulls/comments/:id`). */
+export interface GitHubReactionSubject {
+  type: "issue" | "issueComment" | "reviewComment";
+  id: number;
+}
+
+/** One content's aggregated reaction count for a subject, plus the viewer's own
+ *  reaction id (non-null only when the viewer has reacted with this content) so
+ *  the UI can toggle a chip off via DELETE without a second lookup. */
+export interface GitHubReactionSummary {
+  content: GitHubReactionContent;
+  count: number;
+  viewerReactionId: number | null;
+}
+
+export interface GitHubReactionsResult {
+  reactions: GitHubReactionSummary[];
+}
+
+/** A GitHub notification thread (`GET /notifications`), scoped to the current
+ *  repo (F14). `subjectType` is GitHub's own subject kind ("PullRequest",
+ *  "Issue", "Commit", "Discussion", …) — not narrowed to `GitHubItemKind`
+ *  since notifications cover subjects the rest of the UI doesn't model.
+ *  `subjectUrl`/`latestCommentUrl` are api.github.com URLs (or null); the UI
+ *  opens whichever is present via `api.openExternal`. */
+export interface GitHubNotification {
+  id: string;
+  unread: boolean;
+  reason: string;
+  updatedAt: string;
+  title: string;
+  subjectType: string;
+  subjectUrl: string | null;
+  /** Browsable HTML URL derived from `subjectUrl` (api.github.com → github.com),
+   *  so the UI opens the page rather than the raw JSON. Null when not derivable. */
+  htmlUrl: string | null;
+  latestCommentUrl: string | null;
+  repo: string;
+}
+
+export interface GitHubNotificationsResult {
+  repo: string;
+  notifications: GitHubNotification[];
+}
+
+/**
+ * Streams the run panel listens on. Codex (and any unstructured agent)
+ * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed
+ * into typed events so the UI can render each one with its own component
+ * (text vs. thinking vs. tool call vs. tool result).
+ *
+ *   stdout       — raw bytes from a non-claude agent (codex)
+ *   stderr       — error bytes from any agent
+ *   status       — orchestrator-side commentary (started, mode change, …)
+ *   interaction  — pending approval/question card (data = JSON)
+ *   assistant    — claude assistant text block (markdown)
+ *   thinking     — claude extended-thinking block
+ *   tool_use     — claude tool call (data = JSON { id, name, input })
+ *   tool_result  — output of a tool call (data = JSON { toolUseId, content });
+ *                  may additionally carry `attachments?: ToolResultAttachment[]`
+ *                  when claude's own `toolUseResult` reported a structured
+ *                  attachments array (see `src/shared/sent-files.ts`)
+ *   subagent     — background/sub-agent lifecycle delta (data = JSON
+ *                  SubagentEvent). Live-only (never persisted to run_events):
+ *                  the `/tasks/:id/subagents` snapshot covers panel reopen, so
+ *                  this stream just keeps the open panel's tab strip in sync.
+ *                  The subagent's actual transcript content rides the normal
+ *                  user/assistant/tool_* streams, tagged via `subagentId`.
+ *   compaction_summary — Claude Code's own context-compaction summary (the
+ *                  JSONL `user` line carrying `isCompactSummary: true`),
+ *                  persisted verbatim with no agetor-authored wrapper. Kept
+ *                  off the `user` stream on purpose: the first-load anchor
+ *                  (`runs.lastUserEventId`) and the resend picker
+ *                  (`runs.userMessageHistory`) both filter `stream = 'user'`,
+ *                  so the summary is excluded from them by construction.
+ *                  Set at ingest only — rows stored before this stream
+ *                  existed keep rendering as before (see
+ *                  `src/shared/compaction.ts`).
+ */
+export type RunEventStream =
+  | "stdout"
+  | "stderr"
+  | "status"
+  | "interaction"
+  | "interaction_resolved"
+  | "user"
+  | "assistant"
+  | "thinking"
+  | "tool_use"
+  | "tool_result"
+  | "subagent"
+  | "compaction_summary";
+
+/**
+ * What made a claude-code session start a turn agetor didn't send — the
+ * trigger of an `origin: "continuation"` run (`startContinuationRun` in
+ * `src/bun/orchestrator.ts`, adopted by `maybeAdoptContinuation` in
+ * `src/bun/claude-tmux.ts`):
+ *   notification — a `<task-notification>` (background task finished);
+ *   user         — a `user` line agetor didn't paste (typed in the attached
+ *                  terminal);
+ *   assistant    — an `assistant` line with no turn open (Claude continued
+ *                  on its own).
+ */
+export type ContinuationTrigger = "notification" | "user" | "assistant";
+
+/** The status line a continuation run opens with, per trigger — says what
+ *  actually happened instead of blaming a background task for every case. */
+export const CONTINUATION_STATUS_TEXT: Readonly<Record<ContinuationTrigger, string>> = {
+  notification: "auto-continued after background task",
+  user: "turn started from the terminal",
+  assistant: "Claude continued on its own",
+};
+
+/** Max number of persisted events `GET /tasks/:id/events` replays on SSE
+ *  (re)connect — the most recent window; older history is fetched on demand
+ *  via `GET /tasks/:id/events/page`. */
+export const EVENTS_REPLAY_LIMIT = 800;
+
+/**
+ * Byte budget for the SSE replay window (`GET /tasks/:id/events`), applied
+ * ON TOP OF `EVENTS_REPLAY_LIMIT` — the two caps are ANDed, whichever binds
+ * first wins. Measured on the owner's live tasks: the 800-event count cap
+ * alone let a replay window weigh 61 MB, 4.9 MB or 4.5 MB (single events up
+ * to 1.37 MB), which is what made opening a task with a large transcript
+ * feel like it hung (`docs/plans/task-details-blank-while-session-restores.md`
+ * §2, §3.3). The budget applies to the SUM of the window's event `data`
+ * lengths, not to any individual event — no single event is ever truncated
+ * to fit. Older history stays reachable via "Load earlier"
+ * (`GET /tasks/:id/events/page`, budgeted separately by
+ * `EVENTS_PAGE_MAX_BYTES`).
+ */
+export const EVENTS_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Byte budget for one "Load earlier" page (`GET /tasks/:id/events/page`).
+ * Smaller than `EVENTS_REPLAY_MAX_BYTES` because a page fetch is a
+ * foreground, user-triggered wait (the click), where the initial replay is a
+ * background SSE connect the user isn't staring at a spinner for. Same
+ * whole-window-only semantics: individual events are never truncated.
+ */
+export const EVENTS_PAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Floor on how many events a byte-budgeted window (replay, page, or
+ * rebuild) always keeps, regardless of `EVENTS_REPLAY_MAX_BYTES` /
+ * `EVENTS_PAGE_MAX_BYTES`. Without this floor, a task whose single newest
+ * event alone exceeds the byte budget (a large tool_result, a long pasted
+ * diff, …) would clamp its window to zero events and render nothing — the
+ * floor guarantees at least this many of the newest events always show, even
+ * if that means exceeding the byte budget for that one window.
+ */
+export const MIN_REPLAY_EVENTS = 20;
+
+/** Max number of events the run panel keeps in webview memory for one task.
+ *  When live streaming pushes past this, the oldest events are trimmed and the
+ *  "Load earlier" affordance re-appears. */
+export const EVENTS_WINDOW_MAX = 3000;
+
+/**
+ * Event-count ceiling on extending the first-load window (SSE replay and the
+ * `?limit=` auto-rebuild snapshot) back to the newest main-stream `user`
+ * event, so opening a task shows at least the user's most recent message
+ * without a "Load earlier" click — see
+ * `docs/plans/first-load-reaches-last-user-message.md`. Deliberately equal
+ * to `EVENTS_WINDOW_MAX`: the webview's own SSE-flush trim
+ * (`eventWindowKeepCount` in RunPanel) caps rendered history at that many
+ * events anyway, so a larger anchored window could never actually be shown —
+ * extending past it would only cost bytes on the wire for nothing. The
+ * extension is ALL-OR-NOTHING: when the span from the anchor event to the
+ * newest event exceeds this many events (or `EVENTS_REPLAY_ANCHOR_MAX_BYTES`
+ * below), the default window (`EVENTS_REPLAY_LIMIT` / `EVENTS_REPLAY_MAX_BYTES`,
+ * floor `MIN_REPLAY_EVENTS`) is returned unchanged rather than partially
+ * extended — a partial extension still leaves the user clicking, for extra
+ * complexity with no real payoff. On a task that is still RUNNING the
+ * guarantee is first-paint only: the same `EVENTS_WINDOW_MAX` trim drops the
+ * oldest event for every live event that arrives past the cap, so an anchored
+ * window that arrived at (or near) the ceiling loses its anchor as the agent
+ * keeps streaming — inherent to any bounded window, and the reason a finished
+ * task is the case this ceiling is tuned for. The route also takes
+ * `?anchor=0` to skip the extension (used by the TUI dashboard, which keeps
+ * far fewer lines than this and would only pay for bytes it discards).
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_EVENTS = EVENTS_WINDOW_MAX;
+
+/**
+ * Byte ceiling for the same first-load anchor extension described above —
+ * ANDed with `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` (both must fit, or the
+ * default window stands). Four times `EVENTS_REPLAY_MAX_BYTES`: a generous
+ * worst case for the one-time cost of showing the user's last message
+ * inline, while the pathological transcript that motivated the byte budget
+ * in the first place (measured 61 MB on an 800-event window — see
+ * `EVENTS_REPLAY_MAX_BYTES` above) still falls back to today's 4 MB window
+ * rather than shipping tens of megabytes on open.
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Named SSE event (`event: replay_meta`) sent as the FIRST frame of
+ *  `GET /tasks/:id/events`, before the replayed window. Unnamed `message`
+ *  listeners ignore it, so old clients are unaffected. */
+export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
+
+/**
+ * Bound on how long `POST /runs/:id/input` and `POST /tasks/:id/start` will
+ * hold their HTTP response waiting for the agent's spawn to settle (e.g. a
+ * claude `--resume` session boot, which can take 5–30s — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2). The run
+ * row, the `running` column flip and the initial `user` event are already
+ * persisted well before the spawn resolves, which is all the webview needs
+ * to render — so once this budget elapses the response returns immediately
+ * with `pending: true` and the spawn keeps running detached; the caller
+ * learns the outcome from the task/run's normal SSE stream instead of from
+ * the HTTP response. When the spawn settles inside the budget, the response
+ * is byte-identical to today's (no `pending` key at all).
+ *
+ * `POST /runs/:id/input` applies the budget to ALL of `sendInput`'s
+ * pre-dispatch work, not just the spawn (teardown wait, worktree restore,
+ * codex CLI-version floor, `@`-expansion, liveness probe —
+ * `docs/plans/non-blocking-session-restore.md` decision D). Past the budget
+ * the answer is `{ delivered: true, runId, pending: true }`, where `runId` is
+ * the new turn's run when one was already minted, else the run the message
+ * was addressed to (display only — no client dereferences it further). If the
+ * late work then fails, the message is re-stashed in the task's backlog and a
+ * live-only `send-failed` {@link GlobalEvent} tells the webview to toast.
+ */
+export const SPAWN_RESPONSE_BUDGET_MS = 1500;
+
+/** Payload of the {@link TASK_EVENTS_REPLAY_META_EVENT} frame. */
+export interface TaskEventsReplayMeta {
+  /** DB id of the earliest event included in the replayed window, or null when
+   *  the task has no persisted events. */
+  earliestId: number | null;
+  /** True when older events exist before `earliestId` (drives "Load earlier"). */
+  hasMore: boolean;
+  /**
+   * Present on a forward-resume reconnect (the client sent `Last-Event-ID` /
+   * `?afterId=`): the cursor the server resumed after. The rows that follow are
+   * exactly the events with `id` above it, so a new client keeps its own window
+   * and IGNORES `earliestId` (`null` here) and `hasMore` (`false` here).
+   */
+  resumedAfter?: number;
+  /**
+   * Present (`true`) when the client asked to resume but the gap was too large
+   * (or the cursor was ahead of the server): the server answered with a fresh
+   * window instead. `earliestId` / `hasMore` then describe that fresh window and
+   * REPLACE the client's values; the client drops what it had and shows a notice.
+   */
+  snapshotRequired?: true;
+}
+
+export interface RunEvent {
+  runId: string;
+  taskId: string;
+  stream: RunEventStream;
+  data: string;
+  ts: number;
+  /**
+   * When set, this event belongs to a background/sub agent's stream rather than
+   * the task's main agent stream (NULL/undefined = main). The run panel
+   * partitions the unified event scrollback by this id to drive the read-only
+   * per-subagent tabs. Threaded from `run_events.subagent_id`.
+   */
+  subagentId?: string | null;
+  /**
+   * `run_events.id`. Saved rows carry it both on replay (SSE replay window,
+   * resume gap, `/tasks/:id/events/page`) and on the live broadcast (the
+   * `id:` line of the frame matches it), so a client can resume by it. Live-only
+   * streams — `interaction`, `interaction_resolved`, `subagent` lifecycle and
+   * the ping — have no row and never carry one.
+   */
+  id?: number;
+}
+
+/** Lifecycle state of a tracked background/sub agent. Mirrors `RunStatus` plus
+ *  the subagent-specific transitions. */
+export type SubagentStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "orphaned";
+
+/**
+ * A background / sub agent the main agent spawned, tracked so the run panel can
+ * offer a read-only tab into its live stream. `parentKind` distinguishes:
+ * an in-session Claude Code subagent (`"subagent"`); an independent `claude --bg`
+ * session (`"bg_session"`); a Claude Code Workflow (`/workflow`) run's container
+ * row (`"workflow"` — id = the workflow's background taskId, sourcePath = its
+ * transcriptDir, no event stream of its own — exists to hold the task in
+ * `running` for the workflow's lifetime); one agent inside a workflow
+ * (`"workflow_agent"` — a normal sidechain transcript rendered as a read-only
+ * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
+ * the monitor's `taskId` from its launch stub, no source file of its own, its
+ * tab streams each `<event>` the monitor reports; holds the task in `running`
+ * until the monitor times out or is stopped); an OpenCode child session
+ * (`"opencode_subagent"` — id = the child's `ses_…` id, sourcePath =
+ * `opencode-session:<child>`, events filled from `session export` when a
+ * turn ends, never left `running` past settle; the Claude watcher skips
+ * these rows); and a GitHub Copilot CLI subagent (`"copilot_subagent"` —
+ * reported inline in the copilot run's own JSONL log, persisted by the
+ * orchestrator's copilot sink, no source file of its own; never seeded or
+ * tailed by the Claude subagent watcher).
+ */
+export interface Subagent {
+  /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
+  id: string;
+  taskId: string;
+  /** Parent run that was in flight when this subagent was spawned. */
+  runId: string | null;
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor" | "opencode_subagent" | "copilot_subagent";
+  /** Registered subagent type, e.g. "Explore" / "general-purpose". */
+  agentType: string | null;
+  /** Short human label from the spawning Agent tool call. */
+  description: string | null;
+  /** 1 = spawned by the main agent; >1 = spawned by another subagent. */
+  spawnDepth: number;
+  /** Absolute path to the subagent's JSONL transcript. */
+  sourcePath: string;
+  /** The parent `Agent` tool_use id (meta.json.toolUseId) — the correlation
+   *  key used to settle this row off a `tool_result` block in the MAIN
+   *  session JSONL when the subagent's own transcript never writes a
+   *  terminal end_turn line. Null pre-fix / when the meta sidecar lacked it.
+   *  Optional (not just nullable) so object literals built before this field
+   *  existed — fixtures across several test files — still satisfy the type. */
+  toolUseId?: string | null;
+  status: SubagentStatus;
+  startedAt: number;
+  endedAt: number | null;
+}
+
+/** Payload of a `stream: "subagent"` RunEvent (JSON-encoded in `data`). Lets an
+ *  open run panel add/flip a tab the instant a subagent starts or finishes,
+ *  without re-polling the snapshot endpoint. */
+export interface SubagentEvent {
+  phase: "started" | "finished";
+  subagent: Subagent;
+}
+
+/**
+ * App-wide lifecycle events that drive toasts and any other "what just
+ * happened across all tasks" UI. Streamed from `GET /events` (live-only, no
+ * replay). Distinct from `RunEvent` so the toast hook doesn't have to
+ * re-derive transitions from the firehose of per-run output.
+ *
+ *   run-status — fires once when a run reaches a terminal state.
+ *   column     — fires every time a task's column changes; `prev` is the
+ *                column the row held immediately before the update.
+ *   send-failed — a message already answered `pending: true` was not
+ *                delivered after all (see `SPAWN_RESPONSE_BUDGET_MS`).
+ */
+export type GlobalEvent =
+  | {
+      kind: "run-status";
+      taskId: string;
+      runId: string;
+      status: "succeeded" | "failed" | "cancelled" | "orphaned";
+      ts: number;
+      /** Set when `taskId` is a hidden pipeline STEP task — the id of its
+       *  pipeline parent (board card). Consumers that scope toasts /
+       *  notifications / TUI rows per parent read this instead of having to
+       *  resolve the step row themselves; absent for an ordinary task (and
+       *  on events from an older core, so always read it with a fallback). */
+      pipelineParentId?: string;
+      /** The pipeline parent's title, stamped alongside `pipelineParentId`
+       *  so a toast can name the pipeline before the client's own task poll
+       *  has the parent row (a run started right after the page loaded). */
+      pipelineParentTitle?: string;
+    }
+  | {
+      kind: "column";
+      taskId: string;
+      runId: string | null;
+      column: ColumnId;
+      prev: ColumnId | null;
+      ts: number;
+      /** Why the transition fired, when the column alone is ambiguous.
+       *  Lets the UI pick a more accurate toast copy — e.g. an
+       *  `api-error`-driven `blocked` reads as "API error — retry" rather
+       *  than the generic "waiting on you" used for permission prompts.
+       *  Unset for transitions whose reason is fully implied by the
+       *  (prev, column) pair (e.g. plain success → review). */
+      reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline";
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
+    }
+  | {
+      kind: "update";
+      status: UpdateStatus;
+      /** Remote version string from update.json, when known. */
+      version: string | null;
+      /** Human-readable detail (error message, etc). */
+      message: string | null;
+      ts: number;
+    }
+  | {
+      /**
+       * A question / permission prompt was registered (`pending`) or cleared
+       * (`resolved`). Distinct from the per-task `interaction` SSE event (which
+       * only reaches the open RunPanel): this rides the app-level bus so the
+       * notification hook can alert the user — with a native OS notification
+       * and a "Waiting on you" toast — even when the agetor window is
+       * backgrounded mid-workflow and the panel can't repaint the card.
+       */
+      kind: "interaction";
+      taskId: string;
+      runId: string;
+      state: "pending" | "resolved";
+      /** Stable id of the interaction, so the UI can track which prompts are
+       *  live per task (several can stack) and clear the alert only once the
+       *  last one resolves. */
+      interactionId: string;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive; the interaction registry
+       *  (`src/bun/interactions.ts`) stamps it on the request/resolved
+       *  payloads it hands the orchestrator's bridge. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. Stamped by the orchestrator's
+       *  `emitGlobal`, not by the registry. */
+      pipelineParentTitle?: string;
+    }
+  | {
+      /**
+       * A `SendUserFile` tool_result confirmed delivery (see
+       * `src/shared/sent-files.ts`). Live-only — a replayed historical send
+       * must not notify — so the UI can drive a toast ("Claude sent you N
+       * files") and, when the window is unfocused or `proactive` is true, a
+       * native OS notification.
+       */
+      kind: "files-sent";
+      taskId: string;
+      runId: string;
+      count: number;
+      caption: string | null;
+      proactive: boolean;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
+    }
+  | {
+      /**
+       * fx auto-resume lifecycle transition for a paused task (see
+       * {@link TaskFxRecovery} and `docs/plans/fx-recovery-follow-ups.md`).
+       * Live-only — a replayed historical schedule/cancel must not
+       * re-notify — so the UI can drive a toast (`fired` → info,
+       * `exhausted` → error; `scheduled`/`cancelled`/`disabled` are silent
+       * on the toast layer, driving only the card/notice/context-menu state
+       * via the task's own `fxRecovery` field). Mirrors `files-sent`'s
+       * "live-only, never replayed" contract.
+       */
+      kind: "fx-auto-resume";
+      taskId: string;
+      /** `"scheduled"` — a timer was armed. `"fired"` — the timer fired and
+       *  a resume run was spawned. `"cancelled"` — the pending timer was
+       *  cancelled (explicitly or implicitly — new message, manual Resume,
+       *  Stop, archive, delete, agent switch). `"exhausted"` — the chain hit
+       *  `FX_AUTO_RESUME_MAX` with no further timer scheduled.
+       *  `"disabled"` — the `fxAutoResume` preference was off at schedule
+       *  time, so no timer was armed. */
+      state: "scheduled" | "fired" | "cancelled" | "exhausted" | "disabled";
+      /** Scheduled fire time (ms epoch) — present only for `state:
+       *  "scheduled"`. */
+      at?: number;
+      /**
+       * The auto-resume attempt this event concerns (1-based) — but what it
+       * COUNTS differs by `state`, so read it against the state it's
+       * attached to, not in isolation (mirrors `TaskFxRecovery.autoResume`'s
+       * `attempt`; see `recordFxPause` in `src/bun/orchestrator.ts` for the
+       * canonical statement of this convention):
+       *  - `"scheduled"` / `"fired"` — the ordinal of the attempt being
+       *    armed or fired, i.e. `autoResumeCount + 1` at the moment the
+       *    timer was set, echoed back unchanged when it fires.
+       *  - `"disabled"` — the ordinal that WOULD have been scheduled had the
+       *    `fxAutoResume` preference been on (`autoResumeCount + 1`) — there
+       *    is no real attempt to number, so this reports what was skipped.
+       *  - `"exhausted"` — always `FX_AUTO_RESUME_MAX` (the cap itself, same
+       *    value as `max`), not `autoResumeCount` — pinned to the named
+       *    constant to document "we stopped AT the cap" rather than lean on
+       *    an incidental equality between a counter and a constant.
+       */
+      attempt: number;
+      /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
+      max: number;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
+    }
+  | {
+      /**
+       * A pipeline task's run state changed — a step execution started,
+       * settled, or the run itself transitioned (blocked/done/cancelled).
+       * Drives the run view's sub-poll-latency animation (D12,
+       * `docs/plans/pipelines.md`): the webview refetches the parent task
+       * plus its step tasks on receipt, with the 2s `/tasks` poll as the
+       * fallback. `activeStepIds` mirrors `PipelineRunState.active` at the
+       * moment this fired.
+       */
+      kind: "pipeline";
+      taskId: string;
+      status: PipelineRunStatus;
+      activeStepIds: string[];
+      stepCount: number;
+      ts: number;
+    }
+  | {
+      /**
+       * A message `sendInput` had already answered `pending: true` for (it
+       * outlived `SPAWN_RESPONSE_BUDGET_MS`) turned out not to be delivered —
+       * the late worktree restore / teardown wait / spawn failed, or a claude
+       * modal-guard withheld the paste. `savedToBacklog` says the text is
+       * safe in the task's message tray (it always is when the orchestrator
+       * emits this: the late path re-stashes before announcing). Live-only,
+       * like `files-sent`: the HTTP response that carried `pending` is long
+       * gone, so this is the only way the sender learns the outcome, and the
+       * UI turns it into a warning toast. Not gated on the task being the open
+       * panel — no run status line exists for it.
+       */
+      kind: "send-failed";
+      taskId: string;
+      /** Human-readable cause, already phrased for a toast. */
+      reason: string;
+      savedToBacklog: boolean;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
+    };
+
+/**
+ * Phase of an in-progress `git clone`, as parsed from git's own `--progress`
+ * stderr output by `parseCloneProgress` (`src/bun/clone.ts`,
+ * docs/plans/clone-repository-all-providers.md Addendum A). Shared here
+ * because it also rides the `clone_progress` AppEvent below (server.ts
+ * broadcasts one per parsed/synthetic progress record; the webview and the
+ * CLI both consume it over `GET /app/events`).
+ *
+ *   starting     — before the transfer begins — git's own "Cloning into
+ *                  '<dest>'..." line, AND the synthetic event `cloneRepo`
+ *                  emits itself before attempt 1 and before a token retry
+ *                  (neither of those two carries a real git process yet).
+ *   counting     — `remote: Enumerating objects` / `remote: Counting
+ *                  objects: NN%`.
+ *   compressing  — `remote: Compressing objects: NN%`.
+ *   receiving    — `Receiving objects: NN%` — the actual object transfer.
+ *   resolving    — `Resolving deltas: NN%`.
+ *   checking-out — `Updating files: NN%` — writing the working tree.
+ *   done         — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  succeeded.
+ *   failed       — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  failed (see the accompanying `CloneProgress.line`).
+ *   cancelled    — `cloneRepo`'s own synthetic terminal event: `cancelClone`
+ *                  killed the in-flight git process for this clone.
+ */
+export type CloneProgressPhase =
+  | "starting"
+  | "counting"
+  | "compressing"
+  | "receiving"
+  | "resolving"
+  | "checking-out"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+/**
+ * "Keep Agetor running in the background" (docs/plans/always-on-host.md).
+ *
+ * `BackgroundRegistration` is macOS's own `SMAppService.Status` for the
+ * login-item LaunchAgent, as the bundled `agetor-login-item` helper reports
+ * it. macOS is the source of truth: Agetor stores no copy of it.
+ */
+export type BackgroundRegistration =
+  | "enabled"
+  | "requiresApproval"
+  | "notRegistered"
+  | "notFound";
+
+/** Why the background switch can't be used on this install. */
+export type BackgroundUnavailableReason =
+  | "not-macos"
+  | "dev-build"
+  | "unsigned"
+  | "not-in-applications"
+  | "helper-missing"
+  | "other-install"
+  | "helper-failed";
+
+/**
+ * The derived state the Settings section shows (plan §3.4):
+ *
+ *   running        — registration enabled and the login-item core is serving.
+ *   parked         — registration enabled; the supervisor runs no core because
+ *                    another core (normally the app) owns the port.
+ *   starting       — the supervisor is waiting out a grace window before it
+ *                    boots a core (after a handoff or an update).
+ *   stopped        — registration enabled but no supervisor is alive (it was
+ *                    stopped until the next login, or crashed out).
+ *   needs-approval — the user turned Agetor off in System Settings › Login Items.
+ *   off            — not registered.
+ *   unavailable    — the switch can't be used here; see `unavailableReason`.
+ */
+export type BackgroundState =
+  | "running"
+  | "parked"
+  | "starting"
+  | "stopped"
+  | "needs-approval"
+  | "off"
+  | "unavailable";
+
+export interface BackgroundStatus {
+  state: BackgroundState;
+  /** macOS's registration status; `null` when the state is `unavailable`. */
+  registration: BackgroundRegistration | null;
+  unavailableReason?: BackgroundUnavailableReason;
+  /** The last helper error, or a human detail for the state line. */
+  detail?: string;
+  /** launchd label of this channel's job; `null` when unavailable. */
+  label: string | null;
+  supervisorPid: number | null;
+  corePid: number | null;
+  /** Whether remote access (preview) is on. */
+  remoteAccess: boolean;
+}
+
+/** `GET /remote-access`. Remote access is a preview: nothing pairs yet. */
+export interface RemoteAccessStatus {
+  enabled: boolean;
+  preview: true;
+}
+
+/** `preferences` key holding the remote-access switch; stored "on" | "off".
+ *  Only the native Remote Access… box may turn it on (plan §3.5). */
+export const REMOTE_ACCESS_PREF_KEY = "remoteAccess";
+
+/**
+ * App-level events the webview subscribes to over `GET /app/events`. Used
+ * for cross-cutting flows that aren't tied to a single task — currently:
+ *
+ *   quit_request — main process intercepted Cmd+Q / window close with N
+ *                  runs still active. Webview shows a confirm modal; the
+ *                  user picks Quit-anyway (POST /app/force-quit) or stays.
+ *                  `backgroundArmed` says a parked login-item supervisor
+ *                  will boot a background core once the app quits (so the
+ *                  running tasks keep going), and `completely` says this
+ *                  quit came from "Quit Agetor Completely", which stops
+ *                  that background core too (docs/plans/always-on-host.md
+ *                  §3.6).
+ *   open_task    — a native notification deep-link (`agetor://task/<id>`)
+ *                  was clicked. Webview opens that task's RunPanel.
+ *   harness_usage — the background usage poller (or a force-refresh) produced
+ *                  a fresh `HarnessQuota` snapshot for one harness. Webview
+ *                  updates that harness's topbar chip in place.
+ *   agent_models_changed — the model-discovery scheduler re-probed one or
+ *                  more harnesses' CLI model catalogs and at least one list
+ *                  changed. Webview refetches `GET /agent-models/harnesses`.
+ *   clone_progress — one progress update (or a terminal done/failed/
+ *                  cancelled) for the in-flight `POST /projects/clone`
+ *                  identified by `cloneId` — see `CloneProgressPhase` above.
+ *                  `percent` is `null` whenever git's own output didn't
+ *                  carry one for that record (e.g. `remote: Enumerating
+ *                  objects` and every synthetic phase but `done`). `line` is
+ *                  already sanitized/length-capped and never carries a
+ *                  credential (docs/plans/clone-repository-all-providers.md
+ *                  Addendum A).
+ *   background_changed — the "Keep Agetor running in the background" state
+ *                  or the remote-access preview switch changed (a Settings
+ *                  toggle, the native Remote Access… box, a CLI call). The
+ *                  Settings section re-renders from `status`.
+ */
+export type AppEvent =
+  | {
+      type: "quit_request";
+      runningRunCount: number;
+      runningTaskTitles: string[];
+      backgroundArmed: boolean;
+      completely: boolean;
+      ts: number;
+    }
+  | {
+      type: "background_changed";
+      status: BackgroundStatus;
+      ts: number;
+    }
+  | {
+      type: "open_task";
+      taskId: string;
+      ts: number;
+    }
+  | {
+      type: "harness_usage";
+      quota: HarnessQuota;
+      ts: number;
+    }
+  | {
+      type: "agent_models_changed";
+      harnessIds: string[];
+      ts: number;
+    }
+  | {
+      type: "clone_progress";
+      cloneId: string;
+      phase: CloneProgressPhase;
+      percent: number | null;
+      line: string;
+      ts: number;
+    }
+  | {
+      type: "claude_sessions_found";
+      count: number;
+      ts: number;
+    }
+  | {
+      /** OpenCode sessions started outside Agetor, found by the launch scan
+       *  (`docs/plans/add-opencode-harness.md` D-13). Same toast rules as
+       *  `claude_sessions_found`; `sessionIds` are the ids this notice is
+       *  about (each one is toasted once). */
+      type: "opencode_sessions_found";
+      count: number;
+      sessionIds: string[];
+      ts: number;
+    }
+  | {
+      /** Built-in harnesses turned on because their CLI was found installed
+       *  (D-14, `AUTO_ENABLE_KINDS`). Sent once per harness, to the next
+       *  `/app/events` client. `labels` is index-aligned with `harnessIds`. */
+      type: "harnesses_auto_enabled";
+      harnessIds: string[];
+      labels: string[];
+      ts: number;
+    }
+  | {
+      type: "claude_session_import";
+      taskId: string;
+      status: "ready" | "failed";
+      ts: number;
+    };
+
+/**
+ * Lifecycle of the Electrobun self-updater as exposed to the UI. Mirrors the
+ * subset of `Updater`'s internal state we want to surface — the underlying
+ * state machine has ~25 substates (downloading-patch, decompressing, …) but
+ * the user only cares about three things: am I current, is something coming,
+ * is it ready to restart into. `error` and `unsupported` cover the cases
+ * where we can't tell.
+ *
+ *   idle        — last check found no update.
+ *   checking    — actively probing the update feed.
+ *   downloading — update available, pulling the .app.tar.zst now.
+ *   ready       — fully downloaded and staged; clicking apply restarts.
+ *   error       — last check or download failed; we'll retry on the next tick.
+ *   unsupported — running under `bun run dev` (channel === "dev"), so the
+ *                 updater short-circuits; surfaced only for diagnostics.
+ */
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "ready"
+  | "error"
+  | "unsupported";
+
+export interface ToolUseEventData {
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface ToolResultEventData {
+  toolUseId: string;
+  /** Either a plain string (most tools) or a content-block array (rich
+   *  tools like the built-in Task/Agent). Pass through verbatim so the
+   *  renderer can inspect it. */
+  content: unknown;
+}
+
+/**
+ * The "Commit & push" follow-up prompt, shared by the webview's RunPanel chip
+ * and the CLI's `agetor commit` / dashboard `c` action so the instruction stays
+ * identical across surfaces.
+ *
+ * The commit-subject type is derived from the task's branch prefix, so the
+ * commit matches the project's branch nomenclature (`feature/x` → `feature:`),
+ * falling back to feat/fix/chore by task type when the branch carries no
+ * prefix. The branch is shell-quoted because git ref names may legally contain
+ * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
+ *
+ * After the commit/push, the prompt first asks for the full link to open a
+ * pull request for the branch — as plain text above the code blocks, not
+ * fenced, so react-markdown's GFM autolinking renders it clickable (git prints
+ * the link in the push output for GitHub/GitLab/Bitbucket; otherwise it can be
+ * built from the remote URL). It then asks the agent to propose a pull
+ * request title and description, each emitted in its own fenced code block so
+ * agetor renders a one-click copy button per field — the user copies the title
+ * into the New PR composer's Title field and the description into its
+ * Description field without a second turn. Two blocks (not one) because the
+ * composer has two separate fields; the copy button grabs a whole fenced block.
+ *
+ * The description block uses a FOUR-backtick fence on purpose: PR descriptions
+ * routinely contain their own ``` code fences (test output, snippets), and a
+ * 3-backtick outer fence is closed early by the first inner ```, truncating the
+ * copied text. A 4-backtick fence is closed only by >=4 backticks, so inner ```
+ * blocks survive verbatim (verified against micromark, react-markdown's parser:
+ * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
+ */
+export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
+  const ccType = branchCommitType(task.branch, task.taskType);
+  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, "'\\''")}'` : "<branch>";
+  return (
+    `Commit all changes with a clear commit message ` +
+    `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
+    `then push the current branch to origin. ` +
+    `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
+    `After pushing, first print the full link to open a pull request for the branch ` +
+    `(git prints one in the push output; otherwise build it from the remote URL) as ` +
+    `plain text on its own line — not inside a code block. ` +
+    `Below the link, propose the pull request as two fenced code blocks so each can be ` +
+    `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
+    `only the concise one-line title, then a "PR description:" line followed by a ` +
+    `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
+    `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
+    `close the block early. ` +
+    `Do not include any AI attribution in the commit message, PR title, or PR description — ` +
+    `no "Generated with Claude Code" / "Generated by AI" footers, robot emoji, or ` +
+    `Co-Authored-By trailers crediting an AI tool.`
+  );
+}
+
+/**
+ * A working directory the user has registered as a "project". Surfaced in the
+ * workdir picker on the New Task form so common paths don't need to be typed
+ * every time. Explicit entries come from the native folder dialog
+ * (POST /projects/pick).
+ */
+export interface Project {
+  path: string;
+  name: string;
+  addedAt: number;
+  /**
+   * Per-project branch nomenclature. Null when the user hasn't customized it —
+   * consumers fall back to {@link DEFAULT_BRANCH_CONFIG}.
+   */
+  branchConfig: BranchNamingConfig | null;
+}
+
+/**
+ * A branch in a project repo, as returned by `GET /projects/branches` and
+ * surfaced by the new-task base-ref picker. The single source of truth shared
+ * by the server (`listBranches` in src/bun/worktree.ts), the webview (`api.ts` /
+ * `BranchPicker`), and the CLI — the previous per-side copies had already
+ * silently drifted (the client one omitted `remote`). Keep it that way: do not
+ * re-declare this interface, since TypeScript would silently merge the two
+ * declarations rather than flag the duplicate.
+ */
+export interface BranchInfo {
+  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
+  name: string;
+  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
+  committedAt: number;
+  /** True for the branch currently checked out at the repo. */
+  current: boolean;
+  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
+  remote: boolean;
+  /** Short name of the upstream tracking ref (e.g. "origin/main"), or null when
+   *  the branch has no configured upstream or is itself a remote-tracking ref. */
+  upstream: string | null;
+  /** Commits the upstream has that this branch lacks ("behind" count). 0 when up
+   *  to date; null when there's no upstream. Reflects the last fetch (compared
+   *  against the local remote-tracking ref, not the network). */
+  behind: number | null;
+  /** Commits this branch has that the upstream lacks ("ahead" count). Used to
+   *  detect divergence (ahead > 0 && behind > 0). Null when there's no upstream. */
+  ahead: number | null;
+}
+
+/**
+ * @deprecated Use {@link HarnessStatus} instead. Kept as a type alias so the
+ * webview code that already imported `AgentStatus` doesn't need to rename;
+ * the shape is now per-harness (multiple rows can share a `kind`).
+ */
+export type AgentStatus = HarnessStatus;
+
+/**
+ * Multi-provider git-forge support (docs/plans/multi-provider-git-modal.md).
+ * `canonicalGitHost` in `src/bun/github.ts` already maps any host containing
+ * "github"/"gitlab"/"bitbucket" to the provider's cloud hostname — this is
+ * the provider identifier that maps to that canonical host 1:1.
+ */
+export type GitProvider = "github" | "gitlab" | "bitbucket";
+
+/**
+ * A resolved provider + repo identity for a project directory, as returned by
+ * `providerRepoForDir` (`src/bun/git-provider.ts`) and the `provider-info`
+ * route consumed by the GitHub/GitLab/Bitbucket dialog.
+ */
+export interface ProviderRepoInfo {
+  provider: GitProvider;
+  /** Canonical provider host, e.g. "gitlab.com" — NOT the token-store key. */
+  host: string;
+  /** Raw (pre-canonicalization) remote host — e.g. the ssh-alias host a user
+   *  pins per-identity in `~/.ssh/config`. This is the token-store key (see
+   *  `github-tokens.ts`'s host-keyed store and `docs/plans/github-multi-identity-tokens.md`) —
+   *  callers resolving a token for this repo must use `remoteHost`, not `host`. */
+  remoteHost: string;
+  owner: string;
+  name: string;
+}
+
+/**
+ * Per-provider feature flags + terminology driving the GitHub/GitLab/Bitbucket
+ * dialog's gating (Wave 4, `GitHubDialog.tsx`): affordances the selected
+ * provider doesn't support are hidden rather than shown broken. GitHub is the
+ * baseline the dialog was originally built against, so every flag is `true`
+ * there; GitLab/Bitbucket flip off whatever their APIs can't back (see the
+ * provider API facts in the plan's §2 for the source of each flag).
+ */
+export interface ProviderCaps {
+  labels: boolean;
+  milestones: boolean;
+  /** GitHub's raw search-qualifier syntax (`label:bug sort:updated`) — GitHub
+   *  only; GitLab/Bitbucket use structured filters instead. */
+  searchSyntax: boolean;
+  reviewRequestedFilter: boolean;
+  checks: boolean;
+  /** The separate GitHub commit-status panel (distinct from the CheckRuns UI,
+   *  which GitLab/Bitbucket statuses are normalized into instead). */
+  commitStatusPanel: boolean;
+  reactions: boolean;
+  draft: boolean;
+  autoMerge: boolean;
+  suggestions: boolean;
+  subIssues: boolean;
+  projects: boolean;
+  discussions: boolean;
+  actions: boolean;
+  notifications: boolean;
+  releases: boolean;
+  issueTracker: boolean;
+  requestChanges: boolean;
+  updateBranch: boolean;
+  linkedIssues: boolean;
+  commentSort: boolean;
+  lockConversation: boolean;
+  pinIssue: boolean;
+  issueTransfer: boolean;
+  /** Push-access lookup (`/github/repo-permissions`) — GitHub-only; elsewhere
+   *  the dialog stays optimistic and lets the provider reject a write. */
+  repoPermissions: boolean;
+  /** Repo assignee list for the assignee picker (`/github/assignees`) —
+   *  GitHub-only; elsewhere the picker falls back to free-text logins. */
+  assigneeList: boolean;
+  /** A pull request's commit list (`/github/pull-commits`) — GitHub-only. */
+  pullCommits: boolean;
+  /** Review-thread resolution state (`/github/pull-review-threads`) —
+   *  GitHub-only; review comments themselves are provider-aware. */
+  reviewThreads: boolean;
+  mergeMethods: GitHubPullMergeMethod[];
+  providerName: string;
+  /** Singular term for a "pull request" in this provider's own terminology. */
+  pullNoun: string;
+  pullNounPlural: string;
+  pullAbbrev: string;
+  pullAbbrevPlural: string;
+}
+
+/**
+ * Per-provider capability + terminology table. GitHub is full-featured (the
+ * dialog's original baseline); GitLab and Bitbucket flip off flags for panels
+ * and actions their APIs don't support (Projects/Discussions/Actions/
+ * Notifications/Releases/Reactions/SubIssues/Suggestions/AutoMerge/
+ * UpdateBranch/LinkedIssues/CommentSort/Lock/Pin/Transfer/RepoPermissions/
+ * AssigneeList/PullCommits/ReviewThreads are GitHub-only). The dialog gates
+ * every fetch to a GitHub-only route on these flags via `providerSupports`
+ * (`src/mainview/lib/provider-caps.ts`), never on a bare `provider ===` check.
+ *
+ * `mergeMethods` reuses {@link GitHubPullMergeMethod} ("merge"|"squash"|"rebase")
+ * as the neutral merge-strategy vocabulary:
+ * - GitHub: merge, squash, rebase (all three, unchanged).
+ * - GitLab: merge, squash (GitLab has no rebase-as-a-merge-strategy option —
+ *   its "rebase" action rewrites the branch before merging, it isn't a merge
+ *   strategy choice like GitHub's).
+ * - Bitbucket: merge, squash, rebase — Bitbucket's three `merge_strategy`
+ *   values are `merge_commit` / `squash` / `fast_forward`. There is no
+ *   fast-forward entry in {@link GitHubPullMergeMethod}, so `fast_forward`
+ *   (a linear, no-merge-commit history — the same end result GitHub's
+ *   "rebase and merge" produces) is mapped to `"rebase"` here; the adapter
+ *   (Wave 2/T3, `src/bun/bitbucket.ts`) is responsible for translating
+ *   `"rebase"` back to `merge_strategy: "fast_forward"` on the wire.
+ */
+export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
+  github: {
+    labels: true,
+    milestones: true,
+    searchSyntax: true,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: true,
+    reactions: true,
+    draft: true,
+    autoMerge: true,
+    suggestions: true,
+    subIssues: true,
+    projects: true,
+    discussions: true,
+    actions: true,
+    notifications: true,
+    releases: true,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: true,
+    linkedIssues: true,
+    commentSort: true,
+    lockConversation: true,
+    pinIssue: true,
+    issueTransfer: true,
+    repoPermissions: true,
+    assigneeList: true,
+    pullCommits: true,
+    reviewThreads: true,
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "GitHub",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+  gitlab: {
+    labels: true,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: false,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    repoPermissions: false,
+    assigneeList: false,
+    pullCommits: false,
+    reviewThreads: false,
+    mergeMethods: ["merge", "squash"],
+    providerName: "GitLab",
+    pullNoun: "Merge request",
+    pullNounPlural: "Merge requests",
+    pullAbbrev: "MR",
+    pullAbbrevPlural: "MRs",
+  },
+  bitbucket: {
+    labels: false,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    repoPermissions: false,
+    assigneeList: false,
+    pullCommits: false,
+    reviewThreads: false,
+    // merge_commit/squash/fast_forward → merge/squash/rebase; see the
+    // ProviderCaps doc comment above for the fast_forward↔"rebase" mapping.
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "Bitbucket",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// Theme (Auto / Dark / Light)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The user-facing theme choice, persisted as the `theme` key in the
+ * `preferences` table (see `src/bun/db.ts`) and round-tripped through
+ * `GET/PUT /preferences`. "auto" follows the OS appearance
+ * (`prefers-color-scheme`) and live-reacts to it changing while the app is
+ * open; "dark"/"light" pin an explicit choice. Unset/invalid persisted values
+ * resolve to "auto" — see `parseThemePreference` in `src/mainview/lib/theme.ts`.
+ */
+export type ThemePreference = "auto" | "dark" | "light";
+
+/** The concrete theme actually painted — what `preference` resolves to once
+ *  "auto" has been settled against the OS/system appearance. */
+export type ResolvedTheme = "dark" | "light";
+
+/** Options for the Settings → General theme picker, in display order. */
+export const THEME_PREFERENCES: readonly { id: ThemePreference; label: string }[] = [
+  { id: "auto", label: "Auto" },
+  { id: "dark", label: "Dark" },
+  { id: "light", label: "Light" },
+];
+
+// ───────────────────────────────────────────────────────────────────────────
+// Font size (Cmd+= / Cmd+- global UI zoom)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The current root font size (16px) is both the DEFAULT and the MINIMUM —
+ * Cmd+- has nowhere to go below "what it looks like today". FONT_SIZE_MAX
+ * (170%) and FONT_SIZE_STEP (10%) are the generous-but-layout-safe bounds
+ * chosen in docs/plans/cmd-font-size-controller.md §8. Persisted as the
+ * `fontSize` key in the `preferences` table (see `src/bun/db.ts`) as a plain
+ * percent string ("100"–"170"), round-tripped through `GET/PUT /preferences`
+ * exactly like `theme`. Applied as
+ * `document.documentElement.style.fontSize = (16 * pct/100) + "px"`; at
+ * exactly FONT_SIZE_DEFAULT the inline style is omitted entirely so the
+ * default state stays pristine (and the boot no-flash channels can skip the
+ * write).
+ */
+export const FONT_SIZE_MIN = 100;
+export const FONT_SIZE_MAX = 170;
+export const FONT_SIZE_STEP = 10;
+export const FONT_SIZE_DEFAULT = 100;
+
+/** Root `<html>` font size at 100% (px) — the rem baseline every percent is
+ *  scaled against (`FONT_SIZE_BASE_PX * pct/100`). Consumed by `src/bun/index.ts`
+ *  (preload apply-script) and duplicated inline in `src/mainview/index.html`'s
+ *  blocking boot script, which can't import a module before first paint. */
+export const FONT_SIZE_BASE_PX = 16;
+
+/** xterm terminal pane font size at 100% (px) — the separate baseline
+ *  `TerminalView.tsx` scales against, since xterm renders to canvas outside
+ *  the CSS/rem cascade `FONT_SIZE_BASE_PX` drives. */
+export const TERMINAL_FONT_SIZE_BASE_PX = 12;
+
+/**
+ * Parse anything (a persisted preference string, a hash-fragment param, a
+ * `window.__AGETOR` global, …) into a valid integer font-size percent,
+ * clamped to [FONT_SIZE_MIN, FONT_SIZE_MAX]. Accepts a string ("120",
+ * "120.5") or a number; floats are rounded to the nearest integer before
+ * clamping. Anything else — null/undefined, an empty/non-numeric string,
+ * NaN, ±Infinity — falls back to FONT_SIZE_DEFAULT. Never throws.
+ */
+export function clampFontSizePercent(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : typeof raw === "string" ? parseFloat(raw) : NaN;
+  if (!Number.isFinite(n)) return FONT_SIZE_DEFAULT;
+  const rounded = Math.round(n);
+  return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, rounded));
+}

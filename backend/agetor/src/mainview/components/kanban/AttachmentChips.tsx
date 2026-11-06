@@ -1,0 +1,189 @@
+// Renders the paths parsed from a user message's trailing "Referenced
+// files/folders:" block as clickable chips below the message bubble — a real
+// thumbnail for an image path, an icon chip (matching the existing
+// command-branch idiom in RunPanel.tsx) for everything else.
+//
+// Kept dumb on purpose: the only state here is "which paths have proven to be
+// missing" (so a broken thumbnail doesn't re-fetch on every render) and
+// "which path's not-found dialog is open." All path-shape logic
+// (`isImagePath`, basename, icon-by-extension) already lives in
+// `src/shared/attachments.ts` / `src/mainview/lib/file-icons.tsx`.
+import { useState } from "react";
+import { ImageOff } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
+import { iconForRef, refBasename } from "@/lib/file-icons";
+import { isImagePath } from "../../../shared/attachments.ts";
+import { parseHandoffFilePath } from "../../../shared/pipeline.ts";
+import { AuthedImg } from "@/components/ui/authed-img";
+import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
+import { HandoffFileChip } from "@/components/handoff/HandoffFileChip";
+import { useHandoffView } from "@/components/handoff/handoff-context";
+
+export function AttachmentChips({
+  references,
+  taskId,
+}: {
+  references: string[];
+  /** Task whose worktree/workdir a relative path should resolve against —
+   *  threaded through to `api.openPath` so a relative ref can resolve
+   *  server-side instead of always requiring an absolute path. */
+  taskId?: string;
+}) {
+  // Paths whose thumbnail failed to load, or whose openPath call 404'd (path
+  // genuinely gone) — once known missing we skip re-hitting the server on a
+  // repeat click and go straight to the not-found dialog. Cleared when that
+  // dialog is dismissed — by Escape, the backdrop, OR the dialog's own Close
+  // button, since `AttachmentNotFoundDialog` (`AttachmentDialogs.tsx`) wires
+  // its Close button to the very same `onClose` callback passed in here —
+  // so a later click retries rather than staying amber forever (e.g. the
+  // file reappeared, or the first check raced a slow mount).
+  const [missing, setMissing] = useState<ReadonlySet<string>>(new Set());
+  const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
+  // Distinct from `notFoundPath`: any *other* openPath failure (headless
+  // 501, a relative path with no resolvable cwd, an OS refusal via
+  // `{opened:false}`, or a network error) — none of these mean the path is
+  // gone, so the thumbnail must survive and stay clickable.
+  const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
+  // On a pipeline step's prompt bubble, a reference to a runner-written
+  // handoff file (`pipeline-runs/<parentId>/handoff-…json`) opens the
+  // formatted handoff modal instead of OS-opening the JSON
+  // (`docs/plans/formatted-handoff.md` D18). With the handoff view disabled
+  // (any other task, a subagent tab) every chip renders exactly as before.
+  const handoffView = useHandoffView();
+  const handoffParentId = handoffView.enabled ? handoffView.parentId : null;
+
+  if (references.length === 0) return null;
+
+  const markMissing = (path: string) => {
+    setMissing((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
+  };
+
+  const handleClick = async (path: string) => {
+    if (missing.has(path)) {
+      setNotFoundPath(path);
+      return;
+    }
+    try {
+      const result = await api.openPath({ path, taskId });
+      if (!result.opened) {
+        // The server found the path but the OS declined to open it — not a
+        // "missing" state, so the thumbnail must stay intact.
+        setOpenError({ path, message: "The OS declined to open this file." });
+      }
+    } catch (e) {
+      // A 404 from /open-path means the path genuinely doesn't exist
+      // anymore — that's the only case worth remembering as "missing".
+      // Anything else (501 headless, 400 relative-path-with-no-cwd, a
+      // network failure) is a transient/environmental failure that says
+      // nothing about whether the file exists, so don't poison the
+      // thumbnail over it.
+      if (e instanceof ApiError && e.status === 404) {
+        markMissing(path);
+        setNotFoundPath(path);
+      } else {
+        const message = e instanceof Error ? e.message : String(e);
+        setOpenError({ path, message });
+      }
+    }
+  };
+
+  return (
+    <>
+      <div className="mt-1 flex flex-wrap gap-1">
+        {references.map((path, index) => {
+          if (handoffParentId !== null && parseHandoffFilePath(path, handoffParentId) !== null) {
+            return <HandoffFileChip key={`${path}-${index}`} path={path} taskId={taskId} />;
+          }
+          const isDir = path.endsWith("/");
+          if (!isDir && isImagePath(path)) {
+            return (
+              <ImageChip
+                key={`${path}-${index}`}
+                path={path}
+                isMissing={missing.has(path)}
+                onMissing={() => markMissing(path)}
+                onClick={() => void handleClick(path)}
+              />
+            );
+          }
+          const Icon = iconForRef({ path, isDirectory: isDir });
+          return (
+            <button
+              key={`${path}-${index}`}
+              type="button"
+              title={path}
+              onClick={() => void handleClick(path)}
+              className="inline-flex max-w-full items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/60"
+            >
+              <Icon className="size-3 shrink-0" />
+              <span className="truncate">{refBasename(path)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <AttachmentNotFoundDialog
+        path={notFoundPath}
+        onClose={() => {
+          setNotFoundPath(null);
+          // Retry on a later click/render instead of staying permanently
+          // amber — the underlying file may have reappeared since.
+          setMissing((prev) => {
+            if (notFoundPath === null || !prev.has(notFoundPath)) return prev;
+            const next = new Set(prev);
+            next.delete(notFoundPath);
+            return next;
+          });
+        }}
+      />
+
+      <AttachmentOpenErrorDialog
+        path={openError?.path ?? null}
+        message={openError?.message ?? null}
+        onClose={() => setOpenError(null)}
+      />
+    </>
+  );
+}
+
+function ImageChip({
+  path,
+  isMissing,
+  onMissing,
+  onClick,
+}: {
+  path: string;
+  isMissing: boolean;
+  onMissing: () => void;
+  onClick: () => void;
+}) {
+  const base = refBasename(path);
+
+  if (isMissing) {
+    return (
+      <button
+        type="button"
+        title={`Image not found: ${path}`}
+        onClick={onClick}
+        className="inline-flex max-w-full items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] text-warning"
+      >
+        <ImageOff className="size-3 shrink-0" />
+        <span className="truncate">{base}</span>
+      </button>
+    );
+  }
+
+  return (
+    <button type="button" title={path} onClick={onClick} className="group">
+      <AuthedImg
+        url={api.filePreviewUrl(path)}
+        alt={base}
+        onStatus={(status) => {
+          if (status !== "ok") onMissing();
+        }}
+        decoding="async"
+        className="h-16 max-w-40 rounded-md border border-border/60 object-cover transition group-hover:ring-2 group-hover:ring-primary/40"
+      />
+    </button>
+  );
+}

@@ -1,0 +1,548 @@
+import { test, expect, beforeEach, afterAll } from "bun:test";
+import type { SQLQueryBindings } from "bun:sqlite";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { rmTestDataDir } from "./test-data-dir.ts";
+
+// Set AGETOR_DATA_DIR before any import that pulls in db.ts. ES imports
+// hoist before top-level code, so we use dynamic `await import()` below
+// instead of a top-level `import { db } from "./db.ts"`.
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-harnesses-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+const { db, harnesses, runs, tasks, subagents, HarnessBuiltinError, HarnessInUseError } = await import("./db.ts");
+
+afterAll(() => {
+  // Refuses (returns false) while the live db file is still there.
+  rmTestDataDir(DATA_DIR);
+});
+
+beforeEach(() => {
+  // Wipe any user-added aliases between tests; built-ins (is_builtin=1)
+  // stay so each test sees the seeded baseline. Also re-enable any built-in
+  // a prior test may have toggled off, so the baseline truly is "default".
+  db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
+  db.run(`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`);
+  db.run(`UPDATE harnesses SET profile_mcp_servers = 1 WHERE is_builtin = 1`);
+});
+
+test("seed leaves the two built-in harnesses in place", () => {
+  const list = harnesses.list();
+  // is_builtin DESC then created_at ASC → both builtins come first in
+  // claude-code, codex order (matching the migration INSERT order).
+  expect(list.map((h) => h.id)).toEqual(expect.arrayContaining(["claude-code", "codex"]));
+  for (const id of ["claude-code", "codex"]) {
+    const h = harnesses.get(id)!;
+    expect(h.isBuiltin).toBe(true);
+    expect(h.kind).toBe(id as "claude-code" | "codex");
+  }
+});
+
+test("insert creates a user alias that round-trips through get/list", () => {
+  const inserted = harnesses.insert({
+    id: "claude-work",
+    kind: "claude-code",
+    label: "Claude (work)",
+    home: "/tmp/agetor-test-home",
+    bin: null,
+    env: { FOO: "bar" },
+  });
+  expect(inserted.id).toBe("claude-work");
+  expect(inserted.isBuiltin).toBe(false);
+
+  const fetched = harnesses.get("claude-work")!;
+  expect(fetched.home).toBe("/tmp/agetor-test-home");
+  expect(fetched.env).toEqual({ FOO: "bar" });
+});
+
+test("insert rejects ids that aren't slugs", () => {
+  expect(() =>
+    harnesses.insert({ id: "Bad Id", kind: "claude-code", label: "x" }),
+  ).toThrow(/invalid harness id/);
+});
+
+test("update mutates fields and refuses to touch built-ins", () => {
+  harnesses.insert({ id: "claude-alt", kind: "claude-code", label: "Alt" });
+  const after = harnesses.update("claude-alt", { home: "/tmp/alt-home" });
+  expect(after.home).toBe("/tmp/alt-home");
+
+  expect(() => harnesses.update("claude-code", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("delete refuses built-ins and refuses aliases in use by a task", () => {
+  expect(() => harnesses.delete("claude-code")).toThrow(HarnessBuiltinError);
+
+  harnesses.insert({ id: "claude-tmp", kind: "claude-code", label: "Tmp" });
+  // Manually wire a fake task row referencing the alias — the table is
+  // free-form TEXT so we can write directly without going through
+  // createTask (which would also resolve a workdir, worktrees, etc.).
+  const taskId = "task-using-alias";
+  db.run(
+    `INSERT INTO tasks
+       (id, title, prompt, "column", agent, workdir, isolation,
+        branch, worktree_path, base_ref, mode, model, effort, refs,
+        run_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [taskId, "t", "p", "backlog", "claude-tmp", "/tmp", "none",
+     null, null, null, null, null, null, "[]", null, Date.now(), Date.now()],
+  );
+
+  let caught: InstanceType<typeof HarnessInUseError> | null = null;
+  try {
+    harnesses.delete("claude-tmp");
+  } catch (e) {
+    if (e instanceof HarnessInUseError) caught = e;
+  }
+  expect(caught).not.toBeNull();
+  expect(caught!.taskIds).toEqual([taskId]);
+
+  // After clearing the reference, delete proceeds.
+  db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  harnesses.delete("claude-tmp");
+  expect(harnesses.get("claude-tmp")).toBeNull();
+});
+
+test("setEnabled toggles built-ins (carve-out from immutability) and update still refuses other built-in edits", () => {
+  // Built-ins start enabled.
+  expect(harnesses.get("claude-code")!.enabled).toBe(true);
+
+  // Carve-out: enabled flag is mutable on built-ins.
+  const disabled = harnesses.setEnabled("claude-code", false);
+  expect(disabled.enabled).toBe(false);
+  expect(harnesses.get("claude-code")!.enabled).toBe(false);
+
+  // Identity/config fields stay immutable.
+  expect(() => harnesses.update("claude-code", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+
+  // Re-enable.
+  expect(harnesses.setEnabled("claude-code", true).enabled).toBe(true);
+});
+
+test("usage counts running and total tasks referencing the harness", () => {
+  harnesses.insert({ id: "claude-busy", kind: "claude-code", label: "Busy" });
+  const insertTask = (id: string, column: string) => {
+    db.run(
+      `INSERT INTO tasks
+         (id, title, prompt, "column", agent, workdir, isolation,
+          branch, worktree_path, base_ref, mode, model, effort, refs,
+          run_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, "t", "p", column, "claude-busy", "/tmp", "none",
+       null, null, null, null, null, null, "[]", null, Date.now(), Date.now()],
+    );
+  };
+  insertTask("t-run-1", "running");
+  insertTask("t-run-2", "running");
+  insertTask("t-done", "done");
+
+  const u = harnesses.usage("claude-busy");
+  expect(u.harnessId).toBe("claude-busy");
+  expect(u.totalTaskCount).toBe(3);
+  expect(u.runningTaskIds.sort()).toEqual(["t-run-1", "t-run-2"]);
+
+  // Cleanup so subsequent tests aren't surprised by leftover rows.
+  db.run(`DELETE FROM tasks WHERE agent = 'claude-busy'`);
+});
+
+test("getByIdOrKind synthesises a built-in row for legacy kind ids without a matching row", () => {
+  // Even if a future migration accidentally dropped the seed, legacy
+  // `tasks.agent ∈ {"claude-code","codex"}` rows must keep resolving.
+  //
+  // Deletes a built-in row, which is normally harmless because this file
+  // runs against its own throwaway mkdtemp db (lines 6-10 above) — but that
+  // isolation only protects a db.ts module instance THIS file is the first
+  // to trigger; if some other file `bun test` happens to load earlier
+  // static-imports its way into db.ts first (module instances are cached
+  // per process, and bun test runs every file in one process), this DELETE
+  // runs against whatever db.ts actually opened — which could be the real
+  // ~/.agetor-dev. Capture + restore in `finally` so this test can never
+  // leave a builtin permanently missing even in that case.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("claude-code");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["claude-code"]);
+    const synth = harnesses.getByIdOrKind("claude-code");
+    expect(synth?.kind).toBe("claude-code");
+    expect(synth?.isBuiltin).toBe(true);
+    // And unknown ids still return null — no silent fallback to a random kind.
+    expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("gemini is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  // 033_harness_kind_gemini.sql seeds gemini with enabled=0 (mirrors codex's
+  // 016 disabled-by-default rollout) — verified directly against a fresh
+  // migrate() run in the migrations smoke check, not re-asserted here since
+  // this file's beforeEach unconditionally re-enables every built-in for
+  // test isolation (`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`),
+  // which would make a "seeds disabled" assertion here just test the
+  // beforeEach, not the migration.
+  const h = harnesses.get("gemini")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("gemini");
+  expect(harnesses.setEnabled("gemini", false).enabled).toBe(false);
+  expect(harnesses.get("gemini")!.enabled).toBe(false);
+  expect(() => harnesses.update("gemini", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'gemini' and round-trips a gemini alias", () => {
+  const inserted = harnesses.insert({
+    id: "gemini-work",
+    kind: "gemini",
+    label: "Gemini (work)",
+    home: "/tmp/agetor-test-gemini-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("gemini");
+  expect(harnesses.get("gemini-work")!.home).toBe("/tmp/agetor-test-gemini-home");
+});
+
+test("fx is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  // 046_fx_harness.sql seeds fx with enabled=0 (mirrors codex's 016 /
+  // cursor's / gemini's disabled-by-default rollout posture) — not
+  // re-asserted here for the same reason the gemini test above doesn't
+  // re-assert it: this file's beforeEach unconditionally re-enables every
+  // built-in for test isolation.
+  const h = harnesses.get("fx")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("fx");
+  expect(h.label).toBe("fx.sh");
+  expect(harnesses.setEnabled("fx", false).enabled).toBe(false);
+  expect(harnesses.get("fx")!.enabled).toBe(false);
+  expect(() => harnesses.update("fx", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'fx' and round-trips an fx alias", () => {
+  const inserted = harnesses.insert({
+    id: "fx-work",
+    kind: "fx",
+    label: "fx (work)",
+    home: "/tmp/agetor-test-fx-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("fx");
+  expect(harnesses.get("fx-work")!.home).toBe("/tmp/agetor-test-fx-home");
+});
+
+test("getByIdOrKind synthesises a built-in fx row for legacy id without a matching row", () => {
+  // Same capture/restore rationale as the claude-code/gemini versions of
+  // this test above.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("fx");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["fx"]);
+    const synth = harnesses.getByIdOrKind("fx");
+    expect(synth?.kind).toBe("fx");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("fx.sh");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("insert rejects kind:'grok'/'kimi' even though the harnesses.kind CHECK constraint permits them", () => {
+  // migrations/046_fx_harness.sql widens the `harnesses.kind` CHECK to admit
+  // 'grok' and 'kimi' — reserved kinds the migration's own comment documents
+  // as not shipped here, kept in the CHECK so the table-rebuild recipe's
+  // INSERT...SELECT row copy stays order-independent regardless of which
+  // kind's migration lands first (a rebuild whose CHECK excludes an
+  // already-seeded kind fails its row copy). That widened CHECK is a
+  // SQLite-schema-level allowance only: `harnesses.insert` (db.ts) enforces
+  // its own separate app-layer whitelist (`claude-code` | `codex` |
+  // `cursor` | `gemini` | `fx`) that does not include 'grok'/'kimi', so an
+  // attempt to insert either is rejected before the CHECK constraint is
+  // ever consulted.
+  for (const kind of ["grok", "kimi"]) {
+    expect(() =>
+      harnesses.insert({ id: `${kind}-work`, kind: kind as never, label: kind }),
+    ).toThrow(new RegExp(`unknown harness kind: ${kind}`));
+  }
+});
+
+test("getByIdOrKind returns null for CHECK-permitted-but-app-unrecognized kinds ('grok', 'kimi')", () => {
+  // Mirrors the insert rejection above: getByIdOrKind's synthesis whitelist
+  // is the same closed set as insert's, so a legacy/foreign 'grok' or 'kimi'
+  // id (which the CHECK constraint would happily store, but which no
+  // migration has ever seeded a builtin row for) resolves to null rather
+  // than silently fabricating a builtin for a kind agetor doesn't drive.
+  for (const kind of ["grok", "kimi"]) {
+    expect(harnesses.getByIdOrKind(kind)).toBeNull();
+  }
+});
+
+test("getByIdOrKind synthesises a built-in gemini row for legacy id without a matching row", () => {
+  // Same capture/restore rationale as the claude-code version of this test
+  // above — belt-and-braces against this file's isolation being defeated.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("gemini");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["gemini"]);
+    const synth = harnesses.getByIdOrKind("gemini");
+    expect(synth?.kind).toBe("gemini");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("Gemini CLI");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("antigravity is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  const h = harnesses.get("antigravity")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("antigravity");
+  expect(h.label).toBe("Antigravity");
+  expect(harnesses.setEnabled("antigravity", false).enabled).toBe(false);
+  expect(harnesses.get("antigravity")!.enabled).toBe(false);
+  expect(() => harnesses.update("antigravity", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'antigravity' and round-trips an antigravity alias", () => {
+  const inserted = harnesses.insert({
+    id: "antigravity-work",
+    kind: "antigravity",
+    label: "Antigravity (work)",
+    home: "/tmp/agetor-test-antigravity-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("antigravity");
+  expect(harnesses.get("antigravity-work")!.home).toBe("/tmp/agetor-test-antigravity-home");
+});
+
+test("getByIdOrKind synthesises a built-in antigravity row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("antigravity");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["antigravity"]);
+    const synth = harnesses.getByIdOrKind("antigravity");
+    expect(synth?.kind).toBe("antigravity");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("Antigravity");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("opencode is a built-in row (carve-out setEnabled toggle works like every other built-in; its seeded enabled=0 is pinned in migrate.test.ts)", () => {
+  const h = harnesses.get("opencode")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("opencode");
+  expect(h.label).toBe("OpenCode");
+  expect(h.profileMcpServers).toBe(true);
+  expect(harnesses.setEnabled("opencode", false).enabled).toBe(false);
+  expect(harnesses.get("opencode")!.enabled).toBe(false);
+  expect(() => harnesses.update("opencode", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'opencode' and round-trips an opencode alias", () => {
+  const inserted = harnesses.insert({
+    id: "opencode-2",
+    kind: "opencode",
+    label: "OpenCode (second account)",
+    home: "/tmp/agetor-test-opencode-home",
+    bin: null,
+    env: { OPENCODE_CONFIG: "/tmp/agetor-test-opencode-home/opencode.json" },
+  });
+  expect(inserted.kind).toBe("opencode");
+  const back = harnesses.get("opencode-2")!;
+  expect(back.home).toBe("/tmp/agetor-test-opencode-home");
+  expect(back.env).toEqual({ OPENCODE_CONFIG: "/tmp/agetor-test-opencode-home/opencode.json" });
+  expect(harnesses.list().map((x) => x.id)).toContain("opencode-2");
+});
+
+test("getByIdOrKind synthesises a built-in opencode row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("opencode");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["opencode"]);
+    const synth = harnesses.getByIdOrKind("opencode");
+    expect(synth?.kind).toBe("opencode");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("OpenCode");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("profileMcpServers defaults to true on seeded built-ins, a fresh alias and a synthesized row", () => {
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(true);
+  expect(harnesses.get("claude-code")!.profileMcpServers).toBe(true);
+  const alias = harnesses.insert({ id: "fx-alt", kind: "fx", label: "fx (alt)" });
+  expect(alias.profileMcpServers).toBe(true);
+  expect(harnesses.get("fx-alt")!.profileMcpServers).toBe(true);
+  // Same capture/restore rationale as the getByIdOrKind tests above.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("fx");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["fx"]);
+    expect(harnesses.getByIdOrKind("fx")!.profileMcpServers).toBe(true);
+  } finally {
+    if (saved) {
+      const r = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [r.id, r.kind, r.label, r.is_builtin, r.home, r.bin, r.env_json, r.created_at, r.updated_at, r.enabled, r.profile_mcp_servers] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("profileMcpServers round-trips through insert and update", () => {
+  const off = harnesses.insert({ id: "fx-off", kind: "fx", label: "fx off", profileMcpServers: false });
+  expect(off.profileMcpServers).toBe(false);
+  expect(harnesses.list().find((h) => h.id === "fx-off")!.profileMcpServers).toBe(false);
+
+  expect(harnesses.update("fx-off", { profileMcpServers: true }).profileMcpServers).toBe(true);
+  expect(harnesses.update("fx-off", { profileMcpServers: false }).profileMcpServers).toBe(false);
+  // A patch that doesn't name the toggle leaves it alone.
+  const relabeled = harnesses.update("fx-off", { label: "fx renamed" });
+  expect(relabeled.label).toBe("fx renamed");
+  expect(relabeled.profileMcpServers).toBe(false);
+});
+
+test("update accepts a profileMcpServers-only patch on a built-in but still refuses config edits", () => {
+  const before = harnesses.get("fx")!;
+  const after = harnesses.update("fx", { profileMcpServers: false });
+  expect(after.profileMcpServers).toBe(false);
+  expect(after.label).toBe(before.label);
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(false);
+
+  expect(() => harnesses.update("fx", { profileMcpServers: true, label: "Renamed" })).toThrow(HarnessBuiltinError);
+  expect(harnesses.get("fx")!.profileMcpServers).toBe(false);
+});
+
+test("copilot is a seeded built-in row labelled GitHub Copilot, enabled by default", () => {
+  const h = harnesses.get("copilot")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("copilot");
+  expect(h.label).toBe("GitHub Copilot");
+  expect(h.enabled).toBe(true);
+  expect(() => harnesses.update("copilot", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'copilot' and round-trips a copilot alias", () => {
+  const inserted = harnesses.insert({
+    id: "copilot-2",
+    kind: "copilot",
+    label: "GitHub Copilot (2)",
+    home: "/tmp/agetor-test-copilot-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("copilot");
+  expect(harnesses.get("copilot-2")!.home).toBe("/tmp/agetor-test-copilot-home");
+});
+
+test("getByIdOrKind synthesises a built-in GitHub Copilot row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("copilot");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["copilot"]);
+    const synth = harnesses.getByIdOrKind("copilot");
+    expect(synth?.kind).toBe("copilot");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("GitHub Copilot");
+    expect(synth?.enabled).toBe(true);
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled, s.profile_mcp_servers] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+function seedTaskAndRun(taskId: string, runId: string) {
+  tasks.insert({
+    id: taskId, title: "t", prompt: "p", agent: "copilot", workdir: "/tmp", isolation: "none",
+    taskType: "task", branch: null, branchSource: "created", worktreePath: null, baseRef: null,
+    prUrl: null, mode: null, model: null, effort: null, speed: "off", opencodeServer: "shared", maxMode: false,
+    references: [], backlog: [], plans: [], draft: null, column: "ready", runId: null,
+    createdAt: 1, updatedAt: 1, hasOpenableRun: false, pendingInteractionCount: 0,
+    openTerminalCount: 0, archivedAt: null,
+  });
+  runs.insert({
+    id: runId, taskId, agent: "copilot", status: "running", startedAt: 1, endedAt: null,
+    exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+}
+
+test("runs carry copilotSessionId through insert, update and get (omitted on insert reads back null)", () => {
+  seedTaskAndRun("t-cop-sess", "r-cop-sess");
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBeNull();
+  const updated = runs.update("r-cop-sess", { copilotSessionId: "11111111-2222-3333-4444-555555555555" });
+  expect(updated!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  // A patch that doesn't name it keeps it.
+  runs.update("r-cop-sess", { status: "succeeded", endedAt: 5, exitCode: 0 });
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  db.run(`DELETE FROM tasks WHERE id = ?`, ["t-cop-sess"]);
+});
+
+test("subagents.settleRunningForRun settles only that run's running rows and reports the count", () => {
+  seedTaskAndRun("t-settle", "r-settle-a");
+  runs.insert({
+    id: "r-settle-b", taskId: "t-settle", agent: "copilot", status: "running", startedAt: 2, endedAt: null,
+    exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+  const mk = (id: string, runId: string, status: "running" | "completed", endedAt: number | null) =>
+    subagents.insertIfAbsent({
+      id, taskId: "t-settle", runId, parentKind: "subagent", agentType: null, description: null,
+      spawnDepth: 1, sourcePath: "", status, startedAt: 10, endedAt,
+    });
+  mk("sa-a1", "r-settle-a", "running", null);
+  mk("sa-a2", "r-settle-a", "running", null);
+  mk("sa-a3", "r-settle-a", "completed", 50);
+  mk("sa-b1", "r-settle-b", "running", null);
+
+  expect(subagents.settleRunningForRun("r-settle-a", "completed", 777)).toBe(2);
+  expect(subagents.get("sa-a1")).toMatchObject({ status: "completed", endedAt: 777 });
+  expect(subagents.get("sa-a2")).toMatchObject({ status: "completed", endedAt: 777 });
+  // Already-settled row keeps its own timestamp; other run untouched.
+  expect(subagents.get("sa-a3")).toMatchObject({ status: "completed", endedAt: 50 });
+  expect(subagents.get("sa-b1")).toMatchObject({ status: "running", endedAt: null });
+  // Idempotent.
+  expect(subagents.settleRunningForRun("r-settle-a", "orphaned", 888)).toBe(0);
+  expect(subagents.settleRunningForRun("r-unknown", "completed", 1)).toBe(0);
+  expect(subagents.settleRunningForRun("r-settle-b", "failed", 999)).toBe(1);
+  expect(subagents.get("sa-b1")).toMatchObject({ status: "failed", endedAt: 999 });
+  db.run(`DELETE FROM tasks WHERE id = ?`, ["t-settle"]);
+});

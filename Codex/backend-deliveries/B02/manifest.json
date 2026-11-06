@@ -1,0 +1,32 @@
+{
+  "task": "B-02",
+  "status": "verified-local-runtime",
+  "implementationCommit": "7556c9213ea7862b2bfe5254871ab2503134e97e",
+  "files": {
+    "source-version.json": "085d8250a106e152c59ce21b01abd1ce79e70dba843c496e824634f781685b68",
+    "README.md": "f6793d3199e65c0de38cd53f2c2db6fbfc3910b3b2dd614c848049f043ca92f8",
+    "complete-changes.patch": "a8083436793a0f66bf8e3b0b02915629b1329785ad2a1d82c299c7b73b0ea3b0",
+    "evidence/orchestrator-codex-queue-floor-tests.log": "b778dd2a48d711bf737af34c8680c95c75f945f6a01934d6562b02b4d5c6ea01",
+    "evidence/typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "evidence/hub-codex-runtime-tests.log": "1eb3e202fb5994a613a945d82bfcefcfaab92f0017544338b5cfd67716818930",
+    "evidence/hub-typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "evidence/orchestrator-codex-tests.log": "711fd03bd599ffc6187ce7cfaa722369370a5860619dc1deb68887ac56a304e8",
+    "evidence/b01-tests.log": "9e96b7f431a641519a92f7e6902266cf09543f9a6f0ef7e453b7a49ecf4ad8c7",
+    "evidence/real-runtime.log": "b321725f60ad679a5efba5c81f8ca8c8d4c01f6623277129393dc4a189c0cdab",
+    "evidence/b02-initial-mixed-tests.log": "a044ceab44712563eaf521a2834fa9e579a347d7aff3cab408bdde874faaca4f",
+    "evidence/codex-tmux-tests.log": "485af0aff4b7d5d433e1bf7d91171c25099b510a70729540d13f5b8dce2c8ed7",
+    "evidence/real-runtime/summary.json": "d6927b910e9babd89144a11371f499a29beb511741419cb6fb06fa0512a18a9d",
+    "evidence/real-runtime/66db5c94-2988-46d0-b54b-be7c7c354389.jsonl": "23d9d315d6d237cfcdfcec6af799d4ad532f1f48e1f05268708e981267745185",
+    "evidence/real-runtime/5f35b884-6309-4d89-ab1b-9005b63297cb.jsonl": "cc9c7f02b92c7cb7970a578b1f7743dde7bb542d35cb4c98b6c560f807331d55",
+    "evidence/real-runtime/d981a303-15da-47ad-8685-45bfd90d3372.jsonl": "e63b13c6a8dd1759f68b447254816ec3f6d647823849eb2ecaa18c955f1f9c2b",
+    "evidence/real-runtime/543d183b-0db4-41b7-bf74-7815fc07befa.jsonl": "0c76e4639f423cb792a86502fbafce5b6426e4f9858bdc5b6eb9bbb77ffab4b2",
+    "evidence/real-runtime/72911dc5-452a-4972-8938-73e18f3ee788.jsonl": "c42518a4a4248c838ae198b94c0a62312c26ccaf457aca577c4439c2d32c9cc5",
+    "evidence/real-runtime/88335a59-e0a4-42f5-bcd9-7090820c2122.jsonl": "77e15fda03101dde162e563773cac1d6fd428feaede37b187616d40e9a2dd89c",
+    "source/package.json": "df084960afe047de51084fd5ed80b9c4c125fbe68518cd095c568f937bfb63f7",
+    "source/tsconfig.json": "6e9d81f0e77e1a17cafe6d6f3dbf8aec46856a669fc5b9018a0d57ff3c6865ae",
+    "source/tsconfig.hub.json": "bf4a32adddf5ace0eba9b1a4dc4f3e9b225ed2972737d5b3041997c2149ec9fd",
+    "source/scripts/verify-hub-codex.ts": "74322befb4c0729247f65c6118b84d501ff6e0c6fc66de876c08a7481948fd1e",
+    "source/packages/agent-adapters/codex/runtime.ts": "3d75e1d3a7e27c61d0ff5ebc68666a27770061cb7a726892aa58e543bf724911",
+    "source/src/bun/hub-codex-runtime.test.ts": "f63eead267ebde0f62ea06be975ffb5a939ec1ccf6ef9e4ce192fccddff8be80"
+  }
+}

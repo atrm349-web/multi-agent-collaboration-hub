@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "delivery": "Antigravity F02-r3 (Human-Centric UI & Clean Mission Control Redesign)",
+  "checkedAt": "2026-11-03T08:31:10.000Z",
+  "sourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "a0c69a3ce7d46612241faad718927a82e1ae9dc32079a731681308103e26e29b",
+    "styles.css": "430ef474f31f0b35b9944020ebc4fd364778538200e4e426bfc546e02393c454"
+  },
+  "nativeBundleHashes": {
+    "app.live-native.js": "252ba8265313ea9e07174b5d117efbb8674b2fea0a85b458baba8ac2dd5163d9",
+    "index.live-native.html": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317"
+  },
+  "reviewStatus": "accepted-macos-mvp-scoped",
+  "uiRedesign": {
+    "humanCentricMissionControl": true,
+    "quickPromptPresets": true,
+    "reducedCognitiveOverload": true,
+    "cleanDevToolbar": true
+  }
+}

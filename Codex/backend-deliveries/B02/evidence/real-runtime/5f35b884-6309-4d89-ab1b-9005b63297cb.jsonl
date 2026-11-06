@@ -1,0 +1,4 @@
+{"seq":1,"stream":"event","event":{"type":"thread.started","thread_id":"01a19b5a-e878-7ab2-ba72-fa72915bf0d6"}}
+{"seq":2,"stream":"event","event":{"type":"turn.started"}}
+{"seq":4,"stream":"event","event":{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"HUB_RESUME_OK."}}}
+{"seq":5,"stream":"event","event":{"type":"turn.completed","usage":{"input_tokens":35096,"cached_input_tokens":29440,"cache_write_input_tokens":0,"output_tokens":18,"reasoning_output_tokens":0}}}

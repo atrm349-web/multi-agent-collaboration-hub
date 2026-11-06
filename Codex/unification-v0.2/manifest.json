@@ -1,0 +1,15 @@
+{
+  "contractVersion": "0.2",
+  "owner": "Codex",
+  "status": "awaiting-antigravity-ack",
+  "files": {
+    "typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "README.md": "66832a1d13949c076f6ff50d70e1fd2db6cb815185cebc651bb551c85d9278a2",
+    "verification.md": "9bb90daf5b01c5e6ea478628342a72f4b24f3f4b862463a729a92257e9bd7c9a",
+    "docs/task-board.md": "77e3a1276c50250fad91108a73e184cfa82fe112218449a6cfddebb4d452a9e1",
+    "docs/codex-tasks.md": "ea0d5c2cdf5e453ab50393cd9cfbf1e3a39b5ea0f26f85adebd6934f28ba3cbe",
+    "docs/api-contract.md": "446929001bf73d206629587de75b5b7f909856c2cce33bd575ac848aeb6bcd55",
+    "docs/alignment-v0.2.md": "b2a730c16d2fe11829b54451a9f1af8654ab66afdfef4db0aa1aa496c1201d95",
+    "packages/shared/src/types.v0.2.ts": "a6b0fc147ff22e7508abc79631b3d3f6c4d29bcbe7c49d1378b3a7ce21a6fd42"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "multi-agent-collaboration-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-Agent Collaboration Hub (Agent Router) — 跨厂商多模型自主协同分工调度器",
+  "type": "module",
+  "scripts": {
+    "start": "./start.sh",
+    "dev": "./start.sh",
+    "start:hub": "bun backend/agetor/scripts/start-hub.ts config/hub-config.json",
+    "start:mock": "node apps/web/server.mjs",
+    "test:hub": "bun test --cwd backend/agetor",
+    "verify:contract": "node tests/verify-contract-v0.2.mjs",
+    "verify:browser": "node tests/verify-browser-v0.2.mjs",
+    "verify": "node tests/verify-contract-v0.2.mjs && node tests/verify-browser-v0.2.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "bun": ">=1.0.0"
+  }
+}

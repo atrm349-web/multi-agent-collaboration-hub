@@ -1,0 +1,1864 @@
+import { test, expect, mock, afterAll } from "bun:test";
+import { render } from "ink-testing-library";
+import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, buildHandoffLines, dashboardRows } from "./Dashboard.tsx";
+import type { PipelineRunState } from "../../shared/types.ts";
+import { eventKey } from "./useCoalescedStream.ts";
+import { TASK_STREAM_GAP_NOTICE } from "../../shared/task-stream-resume.ts";
+import type { AgetorClient, CoreInfo } from "../api-client.ts";
+import type { Task, RunEvent } from "../../shared/types.ts";
+import {
+  commitPushPrompt,
+  FX_RECOVERY_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  PERMISSION_MODE_STATUS_PREFIX,
+} from "../../shared/types.ts";
+
+// Snapshot the real `sse.ts` exports before mocking so the mock can be
+// reverted after this file's tests finish — `mock.module` overwrites the
+// module record in place, and other test files in the same `bun test`
+// process (anything importing "../sse.ts" transitively) must see the real
+// implementation again once we're done here.
+import * as realSse from "../sse.ts";
+const realSseSnapshot = { ...realSse };
+
+// Captures the most recently opened `/tasks/:id/events` subscription so a
+// test can push synthetic RunEvents straight into useCoalescedStream without
+// a live daemon. The `/events` global-toast subscription (useGlobalEvents) is
+// acknowledged with a no-op handle and never driven — no test here needs it.
+let onTaskEvents: ((e: RunEvent) => void) | null = null;
+// The same subscription's named-frame hook (`replay_meta`), for the forward-
+// resume tests below.
+let onTaskNamed: ((event: string, data: string) => void) | undefined;
+
+mock.module("../sse.ts", () => ({
+  ...realSseSnapshot,
+  streamSse: (
+    pathname: string,
+    onEvent: (e: unknown) => void,
+    opts?: { onNamedEvent?: (event: string, data: string) => void },
+  ) => {
+    if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
+      onTaskEvents = onEvent as (e: RunEvent) => void;
+      onTaskNamed = opts?.onNamedEvent;
+    }
+    return { close: () => {} };
+  },
+}));
+
+afterAll(() => {
+  mock.module("../sse.ts", () => realSseSnapshot);
+});
+
+const ENTER = "\r";
+const wait = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+// The footer's right-hand status text lives beside a hint string
+// (`↑/↓ select · s run · x stop · m msg · c commit · g answer · r resume ·
+// q quit`) inside ink-testing-library's fixed 100-column fake stdout — a
+// long status (e.g. an "N @ ref(s) won't resolve: …" warning) can wrap onto
+// a second frame line mid-word, splitting a `toContain` needle across the
+// newline. Collapse all whitespace runs (including the wrap's embedded
+// newline) to a single space before asserting on any such needle so the
+// assertion holds regardless of exactly where ink wraps.
+const flatten = (s: string) => s.replace(/\s+/g, " ");
+const core = { kind: "cli-daemon", port: 4317, token: "x", version: "0", pid: 1, startedAt: 0 } as unknown as CoreInfo;
+
+function task(over: Partial<Task>): Task {
+  return {
+    id: "t", title: "T", column: "backlog", runId: null,
+    pendingInteractionCount: 0, archivedAt: null, hasOpenableRun: false,
+    ...over,
+  } as unknown as Task;
+}
+
+// Smoke test: the whole tree mounts (header, empty board, footer hints, and the
+// SSE hooks) without throwing. dataDir points nowhere so discoverCore returns
+// null and the streams just back off harmlessly; unmount() tears them down.
+test("Dashboard mounts the header, empty state, and the new key hints", async () => {
+  const client = { listTasks: async () => [] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Agetor");
+  expect(frame).toContain("no tasks");
+  expect(frame).toContain("m msg");
+  expect(frame).toContain("c commit");
+  expect(frame).toContain("g answer");
+  // Resume affordance for a paused fx recovery (docs/plans/
+  // fix-fx-harness-rate-limit.md §3.5/T6) — present in the default (nav)
+  // mode's footer legend regardless of whether anything is actually resumable.
+  expect(frame).toContain("r resume");
+  unmount();
+});
+
+// Regression: the compose target is pinned by id on entry, so a background
+// re-sort can't redirect the message to whatever task slid into the cursor row.
+test("compose pins the target task even when the board re-sorts under the cursor", async () => {
+  const sends: Array<{ runId: string; line: string }> = [];
+  let calls = 0;
+  const client = {
+    // Poll 1: A running (row 0). Poll 2+: A finished → done (sorts last), so B
+    // (blocked) slides into row 0 — sorted[sel] now points at B, not A.
+    listTasks: async () => {
+      calls++;
+      return calls <= 1
+        ? [task({ id: "taskA", column: "running", runId: "runA", title: "A" }), task({ id: "taskB", column: "blocked", runId: "runB", title: "B" })]
+        : [task({ id: "taskA", column: "done", runId: "runA", title: "A" }), task({ id: "taskB", column: "blocked", runId: "runB", title: "B" })];
+    },
+    getRuns: async () => [],
+    sendInput: async (runId: string, line: string) => {
+      sends.push({ runId, line });
+      return { delivered: true };
+    },
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90); // first poll → taskA at row 0, selected
+  stdin.write("m"); // pin taskA, enter compose
+  await wait(1700); // second poll re-sorts: row 0 is now taskB
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  expect(sends).toEqual([{ runId: "runA", line: "hello" }]);
+  unmount();
+});
+
+test("the 'c' key sends the canned commit & push prompt to the selected task", async () => {
+  const sends: Array<{ runId: string; line: string }> = [];
+  const taskA = task({
+    id: "taskA", column: "review", runId: "runA", hasOpenableRun: true, title: "A",
+    branch: "feature/a", taskType: "task",
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async (runId: string, line: string) => {
+      sends.push({ runId, line });
+      return { delivered: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("c");
+  await wait(80);
+  expect(sends).toEqual([{ runId: "runA", line: commitPushPrompt(taskA) }]);
+  // The prompt must be nomenclature-aware (derived from the branch prefix), not
+  // a stale constant — guards the CLI against drifting from the webview.
+  expect(sends[0]!.line).toContain(`"feature:"`);
+  expect(sends[0]!.line).toContain(`git push -u origin 'feature/a'`);
+  unmount();
+});
+
+test("the 'c' key commits even while the task is running (mid-turn commit folds into the run)", async () => {
+  const sends: Array<{ runId: string; line: string }> = [];
+  const taskR = task({ id: "taskR", column: "running", runId: "runR", title: "R" });
+  const client = {
+    listTasks: async () => [taskR],
+    getRuns: async () => [],
+    sendInput: async (runId: string, line: string) => {
+      sends.push({ runId, line });
+      return { delivered: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("c");
+  await wait(80);
+  expect(sends).toEqual([{ runId: "runR", line: commitPushPrompt(taskR) }]);
+  unmount();
+});
+
+test("event stream: an fx_permission interaction renders generically, sentinel status chunks are suppressed, a plain status renders", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90); // first poll selects taskA and opens the /tasks/taskA/events subscription
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({ ...base, stream: "interaction", data: JSON.stringify({ kind: "fx_permission" }), ts: 1 });
+  push({ ...base, stream: "status", data: `${FX_USAGE_STATUS_PREFIX}{"used":1,"size":2}`, ts: 2 });
+  push({ ...base, stream: "status", data: `${PERMISSION_MODE_STATUS_PREFIX}auto`, ts: 3 });
+  push({ ...base, stream: "status", data: "plain status text", ts: 4 });
+  await wait(80); // let useCoalescedStream's 33ms flush interval commit the batch
+
+  const frame = lastFrame() ?? "";
+  // The interaction row is the same generic "press g" line regardless of
+  // interaction kind — unlike logs.ts, the dashboard doesn't special-case fx.
+  expect(frame).toContain("needs answer — press g");
+  expect(frame).not.toContain("answer in the app");
+  // Internal-only sentinel status chunks never reach the transcript.
+  expect(frame).not.toContain(FX_USAGE_STATUS_PREFIX);
+  expect(frame).not.toContain(PERMISSION_MODE_STATUS_PREFIX);
+  // A plain status line still renders.
+  expect(frame).toContain("plain status text");
+  unmount();
+});
+
+test("event stream: a snapshot replay_meta replaces the visible lines with the dim notice plus the fresh rows", async () => {
+  onTaskEvents = null;
+  onTaskNamed = undefined;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+  expect(onTaskNamed).toBeDefined();
+
+  const row = (id: number, data: string): RunEvent => ({
+    runId: "runA",
+    taskId: "taskA",
+    stream: "status",
+    data,
+    ts: id,
+    id,
+  });
+  onTaskEvents!(row(1, "old line one"));
+  onTaskEvents!(row(2, "old line two"));
+  await wait(80);
+  expect(lastFrame() ?? "").toContain("old line one");
+
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 5, hasMore: true, snapshotRequired: true }));
+  onTaskEvents!(row(5, "fresh row five"));
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain(TASK_STREAM_GAP_NOTICE);
+  expect(frame).toContain("fresh row five");
+  expect(frame).not.toContain("old line one");
+  expect(frame).not.toContain("old line two");
+  unmount();
+});
+
+test("event stream: a resumed replay_meta keeps the lines and adds only rows newer than the last accepted id", async () => {
+  onTaskEvents = null;
+  onTaskNamed = undefined;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const row = (id: number, data: string, ts = id): RunEvent => ({
+    runId: "runA",
+    taskId: "taskA",
+    stream: "status",
+    data,
+    ts,
+    id,
+  });
+  onTaskEvents!(row(1, "kept line one"));
+  onTaskEvents!(row(2, "kept line two"));
+  await wait(80);
+
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false, resumedAfter: 2 }));
+  // A stale re-delivery (id 2 again, with a different key so only the id mark
+  // can reject it) and one genuinely new row.
+  onTaskEvents!(row(2, "stale redelivery", 99));
+  onTaskEvents!(row(3, "new line three"));
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("kept line one");
+  expect(frame).toContain("kept line two");
+  expect(frame).toContain("new line three");
+  expect(frame).not.toContain("stale redelivery");
+  expect(frame).not.toContain(TASK_STREAM_GAP_NOTICE);
+  unmount();
+});
+
+test("event stream: a SendUserFile tool_use renders 📎 sending…, then folds its tool_result into 📎 sent … (size) with no ↳ result line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({
+    ...base, stream: "tool_use",
+    data: JSON.stringify({
+      id: "toolu_1", name: "SendUserFile",
+      input: { files: ["/tmp/a.png", "/tmp/b.md"], caption: "here", status: "normal" },
+    }),
+    ts: 1,
+  });
+  await wait(80);
+
+  let frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sending 2 files: a.png, b.md");
+  expect(frame).not.toContain("▸ SendUserFile");
+
+  push({
+    ...base, stream: "tool_result",
+    data: JSON.stringify({
+      toolUseId: "toolu_1",
+      content: "2 files delivered to user.\n  /tmp/a.png → file_uuid: abc\n  /tmp/b.md → file_uuid: def",
+      isError: false,
+      attachments: [
+        { path: "/tmp/a.png", size: 2048, isImage: true, media_type: "image/png" },
+        { path: "/tmp/b.md", size: null, isImage: false, media_type: null },
+      ],
+    }),
+    ts: 2,
+  });
+  await wait(80);
+
+  frame = lastFrame() ?? "";
+  expect(frame).toContain("📎 sent 2 files: a.png (2.0 KB), b.md");
+  expect(frame).not.toContain("↳ result");
+  unmount();
+});
+
+// `buildSentFilesLines` is the perf fix's exported primitive-prop builder
+// (Dashboard.tsx): `EventLine` takes a `sentLine: string | null | undefined`
+// prop instead of the old whole-window Map, specifically so an unrelated
+// line's prop stays the SAME primitive (`undefined`) across two calls even
+// though the returned Map is a fresh object each time and the input array
+// grew (a coalesced flush always appends). ink-testing-library's `lastFrame()`
+// only exposes rendered text, not React element/prop identity, so this
+// asserts the primitive-shape contract the memo fix actually depends on
+// directly against the exported helper, rather than through a live render.
+test("buildSentFilesLines: an unrelated event's entry stays absent (undefined) across a flush that only appends", () => {
+  const before: RunEvent[] = [
+    { runId: "r", taskId: "t", stream: "assistant", data: "hello", ts: 1 },
+    { runId: "r", taskId: "t", stream: "tool_use", data: JSON.stringify({ id: "toolu_x", name: "Bash", input: { command: "ls" } }), ts: 2 },
+    { runId: "r", taskId: "t", stream: "tool_result", data: JSON.stringify({ toolUseId: "toolu_x", content: "ok" }), ts: 3 },
+  ];
+  const appended: RunEvent[] = [
+    ...before,
+    { runId: "r", taskId: "t", stream: "status", data: "another status line", ts: 4 },
+  ];
+
+  const linesBefore = buildSentFilesLines(before);
+  const linesAfter = buildSentFilesLines(appended);
+
+  // Two distinct Map objects (never the same reference)...
+  expect(linesBefore).not.toBe(linesAfter);
+  // ...but every unrelated event's value is the identical `undefined`
+  // primitive in both — exactly what lets `EventLine`'s shallow memo bail
+  // out for these lines despite the Map's own identity changing.
+  for (const e of before) {
+    expect(linesBefore.get(eventKey(e))).toBeUndefined();
+    expect(linesAfter.get(eventKey(e))).toBeUndefined();
+  }
+  // The newly appended, also-unrelated line is absent too, not merely `null`.
+  expect(linesAfter.has(eventKey(appended[appended.length - 1]!))).toBe(false);
+});
+
+test("buildSentFilesLines: a SendUserFile tool_use formats a stable 📎 string and its paired tool_result maps to null", () => {
+  const toolUse: RunEvent = {
+    runId: "r", taskId: "t", stream: "tool_use",
+    data: JSON.stringify({ id: "toolu_1", name: "SendUserFile", input: { files: ["/tmp/a.png"] } }),
+    ts: 1,
+  };
+  const toolResult: RunEvent = {
+    runId: "r", taskId: "t", stream: "tool_result",
+    data: JSON.stringify({ toolUseId: "toolu_1", content: "1 file delivered to user.\n  /tmp/a.png → file_uuid: abc", isError: false }),
+    ts: 2,
+  };
+  const unrelated: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "hi", ts: 3 };
+
+  const lines = buildSentFilesLines([toolUse, toolResult, unrelated]);
+  expect(lines.get(eventKey(toolUse))).toBe("📎 sent 1 file: a.png");
+  expect(lines.get(eventKey(toolResult))).toBeNull();
+  expect(lines.has(eventKey(unrelated))).toBe(false);
+});
+
+// ── fx-recovery sentinel rendering + Resume (docs/plans/
+// fix-fx-harness-rate-limit.md §3.5/T6) ─────────────────────────────────────
+
+function fxRecoveryEvent(runId: string, payload: Record<string, unknown>, ts: number): RunEvent {
+  return {
+    runId, taskId: "t", stream: "status",
+    data: `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(payload)}`,
+    ts,
+  };
+}
+
+test("buildFxRecoveryLines: only the LAST active sentinel per run maps to text; every other sentinel row maps to null; non-sentinel events are absent", () => {
+  const runAActive1 = fxRecoveryEvent("runA", { state: "active", message: "attempt 1/3" }, 1);
+  const runAActive2 = fxRecoveryEvent("runA", { state: "active", message: "attempt 2/3" }, 2);
+  const runAActive3 = fxRecoveryEvent("runA", { state: "active", message: "attempt 3/3" }, 3);
+  const runAPaused = fxRecoveryEvent("runA", { state: "paused", message: "paused on run A" }, 4);
+  const runBActive = fxRecoveryEvent("runB", { state: "active", message: "run B attempt 1/1" }, 5);
+  const unrelated: RunEvent = { runId: "runA", taskId: "t", stream: "assistant", data: "hello", ts: 6 };
+
+  const lines = buildFxRecoveryLines([runAActive1, runAActive2, runAActive3, runAPaused, runBActive, unrelated]);
+
+  // Every sentinel row for run A maps to `null` except the LAST active one.
+  expect(lines.get(eventKey(runAActive1))).toBeNull();
+  expect(lines.get(eventKey(runAActive2))).toBeNull();
+  expect(lines.get(eventKey(runAActive3))).toBe("attempt 3/3");
+  expect(lines.get(eventKey(runAPaused))).toBeNull();
+  // A different run tracks its own "last active" independently.
+  expect(lines.get(eventKey(runBActive))).toBe("run B attempt 1/1");
+  // A non-recovery event is absent from the map entirely, not merely `null`.
+  expect(lines.has(eventKey(unrelated))).toBe(false);
+});
+
+test("buildFxRecoveryLines: a replayed active sentinel is never eligible to become the run's latest-active line — only a later LIVE active sentinel gets text", () => {
+  const replayedActive = fxRecoveryEvent("runA", { state: "active", message: "stale replayed attempt", replayed: true }, 1);
+  const replayedPaused = fxRecoveryEvent("runA", { state: "paused", message: "stale replayed pause", replayed: true }, 2);
+  const liveActive = fxRecoveryEvent("runA", { state: "active", message: "live attempt 1/3" }, 3);
+
+  const lines = buildFxRecoveryLines([replayedActive, replayedPaused, liveActive]);
+
+  expect(lines.get(eventKey(replayedActive))).toBeNull();
+  expect(lines.get(eventKey(replayedPaused))).toBeNull();
+  expect(lines.get(eventKey(liveActive))).toBe("live attempt 1/3");
+});
+
+test("buildFxRecoveryLines: a run whose events are ALL replayed sentinels shows no text at all", () => {
+  const replayedActive1 = fxRecoveryEvent("runA", { state: "active", message: "replayed attempt 1", replayed: true }, 1);
+  const replayedActive2 = fxRecoveryEvent("runA", { state: "active", message: "replayed attempt 2", replayed: true }, 2);
+  const replayedPaused = fxRecoveryEvent("runA", { state: "paused", message: "replayed pause", replayed: true }, 3);
+
+  const lines = buildFxRecoveryLines([replayedActive1, replayedActive2, replayedPaused]);
+
+  expect(lines.get(eventKey(replayedActive1))).toBeNull();
+  expect(lines.get(eventKey(replayedActive2))).toBeNull();
+  expect(lines.get(eventKey(replayedPaused))).toBeNull();
+});
+
+test("event stream: fx-recovery — the detail pane shows only the LATEST active notice per run and hides the older ones", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const push = onTaskEvents!;
+  push(fxRecoveryEvent("runA", { state: "active", message: "retry attempt one" }, 1));
+  push(fxRecoveryEvent("runA", { state: "active", message: "retry attempt two" }, 2));
+  push(fxRecoveryEvent("runA", { state: "active", message: "retry attempt three (latest)" }, 3));
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("retry attempt three (latest)");
+  expect(frame).not.toContain("retry attempt one");
+  expect(frame).not.toContain("retry attempt two");
+  // The raw sentinel prefix itself never leaks into the transcript.
+  expect(frame).not.toContain(FX_RECOVERY_STATUS_PREFIX);
+  unmount();
+});
+
+test("event stream: a resumable paused fx-recovery sentinel on the newest run shows the '⚠ paused — press r to resume' header hint when the task isn't running", async () => {
+  onTaskEvents = null;
+  // The header hint is now driven by the server-managed `task.fxRecovery`
+  // field (`isTaskFxPaused`), not by rescanning the event window for the
+  // newest run's recovery sentinel (see `Detail`'s `showResumeHint` in
+  // Dashboard.tsx and docs/plans/fx-recovery-follow-ups.md §3) — so the
+  // fixture itself must carry a paused row; pushing the raw sentinel event
+  // (still done below, exercising the transcript-rendering path too) is no
+  // longer what flips the hint on.
+  const taskA = task({
+    id: "taskA",
+    column: "ready",
+    runId: null,
+    title: "A",
+    fxRecovery: { state: "paused", runId: "runA", pausedAt: 1, autoResume: null, autoResumeCount: 0 },
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!(fxRecoveryEvent("runA", { state: "paused", requiredAction: "continue_later", message: "⚠ Rate limited" }, 1));
+  await wait(80);
+
+  expect(lastFrame() ?? "").toContain("⚠ paused — press r to resume");
+  unmount();
+});
+
+test("event stream: the resume hint is hidden while the task is running, even with a resumable paused sentinel on the newest run", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!(fxRecoveryEvent("runA", { state: "paused", requiredAction: "continue_later", message: "⚠ Rate limited" }, 1));
+  await wait(80);
+
+  expect(lastFrame() ?? "").not.toContain("press r to resume");
+  unmount();
+});
+
+test("event stream: the resume hint is hidden on a 'review' task even with a resumable paused sentinel on the newest run (a resumed turn can succeed while fx's replayed 'paused' update is still the last one on record)", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "review", runId: null, title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!(fxRecoveryEvent("runA", { state: "paused", requiredAction: "continue_later", message: "⚠ Rate limited" }, 1));
+  await wait(80);
+
+  // Only `column === "ready"` (the column a failed fx settle leaves the
+  // card in) shows the hint — `review` never does, regardless of what the
+  // last recorded recovery sentinel says.
+  expect(lastFrame() ?? "").not.toContain("press r to resume");
+  unmount();
+});
+
+test("event stream: the resume hint is hidden once the newest run's last recovery sentinel is 'recovered', not 'paused'", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "review", runId: null, title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const push = onTaskEvents!;
+  push(fxRecoveryEvent("runA", { state: "paused", requiredAction: "continue_later", message: "⚠ Rate limited" }, 1));
+  push(fxRecoveryEvent("runA", { state: "recovered", message: "✓ recovered · succeeded on attempt 2/3" }, 2));
+  await wait(80);
+
+  expect(lastFrame() ?? "").not.toContain("press r to resume");
+  unmount();
+});
+
+test("the 'r' key resumes a paused fx response for the selected task and shows the resuming status", async () => {
+  const taskA = task({ id: "taskAbcdefgh12345", column: "ready", runId: null, title: "A" });
+  const seenIds: string[] = [];
+  const client = {
+    listTasks: async () => [taskA],
+    resumeFxRecovery: async (id: string) => {
+      seenIds.push(id);
+      return { ok: true, runId: "run12345678abcd" };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("r");
+  await wait(80);
+
+  expect(seenIds).toEqual([taskA.id]);
+  // Same footer wrap/interleaving as the "@ ref won't resolve" status tests
+  // above (see `flatten`'s doc comment): assert the two halves that each
+  // stay contiguous on their own physical line rather than the single joined
+  // phrase, so this doesn't depend on exactly where ink wraps the footer.
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain(`▸ resuming ${taskA.id.slice(0, 8)} (run`);
+  expect(frame).toContain(`${"run12345678abcd".slice(0, 8)})`);
+  unmount();
+});
+
+test("the 'r' key shows '! <message>' when resumeFxRecovery rejects", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    resumeFxRecovery: async () => {
+      throw new Error("no paused fx response to resume");
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("r");
+  await wait(80);
+
+  // Same footer wrap/interleaving as above — "! no paused fx response to
+  // resume" is unique enough on its own (the "!" marker plus this specific
+  // wording can't be confused with the hint's own "r resume" token) that
+  // checking its un-wrapped prefix is sufficient without needing the
+  // trailing "resume" too.
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("! no paused fx response to");
+  unmount();
+});
+
+// ── fx auto-resume: row hint, detail hint, 'x' cancels, clock tick
+// (docs/plans/fx-recovery-follow-ups.md §2/T6) ──────────────────────────────
+
+function pausedFxRecovery(
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null = null,
+): NonNullable<Task["fxRecovery"]> {
+  return { state: "paused", runId: "runA", pausedAt: Date.now(), autoResume, autoResumeCount: 0 };
+}
+
+test("row hint: '⏸ paused (r)' for a resumable pause with no auto-resume timer pending", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  expect(lastFrame() ?? "").toContain("⏸ paused (r)");
+  unmount();
+});
+
+// A short id/title (rather than the 8-char ids most other tests here use) is
+// deliberate for the next two tests: the list/detail panes are narrow fixed-
+// width boxes, and the fuller auto-resume hint strings ("⏸ auto-resume m:ss",
+// "⏸ auto-resume in m:ss — r resumes now, x cancels") only render un-
+// truncated when the row's other fixed-width content (id, title, column) is
+// short enough to leave room — see `TaskRow`'s `titleMax` budget math and
+// `Detail`'s header `wrap="truncate"` in Dashboard.tsx. A longer id here
+// would ellipsis the very text under test.
+test("row hint: '⏸ auto-resume m:ss' while an auto-resume timer is pending", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  expect(lastFrame() ?? "").toMatch(/⏸ auto-resume \d:\d\d/);
+  unmount();
+});
+
+// Code-review fix: `⏸` (U+23F8 PAUSE SYMBOL) renders double-width in most
+// terminals, but `pauseText.length` (a UTF-16 code-unit count) counted it as
+// 1 — TaskRow's `titleMax` budget (`inner - prefixW - badgeW - pauseW`)
+// therefore used to allow the title one character MORE than the row can
+// actually fit once the pause hint is present. This test pins the fixed
+// `pauseW` (`pauseText.length + 3 + 1`) by observing its effect on
+// `titleMax` directly: with the test harness's fixed `listWidth=34` (real
+// `process.stdout.columns` is `undefined` under `bun test`, so `cols` falls
+// back to 90 — see `Dashboard.tsx`'s `cols`/`listWidth` computation) and a
+// short id ("tA", matching the sibling tests' convention above) plus the
+// SHORT "⏸ paused (r)" pause text (the long "⏸ auto-resume m:ss" form
+// already floors titleMax at its 6-char minimum in both the old and new
+// budget, which would make this off-by-one invisible), the pre-fix budget
+// allowed a 20-char title to truncate to "ABCDEFG…" (8 chars, titleMax=8);
+// the fixed budget truncates it one character shorter, to "ABCDEF…"
+// (7 chars, titleMax=7) — proving the extra glyph-width cell was actually
+// subtracted from the title's room, not silently absorbed by the floor.
+test("row title budget: the pause hint's double-width ⏸ glyph costs the title exactly one more character of truncation room", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null,
+    title: "ABCDEFGHIJKLMNOPQRST", // 20 chars — truncates under either budget
+    fxRecovery: pausedFxRecovery(null), // short form: "⏸ paused (r)"
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("⏸ paused (r)");
+  // Fixed budget (titleMax=7): "ABCDEF" + "…".
+  expect(frame).toContain("ABCDEF…");
+  // Pre-fix budget would have produced "ABCDEFG…" (titleMax=8) instead —
+  // that extra 7th letter must not appear immediately before the ellipsis.
+  expect(frame).not.toContain("ABCDEFG…");
+  unmount();
+});
+
+test("detail hint: '⏸ auto-resume in m:ss — r resumes now, x cancels' while a timer is pending, replacing the plain '⚠ paused' hint", async () => {
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("⏸ auto-resume in");
+  expect(frame).toContain("— r resumes now, x cancels");
+  // The plain (no-timer) hint text must not also be showing.
+  expect(frame).not.toContain("⚠ paused — press r to resume");
+  unmount();
+});
+
+test("'x' on a task sitting on a pending fx auto-resume timer (not running) calls client.cancelFxAutoResume and shows '■ auto-resume cancelled <id8>'", async () => {
+  const taskA = task({
+    id: "taskAbcdefgh12345", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const seenIds: string[] = [];
+  const client = {
+    listTasks: async () => [taskA],
+    cancelFxAutoResume: async (id: string) => {
+      seenIds.push(id);
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(seenIds).toEqual([taskA.id]);
+  // Same footer wrap/interleaving as the "r" key's resume-status tests above
+  // (see `flatten`'s doc comment): the status text ("■ auto-resume cancelled
+  // <id8>") is itself long enough to wrap onto a second footer line, so
+  // assert the two halves that each stay contiguous on their own physical
+  // line rather than the single joined phrase.
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("■ auto-resume cancelled");
+  expect(frame).toContain(taskA.id.slice(0, 8));
+  unmount();
+});
+
+test("'x' on a task with a pending fx auto-resume timer shows '! <message>' when cancelFxAutoResume rejects", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 65_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    cancelFxAutoResume: async () => {
+      throw new Error("no auto-resume pending");
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("! no auto-resume pending");
+  unmount();
+});
+
+test("'x' on a plain non-running task (no active run, no pending fx auto-resume) still shows 'task is not running'", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(lastFrame() ?? "").toContain("task is not running");
+  unmount();
+});
+
+test("'x' on a paused fx task with NO pending auto-resume timer still shows 'task is not running' (the auto-resume-cancel branch only engages when a timer is actually pending)", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+
+  expect(lastFrame() ?? "").toContain("task is not running");
+  unmount();
+});
+
+test("clock tick: the '⏸ auto-resume m:ss' countdown ticks down across a ~1.1s wait while a timer is pending (useClockTick only arms while one is)", async () => {
+  // Short id (see the row/detail hint tests' comment above) so the full
+  // "m:ss" text is never truncated by the row's fixed-width budget.
+  const taskA = task({
+    id: "tA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery({ at: Date.now() + 5_000, attempt: 1, max: 3, delaySec: 120 }),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+
+  const firstMatch = (lastFrame() ?? "").match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(firstMatch).not.toBeNull();
+  const firstSeconds = Number(firstMatch![1]) * 60 + Number(firstMatch![2]);
+
+  await wait(1100);
+
+  const secondMatch = (lastFrame() ?? "").match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(secondMatch).not.toBeNull();
+  const secondSeconds = Number(secondMatch![1]) * 60 + Number(secondMatch![2]);
+
+  expect(secondSeconds).toBeLessThan(firstSeconds);
+  unmount();
+});
+
+test("clock tick: the '⏸ paused (r)' row hint (no timer pending) is unchanged across a ~1.1s wait (no countdown to tick — useClockTick never arms with nothing pending)", async () => {
+  const taskA = task({
+    id: "taskA", column: "ready", runId: null, title: "A",
+    fxRecovery: pausedFxRecovery(null),
+  });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  const first = lastFrame() ?? "";
+  expect(first).toContain("⏸ paused (r)");
+
+  await wait(1100);
+
+  const second = lastFrame() ?? "";
+  expect(second).toBe(first);
+  unmount();
+});
+
+// Code-review fix: `useClockTick`'s `now` used to seed once, at Dashboard's
+// own mount (`useState(() => Date.now())`), and only get refreshed by the
+// 1s interval — which only arms once `active` (here, `hasPendingAutoResume`)
+// goes true. A task that starts with no pending schedule and only picks one
+// up on a LATER poll therefore had its first countdown paint computed
+// against a `now` that was stale by however long that gap was, understating
+// the elapsed time and OVERstating the remaining countdown, until the
+// interval's own first tick corrected it up to a second later. The fix
+// reseeds `now` synchronously the moment `active` flips true, before the
+// interval is armed, so the very first paint is already accurate.
+test("clock tick: the first countdown paint after a LATER-arriving schedule reflects the moment it armed, not Dashboard's stale mount-time `now`", async () => {
+  let call = 0;
+  const client = {
+    listTasks: async () => {
+      call++;
+      // First poll (immediate, at mount): nothing pending yet — `now`'s
+      // `useState` initializer runs around this same instant.
+      if (call === 1) {
+        return [task({ id: "tA", column: "ready", runId: null, title: "A", fxRecovery: null })];
+      }
+      // Second poll fires on useTasks' fixed 1.5s interval — real wall-clock
+      // time has genuinely moved on by ~1.5s from the mount-time `now` seed
+      // by the time this schedule "appears" and `active` flips true.
+      return [
+        task({
+          id: "tA", column: "ready", runId: null, title: "A",
+          fxRecovery: pausedFxRecovery({ at: Date.now() + 5_000, attempt: 1, max: 3, delaySec: 120 }),
+        }),
+      ];
+    },
+  } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+
+  // Land after the second poll resolves (~1.5s in) but well before the
+  // countdown's own interval could have ticked even once (that only arms
+  // once `active` goes true, so its first correction lands ~1s AFTER that
+  // — i.e. not until ~2.5s in). This window is exactly where a stale `now`
+  // would still be showing, if it weren't reseeded on activation.
+  await wait(1700);
+
+  const frame = lastFrame() ?? "";
+  const match = frame.match(/⏸ auto-resume (\d+):(\d\d)/);
+  expect(match).not.toBeNull();
+  const remainingSec = Number(match![1]) * 60 + Number(match![2]);
+  // Correct (reseeded `now`): ~5s remaining. A stale mount-time `now` (~1.5s
+  // behind) would instead read ~7s — well outside this margin.
+  expect(remainingSec).toBeLessThanOrEqual(6);
+  unmount();
+});
+
+// ── @ file autocomplete wiring (compose mode → Composer's fileEntries) ──────
+
+test("opening the composer fetches the task's project-file listing and feeds the @ popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: ["README.md", "src/bun/db.ts"], truncated: false }),
+    sendInput: async () => ({ delivered: true }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the listProjectFiles fetch
+  await wait(80);
+  stdin.write("@RE");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("README.md");
+  expect(frame).toContain("tab/enter accept");
+  unmount();
+});
+
+test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@nope.txt", "@also-missing"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("→ sent");
+  expect(frame).toContain("2 @ refs won't resolve");
+  expect(frame).toContain("@nope.txt");
+  unmount();
+});
+
+test("an unresolved ref matching a discovered extension is exempted — no ⚠ at all", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A", agent: "claude-code", workdir: "/repo", branch: null });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [{ name: "github", insert: "@github" }] }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@github"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("→ sent");
+  expect(frame).not.toContain("⚠");
+  unmount();
+});
+
+test("a discovered-extension mention is filtered out but a real typo alongside it still warns", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A", agent: "claude-code", workdir: "/repo", branch: null });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [{ name: "github", insert: "@github" }] }),
+    sendInput: async () => ({ delivered: true, unresolvedRefs: ["@github", "@nope.txt"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("hello");
+  await wait(40);
+  stdin.write(ENTER);
+  await wait(80);
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("→ sent");
+  expect(frame).toContain("1 @ ref won't resolve");
+  expect(frame).toContain("@nope.txt");
+  expect(frame).not.toContain("@github");
+  unmount();
+});
+
+// ── @ file autocomplete: scope-keyed listing cache (worktree materializing mid-compose) ──
+
+test("the file-listing cache is keyed by scope, not task id — a scope change mid-compose refetches", async () => {
+  let calls = 0;
+  const seenScopes: Array<{ dir: string; ref?: string | null }> = [];
+  // Same task id throughout; only its resolved scope changes (pre-run
+  // {workdir, baseRef} → post-worktree {worktreePath}), mimicking a worktree
+  // materializing while the composer stays open.
+  let materialized = false;
+  const taskA = () =>
+    task({
+      id: "taskA", column: "ready", runId: null, title: "A",
+      workdir: "/repo", isolation: "worktree", baseRef: "main", branchSource: "created", branch: null,
+      worktreePath: materialized ? "/repo-worktree" : null,
+    });
+  const client = {
+    listTasks: async () => [taskA()],
+    listProjectFiles: async (scope: { dir: string; ref?: string | null }) => {
+      calls++;
+      seenScopes.push(scope);
+      return { files: [], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // compose opens — fetches the pre-run scope {dir: workdir, ref: baseRef}
+  await wait(80);
+  expect(calls).toBe(1);
+  expect(seenScopes[0]).toEqual({ dir: "/repo", ref: "main" });
+
+  materialized = true; // next poll's listTasks() reports the worktree path
+  await wait(1700); // let the 1.5s poll pick up the new task snapshot
+  expect(calls).toBe(2); // scope changed → refetched, not served from the stale cache
+  expect(seenScopes[1]).toEqual({ dir: "/repo-worktree" });
+  unmount();
+});
+
+test("a cached listing is invalidated when the task's column changes (run settles) — same scope refetches", async () => {
+  let calls = 0;
+  // Scope stays constant (worktree already materialized); only the column
+  // flips, mimicking the agent's run settling while the composer stays open.
+  let column: "running" | "review" = "running";
+  const taskA = () =>
+    task({
+      id: "taskA", column: column, runId: column === "running" ? "runA" : null, title: "A",
+      workdir: "/repo", isolation: "worktree", baseRef: "main", branchSource: "created", branch: null,
+      worktreePath: "/repo-worktree",
+    });
+  const client = {
+    listTasks: async () => [taskA()],
+    listProjectFiles: async () => {
+      calls++;
+      return { files: [], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // compose opens — fetches under column "running"
+  await wait(80);
+  expect(calls).toBe(1);
+
+  column = "review"; // the run settles; the agent may have written files
+  await wait(1700); // let the 1.5s poll deliver the column transition
+  expect(calls).toBe(2); // same scope key, stale column → refetched
+  unmount();
+});
+
+// ── @ remote search fallback (truncated listing → server-side search, CLAUDE.md §12) ──
+
+test("a truncated listing wires the composer's remoteSearch, which is invoked with a q param after typing", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ dir: string; q?: string | null; limit?: number }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        return { files: ["deep/remote-match.ts"], truncated: true };
+      }
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote search.
+      return { files: ["README.md"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  // Two chars — `remoteSearch` never fires below `MIN_REMOTE_QUERY_LEN`
+  // (Composer.tsx), so this must clear that floor to exercise the wiring.
+  stdin.write("@xy");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBeGreaterThan(0);
+  expect(seenQueries[0]!.q).toBe("xy");
+  expect(seenQueries[0]!.limit).toBe(5);
+  expect(frame).toContain("deep/remote-match.ts");
+  unmount();
+});
+
+test("a remote search failure keeps the local rows instead of blanking the popover", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) throw new Error("network down");
+      // Initial (untruncated-signature) fetch on compose-open: report the
+      // listing itself as truncated so the composer switches to remote
+      // search, with a local match for "xy" so we can tell it survived.
+      return { files: ["deep/xylophone.ts"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the truncated listProjectFiles fetch
+  await wait(80);
+  stdin.write("@xy");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire and reject
+  const frame = lastFrame() ?? "";
+  // A `null` answer (composeRemoteSearch's catch) must not blank the
+  // popover — the local suggestAtEntries row still renders.
+  expect(frame).toContain("deep/xylophone.ts");
+  unmount();
+});
+
+test("an untruncated listing never wires remoteSearch — no q-carrying call is ever made", async () => {
+  const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
+  const seenQueries: Array<{ q?: string | null }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null }) => {
+      if (scope.q !== undefined) seenQueries.push(scope);
+      return { files: ["README.md"], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@RE");
+  await wait(300);
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.length).toBe(0);
+  expect(frame).toContain("README.md");
+  unmount();
+});
+
+// ── 's' start path: unresolvedRefs surfaces a ⚠ in the started status ───────
+
+test("the 's' start path surfaces ⚠ in the started status when startTask returns unresolvedRefs", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A", hasOpenableRun: false });
+  const client = {
+    listTasks: async () => [taskA],
+    // No `agentDiscovery` stub here on purpose — this task was never composed
+    // to, so the discovery cache isn't warmed; `getExtensionNames` must fetch
+    // (and fail open, since the stub client has no such method) rather than
+    // block the "started" status.
+    startTask: async () => ({ runId: "runA", unresolvedRefs: ["@nope.txt"] }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("▸ started");
+  // The footer's hint text grew (`· r resume`) and, at ink-testing-library's
+  // fixed 100-column frame width, this status now wraps onto a second
+  // physical line whose left column is the WRAPPED HINT REMAINDER ("r resume
+  // · q quit") — so after wrap the raw text reads "…won't" / "r resume · q
+  // quit resolve: …", with hint text spliced between the two halves of the
+  // phrase. `flatten`'s whitespace collapse alone can't bridge that (it's
+  // not a whitespace-only gap), so assert the two halves that each stay
+  // contiguous on their own line instead of the single joined phrase.
+  expect(frame).toContain("1 @ ref won't");
+  expect(frame).toContain("resolve: @nope.txt");
+  unmount();
+});
+
+test("the 's' start path shows a plain started status when there are no unresolvedRefs", async () => {
+  const taskA = task({ id: "taskA", column: "ready", runId: null, title: "A", hasOpenableRun: false });
+  const client = {
+    listTasks: async () => [taskA],
+    startTask: async () => ({ runId: "runA" }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("▸ started");
+  expect(frame).not.toContain("⚠");
+  unmount();
+});
+
+// --- userMessageLines rendering (src/shared/user-message.ts) --------------
+// `EventLine`'s "user" case renders one `UserPlainLine` per `userMessageLines`
+// entry; ink-testing-library's fake stdout reports 100 columns and isn't a
+// TTY (so chalk/ink emit no ANSI color codes into `lastFrame()`), which is
+// why these assert on plain substrings rather than stripping escape codes.
+
+test("event stream: an ordinary user event still renders you› <text>, unchanged", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "user", data: "hello there", ts: 1 });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("you› hello there");
+  unmount();
+});
+
+test("event stream: a forked-skill-launch user event renders cmd›/skill› lines with no raw tags", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const data =
+    "<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n" +
+    '<forked-skill-launch>{"agentId":"a7db6829e09d1ba9b","skillName":"code-review","description":"/code-review"}</forked-skill-launch>';
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "user", data, ts: 1 });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("cmd› Running in the background as @code-review");
+  expect(frame).toContain("skill› /code-review launched in background (agent a7db6829)");
+  expect(frame).not.toContain("<forked-skill-launch");
+  expect(frame).not.toContain("<local-command-stdout");
+  unmount();
+});
+
+test("event stream: a bash-input/bash-stdout/bash-stderr pair renders sh›/err› with no out› line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const push = onTaskEvents!;
+  push({ ...base, stream: "user", data: "<bash-input>supabase db push --linked</bash-input>", ts: 1 });
+  push({
+    ...base, stream: "user",
+    data: "<bash-stdout></bash-stdout><bash-stderr>(eval):1: command not found: supabase\n</bash-stderr>",
+    ts: 2,
+  });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("sh› $ supabase db push --linked");
+  expect(frame).toContain("err› (eval):1: command not found: supabase");
+  expect(frame).not.toContain("out›");
+  unmount();
+});
+
+test("event stream: a user-typed <context> tag renders context› followed by you› on the next line", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "user",
+    data: "<context>\nWe migrate X\n</context>\n\nPlease do Y", ts: 1,
+  });
+  await wait(80);
+
+  // Multi-line user events render as multiple frame lines — one per
+  // `userMessageLines` entry — so pin their relative order, not just presence.
+  const lines = (lastFrame() ?? "").split("\n");
+  const contextIdx = lines.findIndex((l) => l.includes("context› We migrate X"));
+  const youIdx = lines.findIndex((l) => l.includes("you› Please do Y"));
+  expect(contextIdx).toBeGreaterThanOrEqual(0);
+  expect(youIdx).toBe(contextIdx + 1);
+  unmount();
+});
+
+
+// --- pipelines: step rows (`p`), parent-aware `s`/`x` (M-CLI2, L-CLI10) -----
+
+function pipelineRun(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+  return {
+    pipelineId: "pipe-1",
+    pipelineName: "Bug fix flow",
+    snapshot: {
+      graph: {
+        steps: [
+          { id: "s1", name: "Investigate", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+          { id: "s2", name: "Fix", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+        ],
+        edges: [{ id: "e1", from: "s1", to: "s2", label: "" }],
+        startStepId: "s1",
+      },
+      maxSteps: 25,
+      profiles: {},
+      capturedAt: 0,
+    },
+    status: "running",
+    active: [{ stepId: "s2", taskId: "stepB", seq: 2 }],
+    joins: {},
+    blocked: [],
+    history: [
+      { seq: 1, stepId: "s1", taskId: "stepA", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+    ],
+    stepCount: 2,
+    startedAt: 0,
+    endedAt: null,
+    ...overrides,
+  };
+}
+
+const parentTask = (over: Partial<Task> = {}) =>
+  task({ id: "parent", title: "Pipeline P", column: "running", pipelineId: "pipe-1", pipelineRun: pipelineRun(), ...over });
+const stepTask = (id: string, over: Partial<Task> = {}) =>
+  task({ id, title: `step ${id}`, column: "running", runId: `run-${id}`, pipelineParentId: "parent", pipelineStepId: "s1", createdAt: 1, ...over });
+
+test("dashboardRows: hides step rows by default, and lists them under their parent (depth 1, creation order) once expanded", () => {
+  const tasks = [
+    stepTask("stepB", { createdAt: 2 }),
+    task({ id: "plain", column: "ready" }),
+    parentTask(),
+    stepTask("stepA", { createdAt: 1 }),
+    task({ id: "archived", archivedAt: 5 }),
+  ];
+  const collapsed = dashboardRows(tasks, new Set());
+  expect(collapsed.map((r) => `${r.task.id}:${r.depth}`)).toEqual(["parent:0", "plain:0"]);
+
+  const expanded = dashboardRows(tasks, new Set(["parent"]));
+  expect(expanded.map((r) => `${r.task.id}:${r.depth}`)).toEqual(["parent:0", "stepA:1", "stepB:1", "plain:0"]);
+});
+
+test("dashboardRows: an expanded id that isn't a pipeline parent expands nothing; an orphaned step (parent gone) stays hidden", () => {
+  const tasks = [task({ id: "plain" }), stepTask("orphan", { pipelineParentId: "gone" })];
+  expect(dashboardRows(tasks, new Set(["plain", "gone"])).map((r) => r.task.id)).toEqual(["plain"]);
+});
+
+test("'p' on a pipeline parent lists its step rows (↳-indented) and the parent's pane says where the transcripts live; 'p' again hides them", async () => {
+  const client = {
+    listTasks: async () => [parentTask(), stepTask("stepA")],
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  let frame = flatten(lastFrame() ?? "");
+  expect(frame).not.toContain("↳");
+  expect(frame).toContain("press p to list its step tasks");
+  expect(frame).toContain("p steps"); // legend mentions p only while a pipeline row is selected
+  stdin.write("p");
+  await wait(80);
+  frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("↳");
+  expect(frame).toContain("step stepA");
+  expect(frame).toContain("select a ↳ step row below it");
+  stdin.write("p");
+  await wait(80);
+  frame = flatten(lastFrame() ?? "");
+  expect(frame).not.toContain("↳");
+  unmount();
+});
+
+test("selecting an expanded step row opens ITS transcript stream (the parent never opens one)", async () => {
+  const opened: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask(), stepTask("stepA")],
+  } as unknown as AgetorClient;
+  // Track every `/tasks/:id/events` subscription the dashboard opens.
+  mock.module("../sse.ts", () => ({
+    ...realSseSnapshot,
+    streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+      const m = /^\/tasks\/([^/]+)\/events/.exec(pathname);
+      if (m) {
+        opened.push(m[1]!);
+        onTaskEvents = onEvent as (e: RunEvent) => void;
+      }
+      return { close: () => {} };
+    },
+  }));
+  try {
+    const { stdin, unmount } = render(
+      <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+    );
+    await wait(90);
+    expect(opened).toEqual([]); // parent selected — no stream
+    stdin.write("p");
+    await wait(60);
+    stdin.write("j"); // down onto stepA
+    await wait(80);
+    expect(opened).toEqual(["stepA"]);
+    unmount();
+  } finally {
+    mock.module("../sse.ts", () => ({
+      ...realSseSnapshot,
+      streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+        if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
+          onTaskEvents = onEvent as (e: RunEvent) => void;
+        }
+        return { close: () => {} };
+      },
+    }));
+  }
+});
+
+test("'p' on a plain task shows 'not a pipeline task' and no legend hint", async () => {
+  const client = { listTasks: async () => [task({ id: "plain", column: "ready" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(lastFrame() ?? "").not.toContain("p steps");
+  stdin.write("p");
+  await wait(80);
+  expect(flatten(lastFrame() ?? "")).toContain("not a pipeline task");
+  unmount();
+});
+
+test("'x' on a pipeline parent calls cancelPipeline (never cancelRun) and shows '■ stopped pipeline'", async () => {
+  const cancelled: string[] = [];
+  let cancelRunCalled = false;
+  const client = {
+    listTasks: async () => [parentTask()],
+    cancelPipeline: async (id: string) => {
+      cancelled.push(id);
+      return parentTask();
+    },
+    cancelRun: async () => {
+      cancelRunCalled = true;
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+  expect(cancelled).toEqual(["parent"]);
+  expect(cancelRunCalled).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("■ stopped pipeline parent");
+  unmount();
+});
+
+test("'x' on a pipeline parent surfaces the route's 409 text (e.g. not running) as '! <message>'", async () => {
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "idle", active: [] }) })],
+    cancelPipeline: async () => {
+      throw new Error("pipeline is not running");
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("x");
+  await wait(80);
+  expect(flatten(lastFrame() ?? "")).toContain("! pipeline is not running");
+  unmount();
+});
+
+test("'s' on a BLOCKED pipeline parent calls retryPipeline (not startTask) and shows '↻ retrying pipeline'", async () => {
+  const retried: string[] = [];
+  let started = false;
+  const client = {
+    listTasks: async () => [parentTask({ column: "blocked", pipelineRun: pipelineRun({ status: "blocked" }) })],
+    retryPipeline: async (id: string) => {
+      retried.push(id);
+      return parentTask();
+    },
+    startTask: async () => {
+      started = true;
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(retried).toEqual(["parent"]);
+  expect(started).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("↻ retrying parent");
+  unmount();
+});
+
+test("'s' on a CANCELLED pipeline parent (column ready) also retries in place", async () => {
+  const retried: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "cancelled" }) })],
+    retryPipeline: async (id: string) => {
+      retried.push(id);
+      return parentTask();
+    },
+  } as unknown as AgetorClient;
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(retried).toEqual(["parent"]);
+  unmount();
+});
+
+test("'s' on a RUNNING pipeline parent points at x instead of calling anything", async () => {
+  let called = false;
+  const client = {
+    listTasks: async () => [parentTask()],
+    retryPipeline: async () => {
+      called = true;
+      return parentTask();
+    },
+    startTask: async () => {
+      called = true;
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(called).toBe(false);
+  expect(flatten(lastFrame() ?? "")).toContain("running — x stops");
+  unmount();
+});
+
+test("'s' on a never-run (idle) pipeline parent starts it via startTask; a finished one surfaces the server's 409 verbatim", async () => {
+  const startedIds: string[] = [];
+  const client = {
+    listTasks: async () => [parentTask({ column: "ready", pipelineRun: pipelineRun({ status: "idle", active: [], history: [] }) })],
+    startTask: async (id: string) => {
+      startedIds.push(id);
+      return { runId: "r" };
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("s");
+  await wait(80);
+  expect(startedIds).toEqual(["parent"]);
+  expect(flatten(lastFrame() ?? "")).toContain("▸ started pipeline parent");
+  unmount();
+
+  const doneClient = {
+    listTasks: async () => [parentTask({ column: "review", pipelineRun: pipelineRun({ status: "done", active: [] }) })],
+    startTask: async () => {
+      throw new Error("pipeline already finished — restart it explicitly");
+    },
+  } as unknown as AgetorClient;
+  const r2 = render(<Dashboard client={doneClient} core={core} dataDir="/nonexistent-agetor-test" />);
+  await wait(90);
+  r2.stdin.write("s");
+  await wait(80);
+  expect(flatten(r2.lastFrame() ?? "")).toContain("! pipeline already finished");
+  r2.unmount();
+});
+
+test("event stream: a compaction_summary event renders one summary› digest line, never the body", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const body = "Summary first line\n\nHidden second paragraph\n" + "y".repeat(1500);
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "compaction_summary", data: body, ts: 1 });
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("summary› Summary first line (1.5 KB)");
+  expect(frame).not.toContain("Hidden second paragraph");
+  unmount();
+});
+
+// --- fx 0.0.14 internal tool calls (docs/plans/fx-0.0.14-and-cursor-updates.md §3.6) ---
+
+test("event stream: fx internal tool_use/tool_result rows are skipped; visible and MCP-labelled tools still render", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const push = onTaskEvents!;
+  push({ runId: "runA", taskId: "taskA", stream: "tool_use", data: JSON.stringify({ id: "call_i", name: "capability_search", input: {}, internal: true }), ts: 1 });
+  push({ runId: "runA", taskId: "taskA", stream: "tool_result", data: JSON.stringify({ toolUseId: "call_i", content: "secret-internal-output", internal: true }), ts: 2 });
+  push({ runId: "runA", taskId: "taskA", stream: "tool_use", data: JSON.stringify({ id: "call_v", name: "read_file", input: {} }), ts: 3 });
+  push({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({ id: "call_m", name: "docs-server · search_pages", mcp: { server: "docs-server", tool: "search_pages" }, input: {} }),
+    ts: 4,
+  });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).not.toContain("capability_search");
+  expect(frame).toContain("▸ read_file");
+  expect(frame).toContain("▸ docs-server · search_pages");
+  // Only the visible tool_uses render a line — the internal result's "↳ result" row is gone too.
+  expect(frame).not.toContain("↳ result");
+  unmount();
+});
+
+// --- formatted handoff digest (docs/plans/formatted-handoff.md, T7 / D19) ---
+
+const HANDOFF_BODY = JSON.stringify({
+  schemaVersion: 1,
+  purpose: "Ship it",
+  summary: "Did the work",
+  reason: "All done",
+  next: "Grilling",
+  artifacts: ["a.md", "b.md"],
+  openQuestions: ["Which db?"],
+});
+const HANDOFF_MESSAGE = `Wrapping up.\n<handoff>\n${HANDOFF_BODY}\n</handoff>`;
+
+test("buildHandoffLines: a real block maps to a primitive one-line digest; everything else is absent; disabled is empty", () => {
+  const withBlock: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: HANDOFF_MESSAGE, ts: 1 };
+  const plain: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "no block here", ts: 2 };
+  const inCode: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "say `<handoff>{}</handoff>`", ts: 3 };
+  const user: RunEvent = { runId: "r", taskId: "t", stream: "user", data: HANDOFF_MESSAGE, ts: 4 };
+
+  const lines = buildHandoffLines([withBlock, plain, inCode, user], true);
+  expect(lines.get(eventKey(withBlock))).toBe("✓ done → Grilling · 2 artifacts · 1 question");
+  expect(typeof lines.get(eventKey(withBlock))).toBe("string");
+  for (const e of [plain, inCode, user]) expect(lines.get(eventKey(e))).toBeUndefined();
+
+  expect(buildHandoffLines([withBlock, plain], false).size).toBe(0);
+  // Two calls give distinct Maps but identical primitives (EventLine's memo).
+  const again = buildHandoffLines([withBlock, plain], true);
+  expect(again).not.toBe(lines);
+  expect(again.get(eventKey(withBlock))).toBe(lines.get(eventKey(withBlock)));
+});
+
+test("buildHandoffLines: an upper-case tag counts, like the locator (shared case-insensitive pre-check)", () => {
+  const upper: RunEvent = {
+    runId: "r",
+    taskId: "t",
+    stream: "assistant",
+    data: `Wrapping up.\n<HANDOFF>\n${HANDOFF_BODY}\n</Handoff>`,
+    ts: 1,
+  };
+  expect(buildHandoffLines([upper], true).get(eventKey(upper))).toBe("✓ done → Grilling · 2 artifacts · 1 question");
+});
+
+test("event stream: a step task renders prose + handoff› digest line; a non-step task renders the raw text", async () => {
+  onTaskEvents = null;
+  // Step rows are hidden until their parent is expanded with `p`; `j` then
+  // selects the step, which opens its event stream.
+  const client = { listTasks: async () => [parentTask(), stepTask("taskS", { runId: "runS" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("p");
+  await wait(60);
+  stdin.write("j");
+  await wait(80);
+  expect(onTaskEvents).not.toBeNull();
+  onTaskEvents!({ runId: "runS", taskId: "taskS", stream: "assistant", data: HANDOFF_MESSAGE, ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Wrapping up.");
+  expect(frame).toContain("handoff› ✓ done → Grilling · 2 artifacts · 1 question");
+  expect(frame).not.toContain("schemaVersion");
+  unmount();
+});
+
+test("event stream: a non-step task prints a handoff block as raw text, as before", async () => {
+  onTaskEvents = null;
+  const plainTask = task({ id: "taskP", column: "running", runId: "runP", title: "P" });
+  const client = { listTasks: async () => [plainTask] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+  onTaskEvents!({ runId: "runP", taskId: "taskP", stream: "assistant", data: "<handoff>raw-marker</handoff>", ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("<handoff>raw-marker</handoff>");
+  expect(frame).not.toContain("handoff›");
+  unmount();
+});
+
+test("event stream: a step task's you› prompt collapses an untrusted-handoff span to one line", async () => {
+  onTaskEvents = null;
+  // Step rows are hidden until their parent is expanded with `p`; `j` then
+  // selects the step, which opens its event stream.
+  const client = { listTasks: async () => [parentTask(), stepTask("taskS", { runId: "runS" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("p");
+  await wait(60);
+  stdin.write("j");
+  await wait(80);
+  expect(onTaskEvents).not.toBeNull();
+  const prompt = [
+    "intro",
+    '--- BEGIN untrusted handoff abcd1234 from "Investigate" ---',
+    "```json\n" + JSON.stringify({ schemaVersion: 1, purpose: "p", summary: "s", reason: "r", next: "Build", artifacts: [], openQuestions: [] }, null, 2) + "\n```",
+    "--- END untrusted handoff abcd1234 ---",
+    "outro",
+  ].join("\n");
+  onTaskEvents!({ runId: "runS", taskId: "taskS", stream: "user", data: prompt, ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain('[handoff from "Investigate" · untrusted — ✓ done → Build]');
+  expect(frame).not.toContain("--- BEGIN untrusted handoff");
+  unmount();
+});
+
+test("event stream: askQuestionToolCall prints the question instead of only the tool name", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({
+      id: "call-1",
+      name: "askQuestionToolCall",
+      input: {
+        askQuestionToolCall: {
+          args: {
+            title: "Pick one",
+            questions: [{ id: "q1", prompt: "Which option?", options: [{ id: "a", label: "Alpha" }], allowMultiple: false }],
+          },
+        },
+      },
+    }),
+    ts: 1,
+  });
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({ id: "toolu_9", name: "Bash", input: { command: "ls" } }),
+    ts: 2,
+  });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Pick one");
+  expect(frame).toContain("Which option?");
+  expect(frame).toContain("Alpha");
+  expect(frame).not.toContain("▸ askQuestionToolCall");
+  expect(frame).toContain("▸ Bash");
+  unmount();
+});
+
+test("event stream: a same-timestamp askQuestionToolCall revision replaces the partial", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  const head = `{"id":"call-1","name":"askQuestionToolCall","input":{"askQuestionToolCall":{"args":{"title":"${"P".repeat(40)}","questions":[{"id":"q1","prompt":"`;
+  const partial = `${head}Soon"}]}}}}`;
+  const full = `${head}Which option?","options":[{"id":"a","label":"Alpha"}]}]}}}}`;
+  expect(partial.slice(0, 64)).toBe(full.slice(0, 64));
+  expect(eventKey({ runId: "runA", taskId: "taskA", stream: "tool_use", data: partial, ts: 5 })).not.toBe(
+    eventKey({ runId: "runA", taskId: "taskA", stream: "tool_use", data: full, ts: 5 }),
+  );
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "tool_use", data: partial, ts: 5 });
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "tool_use", data: full, ts: 5 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Which option?");
+  expect(frame).not.toContain("Soon");
+  unmount();
+});

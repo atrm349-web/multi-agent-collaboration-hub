@@ -1,0 +1,936 @@
+// MUST stay the first import: it sets the channel's default AGETOR_DATA_DIR /
+// API port as a side effect, and ESM evaluates imports in order — anything below
+// that reaches db.ts (which opens and migrates SQLite on import) would otherwise
+// open the wrong data dir (docs/plans/always-on-host.md §3.6).
+import "./channel-defaults.ts";
+import { writeFileSync, existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
+import { rehydratePath } from "./login-path.ts";
+import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
+import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
+import {
+  freezeLaunches,
+  launchesInFlight,
+  reconcileOrphans,
+  rearmFxAutoResumes,
+  sweepArchivedTeardowns,
+  reapIdleSessions,
+  stopFxAutoResumeTimers,
+  waitForLaunchesToSettle,
+} from "./orchestrator.ts";
+import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
+import { createQuitLaunchGate, decideBeforeQuit } from "./quit-launch-gate.ts";
+import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
+import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
+import { checkAllHarnesses } from "./agent-status.ts";
+import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
+import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { beginLagLabel, startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
+import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
+import { ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
+import { initDisclaimSwitch } from "./disclaim-switch.ts";
+import { coreSpawn } from "./core-spawn.ts";
+import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
+import { pollAllUsage } from "./usage/poller.ts";
+import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
+import {
+  armForceQuit,
+  broadcastAppEvent,
+  consumeForceQuit,
+  consumeQuitCompletely,
+  requestQuitCompletely,
+} from "./quit-guard.ts";
+import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
+import { acquireApiPort } from "./app-takeover.ts";
+import { bootReadySignal } from "./boot-gate.ts";
+import { runRemoteAccessBox } from "./remote-access-box.ts";
+import {
+  getBackgroundStatus,
+  turnOnBackground,
+  startBackgroundNow,
+  openLoginItems,
+  getRemoteAccess,
+  setRemoteAccessOff,
+  setRemoteAccessOnFromNativeBox,
+} from "./background.ts";
+import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
+import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
+import { getMainWindow, setMainWindow } from "./window.ts";
+import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
+import { focusWindow } from "./window-focus.ts";
+import { repairFrame } from "./screen-frame.ts";
+import {
+  writeCoreCreds,
+  removeCoreCreds,
+  readCoreCreds,
+  probeLiveCore,
+  waitForPortFree,
+  isPidAlive,
+  portAcceptsConnections,
+} from "./core-creds.ts";
+import { resolveNotifierApp } from "./notifier.ts";
+import { parseTaskDeepLink } from "./deep-link.ts";
+import { createTaskNotifier } from "./task-notifier.ts";
+import { installNotificationRemovalHooks } from "./notification-hooks.ts";
+import { setPendingOpenTask } from "./pending-open.ts";
+import pkg from "../../package.json" with { type: "json" };
+
+/** Drop a pid file in the data dir so out-of-process tools (notably
+ *  `bun run wipe:dev`) can tell whether an agetor instance is using this
+ *  data dir, independent of which API port we ended up on. Stale pid
+ *  files left behind by crashes are harmless — readers verify the pid is
+ *  alive with `kill(pid, 0)` before trusting the file. Best-effort; a
+ *  failed write doesn't block boot.
+ *
+ *  Single-instance enforcement at the application layer is intentionally
+ *  absent: macOS Launch Services already dedupes packaged-app launches by
+ *  bundle identifier (see `electrobun.config.ts:app.identifier`), so a
+ *  double-click in Finder/Spotlight/Dock can't spawn a second process. In
+ *  dev mode, dev and prod use different default ports (4318 vs 4317), so
+ *  the common stale-process case can't collide. If a port is still held
+ *  by something else, the try/catch around `startApiServer()` below fails
+ *  loudly with a useful `lsof` hint rather than silently fighting it. */
+try {
+  writeFileSync(pidFilePath, String(process.pid));
+} catch {
+  /* non-fatal */
+}
+
+/**
+ * Install a native macOS menu bar with standard Edit-menu roles. Without this,
+ * WKWebView never receives `selectAll:` / `cut:` / `copy:` / `paste:` /
+ * `undo:` / `redo:` because the OS routes the shortcut to the (absent) menu
+ * instead of to the responder chain. The menu only needs to exist for the
+ * shortcuts to start working — items still surface in the menu bar so users
+ * can discover them.
+ */
+function installNativeMenu() {
+  ApplicationMenu.setApplicationMenu([
+    {
+      label: "Agetor",
+      submenu: [
+        { role: "about" },
+        { type: "separator" },
+        { label: "Remote Access…", action: "remote-access" },
+        { type: "separator" },
+        { role: "hide", accelerator: "Cmd+H" },
+        { role: "hideOthers", accelerator: "Cmd+Alt+H" },
+        { role: "showAll" },
+        { type: "separator" },
+        { role: "quit", accelerator: "Cmd+Q" },
+        // Stops the background host too (D6): a plain quit parks the core under
+        // the login item when "run in the background" is on.
+        { label: "Quit Agetor Completely", action: "quit-completely", accelerator: "Cmd+Alt+Q" },
+      ],
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo", accelerator: "Cmd+Z" },
+        { role: "redo", accelerator: "Cmd+Shift+Z" },
+        { type: "separator" },
+        { role: "cut", accelerator: "Cmd+X" },
+        { role: "copy", accelerator: "Cmd+C" },
+        { role: "paste", accelerator: "Cmd+V" },
+        { role: "pasteAndMatchStyle", accelerator: "Cmd+Shift+Alt+V" },
+        { role: "delete" },
+        { role: "selectAll", accelerator: "Cmd+A" },
+      ],
+    },
+    {
+      label: "Window",
+      submenu: [
+        { role: "minimize", accelerator: "Cmd+M" },
+        { role: "zoom" },
+        { role: "close", accelerator: "Cmd+W" },
+        { type: "separator" },
+        { role: "toggleFullScreen", accelerator: "Ctrl+Cmd+F" },
+        { type: "separator" },
+        { role: "bringAllToFront" },
+      ],
+    },
+  ]);
+}
+
+const VITE_PORT = 5173;
+const VITE_URL = `http://localhost:${VITE_PORT}`;
+
+async function getMainViewUrl(): Promise<string> {
+  const channel = await Updater.localInfo.channel();
+  if (channel === "dev") {
+    try {
+      await fetch(VITE_URL, { method: "HEAD" });
+      console.log(`[agetor] HMR enabled: ${VITE_URL}`);
+      return VITE_URL;
+    } catch {
+      console.log("[agetor] vite dev server not running — using bundled view");
+    }
+  }
+  return "views://mainview/index.html";
+}
+
+// When agetor is launched as a packaged .app (Finder, Spotlight, Dock),
+// launchd hands the process a minimal PATH that's missing every place users
+// actually install dev CLIs (/opt/homebrew/bin, ~/.nvm/…, ~/.npm-global/bin,
+// asdf shims, …). Source the user's login-shell PATH once at boot so
+// `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
+// before the API server starts handling /agents probes. Idempotent and safe
+// in dev runs — the merge dedupes.
+rehydratePath();
+
+// Boot order (boot-gate.ts): bind the API port first — taking it over from a
+// live background/CLI core — then restore (`reconcileOrphans` and friends),
+// then `markBootReady()`. Only the port owner may restore, and the API must not
+// serve `/tasks`/`/runs` while a `status='running'` row from a previous process
+// is still being reattached or flipped to `orphaned` underneath it (CLAUDE.md
+// §5): routes wait on the ready signal, so a request that arrives mid-restore
+// is answered once the restore is done. A failed restore ends the process
+// loudly (see `failBoot`), never a swallow.
+//
+// Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
+// C): one `.unref()`'d sampler that names whatever held the single main thread
+// for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
+// `sampleMs: 100`, not the 500 ms default: lag is measured as actual - expected
+// fire time, so a block that starts mid-interval is under-measured by up to
+// `sampleMs`; at 100 ms a 1.1 s block reliably crosses the 1 s stall bar.
+// Started BEFORE the boot restore below (not after the API is up) so the
+// `boot reattach` / `reattach session` / watcher-seed labels it exists to
+// attribute are actually sampled. Unref'd, so an early boot failure can never
+// be held open by it; every shutdown path calls `stopLagMonitor()`.
+startLagMonitor({ sampleMs: 100 });
+
+/**
+ * Posts and removes task notifications. Each task owns at most one
+ * Notification Center entry, posted through our bundled native helper
+ * (AgetorNotifier.app, see notifier.ts) under a fixed per-task id, so a newer
+ * event replaces the older one on top. Electrobun's own
+ * `Utils.showNotification` has no click callback and no identifier control,
+ * so it is only the fallback (see task-notifier.ts for when it is used).
+ */
+const taskNotifier = createTaskNotifier({
+  plain: (n) =>
+    Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent }),
+});
+
+// Best-effort: register the notifier helper bundle with LaunchServices at
+// startup. We spawn the helper's inner Mach-O directly (not via `open`), which
+// does not guarantee the bundle is in the LaunchServices database — and a
+// notification CLICK needs LS to be able to relaunch the bundle by identity to
+// deliver the response (which runs `open agetor://…`). Registering it here
+// maximizes the chance the cold-relaunch-on-click path works. Fully non-fatal:
+// posting notifications works regardless; only the click-relaunch depends on it
+// (and that is a manual-QA item on a notarized build either way).
+function registerNotifierBundle(): void {
+  try {
+    const app = resolveNotifierApp();
+    if (!app) return;
+    const lsregister =
+      "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+    if (!existsSync(lsregister)) return;
+    // Fire-and-forget; lsregister is fast and idempotent.
+    // coreSpawn: scrubbed env and, when the disclaim switch is on, the same
+    // permission isolation as every other core-launched program (D13).
+    coreSpawn([lsregister, "-f", app], { stdout: "ignore", stderr: "ignore" });
+  } catch (err) {
+    console.error("[agetor] failed to register notifier bundle with LaunchServices:", err);
+  }
+}
+registerNotifierBundle();
+// Learn which tasks still have an entry from a previous run, so opening one
+// removes it without spawning the helper for every other task.
+void taskNotifier.seed();
+// Remove a task's entry once its reason goes away (answered from any client,
+// or the task left `blocked`).
+installNotificationRemovalHooks((r) => taskNotifier.remove(r));
+
+// Native-host capabilities the API server needs but that only exist inside
+// Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
+// self-updater, quit). The headless CLI daemon injects none of these — its
+// routes 501 — but the packaged app wires them up here.
+const native: ApiNative = {
+  // Electrobun spreads `opts` over its defaults, so an explicit
+  // `allowedFileTypes: undefined` would wipe its "*" default — only pass the
+  // filter when a caller set one (`/bundle/pick-file` asks for "json").
+  openFileDialog: ({ allowedFileTypes, ...opts }) =>
+    Utils.openFileDialog(allowedFileTypes ? { ...opts, allowedFileTypes } : opts),
+  openPath: (p) => Utils.openPath(p),
+  // No Electrobun `Utils.revealPath` equivalent — spawn macOS's own
+  // Finder-reveal command directly (agetor ships arm64 macOS only, so no
+  // cross-platform branch is needed). `open -R <path>` reveals AND selects
+  // the item in Finder, unlike a bare `open <path>` (which would launch it).
+  // Fire-and-forget, same "best-effort boolean" contract as `openPath`.
+  revealPath: (p) => {
+    // Defense in depth: a leading `-` must never reach `open` as a flag, even
+    // if a future caller skips the route's own absolute-path check.
+    if (!isAbsolute(p)) return false;
+    try {
+      coreSpawn(["open", "-R", p], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  openExternal: (url) => Utils.openExternal(url),
+  showNotification: (n) => taskNotifier.post(n),
+  removeTaskNotification: (r) => taskNotifier.remove(r),
+  focusWindow: () => focusMainWindow(),
+  quit: () => Utils.quit(),
+  updates: {
+    snapshot: () => getUpdateSnapshot(),
+    check: () => checkForUpdate(),
+    apply: () => applyUpdate(),
+  },
+};
+
+// AGETOR_API_HOST is a headless-core setting (containers). The desktop app's
+// only clients are its own webview and same-machine CLI/hooks, so it always
+// binds 127.0.0.1 — say so rather than silently ignoring a set override.
+const requestedApiHost = resolveApiHost();
+if (!requestedApiHost.ok || requestedApiHost.host !== DEFAULT_API_HOST) {
+  console.warn(
+    `[agetor] AGETOR_API_HOST is ignored by the desktop app — it applies to the headless core only (agetor daemon). The app's API stays on ${DEFAULT_API_HOST}.`,
+  );
+}
+
+// Bind BEFORE the boot restore (boot-gate.ts): the bind is what makes this
+// process the owner — it hands the port off from a live background/CLI core —
+// and only the owner may reattach sessions, orphan runs or drive pipelines.
+// Until `markBootReady()` every route but the ownership probes waits.
+const { ready: bootReady, markReady: markBootReady } = bootReadySignal();
+let apiServer: ReturnType<typeof startApiServer>;
+try {
+  // Port busy? acquireApiPort asks a CLI daemon / login-item core to hand off
+  // (retrying briefly while a daemon's creds file lands, C16); anything else — a
+  // live app, or a foreign process (a stale agetor, or OTLP gRPC which also
+  // defaults to 4317) — falls through to the loud message + exit so the user
+  // sees the real problem rather than a wall of CORS errors in the renderer.
+  apiServer = await acquireApiPort({
+    start: () =>
+      startApiServer({
+        native,
+        // Same post/remove pair `native` offers; the server prefers `native`
+        // when both are given (headless cores get only this).
+        notifications: { post: (n) => taskNotifier.post(n), remove: (r) => taskNotifier.remove(r) },
+        // Requests wait for the boot restore below (markBootReady).
+        ready: bootReady,
+      }),
+    readCreds: () => readCoreCreds(dataDir),
+    probe: probeLiveCore,
+    fetch,
+    waitForPortFree,
+    sleep: (ms) => Bun.sleep(ms),
+    now: () => Date.now(),
+    isPidAlive,
+    portListening: (port) => portAcceptsConnections(port),
+    log: (m) => console.log(m),
+  });
+} catch (e) {
+  const msg = (e as Error)?.message ?? String(e);
+  console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
+  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+  process.exit(1);
+}
+
+// Publish the per-launch API port + token so the CLI (and a second app launch)
+// can discover and authenticate to this core. `kind: "app"` tells a future
+// daemon spawn that the richer surface owns the port.
+writeCoreCreds(
+  {
+    port: apiServer.port!,
+    // The CLI-scoped token, never the master (D3): this file is readable by
+    // anything running as the user, an agent included. The master reaches only
+    // the webview, via the preload and the window-URL hash below.
+    token: CLI_TOKEN,
+    pid: process.pid,
+    kind: "app",
+    version: pkg.version,
+    startedAt: Date.now(),
+  },
+  dataDir,
+);
+
+
+/**
+ * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
+ * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
+ * by any process running as the user, an agent included, so a stored "off" is
+ * only a request. Returns true ONLY for "Keep it off"; the default button, the
+ * cancel button and a dialog that can't be shown all mean "turn it back on"
+ * (initDisclaimSwitch fails closed on a throw).
+ *
+ * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
+ * the user answers — like `openFileDialog` — so it is bracketed with a lag
+ * label to keep the expected stall from being reported as a core hang. It runs
+ * before the first BrowserWindow and before any agent host starts; the API is
+ * already bound but every route waits for the boot restore, so nothing is
+ * served while it is open. If it ever fails to render that early, P5's
+ * fallback is to ask right after window creation instead.
+ */
+async function confirmKeepOff(): Promise<boolean> {
+  const end = beginLagLabel("native message box");
+  try {
+    const { response } = await Utils.showMessageBox({
+      type: "warning",
+      title: "Permission isolation is off",
+      message:
+        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
+      detail:
+        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
+      buttons: ["Turn it back on", "Keep it off"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    return response === 1;
+  } finally {
+    end();
+  }
+}
+
+// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
+// while the question is open, and only an explicit "Keep it off" turns it off.
+// Must also run before reconcileOrphans(): reconciliation issues `has-session`
+// probes against agetor's tmux socket, and the first tmux command to touch
+// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
+// didn't run first — leaving every session that server ever hosts un-disclaimed too.
+/** A boot restore that throws must not leave a bound server whose routes wait
+ *  forever on a ready signal that never comes. */
+function failBoot(err: unknown): never {
+  console.error("[agetor] boot restore failed:", err);
+  removeCoreCreds(dataDir);
+  process.exit(1);
+}
+
+try {
+  await initDisclaimSwitch("app", {
+    readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+    writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+    confirmKeepOff,
+    log: (m) => console.log(m),
+  });
+  await ensureDisclaimedServer();
+  // Subscribe the pipeline runner to the global lifecycle stream BEFORE
+  // reconcileOrphans() runs, so a step task's boot-time orphan→ready
+  // transition (an ordinary `run-status` "orphaned" event, fired by
+  // reconcileOrphans below) reaches the runner and flips its pipeline parent
+  // back to ready/cancelled-with-retry instead of leaving it silently stuck
+  // `running` forever (docs/plans/pipelines.md §3, T3).
+  initPipelineRunner();
+  await reconcileOrphans();
+
+  // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
+  // by a prior process crash/restart — placed right after `reconcileOrphans`
+  // (per its own doc, and pipeline-runner.ts's module doc) so every step
+  // task's own boot-time orphan→ready transition has already fired and been
+  // observed by the pipeline runner's global-event subscriber (wired up by
+  // `initPipelineRunner()` above) before this does its own pass over parent
+  // rows directly.
+  const reconciledPipelineRunCount = await reconcilePipelineRuns();
+  if (reconciledPipelineRunCount > 0) {
+    console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+  }
+
+  // Re-arm in-memory auto-resume timers for every fx task still carrying a
+  // pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
+  // in-memory `setTimeout` handle never survives a process restart, so without
+  // this a pause recorded in a prior process would sit forever with a
+  // persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
+  // after `reconcileOrphans` so reattach/orphan resolution — which can itself
+  // flip a run's status — settles first.
+  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+  if (rearmedFxAutoResumeCount > 0) {
+    console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+  }
+} catch (err) {
+  failBoot(err);
+}
+
+// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
+// detach) that was deferred to the in-memory teardown queue but never ran
+// because agetor quit or crashed before the job fired. Fire-and-forget — it
+// only enqueues jobs onto that queue, keyed to this instance's own task ids.
+sweepArchivedTeardowns();
+
+// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
+// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
+// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
+// "node" process and per-session timers. A 30s delay before the first sweep
+// lets `reconcileOrphans` above finish reattaching live sessions first, so a
+// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
+// this is best-effort background hygiene, never something that should crash
+// the app.
+setTimeout(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (post-boot) failed:", err);
+  });
+}, 30_000);
+setInterval(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (interval) failed:", err);
+  });
+}, SESSION_REAP_SWEEP_MS);
+
+// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
+// quota/usage snapshots for every enabled harness on a background cadence, so
+// the topbar meters stay fresh without the webview driving the fetches. A
+// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
+// both fire in the same tick) lets boot settle first. Errors are swallowed —
+// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
+// belt-and-suspenders shape.
+setTimeout(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll (post-boot) failed:", err);
+  });
+}, 20_000);
+setInterval(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll sweep failed", err);
+  });
+}, USAGE_POLL_SWEEP_MS);
+
+installNativeMenu();
+
+/** `Utils.showMessageBox` blocks the Bun thread (synchronous FFI) until the user
+ *  answers, so every box is bracketed with the lag label — same as
+ *  `confirmKeepOff`. */
+async function showLabelledMessageBox(opts: Parameters<typeof Utils.showMessageBox>[0]) {
+  const end = beginLagLabel("native message box");
+  try {
+    return await Utils.showMessageBox(opts);
+  } finally {
+    end();
+  }
+}
+
+Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string } }) => {
+  const action = e?.data?.action;
+  if (action === "remote-access") {
+    void runRemoteAccessBox({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        startBackgroundNow,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      log: (m) => console.warn(m),
+    });
+  } else if (action === "quit-completely") {
+    // before-quit reads this one-shot; with runs active it still asks first.
+    requestQuitCompletely();
+    Utils.quit();
+  }
+});
+
+// Best-effort: probe the agent CLIs (and every enabled fx harness's own
+// account-scoped catalog) for their model lists so the form can surface
+// anything new the user installed — or logged into — without an app update.
+// Runs in the background — we don't await it so a slow CLI never delays the
+// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
+// until this sweep lands, which is what closes the boot race
+// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
+// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
+// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
+// drift (new models, revoked account access) is eventually noticed even
+// with no triggering event.
+void refreshAllModels();
+startPeriodicDiscovery();
+
+// The boot restore above is done: let the routes through (boot-gate.ts).
+markBootReady();
+
+// C3 reconcile: the first fresh status read lets background.ts heal a login item
+// whose registration drifted (e.g. an app moved or replaced). Fire-and-forget; a
+// source run has no helper, which reads as `unavailable` and is not an error.
+void getBackgroundStatus({ fresh: true }).catch((err) => {
+  console.warn("[agetor] background status reconcile failed:", err);
+});
+
+// Archived-history retention: first pass ~90 s after boot (after the API is
+// up and restore/seed work has settled), then every 24 h; each fire reads the
+// preference fresh. Also re-armed on demand by `PUT /preferences/...`.
+scheduleRetention();
+
+// Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
+// Scheduled only now that this process owns the API port: during a handoff
+// from a CLI daemon, `await probeLiveCore` above yields while the daemon may
+// still be backfilling the same import, and a process that fails to bind
+// exits. Deferred a tick so it never blocks the window coming up. The scan
+// toasts when its preference is on (holding the notice until the webview
+// connects); an import left in `importing` resumes either way. A thrown scan
+// is logged inside startClaudeSessionLaunchScan.
+setTimeout(() => {
+  startClaudeSessionLaunchScan().catch((err) => {
+    console.error("[agetor] claude session launch scan failed:", err);
+  });
+}, 0);
+
+// An OpenCode import left `importing` by a crash resumes the same way.
+setTimeout(() => {
+  resumeIncompleteOpencodeImports().catch((err) => {
+    console.error("[agetor] opencode session import resume failed:", err);
+  });
+}, 0);
+
+// D-14: turn on built-in harnesses whose CLI is installed. Once, after the API
+// binds (`GET /harnesses` repeats it as CLIs appear later). Fire-and-forget:
+// a failed probe only skips this pass and never delays the window.
+setTimeout(() => {
+  checkAllHarnesses()
+    .then((statuses) => applyHarnessAutoEnable(statuses))
+    .catch((err) => {
+      console.error("[agetor] harness auto-enable failed:", err);
+    });
+}, 0);
+
+// Warn the user before quitting when runs are still active. Electrobun's
+// `before-quit` event fires synchronously from Utils.quit() and reads
+// `responseWasSet && response.allow === false` to veto — we can't await an
+// async confirm here, so the flow is:
+//   1. Block this quit (set allow:false) and broadcast a quit_request app
+//      event over SSE.
+//   2. The webview's QuitConfirmDialog shows the modal.
+//   3. On confirm, the webview POSTs /app/force-quit which arms a one-shot
+//      flag and re-issues Utils.quit(); this handler then sees the flag
+//      via consumeForceQuit() and allows the quit through.
+// Reattached runs (claude-code sessions kept alive across restart) count
+// as running, so the user is still prompted if they try to quit while one
+// is in flight.
+//
+// A quit about to be allowed still waits (bounded, `HANDOFF_LAUNCH_SETTLE_MS`)
+// for agent launches this process is in the middle of — a claude session that
+// hasn't taken its first prompt yet would otherwise die with the app, which
+// breaks "they'll keep running in the background" (quit-launch-gate.ts).
+const quitLaunchGate = createQuitLaunchGate({
+  launchesInFlight,
+  waitForLaunchesToSettle,
+  freezeLaunches,
+  requeueQuit: ({ completely }) => {
+    armForceQuit({ completely });
+    Utils.quit();
+  },
+  timeoutMs: HANDOFF_LAUNCH_SETTLE_MS,
+  log: (m) => console.log(m),
+});
+Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
+  // Background host armed = a live login-item supervisor is parked under this
+  // app, or waiting out a grace window to start. Read synchronously from its
+  // state file — no helper spawn inside before-quit.
+  const supervisor = liveSupervisor(dataDir);
+  const backgroundArmed = supervisor !== null && (supervisor.state === "parked" || supervisor.state === "waiting");
+  // Both one-shots are consumed inside: a vetoed quit loses nothing, since
+  // when the user confirms in the webview `POST /app/force-quit {completely}`
+  // carries the intent again (quit-launch-gate.ts `decideBeforeQuit`).
+  const decision = decideBeforeQuit({
+    consumeForceQuit,
+    consumeQuitCompletely,
+    gate: quitLaunchGate,
+    hasSupervisor: supervisor !== null,
+    runningTaskIds: () => {
+      try {
+        return db
+          .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
+          .all()
+          .map((r) => r.task_id);
+      } catch {
+        // If the DB is unavailable for any reason, allow the quit — the cost
+        // of a missed warning is small; the cost of trapping the user is high.
+        return [];
+      }
+    },
+  });
+  if (decision.kind === "veto") {
+    event.response = { allow: false };
+    return;
+  }
+  if (decision.kind === "confirm") {
+    broadcastAppEvent({
+      type: "quit_request",
+      runningRunCount: decision.runningTaskIds.length,
+      runningTaskTitles: decision.runningTaskIds
+        .map((id) => tasks.get(id)?.title ?? "")
+        .filter((t) => t.length > 0)
+        .slice(0, 10),
+      backgroundArmed,
+      completely: decision.completely,
+      ts: Date.now(),
+    });
+    event.response = { allow: false };
+    return;
+  }
+  // Only when a supervisor is alive to read it (`stopSupervisor`): a request
+  // written with none running would otherwise linger for the next supervisor
+  // to start (the background turned on later, or the next login).
+  // takeSupervisorStop also ignores a stale request, as a second line of
+  // defense. The supervisor would otherwise take the port back when this
+  // process dies; this asks it to stay down until the next login (D6).
+  if (decision.stopSupervisor) {
+    try {
+      requestSupervisorStop(dataDir);
+    } catch (err) {
+      console.warn("[agetor] failed to write the supervisor stop request:", err);
+    }
+  }
+  removeCoreCreds(dataDir);
+  event.response = { allow: true };
+});
+
+// Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8
+// review #7) — mirrors fx-acp.ts's own `process.on("exit", reapLiveFxProcs)`
+// (see that file's doc for why `"exit"` is the right event here: it covers
+// both a normal process exit AND the `Utils.quit()` path this app's own
+// `before-quit` handler above ultimately allows through, unlike SIGINT/
+// SIGTERM which fx-acp's handlers already own separately). Unlike
+// `headless.ts`'s `shutdown()`, this app has no single synchronous teardown
+// function to hook into — the confirm-on-quit flow above just flips
+// `event.response.allow` and lets Electrobun's own quit sequence run — so a
+// bare `process.on("exit", ...)` registration is the only reliable hook.
+// `fxAutoResumeTimers` entries are `.unref()`'d already (never what keeps the
+// process alive), so this is about not racing a timer mid-teardown, not
+// about letting the process exit at all; it touches no persisted
+// `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
+process.on("exit", stopFxAutoResumeTimers);
+// Same for the retention timers (a running pass is told to stop between
+// chunks; trimmed rows stay trimmed and the next boot resumes) and the lag
+// sampler.
+process.on("exit", () => {
+  stopRetentionTimers();
+  stopLagMonitor();
+});
+
+// Background self-update check on launch + every 6h. Emits global events
+// that the UI subscribes to via SSE to render the "update ready" banner.
+// Defers its first probe 5s past boot so it doesn't slow window open.
+startUpdaterLoop();
+
+/** Lifecycle wrapper around BrowserWindow construction. Handles:
+ *   - idempotency (concurrent reopen events share one in-flight build),
+ *   - frame memory (remembered position/size survives close → reopen so
+ *     the window doesn't jump back to its DEFAULT_FRAME on every Dock
+ *     click — the user-visible Mac standard).
+ *  See window-lifecycle.ts + window-lifecycle.test.ts for the contract
+ *  and the race-safety / restore-frame coverage. */
+const windowLifecycle = makeWindowLifecycle({
+  getMainWindow,
+  setMainWindow,
+  buildWindow: async (frame: Frame) => {
+    const url = await getMainViewUrl();
+    const theme = resolveThemePreference();
+    const fontSize = resolveFontSizePreference();
+    // The native views:// scheme handler refuses URLs that carry a fragment
+    // or query — it treats the part after the scheme as a literal file path,
+    // so `views://mainview/index.html#api=…` resolves to a non-existent file
+    // and returns "empty response". Instead, ship the per-launch API
+    // coordinates (now including the resolved theme preference) through a
+    // WKUserScript injection (BrowserWindow's `preload` option). The webview
+    // reads the rest off `window.__AGETOR` too (see api.ts).
+    // For Vite HMR mode the URL is plain http://, which DOES support hash,
+    // so we keep the legacy hash payload (now theme-carrying too, via
+    // buildWindowHash) as a fallback there.
+    //
+    // themeApplyScript below APPLIES the theme itself, rather than only
+    // exposing it for index.html's inline <head> script to read back.
+    // Electrobun's `preload` is documented to run before page scripts, but
+    // the exact injection point (WKUserScript's `.atDocumentStart` vs.
+    // `.atDocumentEnd`) is decided by the native wrapper — a prebuilt binary
+    // this repo doesn't control — so relying on "preload always beats
+    // index.html's inline script" is exactly the kind of ordering
+    // assumption that only breaks in a packaged build (`bun run dev:hmr`
+    // never hits this path: it loads http:// + hash, not views://). Doing
+    // the class/color-scheme application right here removes the dependency
+    // on that ordering: whichever of this script and index.html's inline
+    // script runs first "wins" the paint, and the other is a no-op re-run
+    // of the identical computation from the identical `theme` value — both
+    // derive `dark` the same way, so there is nothing to fight over
+    // regardless of which fires first. `document.documentElement` is
+    // expected to exist even at document-start in WebKit, but the `r &&`
+    // guard and try/catch keep this best-effort defensive against a WKWebView
+    // that injects later than documented, or an environment lacking
+    // `matchMedia`.
+    const themeApplyScript =
+      `try{var p=${JSON.stringify(theme)};` +
+      `var d=p==="dark"||(p==="auto"&&(!window.matchMedia||window.matchMedia("(prefers-color-scheme: dark)").matches));` +
+      `var r=document.documentElement;` +
+      `if(r){r.classList.toggle("dark",d);r.style.colorScheme=d?"dark":"light";}` +
+      `}catch(e){}`;
+    // Same rationale as themeApplyScript above: applies the resolved
+    // font-size percent itself, rather than only exposing it for
+    // index.html's inline <head> script to read back, so neither script has
+    // to win a race against the other — both derive the identical px value
+    // from the identical `fontSize` number. At FONT_SIZE_DEFAULT (100) this
+    // is the empty string: no inline style is written, matching the
+    // "pristine at default" contract (there's nothing to clear, since
+    // nothing was ever set). The px value is computed once here in Bun and
+    // inlined as a literal — re-running this script (e.g. if the preload
+    // and index.html's script both fire) just re-assigns the same value, an
+    // idempotent no-op.
+    const fontSizeApplyScript =
+      fontSize === FONT_SIZE_DEFAULT
+        ? ""
+        : `try{var r2=document.documentElement;` +
+          `if(r2){r2.style.fontSize=${JSON.stringify(`${(FONT_SIZE_BASE_PX * fontSize) / 100}px`)};}` +
+          `}catch(e){}`;
+    const bootGlobals =
+      `window.__AGETOR=${JSON.stringify({
+        port: String(API_PORT),
+        token: API_TOKEN,
+        theme,
+        fontSize,
+      })};` + themeApplyScript + fontSizeApplyScript;
+    const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
+    // `remembered` (window-lifecycle.ts) is in-memory only, updated live from
+    // "move"/"resize" events — it's never validated against the display
+    // layout at the time it was captured. If the user unplugs the display the
+    // window was last on and then closes + reopens the window within the
+    // same process (no restart, so this isn't the boot-reconciliation path),
+    // `frame` here can describe a rect no longer on any screen. Neither
+    // `BrowserWindow`'s construction nor a later `setFrame` auto-constrains
+    // an out-of-bounds frame onto a live display — AppKit's
+    // `constrainFrameRect` only clamps within the window's *current* screen,
+    // which doesn't help a window that hasn't been placed yet — so repair
+    // has to happen here, before construction, not after.
+    const safeFrame = repairFrame(frame, Screen.getAllDisplays());
+    // macOS-only chrome: `hiddenInset` removes the native title bar background
+    // + text but keeps inset traffic lights, letting the React header at the
+    // top of App.tsx render full-bleed on the same row. `trafficLightOffset`
+    // shifts the lights to vertically center inside that header's 40px (h-10)
+    // height — keep `x` here in sync with the header's left padding (`pl-20`
+    // in App.tsx).
+    const mainWindow = new BrowserWindow({
+      title: "Agetor",
+      titleBarStyle: "hiddenInset",
+      trafficLightOffset: { x: 8, y: 8 },
+      url: isHttpUrl
+        ? `${url}${buildWindowHash({ port: String(API_PORT), token: API_TOKEN, theme, fontSize })}`
+        : url,
+      preload: bootGlobals,
+      frame: safeFrame,
+    });
+    setMainWindow(mainWindow);
+    console.log("[agetor] main window ready");
+  },
+});
+
+/** Shared "bring the app to front" call for every raise trigger (notification
+ *  click, Dock reopen) — wraps focusWindow() with this process's concrete
+ *  getMainWindow()/Screen.getAllDisplays() so the three call sites below
+ *  don't each re-spell the deps. Returns false when there's no window to
+ *  focus (caller's cue to create one instead). */
+function focusMainWindow(): boolean {
+  return focusWindow(getMainWindow(), { getAllDisplays: () => Screen.getAllDisplays() });
+}
+
+// Shadow the window's frame as the user moves / resizes it, so the next
+// reopen restores their last placement. Both events carry `id`; we filter
+// to *our* main window so a future secondary window's drags don't pollute
+// the main-window placement memory. `move` is x/y only; `resize` carries
+// both, so we accept partial patches in rememberFrame.
+Electrobun.events.on("move", (e: { data: { id: number; x: number; y: number } }) => {
+  if (getMainWindow()?.id === e.data.id) {
+    windowLifecycle.rememberFrame({ x: e.data.x, y: e.data.y });
+  }
+});
+Electrobun.events.on(
+  "resize",
+  (e: { data: { id: number; x: number; y: number; width: number; height: number } }) => {
+    if (getMainWindow()?.id === e.data.id) {
+      windowLifecycle.rememberFrame({
+        x: e.data.x, y: e.data.y, width: e.data.width, height: e.data.height,
+      });
+    }
+  },
+);
+
+// Clear the registered window reference *only* when the main window
+// closes. The "close" event fires for every BrowserWindow the bun
+// process owns; without the id filter, closing a future secondary
+// window (about box, settings dialog, devtools split) would silently
+// clear the main-window registration and break getMainWindow callers
+// like the /window/toggle-zoom endpoint.
+Electrobun.events.on("close", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setMainWindow(null);
+});
+
+// macOS Dock-icon click on an already-running app fires Cocoa's
+// `applicationShouldHandleReopen:hasVisibleWindows:`, which Electrobun
+// surfaces as the "reopen" event (see node_modules/electrobun/dist/api/
+// bun/proc/native.ts setAppReopenHandler). Re-create the window if the
+// user dismissed it earlier, or raise+focus it if it's merely buried or
+// minimized — createMainWindow() no-ops when a window is already
+// registered, so without the focus branch a Dock click on a minimized or
+// background window did nothing from our side. This is the modern
+// replacement for the old HTTP /focus endpoint, and it's what makes agetor
+// feel like a real macOS app rather than a webapp that happens to live in
+// a window.
+//
+// We catch errors here because a silent fail-to-recreate would look
+// like "Dock click does nothing" to the user, with no diagnostic. The
+// boot-time await further below surfaces first-launch failures via the
+// top-level await; this catch covers every subsequent reopen.
+Electrobun.events.on("reopen", () => {
+  if (getMainWindow()) {
+    focusMainWindow();
+    return;
+  }
+  windowLifecycle.createMainWindow().catch((err) => {
+    console.error("[agetor] failed to recreate window on reopen:", err);
+  });
+});
+
+// Deep-link entry point: macOS routes a click on our custom `agetor://`
+// scheme (e.g. a click on an AgetorNotifier notification — see
+// the task notifier above) to `open <url>`, which Electrobun surfaces as
+// this "open-url" event. There's no notification-click callback in
+// Electrobun, so this is the only way a notification click gets back into
+// the app — see the design note at src/mainview/lib/api.ts:424.
+//
+// We ALWAYS stash the taskId in pending-open.ts (short-TTL) and, if a window
+// already exists, ALSO broadcast immediately and raise the window:
+//   - Window exists: the webview is connected to /app/events, so the direct
+//     broadcast arrives instantly. The pending stash is belt-and-suspenders —
+//     if the broadcast happens to land while the webview is mid-reload or
+//     between EventSource reconnects, the next subscriber flushes the pending
+//     entry (within its TTL) so the click isn't silently lost. We broadcast
+//     BEFORE focusing: the SSE message is a fire-and-forget dispatch (no
+//     round-trip to wait on), so issuing it first lets the webview start
+//     selecting the task while the native activate/un-minimize calls are
+//     still in flight, instead of the reverse order where the window
+//     visibly raises a beat before the UI catches up to it.
+//   - No window (app was fully dismissed / cold start): there's no SSE
+//     subscriber yet, so we rely entirely on the pending flush — create the
+//     window and the freshly-booted webview picks it up when it subscribes
+//     (see the consumePendingOpenTask() flush in server.ts's SSE route).
+//     No focusMainWindow() call here: constructing a BrowserWindow already
+//     calls showWindow(ptr, activate=true) natively, so a freshly built
+//     window is activated on creation — calling focusMainWindow() too would
+//     be redundant, not incorrect, but it'd suggest the two paths need
+//     separate raise logic when they don't.
+// The pending entry's TTL (pending-open.ts) prevents a much-later, unrelated
+// reconnect from resurrecting a stale click. Re-opening the same task is
+// idempotent (webview just re-selects it), so a rare double-delivery is
+// harmless. Wrapped so a malformed URL / window-creation failure never
+// crashes the event dispatcher.
+Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
+  try {
+    const taskId = parseTaskDeepLink(e.data.url);
+    if (!taskId) return;
+    setPendingOpenTask(taskId);
+    if (getMainWindow()) {
+      broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
+      focusMainWindow();
+    } else {
+      windowLifecycle.createMainWindow().catch((err) => {
+        console.error("[agetor] failed to create window for open-url:", err);
+      });
+    }
+  } catch (err) {
+    console.error("[agetor] failed to handle open-url:", err);
+  }
+});
+
+await windowLifecycle.createMainWindow();

@@ -1,0 +1,11 @@
+{
+  "name": "demo-geometry-repo",
+  "version": "1.0.0",
+  "description": "Interactive Multi-Agent Collaborative Geometry Core",
+  "main": "index.js",
+  "scripts": {
+    "test:circle": "node test_circle.js",
+    "test:rect": "node test_rect.js",
+    "test:geom": "node test_geom.js"
+  }
+}

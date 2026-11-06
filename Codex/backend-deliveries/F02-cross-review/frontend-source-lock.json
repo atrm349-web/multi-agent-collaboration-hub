@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "delivery": "Antigravity F02",
+  "checkedAt": "2026-11-03T01:01:38.612Z",
+  "backendBaseCommit": "9322bac26700a251947469a379658607cff4bb4b",
+  "reviewStatus": "changes-requested",
+  "sourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "60612e4e148ff138ff9451263f22965c5daa1360a15bb78b21303ff5b6e9e2f1",
+    "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+  },
+  "nativeBundleHashes": {
+    "app.live-native.js": "57ae412748763aecc81b4ffabe99cd362a141c9d429e55056934b1d16ad09122",
+    "index.live-native.html": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523"
+  },
+  "backendHashes": {
+    "packages/core/frontend.ts": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+    "packages/core/http.ts": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
+    "packages/core/hub.ts": "c78178d24cf188f902f843519e569154aa1e039edad097ce5c68a9f4cc61b097",
+    "packages/core/quality.ts": "469f5e9bb9b27e10b199b282436e55969cb1bec03d449618cf1f21ff040e6e87",
+    "packages/core/workspace.ts": "11f34351be19f10fb28660eac7526b4f84fe998c01f79a0a0f2e47c9b87b9836",
+    "scripts/start-hub.ts": "875fed6861b13fbd73c74e2700cbdbe1d5c14b6d92be629482005835ebef8211"
+  },
+  "runtimeEnforced": false,
+  "note": "Cross-review hash record only; does not change frontend assets or bridge logic."
+}

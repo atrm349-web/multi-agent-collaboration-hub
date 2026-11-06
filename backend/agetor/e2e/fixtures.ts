@@ -1,0 +1,817 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  type WriteStream,
+  chmodSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { test as base } from "@playwright/test";
+import { E2E_BASE_URL, E2E_VITE_PORT, assertBrowserSafePort, e2eIntEnv } from "../playwright.config";
+
+export { expect } from "@playwright/test";
+export type { APIRequestContext, Locator, Page } from "@playwright/test";
+
+/**
+ * Worker-scoped headless-backend fixture (docs/plans/e2e-per-worker-backends
+ * .md §3). Each Playwright worker spawns its own `bun src/bun/headless.ts`
+ * on a dedicated data dir + port + token, so `bunx playwright test` can run
+ * every spec file's worker in parallel without any of them racing shared
+ * SQLite preference/task state. Vite stays single-instance and shared — see
+ * `playwright.config.ts`'s `webServer` block.
+ */
+export interface E2EBackend {
+  apiPort: number;
+  apiToken: string;
+  apiBase: string;
+  bootBase: string;
+  dataDir: string;
+  /** Port the per-worker/per-test stub GitHub API server should (or does)
+   *  listen on — see `e2e/github-stub.ts`. The backend is launched with
+   *  `AGETOR_GITHUB_API_BASE` pointed at this port, so a spec that starts
+   *  `startGitHubStub(backend.githubStubPort, routes)` transparently becomes
+   *  the app's GitHub API for the lifetime of that backend. */
+  githubStubPort: number;
+  /** Directory `POST /refs/pick` returns from in this headless backend.
+   *  Use `plantPicks` — it clears first; the dir is worker-shared, so a
+   *  spec that writes into it directly can leak stale files into a later
+   *  spec's "files" pick. See the seam in server.ts. */
+  fakePickDir: string;
+  /** Clears `fakePickDir` (it's worker-shared, so a spec's leftover files
+   *  would otherwise leak into the next spec's "files"-mode pick) and
+   *  replants it with the given `{ name: content }` entries, returning
+   *  their absolute paths in the same key order. Call this instead of
+   *  writing into `fakePickDir` by hand before exercising the
+   *  Files/Folder picker buttons. */
+  plantPicks: (files: Record<string, string>) => Promise<string[]>;
+  /** Where `POST /bundle/export/save` with `target: "downloads"` writes in
+   *  this backend (`AGETOR_DOWNLOADS_DIR`, docs/plans/agents-pipelines-
+   *  import-export.md). Not created up front — the server creates it on the
+   *  first save, exactly like a missing `~/Downloads`. */
+  downloadsDir: string;
+}
+
+const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
+
+// Disjoint from 4317 (packaged app default), 4318 (legacy single-shared e2e
+// port), and 4399-4531 (bun unit tests, one static port per file).
+// `AGETOR_E2E_PORT_OFFSET` shifts every e2e port range below (API, fresh
+// API, both GitHub stubs) by the same amount, so a second checkout can run
+// Playwright while another one holds 4600-4999 (pair it with
+// `AGETOR_E2E_VITE_PORT`, playwright.config.ts). Unset = today's ports; the
+// cap keeps the highest range (4900 + offset + workers) below 65536. The
+// browser talks to the API ports (not the GitHub stubs, which only the
+// backend calls), so each API port a worker or test allocates below is
+// checked against Chromium's restricted-port list (`assertBrowserSafePort`).
+const E2E_PORT_OFFSET = e2eIntEnv("AGETOR_E2E_PORT_OFFSET", 0, 0, 60_000);
+
+const BASE_API_PORT = 4600 + E2E_PORT_OFFSET;
+
+// Overridable so a slow/loaded machine (many concurrent worker backends
+// booting at once) can widen the budget without editing source — mirrors the
+// old webServer timeout, which this fixture's health poll effectively
+// replaced per worker.
+const HEALTH_TIMEOUT_MS = Number(process.env.E2E_HEALTH_TIMEOUT_MS ?? 60_000);
+const HEALTH_POLL_INTERVAL_MS = 200;
+const TEARDOWN_GRACE_MS = 4_000;
+/** The fake fx storm's pause and the fx auto-resume delay this fixture sets
+ *  on every backend (`AGETOR_FAKE_FX_RECOVERY_PAUSE_MS`,
+ *  `AGETOR_FX_AUTO_RESUME_DELAY_MS` below). Exported so
+ *  `e2e/fx-recovery.spec.ts` sizes its waits from the same numbers. */
+export const E2E_FX_STORM_PAUSE_MS = 6_000;
+export const E2E_FX_AUTO_RESUME_DELAY_MS = 6_000;
+const FINAL_KILL_WAIT_MS = 2_000;
+const PREFLIGHT_TIMEOUT_MS = 2_000;
+
+/**
+ * fx's availability probe (`checkHarness` in src/bun/agent-status.ts) is a
+ * DUAL probe — `--version` (generic, same as every other harness) AND
+ * `--help`, whose output must contain "coding agent" — because the bare
+ * name `fx` collides with an unrelated npm JSON-viewer CLI, and `--version`
+ * alone can't tell them apart. That probe runs regardless of
+ * `AGETOR_FX_DRIVER=fake` (the driver override only replaces `spawnAgent`'s
+ * fx branch, not the separate start-task pre-flight), so a bare `/bin/echo`
+ * — good enough for claude's probe below — would fail fx's `--help` check
+ * and `startTask` would reject every fx run before the fake driver ever ran.
+ * This stub script mirrors the one `src/bun/orchestrator-fx.test.ts` writes
+ * for the identical reason.
+ *
+ * Written inside the given `dataDir` (a subdirectory, so it can't collide
+ * with anything `headless.ts` itself creates there) rather than at its own
+ * module-scope temp dir — `dataDir` is already `rm -rf`'d by
+ * `provisionBackend`'s teardown (both the success and pre-health-check
+ * failure paths), so the stub is cleaned up for free instead of leaking a
+ * bare `mkdtempSync` directory per importing process for the lifetime of the
+ * machine. Callers must invoke this after `dataDir` exists but before
+ * spawning the backend, since `AGETOR_FX_BIN` must already point at an
+ * executable file by the time `headless.ts` starts probing it.
+ *
+ * Also answers `fx models --json` (`src/bun/agent-discovery.ts`'s
+ * `discoverFx`, added by `docs/plans/fx-model-catalog-refresh.md`), which
+ * every enabled fx harness gets probed with — at boot, on enable, on manual
+ * ↻, and periodically. Without a real answer here that probe would resolve
+ * to an empty catalog (a malformed/non-JSON response degrades to `[]`,
+ * never a throw — see `parseFxModels`), which would make every fx-model-
+ * picker e2e assertion trivially true against an empty list instead of
+ * proving the account-scoped merge (`mergeModelOptions`,
+ * curated ∩ discovered + discovered-only) actually happened. The four ids
+ * below are deliberately a small, fixed catalog independent of the real
+ * fx.sh Gateway catalog: three overlap curated `AGENT_OPTIONS.fx.models` rows
+ * (`deepseek/deepseek-v4-flash`, the curated default since fx 0.0.14,
+ * `zai/glm-5.3-flash` and `openai/gpt-5.2`) to exercise the "curated ∩
+ * discovered" intersection, and one (`e2e/discovered-only`) has no curated
+ * row at all, to exercise the discovered-only-id append path. By default it
+ * still does NOT answer `status --json` (empty output, exit 0) — that keeps
+ * the pre-flight auth check failing OPEN (`loggedIn: null`) against this
+ * stub, exactly as documented above and in CLAUDE.md's fx bullet, so no e2e
+ * spec is ever blocked by the auth pre-flight.
+ *
+ * Two opt-in env seams let a spec give one harness its own answers without a
+ * second stub binary: `AGETOR_E2E_FX_STATUS_JSON` (`status --json` prints
+ * that file — e.g. a `permission_mode` for the Settings Ask hint) and
+ * `AGETOR_E2E_FX_MODELS_JSON` (`models --json` prints that file instead of
+ * the fixed catalog — e.g. an fx ≥0.0.14 `models[]` array with speed
+ * flags). They are never set on the backend itself; a spec puts them in an
+ * additional fx harness's `env` map, which `harnessEnv` merges into both the
+ * status probe (`agent-status.ts`) and model discovery (`discoverFx`). Unset,
+ * the stub behaves exactly as described above.
+ */
+function writeFxStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "fx-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "fx");
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--help" ]; then',
+      '  echo "Fast, native coding agent for the terminal"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--version" ]; then',
+      // A harness env map can set AGETOR_E2E_FX_VERSION to look like a newer fx.
+      '  echo "${AGETOR_E2E_FX_VERSION:-0.0.4-fake}"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "status" ] && [ "$2" = "--json" ] && [ -n "$AGETOR_E2E_FX_STATUS_JSON" ]; then',
+      '  cat "$AGETOR_E2E_FX_STATUS_JSON"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "models" ] && [ "$2" = "--json" ]; then',
+      '  if [ -n "$AGETOR_E2E_FX_MODELS_JSON" ]; then',
+      '    cat "$AGETOR_E2E_FX_MODELS_JSON"',
+      "    exit 0",
+      "  fi",
+      '  echo \'{"kind":"models","count":4,"shown_count":4,"more_count":0,"private_models_hidden":false,"ids":["deepseek/deepseek-v4-flash","zai/glm-5.3-flash","openai/gpt-5.2","e2e/discovered-only"]}\'',
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
+/** File a spec writes into a project folder to make the OpenCode stub's
+ *  `session list` answer for that cwd (see `writeOpencodeStubBin`). */
+export const OPENCODE_STUB_SESSIONS_FILE = ".agetor-e2e-opencode-sessions.json";
+
+/** The session ids the OpenCode stub's `session export` answers, each with
+ *  the captured fixture it prints (`src/bun/fixtures/opencode/`). Any other
+ *  id gets OpenCode's own not-found answer (exit 1). */
+export const OPENCODE_STUB_EXPORTS: Readonly<Record<string, string>> = {
+  ses_e8261398affehUf22D8iOXNtgS: "v2-session-export.json",
+  ses_e82612922ffe6VVY5SiPNRsanX: "v2-session-export-child.json",
+};
+
+/**
+ * Stub `opencode` binary for every backend (`AGETOR_OPENCODE_BIN`), the
+ * OpenCode sibling of `writeFxStubBin`. Turns run through the in-process
+ * fake driver (`AGETOR_OPENCODE_DRIVER=fake`), but the start-task pre-flight,
+ * the credential notice, model discovery, the session scan and the session
+ * import still shell out to the binary, so it answers each of them like a
+ * keyless OpenCode 2 install (docs/plans/add-opencode-harness.md §5, item 4):
+ *  - `--version` → `opencode v2.1.4` (so every turn is a 2.x turn);
+ *  - `models [--standalone]` → two Zen ids, one per line;
+ *  - `api --standalone model.list` → the captured `v2-api-model-list.json`;
+ *  - `auth list [--standalone] [--format json]` → `[]` (no credentials, so
+ *    Settings shows the "No OpenCode credentials found" notice);
+ *  - `session list [--standalone] --format json` → the
+ *    {@link OPENCODE_STUB_SESSIONS_FILE} in the cwd when a spec wrote one,
+ *    else `[]` (the scan runs it once per registered project folder);
+ *  - `session export [--standalone] <id>` → the fixture named in
+ *    {@link OPENCODE_STUB_EXPORTS}, else "Session not found" and exit 1;
+ *  - anything else (e.g. `serve`) → exit 0 with no output.
+ * Written into the backend's `dataDir`, like the fx stub, so teardown
+ * removes it.
+ */
+function writeOpencodeStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "opencode-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "opencode");
+  const fixtures = path.join(REPO_ROOT, "src", "bun", "fixtures", "opencode");
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const exportCases = Object.entries(OPENCODE_STUB_EXPORTS).map(
+    ([id, file]) => `      ${id}) cat ${q(path.join(fixtures, file))}; exit 0 ;;`,
+  );
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "opencode v2.1.4"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "models" ]; then',
+      '  echo "opencode/big-pickle"',
+      '  echo "opencode/glm-5.3-flash-free"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "api" ]; then',
+      '  for a in "$@"; do',
+      `    if [ "$a" = "model.list" ]; then cat ${q(path.join(fixtures, "v2-api-model-list.json"))}; exit 0; fi`,
+      "  done",
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "auth" ] && [ "$2" = "list" ]; then',
+      '  echo "[]"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "session" ] && [ "$2" = "list" ]; then',
+      `  if [ -f ./${OPENCODE_STUB_SESSIONS_FILE} ]; then cat ./${OPENCODE_STUB_SESSIONS_FILE}; else echo "[]"; fi`,
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "session" ] && [ "$2" = "export" ]; then',
+      '  for a in "$@"; do id="$a"; done',
+      '  case "$id" in',
+      ...exportCases,
+      '      *) echo "Error: Session not found: $id" >&2; exit 1 ;;',
+      "  esac",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
+/**
+ * GitHub Copilot CLI stub (docs/plans/github-copilot-harness.md T13). Copilot
+ * is seeded ENABLED, so every fresh backend lists a "GitHub Copilot" harness;
+ * its availability probe (`checkHarness`, agent-status.ts) only passes when
+ * `<bin> --version` prints "GitHub Copilot CLI" (the AWS Copilot wrong-binary
+ * guard), which `/bin/echo` can never satisfy — and model discovery
+ * (`discoverCopilot`) reads the `model` block of `<bin> help config`. This
+ * stub answers both: `--version` with the real 1.0.104 banner, and
+ * `help config` with a reproduction of the real output's SHAPE (a few other
+ * keys' value lists around the `model` block, whose items are the curated ids
+ * plus `gpt-5.4-mini`, a discovered-only id with no curated row). Anything
+ * else exits 0 silently.
+ *
+ * It is opt-in: `provisionBackend` points `AGETOR_COPILOT_BIN` at it ONLY when
+ * the backend's `backendEnv` carries `AGETOR_E2E_COPILOT_STUB=1` (see
+ * `e2e/copilot-harness.spec.ts`), so every other spec keeps seeing Copilot as
+ * not installed, exactly as it sees Antigravity. Written into the backend's own
+ * `dataDir` (cleaned up with it), before the backend spawns.
+ */
+function writeCopilotStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "copilot-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "copilot");
+  const modelIds = [
+    "claude-sonnet-5.5",
+    "claude-sonnet-5",
+    "claude-fable-5.1",
+    "claude-opus-5.5",
+    "claude-opus-5",
+    "claude-haiku-5.5",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
+    "gpt-5.4-mini",
+    "mai-code-1.1-flash",
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "grok-4.7",
+    "kimi-k3",
+  ];
+  const helpConfig = [
+    "Configuration Settings:",
+    "",
+    "  Change these settings with `copilot config`, using dot notation for nested keys:",
+    "    $ copilot config footer.showQuota off",
+    "",
+    '  `banner`: frequency of showing animated banner; defaults to "once".',
+    '    - "always" displays it every time',
+    '    - "never" disables it',
+    '    - "once" displays it the first time',
+    "",
+    "  `model`: AI model to use for Copilot CLI; can be changed with /model command or --model flag option.",
+    ...modelIds.map((id) => `    - "${id}"`),
+    "",
+    '  `contextTier`: context window tier for tiered-pricing models (e.g., "default" or "long_context").',
+    '    - "default"',
+    "",
+  ];
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "GitHub Copilot CLI 1.0.104."',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "help" ] && [ "$2" = "config" ]; then',
+      "  cat <<'AGETOR_E2E_COPILOT_HELP_CONFIG'",
+      ...helpConfig,
+      "AGETOR_E2E_COPILOT_HELP_CONFIG",
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
+async function tailFile(filePath: string, maxBytes = 4_000): Promise<string> {
+  if (!existsSync(filePath)) return `<${filePath} not found>`;
+  try {
+    const contents = await readFile(filePath, "utf8");
+    return contents.slice(-maxBytes);
+  } catch {
+    return `<${filePath} unreadable>`;
+  }
+}
+
+/** headless.ts's real diagnostics (bind failures, shutdown reason, idle
+ *  reaper errors) go through `daemonLog` to `<dataDir>/daemon.log`, NOT to
+ *  the piped stdout/stderr in `backend.log` — most startup failures leave
+ *  backend.log empty and the useful signal in daemon.log. Tail both so a
+ *  failure message always points at the actual cause. */
+async function formatLogTails(logFile: string, daemonLogFile: string): Promise<string> {
+  const [stdoutTail, daemonTail] = await Promise.all([tailFile(logFile), tailFile(daemonLogFile)]);
+  return (
+    `--- stdout/stderr tail (${logFile}) ---\n${stdoutTail}\n` +
+    `--- daemon log tail (${daemonLogFile}) ---\n${daemonTail}`
+  );
+}
+
+/** Pre-flight guard against adopting a stale/foreign backend: `/health` is
+ *  unauthenticated, so if anything is already listening on this worker's
+ *  port (an orphaned headless.ts from a prior interrupted run, most likely)
+ *  the post-spawn health poll would happily treat it as "ours" — the token
+ *  mismatch would only surface later, on the first authenticated request,
+ *  far from this fixture and hard to diagnose. Fail fast here instead. */
+async function assertPortFree(apiBase: string, apiPort: number): Promise<void> {
+  let answered: boolean;
+  try {
+    await fetch(`${apiBase}/health`, { signal: AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS) });
+    answered = true;
+  } catch {
+    answered = false; // connection refused/timed out — port is free, proceed
+  }
+  if (!answered) return;
+  throw new Error(
+    `port ${apiPort} is already serving something (pre-flight GET ${apiBase}/health got a ` +
+      `response before we spawned anything) — a stale headless.ts from a prior run is the ` +
+      `likely cause. Recover with:\n  lsof -ti :${apiPort} | xargs kill`,
+  );
+}
+
+async function waitForHealth(apiBase: string): Promise<void> {
+  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${apiBase}/health`);
+      if (res.ok) return;
+    } catch (err) {
+      lastError = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `headless backend at ${apiBase} never became healthy within ${HEALTH_TIMEOUT_MS}ms` +
+      (lastError ? ` (last poll error: ${String(lastError)})` : ""),
+  );
+}
+
+/** SIGTERM, wait up to TEARDOWN_GRACE_MS for a clean exit, SIGKILL fallback.
+ *  Resolves once the process has exited (or we've waited as long as we're
+ *  willing to), so the caller can `rm -rf` the data dir right after without
+ *  racing a still-shutting-down SQLite connection. Never hangs: a child that
+ *  never spawned (`pid === undefined`, e.g. `bun` missing from PATH raised
+ *  ENOENT) has nothing to wait for, and the post-SIGKILL wait is bounded —
+ *  a process wedged in uninterruptible I/O would otherwise stall teardown
+ *  forever. */
+async function killGracefully(child: ChildProcess): Promise<void> {
+  if (child.pid === undefined) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  let settled = false;
+  const exited = new Promise<void>((resolve) => {
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    // ENOENT-style spawn failures can emit 'error'+'close' without ever
+    // firing 'exit'; listen for both so we don't wait on the one that never
+    // comes.
+    child.once("exit", done);
+    child.once("close", done);
+  });
+
+  child.kill("SIGTERM");
+  const timedOut = await Promise.race([
+    exited.then(() => false as const),
+    new Promise<true>((resolve) => setTimeout(() => resolve(true), TEARDOWN_GRACE_MS)),
+  ]);
+  if (timedOut) {
+    child.kill("SIGKILL");
+    await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, FINAL_KILL_WAIT_MS))]);
+  }
+}
+
+/**
+ * Spawns one `headless.ts` backend on `apiPort`/`apiToken`, waits for it to
+ * become healthy, hands it to `use()`, and tears it down afterward. Shared by
+ * both `backend` (worker-scoped — one long-lived instance reused by every
+ * test in a worker) and `freshBackend` (test-scoped — a brand-new instance
+ * per test; see that fixture's doc comment for why it exists) below.
+ * `logLabel` only affects log/error messages (e.g. "worker 2" vs a test
+ * title) so a startup failure or mid-suite-death report points at the right
+ * instance. `extraEnv` (default `{}`) is merged on top of the base env
+ * below — additive, spread last so a spec-supplied value always wins — for
+ * a test that needs a seam env var (e.g.
+ * `AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS`, see `docs/plans/task-details-blank-
+ * while-session-restores.md` §5 E1) on its own dedicated backend rather than
+ * the worker-shared one. See the `backendEnv` fixture option below.
+ */
+async function provisionBackend(
+  apiPort: number,
+  apiToken: string,
+  githubStubPort: number,
+  logLabel: string,
+  use: (backend: E2EBackend) => Promise<void>,
+  extraEnv: Record<string, string> = {},
+): Promise<void> {
+  const apiBase = `http://127.0.0.1:${apiPort}`;
+
+  await assertPortFree(apiBase, apiPort);
+
+  const dataDir = await mkdtemp(path.join(tmpdir(), "agetor-e2e-"));
+  const logFile = path.join(dataDir, "backend.log");
+  const daemonLogFile = path.join(dataDir, "daemon.log");
+  // Must happen before the spawn below — see writeFxStubBin's doc comment.
+  const fxStubBinPath = writeFxStubBin(dataDir);
+  const opencodeStubBinPath = writeOpencodeStubBin(dataDir);
+  const copilotStubBinPath = writeCopilotStubBin(dataDir);
+  // Never created: an absolute path that can't resolve pins a seeded-enabled
+  // harness to "not installed" independent of the machine's PATH.
+  const missingCopilotBinPath = path.join(dataDir, "not-installed", "copilot");
+  const missingAntigravityBinPath = path.join(dataDir, "not-installed", "agy");
+  // Backs the `/refs/pick` test seam (src/bun/server.ts) — a spec plants
+  // files here, then clicks the picker's Files/Folder button, and the
+  // headless backend returns them instead of opening a native panel that
+  // doesn't exist in this environment. Created up front (like the fx stub
+  // bin above) so a spec can write into it before the backend even boots.
+  const fakePickDir = path.join(dataDir, "fake-picks");
+  mkdirSync(fakePickDir, { recursive: true });
+  // Save to Downloads target for the bundle export (see `downloadsDir`).
+  const downloadsDir = path.join(dataDir, "fake-downloads");
+
+  const logStream: WriteStream = createWriteStream(logFile);
+  await new Promise<void>((resolve, reject) => {
+    logStream.once("open", () => resolve());
+    logStream.once("error", reject);
+  });
+
+  const child = spawn("bun", ["src/bun/headless.ts"], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      AGETOR_DATA_DIR: dataDir,
+      AGETOR_API_PORT: String(apiPort),
+      AGETOR_API_TOKEN: apiToken,
+      // Lets the webview served from an overridden Vite port
+      // (`AGETOR_E2E_VITE_PORT`) through the backend's CORS allow-list.
+      AGETOR_DEV_ORIGIN_PORT: String(E2E_VITE_PORT),
+      // 10 min, not disabled (0): the idle-shutdown loop in headless.ts
+      // only fires once there's been no running run AND no attached
+      // client for the whole timeout, so it can't trip during an active
+      // suite. What it buys us: if this fixture's own teardown ever
+      // fails to kill the child (crash, bug), the backend self-reaps
+      // instead of squatting on its port forever.
+      AGETOR_DAEMON_IDLE_MS: "600000",
+      // The headless core would otherwise post real macOS notifications
+      // through the installed app's helper for every fake-driver event.
+      AGETOR_HEADLESS_NOTIFICATIONS: "0",
+      // Same fake-driver combo orchestrator.test.ts uses: with
+      // AGETOR_CLAUDE_DRIVER=fake, spawnAgent's claude-code branch
+      // returns an in-process fake agent instead of shelling out to
+      // tmux. checkHarness (the start-task pre-flight) is a separate
+      // code path that doesn't know about the driver override — it
+      // still resolves a claude-shaped binary AND a tmux binary
+      // regardless — so AGETOR_CLAUDE_BIN/AGETOR_TMUX_BIN point both at
+      // `/bin/echo` (always present) purely to satisfy that probe;
+      // AGETOR_CLAUDE_ARGS is cleared so buildCommand's argv (recorded
+      // by the fake but never executed) isn't polluted by an inherited
+      // shell override. Required by quote.spec.ts; inert for the other
+      // specs, which never start a run.
+      AGETOR_CLAUDE_DRIVER: "fake",
+      AGETOR_CLAUDE_BIN: "/bin/echo",
+      AGETOR_TMUX_BIN: "/bin/echo",
+      AGETOR_CLAUDE_ARGS: "",
+      // fx routes through the in-process fake driver (spawnAgent's fx
+      // branch) exactly like claude-code above, and e2e/fx-interactions
+      // .spec.ts exercises it — this is not inert. Unlike claude, whose
+      // start-task pre-flight is satisfied by a binary-shaped `/bin/echo`,
+      // fx's `checkHarness` (agent-status.ts) dual-probes `--version` AND
+      // `--help`, requiring "coding agent" in the `--help` output to
+      // disambiguate Vercel's fx from an unrelated npm JSON-viewer CLI of
+      // the same name — that probe runs regardless of the driver override,
+      // so `AGETOR_FX_BIN` points at the stub script written into this
+      // backend's own `dataDir` above (mirrors
+      // `src/bun/orchestrator-fx.test.ts`'s) instead of `/bin/echo`. Note:
+      // codex/gemini have no equivalent fake-driver wiring in this fixture —
+      // no spec here starts a run on either of them.
+      AGETOR_FX_DRIVER: "fake",
+      AGETOR_FX_BIN: fxStubBinPath,
+      // cursor routes through its in-process fake driver too
+      // (e2e/cursor-stream.spec.ts starts cursor runs). Its start-task
+      // pre-flight only needs a binary that answers `--version`, so
+      // `/bin/echo` works like claude's above — and it also makes model
+      // discovery (`cursor-agent --list-models`) deterministic: echo prints
+      // the flag back, which `parseCursorModels` rejects, so the picker shows
+      // the curated list whether or not a real cursor-agent is installed on
+      // the machine running the suite.
+      AGETOR_CURSOR_DRIVER: "fake",
+      AGETOR_CURSOR_BIN: "/bin/echo",
+      AGETOR_CURSOR_ARGS: "",
+      // OpenCode turns run through its in-process fake driver (canned v2
+      // NDJSON fed through the real mapper, src/bun/agents.ts D-18); the
+      // stub answers every CLI call the backend still makes itself — see
+      // writeOpencodeStubBin. The built-in row ships disabled; specs that
+      // need it enable it over the API.
+      AGETOR_OPENCODE_DRIVER: "fake",
+      AGETOR_OPENCODE_BIN: opencodeStubBinPath,
+      AGETOR_OPENCODE_ARGS: "",
+      // Auto-enable (src/bun/harness-auto-enable.ts, D-14) would turn on
+      // every built-in harness whose binary answers `--version` — cursor,
+      // fx and opencode through the stubs above, plus a codex or gemini the
+      // machine happens to have installed — the moment a backend boots,
+      // under every spec. Off by default; e2e/harness-auto-enable.spec.ts turns it on
+      // through `backendEnv`.
+      AGETOR_HARNESS_AUTO_ENABLE: "0",
+      // GitHub Copilot routes through its in-process fake driver for every
+      // worker (`src/bun/copilot-fake.ts`, e2e/copilot-harness.spec.ts). Copilot
+      // is seeded enabled, so unlike fx the BIN is opt-in: it points at the
+      // stub script written into this backend's own `dataDir` (see
+      // `writeCopilotStubBin`) ONLY when the backend's `backendEnv` carries
+      // `AGETOR_E2E_COPILOT_STUB=1`; otherwise it points at a path inside this
+      // backend's `dataDir` that never exists, so every other spec sees Copilot
+      // as not installed (and runs no model discovery) whether or not a real
+      // GitHub Copilot CLI is on the machine's PATH. Antigravity, also seeded
+      // enabled, gets the same pin.
+      AGETOR_COPILOT_DRIVER: "fake",
+      AGETOR_COPILOT_BIN: extraEnv.AGETOR_E2E_COPILOT_STUB === "1" ? copilotStubBinPath : missingCopilotBinPath,
+      AGETOR_ANTIGRAVITY_BIN: missingAntigravityBinPath,
+      // Test seam for the fx auto-resume engine (`docs/plans/fx-recovery-
+      // follow-ups.md` §3, `orchestrator.ts`'s `fxAutoResumePrefs`) — shrinks
+      // the auto-resume delay from the 120s default down to 2s so
+      // `e2e/fx-recovery.spec.ts` can observe a scheduled/cancelled/fired
+      // auto-resume within a normal test timeout instead of waiting out the
+      // production default. Read once per schedule/re-arm, so it applies to
+      // every fx task this worker's backend ever runs, not just one spec's
+      // tasks — no other spec file in this fixture starts an fx run.
+      // 6s rather than the 2s it once was: the spec has to see the countdown
+      // and click Cancel inside this window, and a loaded machine (load ~40)
+      // spent most of 2s on the panel's poll round-trips alone.
+      AGETOR_FX_AUTO_RESUME_DELAY_MS: String(E2E_FX_AUTO_RESUME_DELAY_MS),
+      // Test seam for the fake fx storm (`src/bun/agents.ts`,
+      // `fakeFxRecoveryPauseMs`): pause at 6s instead of 1.5s, so the live
+      // "retrying" notice `e2e/fx-recovery.spec.ts` asserts stays up long
+      // enough to be seen under load. Only that spec runs the storm.
+      AGETOR_FAKE_FX_RECOVERY_PAUSE_MS: String(E2E_FX_STORM_PAUSE_MS),
+      // Test seam for the fake fx driver's recovery scenario (`src/bun/
+      // agents.ts`'s `FAKE_FX_RECOVERY_URL_PROMPT_MARKER` doc comment) —
+      // process-wide equivalent of the per-task prompt marker, so every
+      // `active`/`paused` recovery message this worker's fake fx driver
+      // emits carries a fake Gateway URL suffix
+      // (" · upgrade at https://example.invalid/upgrade"), letting
+      // `e2e/fx-recovery.spec.ts` exercise the notice's clickable-link
+      // rendering without a real Gateway URL. Off (unset) would leave every
+      // such message byte-identical to before this constant existed — on
+      // is what this spec's tests are written against.
+      AGETOR_FAKE_FX_RECOVERY_URL: "1",
+      // Points every GitHub REST/GraphQL call this backend makes at a local
+      // stub server instead of the real api.github.com (see
+      // src/bun/github.ts's `GITHUB_API_BASE` seam and e2e/github-stub.ts).
+      // Specs that never open the Git dialog never hit this — it's inert
+      // until something calls startGitHubStub(backend.githubStubPort, ...).
+      AGETOR_GITHUB_API_BASE: `http://127.0.0.1:${githubStubPort}`,
+      // Test seam for `/refs/pick` (src/bun/server.ts) — see fakePickDir
+      // above. Never set in production launches.
+      AGETOR_FAKE_PICK_REFS_DIR: fakePickDir,
+      // Test seam for the bundle export's Save to Downloads — see
+      // downloadsDir above. Never set in production launches.
+      AGETOR_DOWNLOADS_DIR: downloadsDir,
+      // So `githubToken()` resolves this literal token from env and never
+      // shells out to `gh auth token` on the dev machine (which could hang,
+      // fail, or leak a real token into a test run).
+      GITHUB_TOKEN: "e2e-github-token",
+      // Spec-supplied overrides/additions (see `extraEnv`'s doc above) —
+      // spread last so they can override any of the defaults above too.
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout?.pipe(logStream);
+  child.stderr?.pipe(logStream);
+
+  // Surfaces a backend that dies mid-suite (crash, OOM, someone `kill`s
+  // it by hand) instead of leaving it silent — later tests would just
+  // see ECONNREFUSED and point at the wrong thing. Guarded by
+  // `tearingDown` so our own intentional kill in the teardown path below
+  // isn't misreported as a mid-suite death.
+  let tearingDown = false;
+  // Boxed in an object (rather than a bare reassigned `let`) so TS
+  // doesn't narrow the read below back to `null` across the intervening
+  // `await use(backend)` — a plain closure-mutated `let` loses that
+  // narrowing.
+  const deathReport: { info: { code: number | null; signal: NodeJS.Signals | null } | null } = {
+    info: null,
+  };
+  child.on("exit", (code, signal) => {
+    if (!tearingDown) deathReport.info = { code, signal };
+  });
+
+  // Race the health poll against an early exit/spawn failure (e.g. `bun`
+  // not on PATH, or headless.ts throwing before it binds) so a
+  // misconfigured child fails fast with a useful error instead of
+  // burning the full health-poll timeout. `.catch(() => {})` on the
+  // standalone reference keeps a late rejection (the child exiting
+  // normally during teardown, well after the race has already resolved)
+  // from surfacing as an unhandled rejection.
+  const spawnError = new Promise<never>((_, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      reject(new Error(`headless backend exited early (code=${code}, signal=${signal})`));
+    });
+  });
+  spawnError.catch(() => {});
+
+  try {
+    await Promise.race([waitForHealth(apiBase), spawnError]);
+    // `/health` answered, but confirm it was actually *our* child that
+    // answered it and not some other process that raced in and bound
+    // the port after assertPortFree's pre-flight check but before (or
+    // during) our own spawn — e.g. our child crashed immediately after
+    // binding and something else grabbed the now-free port before this
+    // check ran.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(
+        `${apiBase}/health answered but our child (pid ${child.pid}) had already exited ` +
+          `(code=${child.exitCode}, signal=${child.signalCode}) — another process owns that port.`,
+      );
+    }
+  } catch (err) {
+    const tails = await formatLogTails(logFile, daemonLogFile);
+    tearingDown = true;
+    await killGracefully(child);
+    logStream.end();
+    await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(`${(err as Error).message}\n${tails}`);
+  }
+
+  // Backs `E2EBackend.plantPicks` — see its JSDoc on the interface above.
+  // Closes over `fakePickDir` so callers never have to pass it themselves.
+  async function plantPicks(files: Record<string, string>): Promise<string[]> {
+    await rm(fakePickDir, { recursive: true, force: true });
+    await mkdir(fakePickDir, { recursive: true });
+    const paths: string[] = [];
+    for (const [name, content] of Object.entries(files)) {
+      const filePath = path.join(fakePickDir, name);
+      await writeFile(filePath, content);
+      paths.push(filePath);
+    }
+    return paths;
+  }
+
+  const backend: E2EBackend = {
+    apiPort,
+    apiToken,
+    apiBase,
+    bootBase: `${E2E_BASE_URL}/#api=${apiPort}&token=${apiToken}`,
+    dataDir,
+    githubStubPort,
+    fakePickDir,
+    plantPicks,
+    downloadsDir,
+  };
+
+  await use(backend);
+
+  if (deathReport.info) {
+    const tails = await formatLogTails(logFile, daemonLogFile);
+    // eslint-disable-next-line no-console -- deliberate loud stderr so the
+    // report points at infrastructure, not a flaky test.
+    console.error(
+      `[e2e] backend for ${logLabel} died mid-suite: ` +
+        `code=${deathReport.info.code} signal=${deathReport.info.signal}\n${tails}`,
+    );
+  }
+
+  tearingDown = true;
+  await killGracefully(child);
+  logStream.end();
+  if (process.env.E2E_KEEP_DATA_DIR) {
+    console.log(`[e2e] E2E_KEEP_DATA_DIR set — keeping ${dataDir}`);
+  } else {
+    await rm(dataDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// Disjoint from BASE_API_PORT's worker range (4600 + up to ~workers) with a
+// wide gap — `freshBackend` below is test-scoped, so at most a handful of
+// these run concurrently even on a many-worker machine.
+const FRESH_BASE_API_PORT = 4700 + E2E_PORT_OFFSET;
+
+// Disjoint from BASE_API_PORT (4600+) and FRESH_BASE_API_PORT (4700+) above —
+// each worker's (and each freshBackend test's) stub GitHub API server gets
+// its own port so parallel workers/tests never collide on it, mirroring how
+// the two API-port ranges stay disjoint from each other.
+const GITHUB_STUB_BASE_PORT = 4800 + E2E_PORT_OFFSET;
+const FRESH_GITHUB_STUB_BASE_PORT = 4900 + E2E_PORT_OFFSET;
+
+export const test = base.extend<
+  { freshBackend: E2EBackend; backendEnv: Record<string, string> },
+  { backend: E2EBackend }
+>({
+  backend: [
+    async ({}, use, workerInfo) => {
+      // `parallelIndex` is the stable 0..(workers-1) slot this worker
+      // process occupies for the whole run; `workerIndex` increments every
+      // time Playwright restarts a worker (e.g. after a crash), so a
+      // restarted worker could reuse another worker's still-live
+      // `workerIndex`-derived port. `parallelIndex` never collides with a
+      // concurrently-running worker, which is what a port assignment needs.
+      const apiPort = assertBrowserSafePort(
+        `worker ${workerInfo.parallelIndex}'s API port (4600 + AGETOR_E2E_PORT_OFFSET + worker index)`,
+        BASE_API_PORT + workerInfo.parallelIndex,
+      );
+      // Random, not deterministic: a deterministic per-worker token would
+      // let a stale backend still bound to this port (see assertPortFree
+      // above) silently authenticate as "ours" if the pre-flight check ever
+      // raced it. A random token makes any such impostor fail auth loudly
+      // instead.
+      const apiToken = `e2e-w${workerInfo.parallelIndex}-${randomUUID()}`;
+      const githubStubPort = GITHUB_STUB_BASE_PORT + workerInfo.parallelIndex;
+      await provisionBackend(apiPort, apiToken, githubStubPort, `worker ${workerInfo.parallelIndex}`, use);
+    },
+    { scope: "worker" },
+  ],
+
+  // Test-scoped: a brand-new headless backend + SQLite DB spawned for this
+  // one test and torn down right after, unlike `backend` above (worker-
+  // scoped, shared by every test in the file). theme/font-size/quote reset
+  // the one preference they care about before each test and are fine sharing
+  // a DB. Onboarding can't do that: `resolveOnboardingVisibility` (src/
+  // mainview/lib/onboarding.ts) branches on whether `onboardingDismissed` has
+  // *ever* been written (`dismissedPref === undefined`), and there is no
+  // "unset preference" API — once any test writes that key (directly, via
+  // Skip/Dismiss, or via the auto-dismiss-when-all-steps-done effect), no
+  // later test sharing that DB could ever observe the "never evaluated"
+  // state again. Several onboarding.spec.ts cases need exactly that state
+  // independently (fresh welcome dialog, skip-then-persist, existing-user
+  // auto-dismiss), so each gets its own virgin backend instead of fighting
+  // over one shared DB.
+  // Additive test option (not a fixture with real setup/teardown of its
+  // own — `{ option: true }` makes it configurable via
+  // `test.use({ backendEnv: {...} })`), consumed by `freshBackend` below.
+  // Defaults to `{}` so every existing `freshBackend` consumer spawns its
+  // backend exactly as before.
+  backendEnv: [{}, { option: true }],
+
+  freshBackend: async ({ backendEnv }, use, testInfo) => {
+    const apiPort = assertBrowserSafePort(
+      `fresh-backend API port (4700 + AGETOR_E2E_PORT_OFFSET + worker index ${testInfo.parallelIndex})`,
+      FRESH_BASE_API_PORT + testInfo.parallelIndex,
+    );
+    const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
+    const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
+    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use, backendEnv);
+  },
+});

@@ -1,0 +1,2081 @@
+import { test, expect, beforeAll, describe } from "bun:test";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import type { Task } from "../shared/types.ts";
+
+// Set AGETOR_DATA_DIR BEFORE importing db.ts (which imports dataDir at top level).
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-wt-data-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+
+// Standalone helper: run git in a directory.
+async function git(args: string[], cwd: string) {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  await proc.exited;
+}
+
+// Standalone helper: run `git rev-parse` and capture the resolved sha/ref.
+async function revParse(cwd: string, ref: string): Promise<string> {
+  const proc = Bun.spawn(["git", "rev-parse", ref], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return out;
+}
+
+async function makeRepo(): Promise<string> {
+  const repo = mkdtempSync(path.join(tmpdir(), "agetor-wt-repo-"));
+  await git(["init", "-b", "main"], repo);
+  await git(["config", "user.email", "test@example.com"], repo);
+  await git(["config", "user.name", "test"], repo);
+  writeFileSync(path.join(repo, "README"), "hi\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "init"], repo);
+  return repo;
+}
+
+// Run git and capture stdout — used where we need the actual output (branch
+// name, upstream), unlike the fire-and-forget `git()` helper above.
+async function runCapture(args: string[], cwd: string): Promise<string> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return out;
+}
+
+// A repo with a real (bare) "origin" remote — the fixture existing-branch
+// tests need, since `branchSource: "existing"` fetches from `origin` before
+// checking a branch out.
+async function makeRepoWithOrigin(): Promise<{ repo: string; bare: string }> {
+  const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-bare-"));
+  await git(["init", "--bare", "-b", "main"], bare);
+  const repo = await makeRepo();
+  await git(["remote", "add", "origin", bare], repo);
+  await git(["push", "-u", "origin", "main"], repo);
+  return { repo, bare };
+}
+
+// Creates `pr-head` on `repo`, pushes it to origin, then deletes the local
+// branch ref (and, when `pruneRemoteTracking`, the remote-tracking ref too) so
+// the branch lives ONLY on origin — simulating a PR head branch nobody has
+// checked out locally yet.
+async function pushPrHeadOnly(repo: string, opts?: { pruneRemoteTracking?: boolean }): Promise<void> {
+  await git(["checkout", "-b", "pr-head"], repo);
+  writeFileSync(path.join(repo, "prhead.txt"), "pr work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "pr head commit"], repo);
+  await git(["push", "origin", "pr-head"], repo);
+  await git(["checkout", "main"], repo);
+  await git(["branch", "-D", "pr-head"], repo);
+  if (opts?.pruneRemoteTracking) {
+    await git(["update-ref", "-d", "refs/remotes/origin/pr-head"], repo);
+  }
+}
+
+function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
+  return {
+    id: randomUUID(),
+    title: "Fix the thing",
+    prompt: "p",
+    column: "ready",
+    agent: "claude-code",
+    isolation: "worktree",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [],    backlog: [], plans: [], draft: null,
+    runId: null,
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+beforeAll(async () => {
+  // Touch db.ts so its top-level dataDir setup runs once with AGETOR_DATA_DIR set above.
+  await import("./db.ts");
+});
+
+test("prepareWorkdir returns workdir unchanged when isolation is off", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-plain-"));
+  const task = fakeTask({ workdir: dir, isolation: "none" });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.cwd).toBe(dir);
+  expect(r.branch).toBeNull();
+  expect(r.worktreePath).toBeNull();
+});
+
+test("prepareWorkdir returns an error when workdir is not a git repo and isolation is worktree", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-"));
+  const task = fakeTask({ workdir: dir });
+  const r = await prepareWorkdir(task);
+  expect("error" in r).toBe(true);
+  if ("error" in r) expect(r.error).toContain("not inside a git repo");
+});
+
+test("prepareWorkdir creates a worktree + branch inside a git repo", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r = await prepareWorkdir(task);
+  expect("error" in r).toBe(false);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.cwd).not.toBe(repo);
+  expect(existsSync(r.cwd)).toBe(true);
+  expect(r.branch).toMatch(/^agetor\/[a-f0-9]{12}-fix-the-thing$/);
+  expect(r.worktreePath).toBe(r.cwd);
+  // The README from the base commit should be present in the new worktree.
+  expect(existsSync(path.join(r.cwd, "README"))).toBe(true);
+});
+
+test("isBranchNameTakenError matches both git collision wordings, not a stale worktree dir", async () => {
+  const { isBranchNameTakenError } = await import("./worktree.ts");
+  // Both strings captured verbatim from real `git worktree add` failures.
+  // Re-attach form: `git worktree add <path> <branch>` when it's checked out elsewhere.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already used by worktree at '/tmp/wt-b'")).toBe(true);
+  // New-branch form: `git worktree add -b <branch> <path>` when a twin created it first.
+  expect(isBranchNameTakenError("fatal: a branch named 'feature/x' already exists")).toBe(true);
+  // Older git phrasing for the re-attach form.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already checked out at '/tmp/wt-b'")).toBe(true);
+  // A stale worktree *directory* is not a name collision — re-pinning wouldn't help.
+  expect(isBranchNameTakenError("fatal: '/tmp/wt-a' already exists")).toBe(false);
+  expect(isBranchNameTakenError("fatal: invalid reference: nope")).toBe(false);
+});
+
+test("prepareWorkdir re-pins a unique branch when the pinned name is already checked out (create-time race)", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // Task A pins and materializes feature/x.
+  const a = fakeTask({ workdir: repo, branch: "feature/x" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  expect(ra.branch).toBe("feature/x");
+  // Task B raced A at create time and pinned the SAME branch. Materializing it
+  // must not fail trying to check the already-checked-out branch into a second
+  // worktree — it should recover onto a unique variant.
+  const b = fakeTask({ workdir: repo, branch: "feature/x" });
+  const rb = await prepareWorkdir(b);
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/x");
+  expect(rb.branch!.startsWith("feature/x")).toBe(true);
+  expect(existsSync(rb.worktreePath!)).toBe(true);
+});
+
+test("prepareWorkdir re-pin never steals a branch another task has pinned but not started", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const a = fakeTask({ workdir: repo, branch: "feature/y" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  // Task B raced onto feature/y; task C has already pinned feature/y-2 but has
+  // no ref yet, so a ref-only search would hand B that name. Pass it as taken.
+  const b = fakeTask({ workdir: repo, branch: "feature/y" });
+  const rb = await prepareWorkdir(b, { takenBranches: new Set(["feature/y-2"]) });
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/y");
+  expect(rb.branch).not.toBe("feature/y-2");
+  expect(rb.branch).toBe("feature/y-3");
+});
+
+test("prepareWorkdir re-attaches (keeps branch + prior commits) when the worktree dir was deleted", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  // The previous run makes a commit on the task's branch.
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+  rmSync(r1.cwd, { recursive: true, force: true });
+
+  // The persisted row: worktreePath set (it HAS materialized), branch pinned.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  if ("error" in r2) throw new Error(r2.error);
+  // Must re-attach to the SAME branch, not re-pin off base — the commit survives.
+  expect(r2.branch).toBe(r1.branch);
+  expect(existsSync(path.join(r2.cwd, "work.txt"))).toBe(true);
+});
+
+test("prepareWorkdir errors (does NOT re-pin) when a materialized task's branch is checked out elsewhere", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+
+  // User deletes the worktree dir, then checks the branch out somewhere else
+  // (e.g. in their main repo) to inspect the agent's work.
+  rmSync(r1.cwd, { recursive: true, force: true });
+  await git(["worktree", "prune"], repo);
+  // `git worktree add` requires a path that doesn't exist yet.
+  const elsewhere = path.join(mkdtempSync(path.join(tmpdir(), "agetor-wt-elsewhere-")), "wt");
+  await git(["worktree", "add", elsewhere, r1.branch!], repo);
+
+  // Re-running must surface a hard error, NOT silently re-pin to a fresh branch
+  // off base — that would orphan the "prior run" commit.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  expect("error" in r2).toBe(true);
+});
+
+test("prepareWorkdir on branchSource=existing checks out a branch that lives only on origin, tracking it", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  // Neither the local branch ref NOR the remote-tracking ref exist yet — the
+  // materialization must discover the branch via its own targeted fetch.
+  await pushPrHeadOnly(repo, { pruneRemoteTracking: true });
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).toBe("pr-head");
+  expect(existsSync(r.cwd)).toBe(true);
+  expect(existsSync(path.join(r.cwd, "prhead.txt"))).toBe(true);
+
+  const headBranch = await runCapture(["symbolic-ref", "--short", "HEAD"], r.cwd);
+  expect(headBranch).toBe("pr-head");
+  const upstream = await runCapture(["rev-parse", "--abbrev-ref", "pr-head@{upstream}"], r.cwd);
+  expect(upstream).toBe("origin/pr-head");
+});
+
+test("prepareWorkdir on branchSource=existing uses the local branch when it already exists (no error)", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  // Local branch is left in place this time (only the checked-out state moves
+  // back to main), so prepareWorkdir hits the branchExists/re-attach arm.
+  await pushPrHeadOnly(repo);
+  await git(["branch", "pr-head", "origin/pr-head"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).toBe("pr-head");
+  expect(existsSync(r.cwd)).toBe(true);
+  expect(existsSync(path.join(r.cwd, "prhead.txt"))).toBe(true);
+
+  const headBranch = await runCapture(["symbolic-ref", "--short", "HEAD"], r.cwd);
+  expect(headBranch).toBe("pr-head");
+});
+
+test("gitWritableRoots returns the source repo's .git for a linked worktree", async () => {
+  const { prepareWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+
+  const roots = await gitWritableRoots(r.cwd);
+  expect(roots).toHaveLength(1);
+  const common = roots[0]!;
+  // It's the shared common dir (objects/refs + worktree registrations live here)…
+  expect(path.basename(common)).toBe(".git");
+  expect(existsSync(path.join(common, "HEAD"))).toBe(true);
+  expect(existsSync(path.join(common, "worktrees"))).toBe(true);
+  // …and it lives OUTSIDE the worktree cwd — the whole reason codex's sandbox
+  // needs it added as a writable root.
+  expect(common.startsWith(r.cwd + path.sep)).toBe(false);
+});
+
+test("gitWritableRoots returns [] for an ordinary in-repo checkout", async () => {
+  const { gitWritableRoots } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // `.git` sits inside the cwd, already covered by codex's writable workspace.
+  expect(await gitWritableRoots(repo)).toEqual([]);
+});
+
+test("gitWritableRoots returns [] for a non-git directory", async () => {
+  const { gitWritableRoots } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit2-"));
+  expect(await gitWritableRoots(dir)).toEqual([]);
+});
+
+// Async-conversion regression guard (gitWritableRootsSync -> gitWritableRoots):
+// prove several calls can genuinely be in flight together and each still
+// resolves with its own correct, independent result — rather than requiring
+// a caller to serialize them one at a time the way a sync spawn effectively
+// would. Deliberately no wall-clock assertion (documented flake class for
+// fake-tmux/subprocess timing in this repo) — Promise.all + result equality
+// is the whole check.
+test("gitWritableRoots resolves correctly when several calls are in flight concurrently (no serialization required)", async () => {
+  const { prepareWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const wt = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in wt) throw new Error(wt.error);
+  const nonGit = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit3-"));
+
+  const [linkedRoots, plainRoots, nonGitRoots] = await Promise.all([
+    gitWritableRoots(wt.cwd),
+    gitWritableRoots(repo),
+    gitWritableRoots(nonGit),
+  ]);
+  expect(linkedRoots).toHaveLength(1);
+  expect(path.basename(linkedRoots[0]!)).toBe(".git");
+  expect(plainRoots).toEqual([]);
+  expect(nonGitRoots).toEqual([]);
+});
+
+// End-to-end wiring of the codex spawn path: buildCodexCommand resolves the
+// cwd's external git dirs and feeds them to buildCommand's sandbox decision.
+// This is the seam spawnAgent uses; covering it here (where real worktrees
+// exist) locks the cwd→sandbox contract without standing up tmux.
+const codexHarness = {
+  id: "codex", kind: "codex" as const, label: "codex",
+  isBuiltin: true, home: null, bin: null, env: {}, enabled: true,
+};
+const codexOpts = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+
+test("buildCodexCommand refuses external Git writes in a linked worktree", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+  const r = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in r) throw new Error(r.error);
+
+  await expect(buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd)).rejects.toThrow(/PERMISSION_DENIED.*external Git/);
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts, mode: "ask" }, r.cwd);
+  expect(cmd).toContain("read-only");
+  expect(cmd).not.toContain("danger-full-access");
+});
+
+test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout", async () => {
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
+  expect(cmd).toContain("workspace-write");
+  expect(cmd).not.toContain("danger-full-access");
+});
+
+test("prepareWorkdir is idempotent: second call reuses the recorded worktree", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const first = await prepareWorkdir(task);
+  if ("error" in first) throw new Error(first.error);
+  const reused = await prepareWorkdir({
+    ...task,
+    worktreePath: first.worktreePath,
+    branch: first.branch,
+  });
+  if ("error" in reused) throw new Error((reused as { error: string }).error);
+  expect(reused.cwd).toBe(first.cwd);
+  expect(reused.branch).toBe(first.branch);
+  expect(reused.note).toContain("reusing");
+});
+
+test("worktree is pinned to baseRef even when source-repo HEAD has moved", async () => {
+  const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+
+  // Capture the sha we want to pin to.
+  const pinned = await resolveRef(repo, "HEAD");
+  expect(pinned).toMatch(/^[0-9a-f]{40}$/);
+
+  // Move the source repo's HEAD forward with a new file.
+  writeFileSync(path.join(repo, "drift"), "x\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "drift"], repo);
+
+  const task = fakeTask({ workdir: repo, baseRef: pinned });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.cwd).not.toBe(repo);
+
+  // The drift file should NOT be in the worktree because the worktree was
+  // checked out at the pinned base sha, not at the current HEAD.
+  expect(existsSync(path.join(r.cwd, "drift"))).toBe(false);
+  // The base note should reference the short sha.
+  expect(r.note).toContain(pinned!.slice(0, 7));
+});
+
+test("resolveRef returns null for unknown refs and a sha for HEAD", async () => {
+  const { resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  expect(await resolveRef(repo, "HEAD")).toMatch(/^[0-9a-f]{40}$/);
+  expect(await resolveRef(repo, "definitely-not-a-real-branch-xyz")).toBeNull();
+});
+
+test("prepareWorkdir re-attaches existing branch when worktree dir was manually deleted", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  // First run: create the worktree and make a commit inside it.
+  const first = await prepareWorkdir(task);
+  if ("error" in first) throw new Error(first.error);
+  writeFileSync(path.join(first.cwd, "agent-work"), "done\n");
+  await git(["add", "."], first.cwd);
+  await git(["commit", "-m", "agent work"], first.cwd);
+
+  // Manually delete the on-disk directory (simulating a disk event / rm -rf).
+  rmSync(first.cwd, { recursive: true, force: true });
+  expect(existsSync(first.cwd)).toBe(false);
+
+  // Second prepare: worktreePath is cleared (as orchestrator would record after
+  // the dir is missing), but branch name is still known.
+  const second = await prepareWorkdir({ ...task, branch: first.branch, worktreePath: null });
+  if ("error" in second) throw new Error(second.error);
+
+  expect(existsSync(second.cwd)).toBe(true);
+  expect(second.branch).toBe(first.branch);
+
+  // The "agent work" commit must survive — the branch was not reset to base.
+  const logProc = Bun.spawn(["git", "log", "--oneline", first.branch!], { cwd: repo, stdout: "pipe" });
+  const log = (await new Response(logProc.stdout).text()).trim();
+  await logProc.exited;
+  expect(log).toContain("agent work");
+});
+
+test("getTaskDiff returns a friendly note when the task has no worktree", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // isolation=none against a clean repo reports no changes vs HEAD.
+  const off = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  expect(off.files).toEqual([]);
+  expect(off.note).toContain("matches HEAD");
+
+  const notYet = await getTaskDiff(fakeTask({ workdir: repo, worktreePath: null }));
+  expect(notYet.files).toEqual([]);
+  expect(notYet.note).toContain("hasn't created a worktree");
+});
+
+test("getTaskDiff surfaces workdir changes for isolation=none tasks", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "README"), "hi\nthere\n");
+  writeFileSync(path.join(repo, "fresh.txt"), "brand new\n");
+
+  const diff = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  const readme = diff.files.find((f) => f.path === "README");
+  expect(readme).toBeDefined();
+  expect(readme!.status).toBe("modified");
+  expect(readme!.hunks).toContain("there");
+
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+  expect(fresh!.hunks).toContain("brand new");
+});
+
+test("getTaskDiff emits an unchanged (unprefixed) path for an untracked file when the workdir IS the repo root", async () => {
+  // The overwhelmingly common case — no `path.relative(root, cwd)` prefix to
+  // apply since root === cwd. Guards against the normalization accidentally
+  // adding a "./"-style prefix or otherwise mangling the common path.
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "fresh.txt"), "brand new\n");
+
+  const diff = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+});
+
+test("getTaskDiff reports a friendly note when isolation=none workdir isn't a git repo", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-diff-"));
+  const diff = await getTaskDiff(fakeTask({ workdir: dir, isolation: "none" }));
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("isn't a git repo");
+});
+
+test("getTaskDiff reports a friendly note when isolation=none workdir has no commits", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-empty-repo-"));
+  await git(["init", "-b", "main"], dir);
+  const diff = await getTaskDiff(fakeTask({ workdir: dir, isolation: "none" }));
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("no commits");
+});
+
+test("getTaskDiff reports a clean worktree", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const diff = await getTaskDiff({ ...task, worktreePath: prepared.worktreePath, branch: prepared.branch });
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("No changes");
+  if (base) expect(diff.base).toBe(base.slice(0, 7));
+});
+
+test("getTaskDiff surfaces modified, committed, and newly-created files", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const cwd = prepared.cwd;
+
+  // Committed change to the tracked README.
+  writeFileSync(path.join(cwd, "README"), "hi\nthere\n");
+  await git(["commit", "-am", "edit readme"], cwd);
+  // Uncommitted new file (untracked).
+  writeFileSync(path.join(cwd, "fresh.txt"), "brand new\n");
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+  const diff = await getTaskDiff(live);
+
+  const readme = diff.files.find((f) => f.path === "README");
+  expect(readme).toBeDefined();
+  expect(readme!.status).toBe("modified");
+  expect(readme!.additions).toBeGreaterThan(0);
+  expect(readme!.hunks).toContain("there");
+
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+  expect(fresh!.hunks).toContain("brand new");
+});
+
+test("getTaskDiff truncates a huge file's body but keeps honest line counts", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // ~30k lines easily clears the 200 KB per-file cap.
+  const lineCount = 30_000;
+  writeFileSync(path.join(prepared.cwd, "huge.txt"), Array.from({ length: lineCount }, (_, i) => `line ${i}`).join("\n") + "\n");
+
+  const diff = await getTaskDiff({ ...task, worktreePath: prepared.worktreePath, branch: prepared.branch });
+  const huge = diff.files.find((f) => f.path === "huge.txt");
+  expect(huge).toBeDefined();
+  expect(huge!.truncated).toBe(true);
+  // Body is capped, but the additions count reflects the full file, not 0.
+  expect(huge!.hunks.length).toBeLessThanOrEqual(200_000);
+  expect(huge!.additions).toBe(lineCount);
+});
+
+test("parseGitDiff keeps the path for binary-only file sections", async () => {
+  const { parseGitDiff } = await import("./git-diff.ts");
+  const files = parseGitDiff([
+    "diff --git a/assets/logo.png b/assets/logo.png",
+    "index 1234567..89abcde 100644",
+    "Binary files a/assets/logo.png and b/assets/logo.png differ",
+    "",
+  ].join("\n"));
+
+  expect(files).toHaveLength(1);
+  expect(files[0]?.path).toBe("assets/logo.png");
+  expect(files[0]?.binary).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// getTaskDiffBlob
+// ---------------------------------------------------------------------------
+
+// Two distinct "binary" fixtures (PNG magic + filler bytes) — content only
+// needs to differ byte-for-byte between "old" (committed at base) and "new"
+// (working tree); getTaskDiffBlob never interprets the bytes.
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const BLOB_V1 = Buffer.concat([PNG_MAGIC, Buffer.from("version-one-content")]);
+const BLOB_V2 = Buffer.concat([PNG_MAGIC, Buffer.from("version-two-content-different")]);
+
+// Old-side etags are a sha1 hex digest of "<resolved-sha>:<relPath>",
+// quoted — 40 hex chars. New-side etags are `"<size>-<mtimeMs>"` — a
+// completely different shape, since the "new" side isn't content-addressed
+// (it's the live working tree).
+const OLD_ETAG_RE = /^"[0-9a-f]{40}"$/;
+const NEW_ETAG_RE = /^"\d+-\d+(\.\d+)?"$/;
+
+test("getTaskDiffBlob: modified binary — old side reads the committed blob, new side reads the working-tree file, etags differ in shape", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "logo.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add logo"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Uncommitted working-tree modification — this is exactly what `git diff
+  // <base>` would show as the binary file's "new" side.
+  writeFileSync(path.join(prepared.cwd, "logo.png"), BLOB_V2);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "logo.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+  expect(oldSide.etag).toMatch(OLD_ETAG_RE);
+
+  const newSide = await getTaskDiffBlob(live, "logo.png", "new");
+  expect(newSide.ok).toBe(true);
+  if (!newSide.ok) return;
+  expect(Buffer.from(newSide.bytes)).toEqual(BLOB_V2);
+  expect(newSide.etag).toMatch(NEW_ETAG_RE);
+
+  expect(oldSide.etag).not.toBe(newSide.etag);
+});
+
+test("getTaskDiffBlob: added (untracked) file — new side ok, old side 404", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Untracked — never added, never committed, on either side of the base.
+  writeFileSync(path.join(prepared.cwd, "fresh.png"), BLOB_V1);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const newSide = await getTaskDiffBlob(live, "fresh.png", "new");
+  expect(newSide.ok).toBe(true);
+  if (!newSide.ok) return;
+  expect(Buffer.from(newSide.bytes)).toEqual(BLOB_V1);
+
+  const oldSide = await getTaskDiffBlob(live, "fresh.png", "old");
+  expect(oldSide).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: deleted file — old side ok, new side 404", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "gone.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add gone.png"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Delete from the working tree without committing — same shape `getTaskDiff`
+  // would report as a "deleted" file vs base.
+  rmSync(path.join(prepared.cwd, "gone.png"));
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "gone.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+
+  const newSide = await getTaskDiffBlob(live, "gone.png", "new");
+  expect(newSide).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: renamed file — old side is still served at the pre-rename (oldPath) path; new side only resolves at the new path", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "before.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add before.png"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Rename in the working tree (uncommitted) — old content lives only at the
+  // base commit's `before.png`; the working tree now only has `after.png`.
+  await git(["mv", "before.png", "after.png"], prepared.cwd);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "before.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+
+  const newAtNewPath = await getTaskDiffBlob(live, "after.png", "new");
+  expect(newAtNewPath.ok).toBe(true);
+  if (!newAtNewPath.ok) return;
+  expect(Buffer.from(newAtNewPath.bytes)).toEqual(BLOB_V1);
+
+  const newAtOldPath = await getTaskDiffBlob(live, "before.png", "new");
+  expect(newAtOldPath).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: isolation=none task whose workdir is a repo SUBDIRECTORY resolves the new side via the repo root, not cwd + relPath", async () => {
+  // Regression test: `git diff`/`git ls-files` report paths root-relative,
+  // not cwd-relative. A naive `path.join(task.workdir, relPath)` for an
+  // isolation=none task whose workdir is `<repo>/sub` would double-prefix
+  // the subdirectory (`<repo>/sub/sub/assets/x.bin`) and 404.
+  const { getTaskDiffBlob } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const assetsDir = path.join(repo, "sub", "assets");
+  mkdirSync(assetsDir, { recursive: true });
+  writeFileSync(path.join(assetsDir, "x.bin"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add sub/assets/x.bin"], repo);
+
+  const task = fakeTask({ workdir: path.join(repo, "sub"), isolation: "none" });
+
+  // Root-relative, exactly as `git diff` (run from the subdirectory) would
+  // report it — NOT relative to task.workdir.
+  const result = await getTaskDiffBlob(task, "sub/assets/x.bin", "new");
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(Buffer.from(result.bytes)).toEqual(BLOB_V1);
+});
+
+test("getTaskDiff normalizes an UNTRACKED file's path to repo-root-relative for a subdir workdir, and getTaskDiffBlob resolves it at that same path", async () => {
+  // Regression pairing with the tracked-file subdir test above: `git
+  // ls-files --others` (unlike `git diff <base>`) runs in `cwd` and reports
+  // paths relative to IT, not the repo root — so for an isolation=none task
+  // whose workdir is `<repo>/sub`, the raw listing would say `assets/new.bin`
+  // while every tracked entry in the same TaskDiff says `sub/...`. getTaskDiff
+  // must prefix the subdirectory itself so the emitted DiffFile.path is
+  // root-relative like everything else, and getTaskDiffBlob must resolve
+  // that same root-relative path back to bytes.
+  const { getTaskDiff, getTaskDiffBlob } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const assetsDir = path.join(repo, "sub", "assets");
+  mkdirSync(assetsDir, { recursive: true });
+  writeFileSync(path.join(assetsDir, "new.bin"), BLOB_V1);
+  // Deliberately never `git add`ed — this is the untracked path.
+
+  const task = fakeTask({ workdir: path.join(repo, "sub"), isolation: "none" });
+  const diff = await getTaskDiff(task);
+
+  const file = diff.files.find((f) => f.path === "sub/assets/new.bin");
+  expect(file).toBeDefined();
+  expect(file!.status).toBe("added");
+  // Not the cwd-relative shape a naive `git ls-files --others` listing would
+  // have produced.
+  expect(diff.files.some((f) => f.path === "assets/new.bin")).toBe(false);
+
+  const blob = await getTaskDiffBlob(task, "sub/assets/new.bin", "new");
+  expect(blob.ok).toBe(true);
+  if (!blob.ok) return;
+  expect(Buffer.from(blob.bytes)).toEqual(BLOB_V1);
+});
+
+describe("getTaskDiffBlob: path traversal rejections", () => {
+  test("rejects a '../' escaping relative path with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "../x.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+
+  test("rejects an absolute path with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "/etc/passwd.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+
+  test("rejects a path containing a null byte with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "a\0b.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+});
+
+test("getTaskDiffBlob: a new-side file over MAX_BLOB_PREVIEW_BYTES 413s instead of being read into memory", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef, MAX_BLOB_PREVIEW_BYTES } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Working-tree file (untracked is fine — the "new" side is a plain stat +
+  // read of whatever's on disk, no git involved) just over the cap.
+  const big = new Uint8Array(MAX_BLOB_PREVIEW_BYTES + 1);
+  await Bun.write(path.join(prepared.cwd, "huge.png"), big);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+  const result = await getTaskDiffBlob(live, "huge.png", "new");
+  expect(result).toMatchObject({ ok: false, status: 413 });
+
+  // Old-side 413 would require committing a >20MB blob into the temp repo's
+  // history — noticeably slower for marginal extra coverage of the same
+  // `size > MAX_BLOB_PREVIEW_BYTES` check (the old-side code path applies
+  // the identical cap, just sourced from `git cat-file -s` instead of
+  // `fs.statSync`). Skipped here; the check itself is exercised above.
+}, 20_000);
+
+// D26(j): the new side is an agent-writable working-tree file. A symlink
+// planted there (pointing anywhere — here at another file of the tree) is not
+// followed, in-process or through the disclaim helper.
+test("getTaskDiffBlob: a new-side symlink 404s instead of being followed (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const outside = mkdtempSync(path.join(tmpdir(), "agetor-blob-outside-"));
+  writeFileSync(path.join(outside, "secret.png"), BLOB_V1);
+  symlinkSync(path.join(outside, "secret.png"), path.join(prepared.cwd, "link.png"));
+  writeFileSync(path.join(prepared.cwd, "real.png"), BLOB_V2);
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stub = path.join(outside, "disclaim-stub.sh");
+  writeFileSync(stub, "#!/bin/sh\nexec \"$@\"\n", { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      expect(await getTaskDiffBlob(live, "link.png", "new")).toMatchObject({ ok: false, status: 404 });
+      const real = await getTaskDiffBlob(live, "real.png", "new");
+      expect(real.ok).toBe(true);
+      if (real.ok) {
+        expect(Buffer.from(real.bytes)).toEqual(BLOB_V2);
+        expect(real.etag).toMatch(NEW_ETAG_RE);
+      }
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// D26(j): same answers through the disclaim helper as in-process — an
+// unreadable working-tree file is a 403 (never a 200 that dies), a FIFO named
+// like an image is a 404 at once (never a hung read), and the size cap is
+// checked before reading on both paths.
+test("getTaskDiffBlob: unreadable 403s, a FIFO 404s, an over-cap file 413s (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef, MAX_BLOB_PREVIEW_BYTES } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const { chmodSync } = await import("node:fs");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const locked = path.join(prepared.cwd, "locked.png");
+  writeFileSync(locked, BLOB_V1);
+  chmodSync(locked, 0o000);
+  expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(prepared.cwd, "fifo.png")]).exitCode).toBe(0);
+  await Bun.write(path.join(prepared.cwd, "huge.png"), new Uint8Array(MAX_BLOB_PREVIEW_BYTES + 1));
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-blob-stub-"));
+  const stub = path.join(stubDir, "disclaim-stub.sh");
+  writeFileSync(stub, '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      if (process.getuid?.() !== 0) {
+        expect(await getTaskDiffBlob(live, "locked.png", "new")).toMatchObject({ ok: false, status: 403 });
+      }
+      const started = Date.now();
+      expect(await getTaskDiffBlob(live, "fifo.png", "new")).toMatchObject({ ok: false, status: 404 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(await getTaskDiffBlob(live, "huge.png", "new")).toMatchObject({ ok: false, status: 413 });
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    chmodSync(locked, 0o600);
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("removeWorktree tears down both the worktree and the branch", async () => {
+  const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+  const created = await prepareWorkdir(task);
+  if ("error" in created) throw new Error(created.error);
+  expect(existsSync(created.cwd)).toBe(true);
+
+  await removeWorktree({ ...task, worktreePath: created.worktreePath, branch: created.branch });
+
+  expect(existsSync(created.cwd)).toBe(false);
+
+  // The branch should be gone from the source repo.
+  const proc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+    cwd: repo,
+    stdout: "pipe",
+  });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  expect(out).toBe("");
+});
+
+test("removeWorktree removes the worktree but keeps the branch when branchSource is existing", async () => {
+  const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  await pushPrHeadOnly(repo);
+  await git(["branch", "pr-head", "origin/pr-head"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const created = await prepareWorkdir(task);
+  if ("error" in created) throw new Error(created.error);
+  expect(existsSync(created.cwd)).toBe(true);
+
+  await removeWorktree({ ...task, worktreePath: created.worktreePath, branch: created.branch });
+  expect(existsSync(created.cwd)).toBe(false);
+
+  // Unlike a "created" branch, an "existing" one (e.g. a PR's head branch) is
+  // the user's own — removeWorktree must not delete it.
+  const out = await runCapture(["branch", "--list", "pr-head"], repo);
+  expect(out).toContain("pr-head");
+});
+
+test("hasUncommittedChanges returns null when the dir doesn't exist", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+  expect(await hasUncommittedChanges(missing)).toBeNull();
+});
+
+test("hasUncommittedChanges returns null for a non-git directory", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-status-"));
+  expect(await hasUncommittedChanges(dir)).toBeNull();
+});
+
+test("hasUncommittedChanges returns false for a clean repo", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  expect(await hasUncommittedChanges(repo)).toBe(false);
+});
+
+test("hasUncommittedChanges returns true for an untracked file", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "new.txt"), "hello\n");
+  expect(await hasUncommittedChanges(repo)).toBe(true);
+});
+
+test("hasUncommittedChanges returns true for a modified tracked file", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "README"), "changed\n");
+  expect(await hasUncommittedChanges(repo)).toBe(true);
+});
+
+test("gitFetch returns an error when the dir isn't a git repo", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-nongit-"));
+  const r = await gitFetch(dir);
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitFetch succeeds (no-op) for a repo with no remotes", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  // `git fetch --all` with nothing to fetch exits 0 — the picker just sees the
+  // existing local branches, so the button shouldn't surface a spurious error.
+  const repo = await makeRepo();
+  const r = await gitFetch(repo);
+  expect(r.ok).toBe(true);
+  expect(r.error).toBeUndefined();
+});
+
+test("gitFetch pulls a newly pushed branch so listBranches surfaces it", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // `origin` is a normal repo we point the clone at; a new branch pushed here
+  // after the clone is invisible to the clone until a fetch runs.
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // The clone starts unaware of a branch created on origin post-clone.
+  await git(["checkout", "-b", "feature/new-remote-branch"], origin);
+  writeFileSync(path.join(origin, "feature.txt"), "remote work\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feature commit"], origin);
+
+  const before = await listBranches(clone);
+  expect(before.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(false);
+
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const after = await listBranches(clone);
+  expect(after.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(true);
+});
+
+test("gitFetch --prune drops a remote-tracking branch deleted on origin", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // Prove the `--prune` flag really mirrors the remote: a branch that exists at
+  // clone time but is later deleted on origin must disappear from the picker.
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature/short-lived"], origin);
+  writeFileSync(path.join(origin, "tmp.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "short lived"], origin);
+  // Leave origin checked out on main so the branch can be deleted later.
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-prune-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  const cloned = await listBranches(clone);
+  expect(cloned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(true);
+
+  // Delete the branch on origin, then fetch+prune from the clone.
+  await git(["branch", "-D", "feature/short-lived"], origin);
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const pruned = await listBranches(clone);
+  expect(pruned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(false);
+});
+
+test("listBranches reports behind/ahead/upstream once origin moves ahead + fetch", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-behind-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A fresh clone is in sync with its upstream.
+  const fresh = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(fresh?.upstream).toBe("origin/main");
+  expect(fresh?.behind).toBe(0);
+  expect(fresh?.ahead).toBe(0);
+
+  // Advance origin/main, then fetch so the clone's tracking ref sees it.
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+  await gitFetch(clone);
+
+  const list = await listBranches(clone);
+  const after = list.find((b) => b.name === "main");
+  expect(after?.behind).toBe(1);
+  expect(after?.ahead).toBe(0);
+  // Regression guard: with the local `main` behind, `origin/main` has a newer
+  // commit date and sorts ahead of it. The dedup must still keep the LOCAL row
+  // (not collapse to the remote-tracking ref), or the picker would lose the
+  // current/behind/upstream signal for the branch the user actually pulls.
+  expect(after?.remote).toBe(false);
+  expect(list.some((b) => b.name === "origin/main")).toBe(false);
+});
+
+test("gitPull fast-forwards the checked-out branch and clears the behind count", async () => {
+  const { gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-current-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(true);
+  // The fast-forwarded file is now present in the clone's working tree.
+  expect(existsSync(path.join(clone, "more.txt"))).toBe(true);
+  const after = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(after?.behind).toBe(0);
+});
+
+test("gitPull fast-forwards a non-checked-out local branch without a checkout", async () => {
+  const { gitFetch, gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  // Create a feature branch on origin so the clone can track it.
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature` tracking origin/feature, then switch back to
+  // main so `feature` is NOT the checked-out branch.
+  await git(["checkout", "feature"], clone);
+  await git(["checkout", "main"], clone);
+
+  // Advance origin/feature.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(1);
+
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(true);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(0);
+  // main is still the checked-out branch — the pull didn't switch worktrees.
+  expect((await listBranches(clone)).find((b) => b.current)?.name).toBe("main");
+});
+
+test("gitPull refuses to fast-forward a diverged branch", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A local commit on the clone…
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local"], clone);
+  // …and a different commit on origin → divergence.
+  writeFileSync(path.join(origin, "remote.txt"), "R\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "remote"], origin);
+  await gitFetch(clone);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull refuses a non-checked-out branch that has diverged from its upstream", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  // Exercises the `git fetch . <tracking>:<branch>` path's fast-forward-only
+  // guard (distinct from the checked-out `git pull --ff-only` path above).
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature`, give it a local-only commit, then switch back
+  // to main so `feature` is the non-checked-out branch we pull.
+  await git(["checkout", "feature"], clone);
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local feat"], clone);
+  await git(["checkout", "main"], clone);
+
+  // A different commit on origin/feature → divergence.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull returns an error when the dir isn't a git repo", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-nongit-"));
+  const r = await gitPull(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitPull errors when the selected branch has no upstream", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // A second local branch with no upstream, while `main` stays checked out so
+  // we exercise the non-checked-out path's upstream lookup.
+  await git(["branch", "other"], repo);
+  const r = await gitPull(repo, "other");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no upstream");
+});
+
+test("gitPull rejects a branch name that could be read as a git flag", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPull(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush pushes a local-only branch to origin and sets its upstream", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  // origin stays checked out on main; pushing a *different* new branch to a
+  // non-bare repo is allowed (only a push to the checked-out branch is denied).
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  await git(["checkout", "-b", "feature/pushme"], clone);
+  writeFileSync(path.join(clone, "work.txt"), "local work\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local work"], clone);
+
+  const r = await gitPush(clone, "feature/pushme");
+  expect(r.ok).toBe(true);
+  expect(r.remote).toBe("origin");
+
+  // origin now has the branch, and the clone tracks it.
+  const onOrigin = Bun.spawnSync(["git", "rev-parse", "--verify", "feature/pushme"], { cwd: origin });
+  expect(onOrigin.exitCode).toBe(0);
+  const upstream = Bun.spawnSync(
+    ["git", "rev-parse", "--abbrev-ref", "feature/pushme@{upstream}"],
+    { cwd: clone },
+  );
+  expect(new TextDecoder().decode(upstream.stdout).trim()).toBe("origin/feature/pushme");
+});
+
+test("gitPush errors when the repo has no remote configured", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/local"], repo);
+  const r = await gitPush(repo, "feature/local");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no git remote");
+});
+
+test("gitPush rejects a branch name that could be read as a git flag", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPush(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush returns an error when the dir isn't a git repo", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-nongit-"));
+  const r = await gitPush(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+describe("getAheadCount", () => {
+  test("returns null when the dir doesn't exist", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+    expect(await getAheadCount(missing, null)).toBeNull();
+  });
+
+  test("returns null for a non-git directory", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-ahead-"));
+    expect(await getAheadCount(dir, null)).toBeNull();
+  });
+
+  test("counts commits ahead of a given baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const baseSha = await revParse(repo, "HEAD");
+
+    writeFileSync(path.join(repo, "a.txt"), "a\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "second"], repo);
+
+    writeFileSync(path.join(repo, "b.txt"), "b\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "third"], repo);
+
+    expect(await getAheadCount(repo, baseSha)).toBe(2);
+
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(0);
+  });
+
+  test("returns 0 (unknown-but-not-blocking) when there's no upstream and no baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, null)).toBe(0);
+  });
+
+  test("prefers the upstream count over baseRef, including a stale/misleading baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    // A bare repo stands in for the remote: `push -u` gives `repo` a real
+    // `@{u}` so getAheadCount should use tier 1 (upstream), not baseRef.
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-ahead-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+    await git(["push", "-u", "origin", "main"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(0);
+
+    writeFileSync(path.join(repo, "c.txt"), "c\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "after-push"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(1);
+
+    // A stale baseRef pointing at the current HEAD would give a
+    // baseRef..HEAD count of 0 if the baseRef tier were (incorrectly) used —
+    // but the upstream tier must win, so the answer stays 1.
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(1);
+  });
+
+  test("returns null for an invalid baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, "no-such-ref")).toBeNull();
+  });
+});
+
+describe("remoteSyncState", () => {
+  test("returns no-upstream for a non-existent dir", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+    expect(await remoteSyncState(missing)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("returns no-upstream for a non-git directory", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-sync-"));
+    expect(await remoteSyncState(dir)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("returns hasUpstream:false for a branch with no configured upstream", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("reports {hasUpstream:true, ahead:0, behind:0} right after a --set-upstream push", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+
+    const pushed = await gitPush(repo, "main");
+    expect(pushed.ok).toBe(true);
+
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: true, ahead: 0, behind: 0 });
+  });
+
+  test("reports ahead:1 (remoteSynced would be false) after a local commit made following the push", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-ahead-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+    await gitPush(repo, "main");
+
+    writeFileSync(path.join(repo, "after-push.txt"), "local work\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "after push"], repo);
+
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: true, ahead: 1, behind: 0 });
+  });
+
+  test("reports behind >= 1 when the remote is strictly ahead (pushed from a second clone, then fetched)", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-behind-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+
+    const repo1 = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo1);
+    await gitPush(repo1, "main");
+
+    // A second clone pushes a commit that repo1 hasn't seen yet.
+    const repo2 = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-clone2-"));
+    await git(["clone", bare, repo2], path.dirname(repo2));
+    await git(["config", "user.email", "test@example.com"], repo2);
+    await git(["config", "user.name", "test"], repo2);
+    writeFileSync(path.join(repo2, "remote-work.txt"), "remote work\n");
+    await git(["add", "."], repo2);
+    await git(["commit", "-m", "remote work"], repo2);
+    await git(["push", "origin", "main"], repo2);
+
+    // repo1's tracking ref only reflects the new remote commit after a fetch.
+    await git(["fetch"], repo1);
+
+    const result = await remoteSyncState(repo1);
+    expect(result.hasUpstream).toBe(true);
+    expect(result.ahead).toBe(0);
+    expect(result.behind).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// Backs the "Create PR" gate for `isolation: "none"` tasks, which have no
+// agetor-managed `task.branch` — the user's own checkout IS the head branch.
+describe("headBranchState", () => {
+  test("returns no branch for a non-existent dir and for a non-git directory", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-hb-missing-${randomUUID()}`);
+    expect(await headBranchState(missing)).toEqual({ branch: null, isDefaultBranch: false });
+
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-hb-nongit-"));
+    expect(await headBranchState(dir)).toEqual({ branch: null, isDefaultBranch: false });
+  });
+
+  test("flags the local default branch (no origin — resolves via local main)", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await headBranchState(repo)).toEqual({ branch: "main", isDefaultBranch: true });
+  });
+
+  test("a feature branch is not the default branch", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "-b", "feat/thing"], repo);
+    expect(await headBranchState(repo)).toEqual({ branch: "feat/thing", isDefaultBranch: false });
+  });
+
+  test("strips the remote prefix when origin/HEAD supplies the default", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    // Give the clone a real `origin/HEAD` so tier 1 of the resolution ladder
+    // fires and returns the remote-qualified `origin/main` — the comparison
+    // must still match the bare local branch name.
+    await git(["remote", "set-head", "origin", "main"], repo);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "origin/HEAD"], repo)).toBe("origin/main");
+
+    expect(await headBranchState(repo)).toEqual({ branch: "main", isDefaultBranch: true });
+
+    await git(["checkout", "-b", "feat/via-origin-head"], repo);
+    expect(await headBranchState(repo)).toEqual({
+      branch: "feat/via-origin-head", isDefaultBranch: false,
+    });
+  });
+
+  test("detached HEAD reports no branch", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "--detach", "HEAD"], repo);
+    expect(await headBranchState(repo)).toEqual({ branch: null, isDefaultBranch: false });
+  });
+});
+
+describe("detachWorktree", () => {
+  test("removes the checkout but keeps the branch and its commits", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    // The branch must survive in the source repo — that's the whole point of
+    // detach vs removeWorktree.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+
+    // The commit made inside the (now-removed) worktree is still reachable on
+    // the branch in the source repo.
+    const logProc = Bun.spawn(["git", "log", "--oneline", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const log = (await new Response(logProc.stdout).text()).trim();
+    await logProc.exited;
+    expect(log).toContain("agent work");
+  });
+
+  test("round-trip: prepareWorkdir re-materializes the checkout at the same path with the prior commit intact", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    // The orchestrator keeps worktreePath + branch on the task row across
+    // detach (that's what makes the later re-attach deterministic).
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const detached = await detachWorktree(live);
+    expect(detached).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    const restored = await prepareWorkdir(live);
+    if ("error" in restored) throw new Error(restored.error);
+    expect(restored.cwd).toBe(created.cwd);
+    expect(restored.worktreePath).toBe(created.worktreePath);
+    expect(restored.branch).toBe(created.branch);
+    expect(existsSync(path.join(restored.cwd, "work.txt"))).toBe(true);
+  });
+
+  test("skips removal when the worktree has uncommitted changes", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "dirty.txt"), "uncommitted\n");
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "dirty" });
+    expect(existsSync(created.cwd)).toBe(true);
+    expect(existsSync(path.join(created.cwd, "dirty.txt"))).toBe(true);
+  });
+
+  test("no-op when the task never materialized a worktree", async () => {
+    const { detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo, worktreePath: null, branch: null });
+    const result = await detachWorktree(task);
+    expect(result).toEqual({ removed: false, reason: "no-worktree" });
+  });
+
+  test("no-op when the worktree dir is already gone", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+    rmSync(created.cwd, { recursive: true, force: true });
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "already-absent" });
+  });
+
+  test("detaching twice is idempotent — second call reports already-absent without throwing", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const first = await detachWorktree(live);
+    expect(first).toEqual({ removed: true });
+
+    const second = await detachWorktree(live);
+    expect(second).toEqual({ removed: false, reason: "already-absent" });
+
+    // Branch still exists throughout — detach never deletes it.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+  });
+
+  test("force: true removes a dirty worktree, and the branch plus its commits survive", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    // A real commit made inside the worktree — this is what must survive on
+    // the branch after a forced detach, same as the plain (non-dirty) detach
+    // test above.
+    writeFileSync(path.join(created.cwd, "committed.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "committed work"], created.cwd);
+
+    // Uncommitted changes on top — without `force` this alone would block
+    // removal (see "skips removal when the worktree has uncommitted changes"
+    // above).
+    writeFileSync(path.join(created.cwd, "dirty.txt"), "uncommitted\n");
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live, { force: true });
+    expect(result).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    // The whole point of force-detach vs `removeWorktree`: the branch (and
+    // every commit on it) survives in the source repo even though the dirty
+    // checkout was discarded.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+
+    const logProc = Bun.spawn(["git", "log", "--oneline", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const log = (await new Response(logProc.stdout).text()).trim();
+    await logProc.exited;
+    expect(log).toContain("committed work");
+  });
+
+  test("force: true does not paper over no-worktree or already-absent", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+
+    const neverMaterialized = fakeTask({ workdir: repo, worktreePath: null, branch: null });
+    const noWorktree = await detachWorktree(neverMaterialized, { force: true });
+    expect(noWorktree).toEqual({ removed: false, reason: "no-worktree" });
+
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+    rmSync(created.cwd, { recursive: true, force: true });
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const alreadyAbsent = await detachWorktree(live, { force: true });
+    expect(alreadyAbsent).toEqual({ removed: false, reason: "already-absent" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Branch drift is tolerated, never corrected (docs/plans/codex-terminal-worktree-error.md)
+// ---------------------------------------------------------------------------
+
+describe("drift tolerated", () => {
+  /** Materialize a worktree for a fresh task, then drift it onto `implement/x`
+   *  with one commit there. Returns the persisted-shape task (branch +
+   *  worktreePath set, as startTask would store them). */
+  async function materializeAndDrift(): Promise<{ repo: string; task: Task; wt: string; taskBranch: string }> {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    expect(first.checkoutBranch).toBe(first.branch);
+    const wt = first.worktreePath!;
+    const taskBranch = first.branch!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    writeFileSync(path.join(wt, "README"), "drifted\n");
+    await git(["commit", "-am", "drift"], wt);
+    return { repo, task: { ...fresh, branch: taskBranch, worktreePath: wt }, wt, taskBranch };
+  }
+
+  async function expectReusedInPlace(task: Task, wt: string, expectedCheckout: string | null) {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const headBefore = await runCapture(["rev-parse", "HEAD"], wt);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(`unexpected error: ${r.error}`);
+    expect(r.cwd).toBe(wt);
+    expect(r.branch).toBe(task.branch);
+    expect(r.worktreePath).toBe(wt);
+    expect(r.checkoutBranch).toBe(expectedCheckout);
+    expect(r.warning).toBeUndefined();
+    // No checkout happened: HEAD (and the symbolic branch) are untouched.
+    expect(await runCapture(["rev-parse", "HEAD"], wt)).toBe(headBefore);
+    const sym = await runCapture(["symbolic-ref", "--quiet", "--short", "HEAD"], wt);
+    expect(sym).toBe(expectedCheckout ?? "");
+    return r;
+  }
+
+  test("clean drifted tree reuses in place and reports the live branch", async () => {
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    const r = await expectReusedInPlace(task, wt, "implement/x");
+    expect(r.note).toContain("on implement/x");
+    expect(r.note).toContain(`(task branch ${taskBranch})`);
+  });
+
+  test("a conflicting uncommitted edit no longer fails the prepare", async () => {
+    const { task, wt } = await materializeAndDrift();
+    // Before the fix this made `git checkout <task.branch>` refuse ("Your
+    // local changes … would be overwritten") — the terminal-open toast.
+    writeFileSync(path.join(wt, "README"), "uncommitted conflicting edit\n");
+    await expectReusedInPlace(task, wt, "implement/x");
+    expect(await runCapture(["status", "--porcelain"], wt)).toContain("README");
+  });
+
+  test("an untracked-only tree is not silently switched", async () => {
+    const { task, wt } = await materializeAndDrift();
+    writeFileSync(path.join(wt, "scratch.txt"), "untracked\n");
+    await expectReusedInPlace(task, wt, "implement/x");
+  });
+
+  test("a detached HEAD reuses in place with checkoutBranch null", async () => {
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    await git(["checkout", "--detach"], wt);
+    const r = await expectReusedInPlace(task, wt, null);
+    expect(r.note).toContain("detached HEAD");
+    expect(r.note).toContain(taskBranch);
+  });
+
+  test("a worktree still on the task branch reports it", async () => {
+    const { prepareWorkdir } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const r = await prepareWorkdir({ ...fresh, branch: first.branch, worktreePath: first.worktreePath });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.note).toBe(`reusing worktree at ${first.worktreePath} on ${first.branch}`);
+  });
+
+  test("re-attach prefers the recorded checkout when it still exists", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    expect(existsSync(wt)).toBe(false);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBeUndefined();
+    expect(r.note).toContain("restored worktree");
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+    expect(await runCapture(["log", "-1", "--format=%s"], wt)).toBe("drift");
+  });
+
+  test("re-attach falls back to the task branch with a warning when the recorded branch is gone", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo, wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", "implement/x"], repo);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe(taskBranch);
+    expect(r.warning).toBe(`recorded checkout implement/x no longer exists — restored on ${taskBranch}`);
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe(taskBranch);
+  });
+
+  test("re-attach with the recorded checkout equal to the task branch takes the plain path", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const task = { ...fresh, branch: first.branch, worktreePath: first.worktreePath, checkoutBranch: first.branch };
+    await detachWorktree(task, { force: true });
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.warning).toBeUndefined();
+    expect(r.note).toContain("created worktree");
+  });
+
+  test("isolation none reports checkoutBranch null", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-plain-"));
+    const r = await prepareWorkdir(fakeTask({ workdir: dir, isolation: "none" }));
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBeNull();
+    expect(r.checkoutKnown).toBe(false);
+    expect(recordableCheckout(r)).toBeUndefined();
+  });
+
+  test("a readable reuse is known — a drifted branch and a detached HEAD are both recordable", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt } = await materializeAndDrift();
+    const onBranch = await prepareWorkdir(task);
+    if ("error" in onBranch) throw new Error(onBranch.error);
+    expect(onBranch.checkoutKnown).toBe(true);
+    expect(recordableCheckout(onBranch)).toBe("implement/x");
+    await git(["checkout", "--detach"], wt);
+    const detached = await prepareWorkdir(task);
+    if ("error" in detached) throw new Error(detached.error);
+    expect(detached.checkoutKnown).toBe(true);
+    // A detached HEAD is a real reading: record null.
+    expect(recordableCheckout(detached)).toBeNull();
+  });
+
+  test("a reuse whose branch read fails is unknown, not detached, and records nothing", async () => {
+    const { prepareWorkdir, recordableCheckout } = await import("./worktree.ts");
+    const { task, wt, taskBranch } = await materializeAndDrift();
+    // Break the worktree's `.git` pointer so `git symbolic-ref` exits 128.
+    const pointer = path.join(wt, ".git");
+    const saved = await Bun.file(pointer).text();
+    writeFileSync(pointer, "gitdir: /nonexistent/agetor-broken\n");
+    try {
+      const r = await prepareWorkdir(task);
+      if ("error" in r) throw new Error(`unexpected error: ${r.error}`);
+      expect(r.cwd).toBe(wt);
+      expect(r.checkoutBranch).toBeNull();
+      expect(r.checkoutKnown).toBe(false);
+      expect(recordableCheckout(r)).toBeUndefined();
+      expect(r.note).toBe(`reusing worktree at ${wt} on ${taskBranch}`);
+    } finally {
+      writeFileSync(pointer, saved);
+    }
+  });
+
+  test("re-attach restores the recorded checkout even when the task branch was deleted", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo, wt, task, taskBranch } = await materializeAndDrift();
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", taskBranch], repo);
+    const r = await prepareWorkdir({ ...task, checkoutBranch: "implement/x" });
+    if ("error" in r) throw new Error(r.error);
+    expect(r.branch).toBe(taskBranch);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.checkoutKnown).toBe(true);
+    expect(r.warning).toBe(`task branch ${taskBranch} no longer exists — restored on implement/x`);
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+    // The drifted work came back with it.
+    expect(await runCapture(["log", "-1", "--format=%s"], wt)).toBe("drift");
+    // task.branch is not recreated behind the user's back.
+    expect(await runCapture(["branch", "--list", taskBranch], repo)).toBe("");
+  });
+
+  test("re-attach of a PR-head task whose branch lives only on origin restores the recorded checkout without a gone-branch warning", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    writeFileSync(path.join(wt, "README"), "drifted\n");
+    await git(["commit", "-am", "drift"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    // Only the LOCAL ref goes; `origin/pr-head` survives, as it does for any
+    // PR head nobody kept a local branch for.
+    await git(["branch", "-D", "pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBeUndefined();
+    expect(await runCapture(["symbolic-ref", "--short", "HEAD"], wt)).toBe("implement/x");
+  });
+
+  test("re-attach of a PR-head task whose branch is gone from origin too still warns", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    await pushPrHeadOnly(repo);
+    const fresh = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    const task = { ...fresh, worktreePath: wt, checkoutBranch: "implement/x" };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", "pr-head"], repo);
+    await git(["push", "origin", "--delete", "pr-head"], repo);
+    await git(["update-ref", "-d", "refs/remotes/origin/pr-head"], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe("implement/x");
+    expect(r.warning).toBe("task branch pr-head no longer exists — restored on implement/x");
+  });
+
+  test("re-attach that has to recreate a deleted task branch from base says so", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const task = { ...fresh, branch: first.branch, worktreePath: first.worktreePath, checkoutBranch: first.branch };
+    await detachWorktree(task, { force: true });
+    await git(["branch", "-D", first.branch!], repo);
+    const r = await prepareWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.checkoutBranch).toBe(first.branch);
+    expect(r.warning).toBe(`task branch ${first.branch} no longer exists — recreated it from HEAD`);
+  });
+});
+
+describe("readCheckoutBranch", () => {
+  test("named branch, detached HEAD, and unreadable dir", async () => {
+    const { readCheckoutBranch } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await readCheckoutBranch(repo)).toEqual({ ok: true, branch: "main" });
+    await git(["checkout", "--detach"], repo);
+    expect(await readCheckoutBranch(repo)).toEqual({ ok: true, branch: null });
+    const missing = await readCheckoutBranch(path.join(repo, "does-not-exist"));
+    expect(missing.ok).toBe(false);
+    const notRepo = await readCheckoutBranch(mkdtempSync(path.join(tmpdir(), "agetor-wt-norepo-")));
+    expect(notRepo.ok).toBe(false);
+  });
+});
+
+describe("resolveDefaultBranchName", () => {
+  test("strips the remote prefix and returns null outside a repo", async () => {
+    const { resolveDefaultBranchName } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    expect(await resolveDefaultBranchName(repo)).toBe("main");
+    expect(await resolveDefaultBranchName(path.join(repo, "nope"))).toBeNull();
+  });
+});
+
+describe("planTeardownBranches", () => {
+  const base = {
+    taskBranch: "agetor/abc-fix" as string | null,
+    branchSource: "created" as "created" | "existing",
+    liveBranch: null as string | null,
+    lastSeen: null as string | null,
+    defaultBranch: "main" as string | null,
+    heldByOthers: new Set<string>(),
+  };
+
+  test("no drift → only the task branch", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "agetor/abc-fix" })).toEqual({
+      branches: ["agetor/abc-fix"], source: "task-branch", excluded: [],
+    });
+  });
+
+  test("live drift → both branches, source live", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "implement/x", lastSeen: "other" })).toEqual({
+      branches: ["agetor/abc-fix", "implement/x"], source: "live", excluded: [],
+    });
+  });
+
+  test("no live read → falls back to the last-seen checkout", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, lastSeen: "implement/x" })).toEqual({
+      branches: ["agetor/abc-fix", "implement/x"], source: "last-seen", excluded: [],
+    });
+  });
+
+  test("PR-head task keeps its own branch but still removes a drifted one", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, branchSource: "existing", taskBranch: "pr-head", liveBranch: "implement/x" })).toEqual({
+      branches: ["implement/x"], source: "live", excluded: [{ branch: "pr-head", reason: "pr-head" }],
+    });
+  });
+
+  test("the default branch is never deleted", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "main" })).toEqual({
+      branches: ["agetor/abc-fix"], source: "live", excluded: [{ branch: "main", reason: "default-branch" }],
+    });
+    // Unresolvable default → literal main/master are protected.
+    expect(planTeardownBranches({ ...base, defaultBranch: null, liveBranch: "master" }).excluded).toEqual([
+      { branch: "master", reason: "default-branch" },
+    ]);
+    // A resolved non-main default protects that name instead.
+    expect(planTeardownBranches({ ...base, defaultBranch: "trunk", liveBranch: "trunk" }).branches).toEqual(["agetor/abc-fix"]);
+  });
+
+  test("a branch another task holds is excluded", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, liveBranch: "shared", heldByOthers: new Set(["shared"]) })).toEqual({
+      branches: ["agetor/abc-fix"], source: "live", excluded: [{ branch: "shared", reason: "held-by-task" }],
+    });
+    expect(planTeardownBranches({ ...base, heldByOthers: new Set(["agetor/abc-fix"]) })).toEqual({
+      branches: [], source: "task-branch", excluded: [{ branch: "agetor/abc-fix", reason: "held-by-task" }],
+    });
+  });
+
+  test("nothing to delete → source none", async () => {
+    const { planTeardownBranches } = await import("./worktree.ts");
+    expect(planTeardownBranches({ ...base, taskBranch: null })).toEqual({ branches: [], source: "none", excluded: [] });
+  });
+});
+
+describe("removeWorktree branches option", () => {
+  async function branchExists(repo: string, name: string): Promise<boolean> {
+    return (await runCapture(["branch", "--list", name], repo)).length > 0;
+  }
+
+  test("deletes every listed branch after removing the worktree", async () => {
+    const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    const task = { ...fresh, branch: first.branch, worktreePath: wt };
+    await removeWorktree(task, { branches: [first.branch!, "implement/x"] });
+    expect(existsSync(wt)).toBe(false);
+    expect(await branchExists(repo, first.branch!)).toBe(false);
+    expect(await branchExists(repo, "implement/x")).toBe(false);
+  });
+
+  test("omitting the option keeps today's behaviour: only task.branch goes", async () => {
+    const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const fresh = fakeTask({ workdir: repo });
+    const first = await prepareWorkdir(fresh);
+    if ("error" in first) throw new Error(first.error);
+    const wt = first.worktreePath!;
+    await git(["checkout", "-b", "implement/x"], wt);
+    await removeWorktree({ ...fresh, branch: first.branch, worktreePath: wt });
+    expect(await branchExists(repo, first.branch!)).toBe(false);
+    expect(await branchExists(repo, "implement/x")).toBe(true);
+  });
+});
+
+// `GET /worktrees` (CLI-reachable) parses every dir's `.git` pointer in the
+// core: it must not follow a planted symlink or read an oversized file.
+describe("parseWorktreeGitPointer", () => {
+  test("reads a real pointer file; refuses a symlinked .git, a symlinked dir, and an oversized file", async () => {
+    const { parseWorktreeGitPointer } = await import("./worktree.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-wt-pointer-"));
+    try {
+      const pointer = "gitdir: /src/repo/.git/worktrees/abc\n";
+      const real = path.join(root, "real");
+      mkdirSync(real);
+      writeFileSync(path.join(real, ".git"), pointer);
+      expect(parseWorktreeGitPointer(real)).toBe("/src/repo");
+
+      const outside = path.join(root, "outside");
+      mkdirSync(outside);
+      writeFileSync(path.join(outside, "pointer"), pointer);
+      writeFileSync(path.join(outside, ".git"), pointer);
+
+      const fileLink = path.join(root, "file-link");
+      mkdirSync(fileLink);
+      symlinkSync(path.join(outside, "pointer"), path.join(fileLink, ".git"));
+      expect(parseWorktreeGitPointer(fileLink)).toBeNull();
+
+      const dirLink = path.join(root, "dir-link");
+      symlinkSync(outside, dirLink);
+      expect(parseWorktreeGitPointer(dirLink)).toBeNull();
+
+      const big = path.join(root, "big");
+      mkdirSync(big);
+      writeFileSync(path.join(big, ".git"), pointer + " ".repeat(64 * 1024));
+      expect(parseWorktreeGitPointer(big)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

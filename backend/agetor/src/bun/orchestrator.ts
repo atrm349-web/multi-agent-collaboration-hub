@@ -1,0 +1,9537 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  db,
+  tasks,
+  runs,
+  harnesses,
+  projects,
+  subagents,
+  backlog,
+  dataDir,
+  preferences,
+  agentProfiles,
+  pipelines,
+  IMPORTED_CLAUDE_HELD_ELSEWHERE,
+  IMPORTED_OPENCODE_HELD_ELSEWHERE,
+  type SessionIdColumn,
+  type AppendedEvent,
+} from "./db.ts";
+import { markStalled, clearStalled } from "./stall-registry.ts";
+import {
+  spawnAgent,
+  toClaudeModelArg,
+  claudeModelPickerFamily,
+  opencodeDriverHooks,
+  opencodeEffectiveServerFor,
+  type SpawnAgentArgs,
+  type SpawnedAgent,
+} from "./agents.ts";
+import { cachedCliVersion, checkHarness, peekCachedCliVersion, upgradeHintFor } from "./agent-status.ts";
+import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor } from "../shared/opencode.ts";
+import { importedSessionOf } from "../shared/imported-session.ts";
+import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
+import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
+import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
+import { providerRepoForDir } from "./git-provider.ts";
+import {
+  AGENT_OPTIONS,
+  DEFAULT_BRANCH_CONFIG,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  DEFAULT_TASK_TYPE,
+  FX_AUTO_RESUME_MAX,
+  FX_RECOVERY_STATUS_PREFIX,
+  IDLE_SESSION_REAP_MS,
+  MODEL_MIN_CLI_VERSION,
+  OPENCODE_SERVER_MODES,
+  SESSION_DIED_STATUS_PREFIX,
+  SPAWN_RESPONSE_BUDGET_MS,
+  TURN_STALLED_STATUS_PREFIX,
+  TURN_STALL_RESUMED_STATUS_PREFIX,
+  TASK_TYPES,
+  branchPattern,
+  defaultModeFor,
+  renderBranchTemplate,
+  retainableEfforts,
+  supportedEfforts,
+  validateBranchName,
+  type AgentKind,
+  type Harness,
+  type HarnessStatus,
+  type OpencodeServerMode,
+  type TaskType,
+} from "../shared/types.ts";
+import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
+import {
+  FX_RESUME_UNSUPPORTED_TEXT,
+  fxSupportsContinueRecovery,
+  isFxRecoveryResumable,
+  parseFxAutoResumePrefs,
+  parseFxRecoveryPayload,
+} from "../shared/fx-recovery.ts";
+import { resolveStartStep } from "../shared/pipeline.ts";
+import {
+  cascadePipelineArchive,
+  cascadePipelineDelete,
+  initialPipelineRunState,
+  startPipelineRun,
+  tombstonedPipelineParents,
+  withPipelineLock,
+} from "./pipeline-runner.ts";
+
+/**
+ * Resolve a task's harness id to its full row (falling back to a synthetic
+ * built-in via `getByIdOrKind` so legacy `"claude-code"` / `"codex"` rows
+ * still work even before the migration seed lands). Returns null for
+ * dangling alias references — callers must surface a clear error rather
+ * than silently picking a kind.
+ */
+function resolveHarness(harnessId: string): Harness | null {
+  return harnesses.getByIdOrKind(harnessId);
+}
+import {
+  cancelPendingForTask,
+  countPendingForTask,
+  setBroadcaster,
+  setResolvedBroadcaster,
+  setRunEventEmitter,
+  type AnyRequest,
+  type InteractionResolved,
+} from "./interactions.ts";
+import {
+  CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  cycleToMode,
+  type CycleResult,
+  type ContinuationHooks,
+  dropSession,
+  killSessionByName,
+  reattachSession,
+  pasteFollowUp,
+  sendTurn,
+  mirrorModelViaPicker,
+  getSessionLaunchEffort,
+  hasSessionState,
+  drainSessionJsonl,
+  sessionHasTurn,
+  sessionExists,
+  sessionExistsByName,
+  sessionIdleInfo,
+  sessionLiveness,
+  sessionNameFor,
+  probeSessionActivity,
+  jsonlPathFor,
+  interruptTaskSession,
+  setContinuationRunFactory,
+  setHeldSessionProbe,
+  setActiveRunProbe,
+  setBackgroundTaskSettledHandler,
+  setLocalSettingChangedHandler,
+  claudeBootsInFlight,
+  claudeTmuxOpsInFlight,
+  CLAUDE_BOOT_TIMEOUT_MS,
+  type LocalSettingInfo,
+} from "./claude-tmux.ts";
+import {
+  parseClaudeLocalSetting,
+  describeLocalSettingSync,
+  describeUnrepresentableLocalSetting,
+  describeKeptModelNotSynced,
+} from "./claude-local-setting.ts";
+import {
+  dropCodexSession,
+  reattachCodexSession,
+} from "./codex-tmux.ts";
+import {
+  dropCursorSession,
+} from "./cursor-tmux.ts";
+import { rebuildOpenCursorAsks } from "./cursor-acp.ts";
+import {
+  dropGeminiSession,
+  reattachGeminiSession,
+} from "./gemini-tmux.ts";
+import {
+  dropAntigravitySession,
+  reattachAntigravitySession,
+} from "./antigravity-tmux.ts";
+import {
+  dropOpencodeSession,
+  opencodeSessionActive,
+  reattachOpencodeSession,
+} from "./opencode-tmux.ts";
+import {
+  opencodeTurnOfRun,
+  orphanRunningOpencodeSubagents,
+  setOpencodeSubagentEmitter,
+  setOpencodeSubagentSettleHook,
+} from "./opencode-subagents.ts";
+import {
+  COPILOT_PLAN_TOOL_NAME,
+  dropCopilotSession,
+  reattachCopilotSession,
+  type CopilotSubagentSink,
+} from "./copilot-tmux.ts";
+import { copilotHome } from "./copilot-home.ts";
+import {
+  dropFxSession,
+} from "./fx-acp.ts";
+import { beginLagLabel, setLagStallSink } from "./event-loop-lag.ts";
+import {
+  attachSubagentWatcher,
+  handleBackgroundTaskNotification,
+  orphanRunningSubagents,
+  pumpWatcherForHoldCheck,
+  setParkedDiscoveryHandler,
+  setSubagentEmitter,
+  setSubagentSettleHook,
+} from "./claude-subagents.ts";
+import {
+  prepareWorkdir,
+  removeWorktree,
+  detachWorktree,
+  repoRoot,
+  resolveRef,
+  branchName,
+  ensureUniqueBranch,
+  fetchBranch,
+  WORKTREES_DIR,
+  parseWorktreeGitPointer,
+  pruneWorktrees,
+  hasUncommittedChanges,
+  getAheadCount,
+  isMergedIntoDefaultBranch,
+  readCheckoutBranch,
+  recordableCheckout,
+  planTeardownBranches,
+  resolveDefaultBranchName,
+  type PreparedWorkdir,
+} from "./worktree.ts";
+import { killTerminalsForTask } from "./terminals.ts";
+import { ensureInstalledForCwd } from "./hook-installer.ts";
+import type {
+  AgentProfile,
+  AgentProfileSnapshot,
+  ColumnId,
+  ContinuationTrigger,
+  FxRecoveryPayload,
+  GlobalEvent,
+  Pipeline,
+  Run,
+  RunEvent,
+  RunStatus,
+  SentFileEntry,
+  Subagent,
+  SubagentEvent,
+  Task,
+  TaskFxRecovery,
+  WorktreeGitStatus,
+  TaskTeardownPreview,
+  WorktreeInfo,
+  WorktreeStaleReason,
+  WorktreeTeardownResult,
+} from "../shared/types.ts";
+import { CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import {
+  SENT_FILES_DELIVERED_RE,
+  parseSentFilesToolResult,
+  parseSentFilesToolUse,
+  sanitizeToolResultAttachments,
+  toolResultText,
+  type SentFilesRequest,
+} from "../shared/sent-files.ts";
+import { appendReferences } from "../shared/refs.ts";
+import { promptByteOverage } from "../shared/prompt-limits.ts";
+import { expandAtReferencesDetailedAsync } from "./project-files.ts";
+import { resolveAtPathsInTaskDir } from "./task-dir-fs.ts";
+import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import { isSpeed } from "../shared/speed.ts";
+
+type Listener = (e: RunEvent) => void;
+const listeners = new Set<Listener>();
+
+type GlobalListener = (e: GlobalEvent) => void;
+const globalListeners = new Set<GlobalListener>();
+
+interface ActiveRun {
+  taskId: string;
+  agent: Task["agent"];
+  kill: () => void;
+  cancelled: boolean;
+  /**
+   * Send a follow-up user message. For claude-code this routes through tmux
+   * (paste-buffer + Enter) and creates a brand-new run row in `sendInput`.
+   * For codex it writes to the spawned process's stdin and stays within the
+   * same run row.
+   */
+  writeInput: (line: string) => boolean;
+  /**
+   * fx-only (steering, fx 0.0.13 or later): fold a follow-up into the turn
+   * that is running right now instead of queueing it for the next one.
+   * Returns true only when the steer was actually sent; `sendFxTurn` queues
+   * on false.
+   * Absent for every other kind and for an fx turn that can't steer.
+   */
+  steer?: (line: string) => boolean;
+  /** Set when claude code emitted an `isApiErrorMessage` line during this
+   *  run (e.g. 529 Overloaded). The chunk handler flips the column to
+   *  `blocked` immediately; the done handler reads this on resolution to
+   *  keep the column at `blocked` (instead of bouncing to `ready`) and
+   *  record the run as `failed`. */
+  apiError: boolean;
+  /** Set when the run's tmux session died unexpectedly mid-turn (the driver
+   *  emitted the `SESSION_DIED_STATUS_PREFIX` sentinel). Like `apiError`, the
+   *  chunk handler flips the column to `blocked` immediately and the done
+   *  handler reads this on resolution to keep it there (record the run as
+   *  `failed`, not bounce to `ready`). */
+  sessionDied: boolean;
+  /** Set when claude's TUI rejected the pasted message as an unknown slash
+   *  command (the driver emitted the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+   *  sentinel — no JSONL line was ever written for that turn). Like
+   *  `apiError`/`sessionDied`, the chunk handler flips the column to
+   *  `blocked` immediately and the done handler reads this on resolution to
+   *  keep it there (record the run as `failed`, not bounce to `ready`). */
+  unknownCommand: boolean;
+}
+const active = new Map<string, ActiveRun>(); // runId -> handle
+
+// Guards `reapIdleSessions` against overlapping sweeps — the boot one-shot
+// and the recurring `setInterval` in index.ts could otherwise both be
+// in-flight if a sweep ever ran long (many candidate tasks, a slow tmux
+// probe). A simple boolean is enough: sweeps are infrequent (every
+// `SESSION_REAP_SWEEP_MS`) and idempotent, so skipping one entirely when
+// another is still running just means its candidates get picked up next tick.
+let reapInFlight = false;
+
+// Archive/delete teardown (tmux session kill, terminal teardown, worktree
+// detach/remove) is deferred onto a per-source-workdir FIFO queue so
+// `archiveTask` can flip the DB column and respond in milliseconds instead of
+// blocking on tmux kills (async `Bun.spawn` since the fix-task-details-load-
+// delay conversion, but still real wall-clock latency, not free) and `git
+// worktree remove --force`/`prune`. The serialization is deliberate, not
+// incidental: concurrent `git
+// worktree remove`/`prune` invocations against the SAME source repo contend
+// on git's internal locks (`.git/worktrees/.lock` etc.), so archiving several
+// tasks that share a workdir must still tear them down one at a time — just
+// not on the request's critical path. Tasks in *different* source repos have
+// no such lock contention, so they get independent chains and never wait on
+// each other — a big worktree removal for repo A must not stall a DELETE in
+// unrelated repo B. `teardownTails` keys the chain by `task.workdir` (the raw
+// string, not a resolved repo root — two tasks pointed at different subdirs
+// of the same repo would therefore get separate chains and could still
+// contend on git's locks; accepted as rare, and best-effort teardown plus the
+// boot sweep heal any resulting strand). `teardowns` is unchanged: it lets
+// callers (unarchive/start/delete, plus the boot-time sweep) await a specific
+// task's in-flight teardown before touching the same worktree, keyed by task
+// id as before — this still works under per-workdir chains because a task's
+// workdir can't change while a teardown is pending (archived tasks are
+// PATCH-frozen, and every materializing path awaits `pendingTeardown` first).
+const teardownTails = new Map<string, Promise<void>>();
+const teardowns = new Map<string, Promise<void>>();
+
+/**
+ * Chain `job` onto the teardown FIFO for `key` (the task's source `workdir`)
+ * and track it per-task so `pendingTeardown` can be awaited by callers that
+ * must not race a deferred teardown (unarchive, start, delete, the orphan
+ * sweep). Errors from `job` are caught and logged — a single misbehaving
+ * teardown must never break the chain for every task queued behind it on the
+ * same workdir.
+ */
+function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>): Promise<void> {
+  const tail = teardownTails.get(key) ?? Promise.resolve();
+  const p = tail
+    .then(job)
+    .catch((err) => {
+      console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
+    });
+  teardownTails.set(key, p);
+  p.finally(() => {
+    // Only clear the entry if it's still the current tail for this key — a
+    // later enqueue for the same workdir must not have its chain slot
+    // clobbered by this settle, and this also bounds the map's size (an idle
+    // workdir's entry is removed once its chain drains).
+    if (teardownTails.get(key) === p) teardownTails.delete(key);
+  });
+  teardowns.set(taskId, p);
+  p.finally(() => {
+    // Only clear the entry if it's still ours — a later enqueue for the same
+    // task (e.g. delete right after archive) must not have its promise
+    // clobbered by this settle.
+    if (teardowns.get(taskId) === p) teardowns.delete(taskId);
+  });
+  return p;
+}
+
+/**
+ * Await any deferred teardown currently in flight (or queued) for `taskId`.
+ * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
+ * `startTask`, terminal open (`createTerminal`), and the boot-time sweep can serialize against a still-running
+ * archive/delete teardown before touching the same worktree, and so tests can
+ * drain the queue deterministically.
+ */
+export function pendingTeardown(taskId: string): Promise<void> {
+  return teardowns.get(taskId) ?? Promise.resolve();
+}
+
+/** Tasks whose `deleteTask` is in progress. A pipeline parent's delete awaits
+ *  its step cascade before it ever enqueues a teardown, so `teardowns` alone
+ *  can't tell that the task is on its way out during that window. */
+const deletingTaskIds = new Set<string>();
+
+/**
+ * Synchronous "is this task being torn down right now" — an archive/delete
+ * teardown is queued or running, or a delete has started. For a caller that
+ * has already awaited `pendingTeardown` and then did async work of its own
+ * (terminal open's `prepareWorkdir`): a teardown that landed meanwhile has
+ * killed, or is about to kill, what the caller is about to start, so the
+ * caller must re-check this in the same synchronous run as its spawn.
+ */
+export function isTaskTearingDown(taskId: string): boolean {
+  return teardowns.has(taskId) || deletingTaskIds.has(taskId);
+}
+
+/** Test hook: queue `job` on the teardown FIFO for `key` under `taskId`, so a
+ *  test can hold that queue open (and make `pendingTeardown(taskId)` wait)
+ *  until it releases a gate. Not part of the public surface. */
+export function __enqueueTeardownForTest(taskId: string, key: string, job: () => Promise<void>): Promise<void> {
+  return enqueueTeardown(taskId, key, job);
+}
+
+export function subscribe(fn: Listener): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+/**
+ * Fan an event out to the `/tasks/:id/events` subscribers.
+ *
+ * Ordering invariant (the SSE resume cursor relies on it): a SAVED row is
+ * sent synchronously, right after its insert, with its stored `{id, ts}` —
+ * so the order frames leave here is the order of their `run_events.id`s. Go
+ * through {@link saveAndEmit} for that; never batch, defer or queue the send
+ * of a saved row, or a client could see id N+1 before id N and a resume from
+ * N+1 would skip it. Unsaved (live-only) events carry no `id`.
+ */
+function emit(e: RunEvent) {
+  for (const fn of listeners) fn(e);
+}
+
+/**
+ * Persist an event and send it to live subscribers with the row's stored
+ * `id` and `ts` (so a live frame and its replayed copy are identical).
+ * Sends nothing on a `(run_id, line_uuid)` dedup hit — that row was already
+ * delivered when it was first saved. Throws like `runs.appendEvent` (e.g. a
+ * cascade-deleted run); use {@link saveStatusLineQuietly} on settle paths.
+ */
+function saveAndEmit(args: {
+  runId: string;
+  taskId: string;
+  stream: RunEvent["stream"];
+  data: string;
+  lineUuid?: string | null;
+  subagentId?: string | null;
+}): AppendedEvent | null {
+  const { runId, taskId, stream, data, lineUuid, subagentId } = args;
+  const row = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
+  if (!row) return null;
+  emit({
+    runId,
+    taskId,
+    stream,
+    data,
+    ts: row.ts,
+    id: row.id,
+    ...(subagentId ? { subagentId } : {}),
+  });
+  return row;
+}
+
+/**
+ * {@link saveAndEmit} for status/stderr lines written on settle paths
+ * (`started —`, the hold line, `exit:N`, a rejected spawn). Never throws: a
+ * run deleted under a settling turn drops the line silently (there is
+ * nothing left to record it on), anything else is logged — losing a
+ * breadcrumb must not stop `attachDoneHandler` from draining queues and
+ * moving the card.
+ */
+function saveStatusLineQuietly(
+  runId: string,
+  taskId: string,
+  data: string,
+  stream: "status" | "stderr" = "status",
+): AppendedEvent | null {
+  try {
+    return saveAndEmit({ runId, taskId, stream, data });
+  } catch (err) {
+    if (runs.get(runId)) console.warn(`[agetor] failed to persist ${stream} line for run ${runId}:`, err);
+    return null;
+  }
+}
+
+/** Fan a persisted event out to `/tasks/:id/events` subscribers. History
+ *  backfill writes through `runs.appendEvent` outside `makeChunkHandler`, so
+ *  it has to emit itself or a panel opened mid-import never sees the rest. */
+export function emitRunEvent(e: RunEvent): void {
+  emit(e);
+}
+
+// The subagent watcher (armed inside the claude-tmux tailer) persists its
+// tagged events itself but needs the orchestrator's SSE fan-out to reach the
+// run panel. Register `emit` as its sink once, at module load — there's exactly
+// one listener set and the subagent stream rides the same `/tasks/:id/events`
+// channel the UI already subscribes to.
+setSubagentEmitter(emit);
+// OpenCode subagent tabs (opencode-subagents.ts, D-11) fill from `session
+// export` at turn end rather than a live watcher, but their events ride the
+// same `/tasks/:id/events` channel — same sink.
+setOpencodeSubagentEmitter(emit);
+
+// A held task's terminal run is already `succeeded`, so nothing in the run
+// lifecycle will ever move it out of `running` — the release has to be driven
+// by the background agents themselves. Register the release as the subagent
+// settle hook so the last-agent-finishing edge lands the card in `review`.
+setSubagentSettleHook(maybeReleaseHeldTask);
+// OpenCode subagent rows settle outside the claude watcher (turn-end export
+// refresh, teardown, boot) — same release, so a refresh that lands after the
+// driver's `beforeSettle` budget still frees a held task.
+setOpencodeSubagentSettleHook(maybeReleaseHeldTask);
+
+// Parked-discovery: a subagent newly (or once again) `running` should pull a
+// `review` card back to `running` — the mirror-image of the settle hook
+// above. Registered here (not inline) so it's visible alongside the other
+// claude-subagents.ts seams; see `pullBackParkedTask` below for the policy
+// (only from `review`, only when the terminal run actually succeeded).
+setParkedDiscoveryHandler(pullBackParkedTask);
+
+// Continuation-run adoption: claude-tmux calls this when a genuinely-new
+// content line arrives on a task's session with no turn in flight — the case
+// a post-`end_turn` background-task auto-continuation produces. See
+// `startContinuationRun` below.
+setContinuationRunFactory(startContinuationRun);
+
+// Event-loop stall attribution (non-blocking session restore, plan §2.2): the
+// lag monitor (started by index.ts / headless.ts) already `console.warn`s every
+// stall, so this sink only adds the user-visible half — a status line on the
+// run the stalled work was labelled with, so a transcript explains why the app
+// froze. A stall with no run in its label context (or whose run/task has since
+// vanished) is logged by the monitor alone.
+setLagStallSink((stall) => {
+  const ctx = stall.ctx;
+  if (!ctx?.runId) return;
+  try {
+    appendRunStatusLine(
+      ctx.taskId,
+      ctx.runId,
+      `core was unresponsive for ${(stall.lagMs / 1000).toFixed(1)} s during ${stall.label ?? "unlabelled work"}`,
+    );
+  } catch {
+    // The run or task is gone (deleted mid-stall) — nothing to annotate.
+  }
+});
+
+// Death-watch during a #92 hold: keep polling `tmux has-session` even though
+// no turn is in flight, so a session dying mid-hold is caught instead of
+// silently stranding the card in `running` until the next boot. Reuses the
+// existing DB-derived hold predicate — no new state to track.
+setHeldSessionProbe(isHeldByBackgroundAgents);
+
+// Run association for `signalSubagentApiError` (#93): answers "what run id
+// is currently in flight for this task, per the orchestrator's OWN `active`
+// map?" so a stale async subagent from an older run can't abort a newer
+// run's turn. `task.runId` alone isn't enough — it's set the instant
+// `startTask` inserts the run row, before `spawnAgent` returns and
+// `registerActiveRun` populates `active`, and it's also left stale after a
+// run resolves — so the extra `active.has` check (the exact idiom used
+// throughout this file, e.g. the busy/idle branch in `sendInput`) is what
+// actually answers "in flight right now."
+setActiveRunProbe((taskId) => {
+  const task = tasks.get(taskId);
+  if (!task?.runId) return null;
+  return active.has(task.runId) ? task.runId : null;
+});
+
+// Local-command setting sync (§10 of the model/effort local-command plan):
+// claude answers `/model` and `/effort` inside its own TUI and never writes
+// an `assistant`/`end_turn` for them — the driver parses the
+// `<local-command-stdout>` outcome and fires this regardless of whether the
+// change came from the dropdown mirror, a typed command, a picker/slider
+// card answer, or a terminal-side edit. `applyClaudeLocalSetting` syncs
+// `task.model`/`task.effort` from that outcome WITHOUT re-mirroring back
+// into the session (that would be `reconcileTaskSession`'s job, and calling
+// it here would bounce a spurious second confirm off the very update we're
+// recording).
+setLocalSettingChangedHandler((taskId, info) => {
+  applyClaudeLocalSetting(taskId, info);
+});
+
+// Background-task notification signal: a parent task-notification JSONL line
+// named a background agent/task id. The raw payload is handed to
+// claude-subagents, which owns the receipt rule: for ordinary rows ANY
+// notification naming the id is the harness's authoritative completion
+// receipt (DB flip → lifecycle emit → settle hook → `maybeReleaseHeldTask`,
+// `source: "receipt"` so a trailing assistant/attachment flush can't resurrect
+// the row the way an inferred settle would allow) — but a Claude Code
+// Monitor's ordinary events ride the SAME `<task-notification>` envelope as
+// its completion, so a `monitor` row settles only on a terminal receipt and
+// records everything else as activity. Tolerant by design: an id matching no
+// row, or a duplicate fired again on reattach replay, is a no-op.
+setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) => {
+  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs);
+});
+
+/**
+ * Subscribe to the app-wide lifecycle stream — terminal run-status
+ * transitions and column changes. Live-only: subscribers see events from the
+ * moment they connect, never a replay. Drives the toast hook in the webview.
+ */
+export function subscribeGlobal(fn: GlobalListener): () => void {
+  globalListeners.add(fn);
+  return () => globalListeners.delete(fn);
+}
+
+/**
+ * Pipeline-runner-only report of a settle the global bus deliberately never
+ * carries: a STEP task's run that finished after it was displaced as the
+ * task's current run (`task.runId !== runId` — e.g. a continuation a
+ * reminder run overwrote). `attachDoneHandler` suppresses the column move and
+ * the `run-status` event for such a run, so the runner would otherwise never
+ * learn that a handoff may have landed on it (docs/plans/handoff-
+ * identification-fix.md RC3). This is a module-level setter, NOT a
+ * `GlobalEvent`: no SSE client, toast, OS notification, TUI or `logs --notify`
+ * consumer can see it (O6). Same setter pattern as the claude-tmux seams;
+ * it also avoids an orchestrator ↔ pipeline-runner import cycle.
+ */
+export type DisplacedStepRunSettledHandler = (
+  taskId: string,
+  runId: string,
+  status: "succeeded" | "failed" | "cancelled",
+) => void;
+let displacedStepRunSettledHandler: DisplacedStepRunSettledHandler | null = null;
+export function setDisplacedStepRunSettledHandler(
+  fn: DisplacedStepRunSettledHandler | null,
+): DisplacedStepRunSettledHandler | null {
+  const prev = displacedStepRunSettledHandler;
+  displacedStepRunSettledHandler = fn;
+  return prev;
+}
+
+/**
+ * Pipeline-runner-only report that the Stop button was pressed on a HELD step
+ * task (`cancelRun` → `stopHeldTask`). Its turn already succeeded, so no
+ * `cancelled` settle will tell the runner the step was stopped, and the
+ * settle that follows the hold's release would otherwise get the release
+ * grace and paste the handoff reminder into the session the user just
+ * stopped. Same setter pattern as {@link setDisplacedStepRunSettledHandler},
+ * and likewise never a `GlobalEvent`.
+ */
+export type HeldStepStoppedHandler = (taskId: string, runId: string | null) => void;
+let heldStepStoppedHandler: HeldStepStoppedHandler | null = null;
+export function setHeldStepStoppedHandler(fn: HeldStepStoppedHandler | null): HeldStepStoppedHandler | null {
+  const prev = heldStepStoppedHandler;
+  heldStepStoppedHandler = fn;
+  return prev;
+}
+
+/** Report a Stop on a held step task to the pipeline runner (if one is
+ *  installed), with the run current when Stop was pressed — the runner's
+ *  record of the stop runs later, under its per-parent lock, by which time
+ *  Claude may have adopted a continuation that is a NEW turn, not the stopped
+ *  one. Never throws — a runner bug must not break Stop. */
+function reportHeldStepStopped(taskId: string): void {
+  const task = tasks.get(taskId);
+  if (!task?.pipelineParentId) return;
+  try {
+    heldStepStoppedHandler?.(taskId, task.runId ?? null);
+  } catch (err) {
+    console.warn(`[agetor] held step stop report failed for task ${taskId}:`, err);
+  }
+}
+
+/** Report a displaced step run's settle to the pipeline runner (if one is
+ *  installed). Never throws — a runner bug must not break run settlement. */
+function reportDisplacedStepRunSettled(
+  task: Task | null | undefined,
+  taskId: string,
+  runId: string,
+  status: RunStatus,
+): void {
+  if (!task?.pipelineParentId) return;
+  if (status !== "succeeded" && status !== "failed" && status !== "cancelled") return;
+  try {
+    displacedStepRunSettledHandler?.(taskId, runId, status);
+  } catch (err) {
+    console.warn(`[agetor] displaced step run settle report failed for task ${taskId}:`, err);
+  }
+}
+
+/** `GlobalEvent` kinds that carry a per-task `taskId` and get stamped with
+ *  the task's `pipelineParentId` (when it's a hidden pipeline step row) so
+ *  consumers — the webview's toast/notification gates, the CLI's `--notify`,
+ *  the TUI — can scope a step's own lifecycle noise to its parent without a
+ *  DB round-trip of their own. `pipeline` events already name the parent as
+ *  their `taskId`, and `update` carries no task at all. */
+const PIPELINE_PARENT_STAMPED_KINDS = new Set<GlobalEvent["kind"]>([
+  "run-status",
+  "column",
+  "interaction",
+  "files-sent",
+  "fx-auto-resume",
+  "send-failed",
+]);
+
+/** The pipeline parent id of a hidden step task, or `undefined` for an
+ *  ordinary task (including a pipeline PARENT — `pipelineParentId` is only
+ *  ever set on a step row). A cheap single-row read; the field is written
+ *  exactly once, at insert, so there's nothing to invalidate. */
+function stepParentOf(taskId: string): string | undefined {
+  return tasks.get(taskId)?.pipelineParentId ?? undefined;
+}
+
+/** Stamp `pipelineParentId` onto a per-task event (see
+ *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
+ *  (interactions.ts stamps its own `interaction` events), plus the parent's
+ *  title as `pipelineParentTitle` — a toast for a run started right after the
+ *  page loaded can arrive before the client's task poll has the parent row,
+ *  and would otherwise name the pipeline by a short id. Built with
+ *  `Object.assign` rather than an object-literal spread so this compiles the
+ *  same whether or not the union member declares the optional fields. */
+function stampPipelineParent(e: GlobalEvent): GlobalEvent {
+  if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
+  const stamped = e as { pipelineParentId?: string; pipelineParentTitle?: string };
+  if (stamped.pipelineParentTitle !== undefined) return e;
+  const pipelineParentId = stamped.pipelineParentId ?? stepParentOf(e.taskId);
+  if (pipelineParentId === undefined) return e;
+  const pipelineParentTitle = tasks.get(pipelineParentId)?.title;
+  return Object.assign(
+    {},
+    e,
+    { pipelineParentId },
+    pipelineParentTitle ? { pipelineParentTitle } : {},
+  ) as GlobalEvent;
+}
+
+/** Fan an app-wide lifecycle event out to every subscriber. Each listener
+ *  is isolated (L-R8): a throw inside one — the pipeline runner's own
+ *  `handleRunStatus`/`handleColumnChange` dispatch, the SSE bridge, a test
+ *  hook — is logged and must never skip the listeners after it, nor unwind
+ *  into the emitter (the done handler's `noteFxRunSettled` and the four
+ *  `drain*Queue` calls run AFTER its `emitGlobal`, and would be silently
+ *  skipped otherwise). */
+function emitGlobal(e: GlobalEvent) {
+  const stamped = stampPipelineParent(e);
+  for (const fn of globalListeners) {
+    try {
+      fn(stamped);
+    } catch (err) {
+      console.error(`[agetor] global event listener threw on ${stamped.kind}:`, err);
+    }
+  }
+}
+
+/**
+ * Publish an app-wide lifecycle event from outside the orchestrator (e.g.
+ * the auto-updater). Exported so subsystems with their own lifecycle don't
+ * have to re-implement the listener set — there's exactly one
+ * `subscribeGlobal` channel and the SSE endpoint that feeds the UI is wired
+ * to it once.
+ */
+export function publishGlobalEvent(e: GlobalEvent): void {
+  emitGlobal(e);
+}
+
+/** Canonicalize CR/LF in user-supplied text before it's emitted as a
+ *  `user` stream event. The JSONL emit path in claude-tmux.ts does the
+ *  same — keeping both sides symmetric guarantees the panel's dedup
+ *  (keyed on `data.slice(0,200)`) collapses live + JSONL into one
+ *  bubble even when the input arrived with Windows line endings
+ *  (`\r\n`) from a clipboard paste. */
+function normalizeUserText(s: string): string {
+  return s.replace(/\r\n?/g, "\n");
+}
+
+/**
+ * Update a task's column and broadcast the transition. Reads the row's
+ * current column first so the global event carries `prev` — saves the UI
+ * from keeping its own diff state. Pass `null` for `runId` when the change
+ * isn't tied to a specific run (e.g. orphan reconciliation).
+ */
+function updateColumn(
+  taskId: string,
+  runId: string | null,
+  next: ColumnId,
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline",
+): void {
+  const before = tasks.get(taskId);
+  const prev: ColumnId | null = before?.column ?? null;
+  tasks.update(taskId, { column: next });
+  if (prev !== next) {
+    emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
+  }
+}
+
+/**
+ * Thin export of `updateColumn` (module-private otherwise) for
+ * `pipeline-runner.ts` — every column transition the runner drives (a step
+ * task settling to `done`, the parent mirroring running/blocked/review/
+ * ready) rides the `"pipeline"` reason so the UI/CLI can tell a
+ * runner-driven transition apart from an ordinary one (docs/plans/pipelines.md
+ * D12).
+ */
+export function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): void {
+  updateColumn(taskId, runId, next, "pipeline");
+}
+
+/**
+ * M7: true when `task` is a pipeline step row (`pipelineParentId` set) whose
+ * parent pipeline task no longer exists — the parent row was itself deleted
+ * (`deleteTask` cascades every step first, but a step can also be left
+ * behind by a bug, a partial cascade failure, or on-disk state predating
+ * this fix) with no legitimate way left to "act on the pipeline task
+ * instead". The ordinary step-task guards on `deleteTask`/`archiveTask` (and
+ * `server.ts`'s matching route checks) exempt exactly this case: routing the
+ * user at a parent that's already gone would leave the orphaned step
+ * permanently undeletable/unarchivable.
+ */
+export function isOrphanedPipelineStep(task: Task): boolean {
+  return task.pipelineParentId != null && tasks.get(task.pipelineParentId) == null;
+}
+
+/**
+ * A task is "held" when its terminal run already succeeded but background
+ * agents are still running. Derived purely from the DB (not the in-memory
+ * `active` map) so the answer survives a restart and doesn't depend on
+ * whether the subagent's settle fired before or after the run's completion
+ * landed — either interleaving reads the same committed rows.
+ *
+ * Split into a pure `(task) => boolean` predicate plus a taskId-keyed
+ * wrapper so callers that already hold a freshly-fetched `Task` row (e.g.
+ * `reapIdleSessions`'s per-candidate guard) can reuse it without a second,
+ * redundant `tasks.get`.
+ */
+function isTaskHeldByBackgroundAgents(task: Task): boolean {
+  if (task.column !== "running" || task.runId == null) return false;
+  if (runs.get(task.runId)?.status !== "succeeded") return false;
+  return subagents.hasRunning(task.id);
+}
+
+/** Exported for `pipeline-runner.ts` (M-R3): a step task whose turn
+ *  succeeded but whose background subagents are still running has NOT
+ *  settled as far as the pipeline is concerned — the runner keeps that
+ *  execution active until `maybeReleaseHeldTask` releases it. */
+export function isHeldByBackgroundAgents(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  return task ? isTaskHeldByBackgroundAgents(task) : false;
+}
+
+/**
+ * Flip a held task to `review` once its last subagent finishes. Called on
+ * every subagent completion (via the settle hook), so it must be cheap and
+ * safe to call repeatedly — it no-ops unless the task is still held-and-clear:
+ * the user hasn't moved the card, the terminal run still succeeded, and no
+ * subagent is left running. A newer in-flight run (status !== succeeded) also
+ * bails, so a held release can't stomp a follow-up turn's `running` state.
+ *
+ * Drains the session's JSONL FIRST (docs/plans/handoff-identification-fix.md,
+ * RC1). The subagent watcher scans the same JSONL independently of the
+ * session tailer, so it can settle the last subagent — and reach this hook —
+ * a few hundred ms before the tailer has dispatched the very
+ * `<task-notification>` line that starts Claude's auto-continuation. Without
+ * the drain the release would flip the card to `review` (and a pipeline step
+ * would settle the pre-continuation run) a beat before the continuation is
+ * adopted. With it, a line that is already on disk is dispatched now:
+ * `maybeAdoptContinuation` points `task.runId` at a `running` continuation run
+ * and the fresh read below bails on the `!== "succeeded"` check. The drain is
+ * a no-op when this hook is reached from inside the tailer's own dispatch
+ * (re-entry guard) — there the tailer already adopted ahead of the settle —
+ * and it never fires a staged end_turn. A release whose notification line is
+ * not on disk yet (the `checkDone`/`checkStale` paths) still releases; the
+ * pipeline runner's release grace covers that case.
+ */
+function maybeReleaseHeldTask(taskId: string): void {
+  // A delete or archive tearing the task's session down settles its subagent
+  // rows on the way out; moving the card to `review` then would fire a column
+  // event, a toast, an OS notification and the pipeline runner's column
+  // listener for a task that is going away (or already frozen).
+  if (deletingTaskIds.has(taskId)) return;
+  drainSessionJsonl(taskId);
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null || task.column !== "running" || task.runId == null) return;
+  if (runs.get(task.runId)?.status !== "succeeded") return;
+  if (subagents.hasRunning(taskId)) return;
+  updateColumn(taskId, task.runId, "review");
+}
+
+/**
+ * Pull a `review` card back to `running` when a background agent is
+ * discovered (newly, or once again) `running` for its task — the mirror
+ * image of `maybeReleaseHeldTask` above. Fired from claude-subagents.ts'
+ * `setParkedDiscoveryHandler` on every fresh-insert or resumed-running edge,
+ * so it must be cheap and idempotent (a no-op call is the common case: most
+ * discoveries happen while the card is already `running`, not `review`).
+ *
+ * Deliberately narrow — only `review → running`, and only when the card's
+ * own terminal run actually `succeeded` (i.e. this looks like the #92 hold
+ * shape: the visible turn finished, background work continued after it).
+ * Never pulls from `done`/`blocked`/`ready`/`backlog` — those encode user
+ * intent or an error state the discovery of a background agent must not
+ * override.
+ */
+function pullBackParkedTask(taskId: string): void {
+  const task = tasks.get(taskId);
+  if (!task || task.column !== "review" || task.runId == null) return;
+  if (runs.get(task.runId)?.status !== "succeeded") return;
+  const runId = task.runId;
+  updateColumn(taskId, runId, "running");
+  const data = "background agent active — task pulled back to running";
+  saveAndEmit({ runId, taskId, stream: "status", data });
+}
+
+/** Test hook: drive the event bus directly to verify SSE routing without
+ *  needing a live agent. Not part of the public surface. */
+export function __emitForTest(e: RunEvent): void {
+  emit(e);
+}
+
+/** Test hook: drive the global event bus directly to verify the `/events`
+ *  SSE wiring without orchestrating a real run. Not part of the public
+ *  surface. */
+export function __emitGlobalForTest(e: GlobalEvent): void {
+  emitGlobal(e);
+}
+
+/**
+ * Test hook: build and immediately fire a `makeChunkHandler` chunk for a
+ * given run/task — the SAME handler real runs use (`runs.appendEvent` +
+ * SSE emit + todo-progress/claude-plan detection + the api-error/
+ * session-died/unknown-command sentinel checks). Lets orchestrator-level
+ * tests (e.g. `orchestrator-claude-plan.test.ts`) drive synthetic
+ * `tool_use`/`tool_result` chunks through the real detection pipeline
+ * without a canned fake-driver scenario for every shape under test. Not
+ * part of the public surface. */
+export function __dispatchChunkForTest(
+  runId: string,
+  taskId: string,
+  kind: AgentKind,
+  stream: RunEvent["stream"],
+  data: string,
+  lineUuid?: string,
+): void {
+  makeChunkHandler(runId, taskId, kind, null)(stream, data, lineUuid);
+}
+
+/**
+ * Bridge: interactions.ts publishes new/resolved entries here so they ride the
+ * same SSE stream the UI is already subscribed to (the UI distinguishes them
+ * from regular log events via `stream === "interaction"`) AND the app-level
+ * global bus so the notification hook can alert the user.
+ *
+ * Both bridges are installed exactly once, at module load (below). The
+ * resolved bridge emits the per-task `interaction_resolved` SSE event AND the
+ * global `interaction`/`resolved` event, which the webview tracker and the
+ * native-notification removal hooks rely on.
+ *
+ * `setBroadcaster`/`setResolvedBroadcaster` install a single process-wide
+ * callback and return the one they replaced, so a test that overrides them to
+ * capture raw broadcasts must restore the returned fn when done. Exported and
+ * idempotent so a test can also re-install the real wiring outright.
+ */
+export function wireInteractionBroadcast(): void {
+  setRunEventEmitter(emit);
+  setBroadcaster((req: AnyRequest, reason) => {
+    emit({
+      runId: req.runId,
+      taskId: req.taskId,
+      stream: "interaction",
+      data: JSON.stringify(req),
+      ts: req.createdAt,
+    });
+    // A delivery change republishes the same card. The panel needs that
+    // payload; a second app-level "pending" event would alert again and
+    // bump the board's pending count for a prompt that is already showing.
+    if (reason === "update") return;
+    // Also ride the app-level bus so the notification hook can alert the user
+    // even when no panel for this task is open (or it's open but the window is
+    // backgrounded and can't repaint the card). The per-task `interaction`
+    // event above only reaches the RunPanel subscribed to this task.
+    emitGlobal({
+      kind: "interaction",
+      taskId: req.taskId,
+      runId: req.runId,
+      state: "pending",
+      interactionId: req.id,
+      ts: req.createdAt,
+      // Forwarded off the request itself (interactions.ts stamps it at
+      // registration); `emitGlobal`'s own stamp only fills it when absent.
+      ...(req.pipelineParentId ? { pipelineParentId: req.pipelineParentId } : {}),
+    });
+  });
+
+  // Companion bridge for the *removal* side. Every answer*/cancel* path in
+  // interactions.ts calls into this, so the run panel can drop the card
+  // immediately instead of waiting for a refresh poll. Without this, scraper
+  // auto-cancel and run-cancellation leave stale cards in the panel (the
+  // existing additions-only SSE plumbing has no way to signal "this is gone").
+  setResolvedBroadcaster((res: InteractionResolved) => {
+    emit({
+      runId: res.runId,
+      taskId: res.taskId,
+      stream: "interaction_resolved",
+      data: JSON.stringify({ id: res.id, kind: res.kind }),
+      ts: Date.now(),
+    });
+    // App-level companion to the pending emit above — lets the notification
+    // hook clear its "Waiting on you" alert once the last prompt is gone.
+    emitGlobal({
+      kind: "interaction",
+      taskId: res.taskId,
+      runId: res.runId,
+      state: "resolved",
+      interactionId: res.id,
+      ts: Date.now(),
+      ...(res.pipelineParentId ? { pipelineParentId: res.pipelineParentId } : {}),
+    });
+  });
+}
+
+// The single install of both bridges. Nothing else in production may call
+// setBroadcaster/setResolvedBroadcaster: a second install REPLACES the first,
+// which is how the global `interaction`/`resolved` event once went missing
+// (a per-task-only resolved bridge used to be installed right after this).
+wireInteractionBroadcast();
+
+/**
+ * Decide what to do with runs left in `status='running'` from a previous
+ * agetor process. For claude-code runs whose tmux session is still alive
+ * (the REPL is detached — it survives our exit), we *reattach* and resume
+ * tailing claude's JSONL; the run stays in `running` and the user picks up
+ * where they left off. Anything else (tmux gone, JSONL missing, codex run
+ * whose child process died with us) is flipped to `orphaned`.
+ *
+ * We never enumerate-and-kill `agetor-*` sessions here. Agetor runs on the
+ * user's *shared* default tmux socket, so a blind sweep would reap sessions
+ * belonging to a different agetor instance (dev vs release DB) or to a
+ * `bun test` run — the bug this deliberately avoids. Every kill agetor issues
+ * is keyed to a specific task id from *this* instance's own DB (see the
+ * per-row `killSessionByName` below, `killTaskSession` on delete/archive, and
+ * codex's own teardown), so it can never touch a foreign instance's sessions.
+ * A genuinely-leaked session (crash artifact, or a task deleted while agetor
+ * was offline) is simply left alive rather than risk killing a live one.
+ *
+ * Called once at boot from `src/bun/index.ts`.
+ */
+/** How long after a claude run started its session JSONL may still be missing
+ *  without that meaning the session is broken: claude writes the file when it
+ *  takes the first prompt, a few seconds after the spawn — or, on a big
+ *  project, as late as the spawner's own boot timeout. Sized past
+ *  `CLAUDE_BOOT_TIMEOUT_MS` so a slow boot whose previous owner handed off
+ *  mid-launch is never killed as "JSONL missing" while it is still healthy. */
+export const CLAUDE_JSONL_APPEAR_GRACE_MS = CLAUDE_BOOT_TIMEOUT_MS + 5_000;
+
+export async function reconcileOrphans(): Promise<number> {
+  // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
+  // the latest run row. If agetor crashed in the narrow window between
+  // `sendTurnInExistingSession` inserting Run2 and `attachDoneHandler`
+  // marking Run1 succeeded, the DB has two `running` rows for the same
+  // task; only the latest reflects the user's current intent. Older
+  // siblings get flipped to orphaned so we never have two SessionState
+  // objects fighting for the same tmux session.
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string; started_at: number }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent, started_at FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  ).all();
+
+  const reattachedTaskIds = new Set<string>();
+  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
+
+  for (const row of stale) {
+    const task = tasks.get(row.task_id);
+    const prevColumn: ColumnId | null = task?.column ?? null;
+    const kind = resolveHarness(row.agent)?.kind ?? null;
+    // claude-code, codex, gemini, antigravity, opencode and copilot runs can
+    // be reattached when their detached tmux session is still alive. Cursor
+    // and fx are ACP over stdio: a `running` row is orphaned (cursor also
+    // kills a leftover tmux name from the old driver, then rebuilds open
+    // questions from `cursor_asks`). The reattach key differs by kind: claude
+    // needs its JSONL session uuid (`claude_session_id`), codex needs its
+    // thread id (`codex_session_id`), gemini needs its self-issued uuid
+    // (`gemini_session_id`), antigravity needs its conversation id
+    // (`antigravity_session_id`), opencode needs its discovered `ses_…` id
+    // (`opencode_session_id`), copilot needs its self-issued uuid
+    // (`copilot_session_id`). Codex, gemini, antigravity, opencode and copilot
+    // sessions only live while their turn is in flight, so a reattachable one
+    // was still running when agetor restarted. If we already reattached a
+    // newer sibling for this task, orphan the older one — only one
+    // SessionState can drive a given tmux session at a time.
+    if (kind === "cursor") {
+      // ACP has no mid-turn reattach. A name left from the old tmux driver
+      // is this task's own session; kill that one, then orphan the row.
+      if (row.tmux_session) {
+        try {
+          await killSessionByName(row.tmux_session);
+        } catch (err) {
+          console.warn(`[agetor] could not kill leftover cursor tmux ${row.tmux_session}:`, err);
+        }
+      }
+      orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
+      continue;
+    }
+
+    const reattachKey =
+      kind === "claude-code" ? row.claude_session_id
+      : kind === "codex" ? row.codex_session_id
+      : kind === "gemini" ? row.gemini_session_id
+      : kind === "antigravity" ? row.antigravity_session_id
+      : kind === "opencode" ? row.opencode_session_id
+      : kind === "copilot" ? row.copilot_session_id
+      : null;
+    // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
+    // `running` fx row at boot always takes the orphaned→ready path.
+    // Split into a cheap sync pre-check and a separate async liveness probe
+    // (rather than one `&&` chain) — `sessionExistsByName` is genuinely async
+    // now (wave 1), and a boolean-context `&&` with an un-awaited Promise
+    // operand would evaluate to always-truthy (the Promise object itself),
+    // silently skipping the actual liveness check. The `if` guard preserves
+    // the original short-circuit (never probes tmux for a row that can't
+    // possibly reattach) and keeps TS's narrowing of `row.tmux_session` to
+    // `string` for everything below.
+    let canTryReattach = false;
+    if (
+      (kind === "claude-code" || kind === "codex" || kind === "gemini" || kind === "antigravity" || kind === "opencode" || kind === "copilot")
+      && task !== null
+      && row.tmux_session !== null
+      && reattachKey !== null
+      && !reattachedTaskIds.has(row.task_id)
+    ) {
+      canTryReattach = await sessionExistsByName(row.tmux_session);
+    }
+
+    if (canTryReattach && task) {
+      // Attribute any event-loop stall during this reattach (JSONL re-tail,
+      // tmux probes, DB seeding) to the task, so the lag monitor names it in
+      // the log and on the run instead of reporting an anonymous stall.
+      const endLag = beginLagLabel(`boot reattach · task ${row.task_id}`, { taskId: row.task_id, runId: row.id });
+      try {
+        const cwd = task.worktreePath ?? task.workdir;
+        const harness = resolveHarness(task.agent);
+        const onChunk = makeChunkHandler(row.id, row.task_id, kind as AgentKind, task.mode);
+        const spawned = kind === "claude-code"
+          ? await reattachSession({
+              taskId: row.task_id,
+              cwd,
+              sessionId: row.claude_session_id as string,
+              configDir: harness?.home ?? null,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              mode: task.mode,
+              // A session spawned moments before the previous owner exited (an
+              // app taking the port over from a live background core) may not
+              // have written its JSONL yet: wait for it rather than killing a
+              // healthy session as "JSONL missing".
+              jsonlWaitUntil: row.started_at + CLAUDE_JSONL_APPEAR_GRACE_MS,
+            })
+          : kind === "codex"
+          ? await reattachCodexSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : kind === "gemini"
+          ? await reattachGeminiSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : kind === "opencode"
+          ? await reattachOpencodeTurn(row.id, row.task_id, row.agent, row.tmux_session as string, cwd, onChunk)
+          : kind === "antigravity"
+          ? await reattachAntigravitySession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : await reattachCopilotSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              sessionId: row.copilot_session_id as string,
+              copilotHome: copilotHome({ harnessHome: harness?.home ?? null, harnessEnv: harness?.env ?? null }),
+              mode: task.mode ?? defaultModeFor("copilot"),
+              model: task.model ?? DEFAULT_MODEL.copilot,
+              onSubagent: makeCopilotSubagentSink(row.id, row.task_id),
+            });
+        if (spawned) {
+          registerActiveRun(row.id, row.task_id, task, spawned);
+          // Pre-seed `handle.apiError` when the prior process had already
+          // emitted the api-error status to run_events for this run. The
+          // reattach replay can't re-emit it — the assistant-line uuid is in
+          // seenLineUuids, so `dispatchLine` short-circuits before the
+          // mapper runs — so without this seed `attachDoneHandler` would
+          // resolve with `wasApiError=false` and bounce the column from the
+          // (correctly-persisted) `blocked` back to `review` on the first
+          // pending-end-turn fire. `hasPriorApiErrorStatus` pins the
+          // `(run_id)` index (a bare EXISTS let the planner walk the whole
+          // `status` stream) and ignores subagent tailers' own transient
+          // api-error rows (`subagent_id IS NULL`, since #81), which must not
+          // seed the main run's apiError.
+          const priorApiError = runs.hasPriorApiErrorStatus(row.id, CLAUDE_API_ERROR_STATUS_PREFIX);
+          if (priorApiError) {
+            const handle = active.get(row.id);
+            if (handle) handle.apiError = true;
+          }
+          attachDoneHandler(row.id, row.task_id, spawned);
+          reattachedTaskIds.add(row.task_id);
+          // Visible seam in the run panel so the user can tell where the
+          // process boundary is. Non-JSONL chunk → no dedup key needed.
+          onChunk("status", "reconnected to live session after agetor restart");
+          continue;
+        }
+        // JSONL missing despite live tmux — can't safely resume; kill the
+        // session and fall through to orphan marking.
+        await killSessionByName(row.tmux_session as string);
+      } finally {
+        endLag();
+      }
+    }
+    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
+  }
+
+  const now = Date.now();
+  if (orphaned.length > 0) {
+    const reconcile = db.transaction(() => {
+      for (const row of orphaned) {
+        db.run(
+          `UPDATE runs SET status = 'orphaned', ended_at = ?, exit_code = -1 WHERE id = ?`,
+          [now, row.id],
+        );
+        db.run(
+          `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
+          [row.id, "status", "orphaned — agetor restarted while this run was active", now],
+        );
+        db.run(
+          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
+          [row.task_id],
+        );
+        // Copilot owns its subagent rows (the claude watcher is the only other
+        // writer, and its rows are retired by the held-task pass below). A
+        // dead copilot run can never settle its tabs, and a row left `running`
+        // would read as a live background agent forever.
+        if (row.kind === "copilot") subagents.settleRunningForRun(row.id, "orphaned", now);
+      }
+    });
+    reconcile();
+    for (const row of orphaned) {
+      emitGlobal({
+        kind: "run-status",
+        taskId: row.task_id,
+        runId: row.id,
+        status: "orphaned",
+        ts: now,
+      });
+      if (row.prevColumn === "running") {
+        emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
+      }
+    }
+  }
+
+  // Deliberately NO straggler sweep here. Sessions live on the shared default
+  // tmux socket, so enumerating + killing every un-reattached `agetor-*`
+  // session would reap a sibling instance's (dev vs release DB) or a test
+  // run's live sessions. We reattach what we can, orphan the rest in the DB,
+  // and leave any unaccounted-for session alive.
+  if (reattachedTaskIds.size > 0) {
+    console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
+  }
+  if (orphaned.length > 0) {
+    console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
+  }
+
+  // Open Cursor questions survive the process. Rebuild them from cursor_asks
+  // after the orphan writes, so a card's follow-up
+  // addresses a task that is no longer `running`.
+  try {
+    rebuildOpenCursorAsks();
+  } catch (err) {
+    console.warn("[agetor] could not rebuild open cursor questions:", err);
+  }
+
+  // Held tasks — and, more generally, ANY task with a stuck `running`
+  // subagents row — are invisible to the pass above: their terminal run is
+  // already `succeeded`, so it never appears in the `status='running'` scan
+  // and nothing re-arms the subagent watcher that would eventually release
+  // the card. Left alone, a restart strands them forever. This used to only
+  // scan `tasks WHERE column = 'running'`, which covers the classic
+  // held-in-running case but has a blind spot: a `review`/`done`-column task
+  // whose subagents row is still `running` after a restart (the terminal run
+  // resolved and moved the card out of `running` *before* the crash, so the
+  // old scan skipped it entirely) was invisible here too — nothing ever
+  // re-armed its watcher or orphaned its rows, and the badge/tab dot stayed
+  // stuck forever. Source the wider set instead: every task with at least
+  // one `running` subagents row, regardless of column.
+  let reArmed = 0;
+  let released = 0;
+  const heldTaskIds = subagents.taskIdsWithRunning();
+  for (const heldId of heldTaskIds) {
+    const task = tasks.get(heldId);
+    if (!task) continue;
+    const heldKind = resolveHarness(task.agent)?.kind ?? null;
+    // OpenCode rows settle at turn end (the export refresh in the driver's
+    // `beforeSettle`). Only a reattached OpenCode tail (above) will still run
+    // one; with none — the turn died with the restart, or the task has since
+    // switched harness — nothing ever will, so orphan them now. The settle
+    // hook then releases a held card. Runs before the claude branch so a
+    // claude task's leftover OpenCode rows can't hold it either.
+    const openCodeTailLive = heldKind === "opencode" && opencodeSessionActive(heldId);
+    if (!openCodeTailLive) {
+      released += orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
+    }
+    if (heldKind !== "claude-code") {
+      // A live OpenCode tail owns its own rows (its `beforeSettle` retires
+      // them); the generic orphaning below would pull them out from under it.
+      if (openCodeTailLive) continue;
+      // Copilot is the other subagent-row writer, but only through its
+      // per-turn sink: no watcher ever re-arms for a copilot row, so a row
+      // still `running` outside a live turn (its run's in-turn `settleAll`
+      // write failed, or the task's harness changed) can never settle. A
+      // reattached copilot turn owns its OWN run's rows — leave those to its
+      // sink — and every other run's rows are retired through that run's
+      // sink, so the lifecycle events and the held-task release fire exactly
+      // as on a normal settle. Any other kind (claude rows left behind by a
+      // harness switch) has nothing that could ever settle them either.
+      const liveRunId = heldKind === "copilot" && reattachedTaskIds.has(heldId) ? task.runId : null;
+      if (liveRunId) {
+        const staleRunIds = new Set(
+          subagents
+            .listForTask(heldId)
+            .flatMap((r) => (r.status === "running" && r.runId && r.runId !== liveRunId ? [r.runId] : [])),
+        );
+        for (const staleRunId of staleRunIds) {
+          makeCopilotSubagentSink(staleRunId, heldId).settleAll("orphaned");
+          released++;
+        }
+      } else {
+        orphanRunningSubagents(heldId);
+        released++;
+      }
+      continue;
+    }
+    if (!subagents.hasRunning(heldId)) continue;
+
+    if (task.column === "running") {
+      // Classic held-task path, unchanged: only proceed when the terminal run
+      // has actually succeeded (i.e. this is a genuinely stuck "held for
+      // background agents" task, not an ordinary run still legitimately in
+      // progress that just happens to also have live subagent rows).
+      if (!isHeldByBackgroundAgents(heldId)) continue;
+      if (await sessionExistsByName(sessionNameFor(heldId))) {
+        const run = task.runId ? runs.get(task.runId) : null;
+        // No JSONL session id means no watch directory to derive, so nothing will
+        // ever observe these agents finishing. Treat it exactly like a dead
+        // session and release, rather than leaving the card held forever.
+        if (!run?.claudeSessionId) {
+          orphanRunningSubagents(heldId);
+          released++;
+          continue;
+        }
+        const cwd = task.worktreePath ?? task.workdir;
+        const harness = resolveHarness(task.agent);
+        // `.ready` = the seed finished: the boot path waits for each watcher's
+        // seed (so the held-task decision below sees a consistent view) but
+        // the seed itself is cooperative and yields to the event loop.
+        await attachSubagentWatcher({
+          taskId: heldId,
+          runId: run.id,
+          jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
+        }).ready;
+        reArmed++;
+      } else {
+        // Session gone: no watcher could ever observe these agents finishing, so
+        // flip the rows now. `orphanRunningSubagents` fires the settle hook →
+        // `maybeReleaseHeldTask` → the card advances to `review`.
+        orphanRunningSubagents(heldId);
+        released++;
+      }
+      continue;
+    }
+
+    // Blind-spot path: any column other than `running` (review, done, ready,
+    // blocked, archived or not). `isHeldByBackgroundAgents` doesn't apply
+    // here — it only ever looks at `column === 'running'` rows — but the
+    // task's terminal run resolved normally (that's how the card got out of
+    // `running` before the crash), so `task.runId` still reliably points at
+    // that succeeded run and its `claudeSessionId`. Mirror the exact same
+    // session-alive / session-id-recoverable branch structure as above.
+    // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
+    // watchers and flip DB rows.
+    if (await sessionExistsByName(sessionNameFor(heldId))) {
+      const run = task.runId ? runs.get(task.runId) : null;
+      if (!run?.claudeSessionId) {
+        orphanRunningSubagents(heldId);
+        released++;
+        continue;
+      }
+      const cwd = task.worktreePath ?? task.workdir;
+      const harness = resolveHarness(task.agent);
+      await attachSubagentWatcher({
+        taskId: heldId,
+        runId: run.id,
+        jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
+      }).ready;
+      reArmed++;
+    } else {
+      // Session gone: orphan the rows. Unlike the held-in-running case, the
+      // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
+      // isn't `running`), so this only clears the stale subagent rows — it
+      // does not move the card, which is already sitting wherever the user
+      // (or the earlier normal completion) left it.
+      orphanRunningSubagents(heldId);
+      released++;
+    }
+  }
+  if (reArmed > 0 || released > 0) {
+    console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} background-agent row(s)`);
+  }
+
+  return orphaned.length;
+}
+
+/**
+ * Wraps `spawnAgent` so a failure inside it — either a *synchronous* throw
+ * before a process is ever spawned (`buildCommand` can throw on gemini's
+ * argv-size cap, "model is required", …) or an *async rejection* partway
+ * through spawning (e.g. a `git` failure inside `buildCodexCommand`'s
+ * external-git escalation check, or any other awaited step of `spawnAgent`
+ * that rejects) — can't strand the run row it was called for. `await
+ * spawnAgent(args)` inside the `try` catches both shapes identically; the
+ * catch block below doesn't need to know which one fired. Every call site
+ * below has already inserted the run row and flipped the task to `running`
+ * by the time it calls this, so on a throw/rejection there's persisted state
+ * to unwind: emit the error as a stderr chunk, fail the run, and bounce the
+ * task back to `ready` — the same recovery each call site already does for a
+ * missing harness (see the neighboring `if (!harness)` branches). Returns
+ * `{ agent: null, message }` on failure so callers can early-return exactly
+ * the way they already did when this returned a bare `null` (`if (!agent)`
+ * still works unchanged after destructuring), while `startTask` — the one
+ * call site that needs to surface *why* — can report `message` instead of a
+ * generic "check the run log" string. `args` carries `runId`/`taskId`/
+ * `onChunk` itself (see `SpawnAgentArgs`), so there's no separate parameter
+ * for them.
+ */
+async function spawnAgentOrFail(
+  args: SpawnAgentArgs,
+): Promise<{ agent: SpawnedAgent; message?: undefined } | { agent: null; message: string }> {
+  try {
+    return { agent: await spawnAgent(args) };
+  } catch (err) {
+    const { runId, taskId, onChunk } = args;
+    const message = err instanceof Error ? err.message : String(err);
+    onChunk("stderr", `failed to start agent: ${message}`);
+    // H1: capture "was this the task's current run" BEFORE the row update
+    // below clears `runId`, so the terminal `run-status` emit can be gated on
+    // exactly the condition the done handler's own `isTerminalRun` uses. No
+    // done handler will ever fire for this run (the agent never registered),
+    // so this is the ONLY terminal signal a subscriber — the pipeline
+    // runner, the UI's toasts — gets for a spawn that never started; without
+    // it a pipeline step whose spawn threw sat `running` forever.
+    const wasCurrentRun = tasks.get(taskId)?.runId === runId;
+    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    tasks.update(taskId, { column: "ready", runId: null });
+    if (wasCurrentRun) {
+      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+    }
+    return { agent: null, message };
+  }
+}
+
+/**
+ * Race a spawn-in-progress continuation promise against
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) so a slow agent
+ * launch never holds an HTTP response open. Clears its timer on whichever
+ * side wins — the same discipline `resolveClaudeTurnOutcome` uses below for
+ * `PASTE_OUTCOME_TIMEOUT_MS` — so a settled-early spawn doesn't leave a
+ * timer running (which would otherwise hold the Bun test runner open for up
+ * to `ms` past the real settle on every test exercising this path).
+ *
+ * `p` must never reject — every caller here builds it from a continuation
+ * that already catches its own errors (mirroring `spawnAgentOrFail`, which
+ * never throws either), so a rejection reaching this helper would be a bug
+ * upstream, not something this helper papers over.
+ */
+async function raceSpawnBudget<T>(
+  p: Promise<T>,
+  ms: number,
+): Promise<{ settled: true; value: T } | { settled: false }> {
+  // Defensive, belt-and-braces: `p` is documented above to never reject, but
+  // if that invariant is ever broken by a bug upstream, this attaches a
+  // rejection handler directly to `p` — separate from the `.then()`
+  // derivation below that `Promise.race` actually consumes — so a rejection
+  // arriving after the timeout has already won the race can never surface as
+  // a process-level unhandledRejection; it only logs. This handler is
+  // fire-and-forget and never rethrows, so it can't itself produce a
+  // rejection to go unhandled. Race semantics are unchanged: if `p` rejects
+  // BEFORE the timeout, `settled` below still rejects and `Promise.race`
+  // still rejects this function's own promise, exactly as before — every
+  // caller already wraps that.
+  p.catch((err) => {
+    console.error("[agetor] spawn continuation rejected:", err);
+  });
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<{ settled: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ settled: false }), ms);
+  });
+  const settled = p.then((value): { settled: true; value: T } => ({ settled: true, value }));
+  const result = await Promise.race([settled, timeout]);
+  clearTimeout(timer!);
+  return result;
+}
+
+/**
+ * Guards against two overlapping "mint a fresh run for this task" calls
+ * racing each other. The same failure shape shows up at every entry point
+ * that (a) reads `task.runId && active.has(task.runId)` (or, for claude,
+ * the `sessionLiveness`/`hasSessionState` equivalent) as "nothing in flight
+ * for this task", then (b) walks a chain of awaits — `pendingTeardown`,
+ * `checkHarness`, `prepareWorkdir`, `resolveRef`, `sessionLiveness`, the
+ * async `spawnAgentOrFail` itself — before it has registered the new run in
+ * `active` or (for codex/cursor/gemini/fx) even written `task.runId` via
+ * `tasks.update`. A second overlapping call can read that same stale "idle"
+ * snapshot before the first call's DB write lands, race in behind it, and
+ * reach its own mint path too: two run rows, two spawned agents — or worse,
+ * the second spawn's unconditional tmux pre-kill (`spawnClaudeViaTmux` et
+ * al.) tearing down the first turn's session mid-spawn — for one task.
+ *
+ * ONE module-level set closes this window for every caller that mints a
+ * fresh run without an existing one to fold into:
+ *   - `startTask`'s wrapper directly below (double clicks / rapid re-POSTs
+ *     to `/tasks/:id/start`);
+ *   - claude's idle/dead-session mint paths (`sendClaudeTurn`'s fresh-spawn
+ *     branch and `sendTurnInExistingSession`'s idle branch) — these used to
+ *     share a separate `startingClaudeIdleTurns` set; unified here so a
+ *     `startTask` and a claude idle-send can't each claim their own
+ *     disjoint keyspace and both mint against the same task;
+ *   - the four one-shot `spawn{Codex,Cursor,Gemini,Fx}TurnNow` functions,
+ *     which claim at entry (before `runs.insert`) and release in `finally`.
+ *
+ * Deliberately NOT claimed by claude's fold-while-busy path (`pasteFollowUp`,
+ * inside `sendTurnInExistingSession`, above its idle branch) — folding a
+ * message into an already-active run is safe under any amount of
+ * concurrency by design, and serializing it here would only add latency
+ * with no correctness benefit.
+ *
+ * Whichever call claims a taskId first proceeds through its whole function;
+ * every other overlapping call for the same taskId is rejected immediately
+ * with a friendly "try again" result instead of racing through the awaits
+ * behind it. Trade-off, accepted: a permanently wedged tmux op (its owner
+ * declined to add a timeout) leaves the claim held and that task un-startable
+ * / un-sendable for the remaining lifetime of the process — strictly better
+ * than the old app-wide synchronous hang this replaced, and scoped to one
+ * task rather than the whole app. Revisit if/when that op grows a timeout.
+ *
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) does NOT shrink the
+ * window this claim closes: `startTaskInner` and `spawnResumedSession`
+ * (claude's fresh-spawn path) both respond to their HTTP caller once the
+ * budget elapses, before the underlying `spawnAgentOrFail` has necessarily
+ * settled, but the claim itself is released by the detached continuation's
+ * own `finally` once the spawn actually settles — not by the wrapper that
+ * took the claim returning early. A second overlapping call during that
+ * still-pending stretch keeps hitting the "already starting" guard above for
+ * as long as the real spawn takes, exactly as it did before the budget was
+ * bounded.
+ */
+const startingTaskIds = new Set<string>();
+
+/**
+ * How many agent runs this process is driving right now: registered runs
+ * (`active`) plus spawns that have claimed a task but not yet registered
+ * (`startingTaskIds` — a claim is held through the whole bounded-spawn
+ * pending window, so a launch the HTTP response already answered `pending`
+ * for still counts). The database Compact gate (plan §8 A4) refuses to
+ * `VACUUM` while this is non-zero: a VACUUM holds the single writer for
+ * seconds-to-minutes, which would stall every streaming `run_events` append.
+ * A claude run held open only by background subagents is still in `active`
+ * until it settles, so it counts too.
+ */
+export function activeRunCount(): number {
+  return active.size + startingTaskIds.size;
+}
+
+/**
+ * How many launches this process is still in the middle of: spawns that hold
+ * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
+ * one-shot launches and claude's own pre-JSONL spawn), claude sessions that
+ * haven't written their JSONL yet (`claudeBootsInFlight` — the deferred
+ * > 4 KB first-prompt paste and the startup-dialog confirm both run in this
+ * process), and claude tmux op chains still running (`claudeTmuxOpsInFlight` —
+ * a follow-up paste between its text and its Enter, an ask-card drive). A
+ * launch interrupted by the process exiting leaves a session the next owner
+ * can't reattach or a composer holding half a message, so a core handing the
+ * port off — and the app before it lets a quit through — waits for these.
+ */
+export function launchesInFlight(): number {
+  return startingTaskIds.size + claudeBootsInFlight() + claudeTmuxOpsInFlight();
+}
+
+/** Poll cadence of `waitForLaunchesToSettle`. */
+const LAUNCH_SETTLE_POLL_MS = 100;
+
+/**
+ * Resolves `true` once `launchesInFlight()` is zero, or `false` after
+ * `timeoutMs` with launches still pending. Never rejects.
+ */
+export async function waitForLaunchesToSettle(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (launchesInFlight() === 0) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(Math.min(LAUNCH_SETTLE_POLL_MS, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/** Why a launch was refused once this process stopped taking new work. */
+export const LAUNCHES_FROZEN_REASON =
+  "Agetor is handing its work over to another process — try again in a moment";
+
+/** True once `freezeLaunches` ran: this process is about to exit. */
+let launchesFrozenFlag = false;
+
+/**
+ * Stop taking new work because this process is about to exit — a headless core
+ * handing the port to the app (or stopping), or the app letting a quit through.
+ * Called right before the bounded `waitForLaunchesToSettle`, so nothing new
+ * starts that the wait would then cut off at its deadline. Terminal and
+ * idempotent: the process exits once the wait ends.
+ *
+ * - `startTask`, `sendInput` and `resumeFxRecovery` refuse with
+ *   {@link LAUNCHES_FROZEN_REASON} (an idle-only send also reads `busy`, so
+ *   the pipeline runner's reminder is retried by the next owner instead of
+ *   blocking the step);
+ * - fx auto-resume timers stop (the next owner re-arms them from the DB);
+ * - follow-ups queued behind a running one-shot turn — memory-only, so they
+ *   would die with the process — move to their task's backlog tray now, and a
+ *   turn that settles during the wait stashes its queue instead of draining it;
+ * - the pipeline runner leaves step settles to the next owner's
+ *   `reconcilePipelineRuns` (`launchesFrozen()`).
+ *
+ * Runs already in flight keep going: their tmux sessions outlive the process
+ * and the next owner reattaches them.
+ */
+export function freezeLaunches(): void {
+  if (launchesFrozenFlag) return;
+  launchesFrozenFlag = true;
+  try {
+    stopFxAutoResumeTimers();
+  } catch (err) {
+    console.warn("[agetor] stopping fx auto-resume timers failed:", err);
+  }
+  for (const taskId of tasksWithQueuedFollowUps()) {
+    try {
+      stashQueuedFollowUps(taskId, tasks.get(taskId)?.runId ?? null, "Agetor stopped before it could run");
+    } catch (err) {
+      console.warn(`[agetor] stashing queued follow-ups for task ${taskId} failed:`, err);
+    }
+  }
+}
+
+/** True once {@link freezeLaunches} ran. */
+export function launchesFrozen(): boolean {
+  return launchesFrozenFlag;
+}
+
+/** Test-only: undo {@link freezeLaunches} (it is terminal in production). */
+export function __resetLaunchFreezeForTest(): void {
+  launchesFrozenFlag = false;
+}
+/**
+ * Runs the user asked to Stop while their spawn was still in flight (the
+ * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
+ * is the task's current run, but no `active` handle is registered yet, so
+ * `cancelRun` has nothing to kill. It records the intent here instead and
+ * the detached continuation honors it on settle — kills the just-spawned
+ * agent, drops the claude session, records the run `cancelled` and returns
+ * the task to `ready` — rather than registering a run the user already
+ * stopped. Consumed (deleted) by the continuation on every settle path.
+ */
+const pendingCancelRunIds = new Set<string>();
+
+/**
+ * Tasks the user asked to Stop while a spawn path held their
+ * `startingTaskIds` claim but had not minted its run row yet (codex's
+ * per-model CLI floor probe, `startTask`'s pre-flight): there is no run for
+ * `cancelRun` to record in {@link pendingCancelRunIds}, so
+ * {@link cancelLiveRunOfTask} records the task here. The spawn path converts
+ * it into a run-level pending cancel the moment it mints the run
+ * ({@link adoptPendingTaskCancel}), and `consumePendingCancel` then kills the
+ * turn instead of registering it. Released with the claim
+ * ({@link releaseStartingClaim}), so a claim that ends without a run (a floor
+ * decline, a failed pre-flight) never carries a Stop into a later turn.
+ */
+const pendingCancelTaskIds = new Set<string>();
+
+/**
+ * Hand a Stop recorded against `taskId`'s claim ({@link pendingCancelTaskIds})
+ * to the run the claim just minted. Every spawn path that mints a run under a
+ * `startingTaskIds` claim calls this right after pointing `task.runId` at it,
+ * before it emits the `running` column event, so the pipeline runner already
+ * sees the run as cancelling ({@link isTaskRunCancelling}). Returns whether a
+ * Stop was adopted.
+ */
+function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
+  if (!pendingCancelTaskIds.delete(taskId)) return false;
+  pendingCancelRunIds.add(runId);
+  return true;
+}
+
+/** Release `taskId`'s `startingTaskIds` claim, dropping any Stop recorded
+ *  against the claim that no minted run adopted. */
+function releaseStartingClaim(taskId: string): void {
+  startingTaskIds.delete(taskId);
+  pendingCancelTaskIds.delete(taskId);
+}
+
+/**
+ * Consume a Stop recorded in `pendingCancelRunIds` right before a run would
+ * register — the one hook every spawn path that inserts a run row BEFORE an
+ * `await` must call (`startTaskInner`/`spawnResumedSessionInner` do it
+ * inline, `spawnCodexTurnNow`/`spawnCursorTurnNow`/`spawnGeminiTurnNow`/
+ * `spawnFxRun` and the claude idle mint in `sendTurnInExistingSession` call
+ * this). Returns `false` — nothing consumed — in the common case. When a
+ * Stop was recorded: kills the just-spawned agent (`dropClaudeSession`
+ * additionally tears down a claude tmux session that was created for this
+ * run only — NOT for a turn pasted into a pre-existing live session, where
+ * Stop means "interrupt", same as `stopActiveHandle`), records the run
+ * `cancelled`, and — when the run is still the task's current one — returns
+ * the task to `ready` with a status line. The caller must then skip
+ * `registerActiveRun`/`attachDoneHandler` and settle its own follow-up queue
+ * exactly as it does for a failed spawn.
+ */
+async function consumePendingCancel(
+  runId: string,
+  taskId: string,
+  agent: SpawnedAgent,
+  onChunk: (stream: "status", data: string) => void,
+  opts: { dropClaudeSession: boolean },
+): Promise<boolean> {
+  if (!pendingCancelRunIds.delete(runId)) return false;
+  // Nothing will ever attach a handler to this agent's `done` — swallow the
+  // rejection a kill/drop may produce so it can't become an unhandledRejection.
+  agent.done.catch(() => {});
+  agent.kill();
+  if (opts.dropClaudeSession) await dropSession(taskId);
+  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+  if (tasks.get(taskId)?.runId === runId) {
+    onChunk("status", "cancelled by user before the agent launched");
+    updateColumn(taskId, runId, "ready");
+    // H1: no done handler will ever fire for this run (it never registered),
+    // so emit the terminal transition here — gated exactly like the done
+    // handler's `isTerminalRun` — or a pipeline step stopped mid-spawn would
+    // never reach the runner and its run would sit `running` forever.
+    emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+  }
+  return true;
+}
+
+/**
+ * Resolve which {@link AgentProfileSnapshot} a task should actually launch
+ * with right now — "live" (follows edits to the profile) before the task's
+ * first run, "snapshot" (frozen at whatever it captured) from the first run
+ * on, per the freeze-at-first-run rule (docs/plans/agent-profiles.md D2).
+ * Returns `null` when the task has never been bound to a profile at all
+ * (`agentProfileId` unset AND no stored snapshot — the common "no agent"
+ * case).
+ *
+ * "Live" requires both that `task.agentProfileId` still resolves to a real
+ * row (`agentProfiles.get`) AND that the task has never run
+ * (`runs.countForTask(task.id) === 0`) — a task that ran even once, or whose
+ * profile has since been deleted, falls back to the stored snapshot instead.
+ * The live profile is converted to a snapshot shape via
+ * {@link snapshotFromProfile} using the harness resolved right now
+ * (`resolveHarness(profile.harness)`) so a harness rename/relabel is
+ * reflected — if that harness no longer resolves (deleted out from under an
+ * otherwise-live profile), the stored snapshot is used instead, since there's
+ * no live harness identity left to capture.
+ *
+ * Callers needing to know whether they're looking at a live or frozen value
+ * (`startTaskInner`'s pre-first-run refresh) get that via `source`; callers
+ * that only want "the profile to inject/display right now" (the CLI, the
+ * webview) can just read `.profile`.
+ */
+export function effectiveAgentProfile(
+  task: Task,
+): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
+  if (!task.agentProfileId && !task.agentProfile) return null;
+
+  // Pipeline step tasks are frozen at launch (D8, docs/plans/pipelines.md):
+  // the parent's run snapshot already captured the profile as it was when
+  // the run started, and a step task's `agentProfile` is that exact frozen
+  // copy. Step tasks never enter the "live until first run" window below —
+  // even a fresh step task's very first run must launch with the snapshot,
+  // not a possibly-since-edited live profile.
+  if (task.pipelineParentId) {
+    if (!task.agentProfile) return null;
+    return { profile: task.agentProfile, source: "snapshot" };
+  }
+
+  if (task.agentProfileId && runs.countForTask(task.id) === 0) {
+    const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
+    if (profile) {
+      const harness = resolveHarness(profile.harness);
+      if (harness) {
+        return {
+          profile: snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, Date.now()),
+          source: "live",
+        };
+      }
+    }
+  }
+
+  if (!task.agentProfile) return null;
+  return { profile: task.agentProfile, source: "snapshot" };
+}
+
+/**
+ * Whether `next` (the live profile, converted to snapshot shape) differs
+ * meaningfully from `prior` (whatever's stored on the task row already) —
+ * "meaningfully" excluding `capturedAt`, which is stamped fresh on every call
+ * to {@link effectiveAgentProfile} and would otherwise make this always
+ * `true`, forcing `startTaskInner`'s live-refresh block to `tasks.update`
+ * (bumping `updated_at`) on every single Run click even when the bound
+ * profile hasn't changed at all. `prior === null` (never captured before)
+ * always counts as drifted.
+ */
+export function agentProfileSnapshotDrifted(
+  prior: AgentProfileSnapshot | null,
+  next: AgentProfileSnapshot,
+): boolean {
+  if (!prior) return true;
+  const { capturedAt: _priorCapturedAt, ...priorRest } = prior;
+  const { capturedAt: _nextCapturedAt, ...nextRest } = next;
+  return JSON.stringify(priorRest) !== JSON.stringify(nextRest);
+}
+
+/**
+ * True when `taskId` currently has a live run in flight — mirrors the exact
+ * check `startTask` itself uses to refuse a double-start: either an
+ * `active`-registered handle for the task's current `runId`, or a spawn
+ * claim still held in `startingTaskIds` (the window between `startTask`
+ * minting the claim and the spawn actually registering — including the
+ * bounded-pending continuation described in `startingTaskIds`'s own doc,
+ * where the HTTP response has already returned but the real spawn hasn't
+ * settled yet). Callers that need "is this task actually busy right now" —
+ * as opposed to `task.column === 'running'`, which can lag a beat behind a
+ * just-started or just-settled spawn — should use this instead of
+ * re-deriving the same check inline.
+ */
+export function isTaskRunLive(taskId: string): boolean {
+  if (startingTaskIds.has(taskId)) return true;
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if (task.runId && active.has(task.runId)) return true;
+  // M-R3: a HELD task (terminal run succeeded, background subagents still
+  // running, card parked in `running` by the done handler) has no `active`
+  // handle, but its work genuinely isn't finished — `cancelRun` still has
+  // something to stop (`stopHeldTask`), and the pipeline runner must not
+  // Retry/Advance past it or advance the graph off its handoff until
+  // `maybeReleaseHeldTask` lets it go. Same DB-derived predicate the done
+  // handler and `cancelRun` already agree on.
+  return isTaskHeldByBackgroundAgents(task);
+}
+
+/**
+ * Whether ANY run of `taskId` is live in this process: everything
+ * {@link isTaskRunLive} counts (current run active, a spawn claim, a held
+ * task) plus every other run registered in `active` for the task — a run
+ * that was displaced as `task.runId` (a continuation a reminder run
+ * overwrote, a stranded slot) is still running and still writing to the
+ * shared worktree. In-memory and authoritative: a stale `running` DB row
+ * with no `active` handle (what boot reconcile would orphan) does not count,
+ * so it can never freeze a pipeline step forever. Backs the runner's "never
+ * advance a step while any of its runs is live" rule and the idle-only send
+ * gate (docs/plans/handoff-identification-fix.md D5/D6).
+ */
+export function isAnyRunOfTaskLive(taskId: string): boolean {
+  if (isTaskRunLive(taskId)) return true;
+  for (const handle of active.values()) {
+    if (handle.taskId === taskId) return true;
+  }
+  return false;
+}
+
+/**
+ * True when `taskId`'s current run has been stopped (`stopActiveHandle`
+ * flagged its `active` handle `cancelled`) but the handle hasn't been
+ * removed from `active` yet — the async window between `kill()` being
+ * called and the exit handler's `active.delete` actually running (see the
+ * "live-run check keys on `cancelled`, NOT on `active.has`" note near
+ * `enqueueArchiveTeardown`'s worktree-removal guard for the same window
+ * from the other side). A handle that's absent, or present but not
+ * cancelled, is not "cancelling" — it's either idle or a genuinely live run.
+ */
+export function isTaskRunCancelling(taskId: string): boolean {
+  // Every live handle of the task counts, a displaced one included: a task
+  // whose current run is cancelling but whose displaced continuation is still
+  // running genuinely is not stopping.
+  let any = false;
+  for (const handle of active.values()) {
+    if (handle.taskId !== taskId) continue;
+    if (!handle.cancelled) return false;
+    any = true;
+  }
+  if (any) return true;
+  // A Stop that landed before the current run's agent registered
+  // (`pendingCancelRunIds`): its spawn path will kill it instead of
+  // registering it, so the run is going down even though its row still
+  // reads `running` and no handle exists yet.
+  const currentRunId = tasks.get(taskId)?.runId;
+  return currentRunId != null && pendingCancelRunIds.has(currentRunId) && runs.get(currentRunId)?.status === "running";
+}
+
+/**
+ * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
+ * (see that constant's doc): once the run row exists, the task has flipped
+ * to `running`, and the initial prompt has been echoed as a `user` event,
+ * this responds as soon as either the spawn settles OR the budget elapses —
+ * whichever comes first. On the fast path (spawn settles within budget) the
+ * result is byte-identical to before this bound existed. On the slow path
+ * the result additionally carries `pending: true`: the spawn is still
+ * running detached, and the caller learns the real outcome (success,
+ * failure, session-died, …) from the task's normal event stream rather than
+ * from this HTTP response. See `startingTaskIds`'s doc above for how the
+ * "already starting" claim survives past this function returning early.
+ */
+export async function startTask(
+  taskId: string,
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
+  let task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (launchesFrozenFlag) return { error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" };
+  if (task.runId && active.has(task.runId)) return { error: "task already running" };
+  if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
+  startingTaskIds.add(taskId);
+  return startTaskInner(taskId, task);
+}
+
+/**
+ * Status lines a run start writes about the worktree's checkout. Drift is
+ * tolerated, never corrected (`prepareWorkdir` no longer checks out on reuse),
+ * so when the worktree is on a different named branch than `task.branch` the
+ * run log says so — and, for a PR-head task (`branchSource: "existing"`),
+ * warns that commits there won't reach the pull request. A re-attach that
+ * couldn't restore the recorded checkout adds its own `warning` line.
+ */
+function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string[] {
+  const lines: string[] = [];
+  const live = prepared.checkoutBranch;
+  if (prepared.worktreePath && prepared.branch && live && live !== prepared.branch) {
+    lines.push(
+      task.branchSource === "existing"
+        ? `⚠ worktree is on ${live}, not the PR head branch ${prepared.branch} — commits here will not land on the pull request`
+        : `worktree is on ${live} (task branch ${prepared.branch}) — running there`,
+    );
+  }
+  if (prepared.warning) lines.push(prepared.warning);
+  return lines;
+}
+
+async function startTaskInner(
+  taskId: string,
+  task: Task,
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
+  // Whether ownership of releasing the `startingTaskIds` claim (added by
+  // `startTask` above) has been handed off to the detached spawn
+  // continuation created further down (see its own `finally`). Every return
+  // path ABOVE that point (harness checks, worktree prep, prompt budget, …)
+  // still owns the release itself, via the `finally` below.
+  let claimTransferred = false;
+  try {
+  // An imported Claude Code / OpenCode session already has its transcript.
+  // Run would mint a fresh session and re-execute the prompt in the user's
+  // checkout.
+  const imported = importedSessionOf(task);
+  if (imported) {
+    return {
+      error: imported.kind === "opencode"
+        ? "imported OpenCode session — send a message to continue"
+        : "imported Claude session — send a message to continue",
+      code: "imported-session",
+    };
+  }
+  // startTask auto-unarchives and materializes the worktree below — it must
+  // not race a teardown archiveTask (or deleteTask) deferred for this task,
+  // or a `detachWorktree`/`removeWorktree` still in flight could yank the
+  // directory out from under the freshly-prepared one.
+  await pendingTeardown(taskId);
+
+  // Starting an archived task auto-unarchives it — otherwise the card would
+  // move through columns (running → review/ready) while hidden behind the
+  // archive filter, which is confusing at best.
+  if (task.archivedAt != null) {
+    task = tasks.update(taskId, { archivedAt: null }) ?? task;
+  }
+
+  // Pipeline tasks never spawn an agent themselves — Run instead kicks off
+  // the pipeline runner, which materializes the shared worktree once and
+  // launches the graph's start step (or retries whatever's blocked/
+  // cancelled) as a hidden step task (D1/D9, docs/plans/pipelines.md).
+  // Placed after the pendingTeardown wait and auto-unarchive above (a
+  // pipeline task can be archived/unarchived like any other task) but
+  // before every harness/profile pre-flight below, none of which apply to
+  // the parent row itself — the runner does its own pre-flight per step via
+  // the ordinary `startTask` path for each child.
+  if (task.pipelineId) {
+    return startPipelineRun(task);
+  }
+
+  // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
+  // task's agent profile — if any — BEFORE the harness pre-flight below, so
+  // a live profile edit (including a harness swap) is what actually gets
+  // resolved/checked/spawned, not whatever the task row was last left with.
+  // Only a "live" result (profile still exists AND the task has never run)
+  // triggers a copy-down; a "snapshot" result means the task already ran at
+  // least once and must launch with exactly what it launched with before —
+  // nothing to refresh, `effective` below just carries it through unchanged.
+  const resolvedProfile = effectiveAgentProfile(task);
+  if (resolvedProfile?.source === "live") {
+    const { profile } = resolvedProfile;
+    // A profile's own `effort: null` means "no opinion" — but a model that
+    // requires an effort flag (`buildCommand`'s "effort is required for …"
+    // throw) must still get a real default here, same as the no-profile path
+    // in `createTask`. Only the resolved task-row `effort` gets this
+    // treatment; the stored snapshot (`profile`, and `task.agentProfile`
+    // below) keeps the profile's raw `null`.
+    const resolvedEffort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+    // A snapshot captured before the field existed reads as "shared".
+    const profileOpencodeServer = profile.opencodeServer ?? "shared";
+    const driftedFromRow =
+      task.agent !== profile.harness ||
+      task.model !== profile.model ||
+      task.effort !== resolvedEffort ||
+      task.mode !== profile.mode ||
+      task.speed !== profile.speed ||
+      task.maxMode !== profile.maxMode ||
+      task.opencodeServer !== profileOpencodeServer ||
+      agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
+    if (driftedFromRow) {
+      task = tasks.update(taskId, {
+        agent: profile.harness,
+        model: profile.model,
+        effort: resolvedEffort,
+        mode: profile.mode,
+        speed: profile.speed,
+        maxMode: profile.maxMode,
+        opencodeServer: profileOpencodeServer,
+      }) ?? task;
+      task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
+    }
+  }
+  const effective: AgentProfileSnapshot | null = resolvedProfile?.profile ?? null;
+
+  const harness = resolveHarness(task.agent);
+  if (!harness) {
+    return { error: `harness "${task.agent}" not found — pick another in the task's settings` };
+  }
+  // Soft-delete gate: disabled harnesses still resolve (so historical rows
+  // and currently-running children stay attributable), but new runs are
+  // blocked. The user re-enables in Settings to recover.
+  if (!harness.enabled) {
+    return { error: `${harness.label} is disabled — re-enable it in Settings to start new runs.` };
+  }
+  // `freshAuth: true` bypasses agent-status.ts's fx status-cache (60s TTL) —
+  // a Start click must never be refused by a stale cached "logged out" from
+  // before the user ran `fx login`. The 15s `/harnesses` poll that paints the
+  // header status dots is the only caller that tolerates the cached value.
+  const status = await checkHarness(harness, { freshAuth: true });
+  if (!status.available) {
+    const hint = status.installHint ? ` Install it with: ${status.installHint}` : "";
+    return { error: `${harness.label} is not available — ${status.reason}.${hint}` };
+  }
+  // Fail-open: only an explicit `false` means the CLI positively reported
+  // it's logged out. `null` (not probed / unknown) must never block a run.
+  // Empirically (real fx v0.0.6, v0.0.7, v0.0.8, v0.0.9, and v0.0.10 — 0.0.8
+  // re-verified 2026-09-08, 0.0.9 and 0.0.10 re-verified 2026-09-14, HOME
+  // pointed at an empty dir): env-var auth IS reflected by
+  // the probe (AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN both report a
+  // non-"missing" `auth` value) — since the probe runs with the same
+  // harnessEnv(harness) a real spawn uses, a key-authenticated user is never
+  // gated out here. As of 0.0.7 (unchanged through 0.0.10 — the credential
+  // re-check BEHAVIOUR and its `-32600` texts are unchanged 0.0.7→0.0.10;
+  // 0.0.10's only change is a `verified_recently` short-circuit inside
+  // `refreshModelCredential` (`server.zig`, `auth_runtime.requestPathCredentialVerifiedRecently`)
+  // that skips redundant refreshes and has no observable effect here), that same explicit
+  // `false` can also come from an expired login that can't self-refresh
+  // (`auth_expired === true && auth_refreshable === false`) — but that gate
+  // explicitly exempts the env-key `auth` values above (see agent-status.ts's
+  // probeStatus doc comment for the full rationale), so the "never gated
+  // out" guarantee holds with no exception.
+  if (status.loggedIn === false) {
+    return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
+  }
+
+  // Pre-flight 1b — per-model minimum CLI version. See `minCliVersionError`
+  // (below) for the rationale and the fail-open contract; this is the
+  // first-run half, reusing the status the availability gate just probed.
+  // The follow-up-turn half lives in `spawnCodexTurnNow`.
+  {
+    const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind], status);
+    if (floorError !== null) return { error: floorError };
+  }
+
+  // M6: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2, docs/plans/pipelines.md) — `launchStep` copies `worktreePath`/
+  // `branch` straight from the parent row at insert time, and the parent's
+  // own `startPipelineRun` is what materializes that worktree, once, up
+  // front. Such a step task must NEVER fall through to `prepareWorkdir`
+  // below on its own: `prepareWorkdir`'s reuse branch only fires when
+  // `worktreePath` is both set AND present on disk — anything else (a step
+  // row inserted with no worktree yet, or one whose directory has since
+  // been removed, e.g. a stray retry racing the parent's own teardown)
+  // falls through to its "materialize a brand-new worktree" path, which
+  // would silently give this ONE step its own private checkout instead of
+  // the shared one every other step (and the parent) is using. Refuse
+  // instead — the pipeline task itself is what re-materializes the shared
+  // worktree on Run/Retry. Gated on `isolation === "worktree"`: an
+  // `isolation: "none"` step legitimately carries a `null` `worktreePath`
+  // forever (copied from an equally `null` parent) and `prepareWorkdir`
+  // never reaches the worktree-creation branch for it at all — that's not
+  // a missing worktree, it's the correct shape for that isolation mode.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { error: "step task's worktree is missing — run the pipeline task instead" };
+  }
+
+  // Pass the branches other tasks have pinned. If materializing this task's
+  // branch hits a create-time uniqueness race, the recovery re-pins to a name
+  // that's free of both existing refs AND those not-yet-started pins.
+  const prepared = await prepareWorkdir(task, {
+    takenBranches: new Set(
+      tasks.list()
+        .filter((t) => t.id !== taskId)
+        .map((t) => t.branch)
+        .filter((b): b is string => Boolean(b)),
+    ),
+  });
+  if ("error" in prepared) return { error: prepared.error };
+
+  // Expand `@`-tokens into absolute paths now, right after `prepareWorkdir`
+  // returns — this is the EARLIEST point in the whole flow that knows the
+  // agent's real cwd: `prepared.cwd` is the worktree root once it has just
+  // been materialized (isolation "worktree"), or the raw workdir otherwise.
+  // No code before this line could have resolved a token correctly. Only
+  // `expandedPrompt` (a local) carries the expansion — `task.prompt` itself
+  // is left untouched in the DB, so editing the task or re-running it later
+  // keeps the `@tokens` and re-resolves them against whatever cwd that next
+  // run gets (a fresh worktree, a moved workdir, etc).
+  //
+  // The stat/realpath work behind each token runs in a disclaimed child when
+  // the disclaim switch is on (`resolveAtPathsInTaskDir`, D25): the core never
+  // touches the task directory itself, so an agent that planted a symlink in
+  // its own cwd can't use `@x` to make the core probe a protected path under
+  // the core's TCC identity. Injected as a parameter (rather than imported by
+  // project-files.ts) to avoid an import cycle.
+  const { text: expandedPrompt, unresolved: unresolvedRefs } = await expandAtReferencesDetailedAsync(
+    task.prompt,
+    prepared.cwd,
+    resolveAtPathsInTaskDir,
+  );
+  // Budget-check the fully expanded + reffed prompt against what the RAW
+  // (pre-expansion) prompt would already have needed. Expansion can turn a
+  // handful of short `@tokens` into long absolute paths and push a prompt
+  // over an agent's argv-launch cap (gemini today, see prompt-limits.ts)
+  // even though the raw text the user typed comfortably fit under it —
+  // that's the ONLY case this pre-check exists to catch early, before any
+  // run row is inserted or the task flips to `running`. A prompt that was
+  // ALREADY over budget with no `@` tokens involved (`rawOverage` truthy
+  // too) is deliberately left alone here and falls through to the
+  // pre-existing hardening below — `buildCommand`'s own throw inside
+  // `spawnAgentOrFail`'s catch, exercised (with a run row landing `failed`)
+  // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
+  // so that pre-existing behavior/error text is unchanged by this feature.
+  // Both budgets now include the agent-instructions preamble (`effective`,
+  // resolved above — null for a task with no bound profile, in which case
+  // `composeLaunchPrompt` is a no-op passthrough): the preamble is authored
+  // text that ships with every launch, so a profile whose instructions push
+  // an otherwise-fine prompt over budget must be caught by this same rule,
+  // and — since it's added identically to both sides — the
+  // `expandedOverage && !rawOverage` semantics (only the @-expansion itself
+  // pushed things over) are unchanged either way.
+  const expandedOverage = promptByteOverage(
+    harness.kind,
+    appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+  );
+  // Skip re-encoding the same text twice (R19, code review) when expansion
+  // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
+  // has `expandedPrompt === task.prompt`, so `expandedOverage` already IS
+  // what re-running `promptByteOverage` on the raw prompt would compute
+  // (composing the same `effective` preamble around the same text again
+  // would only reproduce it).
+  const rawOverage = expandedPrompt === task.prompt
+    ? expandedOverage
+    : promptByteOverage(
+      harness.kind,
+      appendReferences(composeLaunchPrompt(effective, task.prompt), task.references),
+    );
+  if (expandedOverage && !rawOverage) {
+    return {
+      error:
+        `prompt is ${expandedOverage.bytes - expandedOverage.limit} bytes over ${harness.label}'s `
+        + `${expandedOverage.limit}-byte launch limit after expanding @ file references — shorten it or `
+        + `reference fewer files`,
+    };
+  }
+
+  // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
+  // is one now. Pin the sha actually used so re-runs stay reproducible.
+  if (!task.baseRef && prepared.worktreePath) {
+    const sha = await resolveRef(task.workdir, "HEAD");
+    if (sha) tasks.update(taskId, { baseRef: sha });
+  }
+
+  // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
+  // spawn) begins a brand-new turn, not a continuation of any pause — clear
+  // any leftover fx auto-resume schedule/row so it can't linger past the
+  // point it stopped being relevant (plan §3 T2 item 7). Deliberately placed
+  // here, past every early `return { error }` above (harness availability,
+  // worktree prep, prompt budget) rather than at the top of the function
+  // (Phase 8 review #2): a pre-flight failure means no new turn ever started,
+  // so a paused row (and its still-resumable checkpoint / pending auto-resume
+  // timer) must survive an aborted Start — clearing it there would silently
+  // strand the user's only path back to the paused response. From this point
+  // on a run row WILL be inserted below, so the old pause is genuinely
+  // superseded regardless of whether the spawn itself goes on to succeed.
+  if (harness.kind === "fx") clearFxRecovery(taskId);
+
+  const runId = randomUUID();
+  const now = Date.now();
+  const prevColumn: ColumnId = task.column;
+
+  // Single transaction: flip the task into running with the new run id, branch,
+  // worktree path; insert the run row. Either everything sticks or nothing does.
+  const persist = db.transaction(() => {
+    tasks.update(taskId, {
+      column: "running",
+      branch: prepared.branch,
+      worktreePath: prepared.worktreePath,
+      runId,
+    });
+    // Run start is one of the four last-seen-checkout refresh points (start,
+    // settle, terminal open, archive). Isolation "none", or a reuse whose
+    // branch read failed, has nothing to record — keep whatever was recorded
+    // rather than erasing it (`recordableCheckout`).
+    const checkout = recordableCheckout(prepared);
+    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+    runs.insert({
+      id: runId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      // All four kinds now run in a per-task tmux session. fx is the
+      // exception — it's driven over ACP/stdio, not tmux — but it still
+      // gets a `tmuxSession` name here for symmetry with the run row shape;
+      // `spawnFxViaAcp` simply doesn't use it.
+      tmuxSession: sessionNameFor(taskId),
+      // Filled in by spawnAgent's onSessionId callback once the session id is
+      // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
+      // codexSessionId, cursor's session_id → cursorSessionId, gemini's
+      // self-issued uuid → geminiSessionId, fx's ACP session id →
+      // fxSessionId. Exactly one is non-null per run.
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+      copilotSessionId: null,
+    });
+  });
+  persist();
+  adoptPendingTaskCancel(taskId, runId);
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  // The agent-instructions preamble (from `effective`, if this task is bound
+  // to a profile) wraps the expanded prompt BEFORE references are appended —
+  // skills/instructions are authored text, references are file pointers, and
+  // the existing convention keeps references last (docs/plans/agent-profiles.md
+  // D3/D11). `composeLaunchPrompt` is a no-op passthrough when `effective` is
+  // null, so an unbound task's launch prompt is byte-identical to before this
+  // feature.
+  const promptWithRefs = appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references);
+
+  const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
+  // Echo the initial prompt as a "user" event so the panel renders a
+  // bubble for it right away — claude won't transcribe the prompt into
+  // its JSONL until it boots (can take a few seconds). The JSONL-flush
+  // path will emit the same line again once claude writes it; the run
+  // panel's dedup keys user events on (runId, data) so we don't double
+  // up.
+  onChunk("user", normalizeUserText(promptWithRefs));
+
+  const spawnArgs: SpawnAgentArgs = {
+    taskId,
+    runId,
+    harness,
+    prompt: promptWithRefs,
+    cwd: prepared.cwd,
+    onChunk,
+    onSessionId: (sessionId) => {
+      runs.update(runId, sessionIdPatchFor(harness.kind, sessionId));
+    },
+    // copilot: the driver reports subagents inline in its JSON stream; the
+    // sink turns each into a `subagents` row (a tab) + tagged events.
+    ...(harness.kind === "copilot" ? { copilotSubagents: makeCopilotSubagentSink(runId, taskId) } : {}),
+    // fx: a mid-turn steer fx didn't take comes back here as the next turn.
+    ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
+    opts: {
+      mode: task.mode,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
+      effort: task.effort,
+      speed: task.speed,
+      maxMode: task.maxMode,
+      // opencode: the version the pre-flight above already probed picks the
+      // CLI line (D-2); the server mode and title ride along (D-3/D-4).
+      ...(harness.kind === "opencode"
+        ? { cliVersion: status.version, opencodeServer: task.opencodeServer, title: task.title }
+        : {}),
+    },
+  };
+  // D-19: an OpenCode turn opens with a persisted breadcrumb naming the CLI
+  // line, server mode, model, effort and mode it actually launches with.
+  if (harness.kind === "opencode") onChunk("status", opencodeTurnBreadcrumb(harness, task, status.version));
+
+  // Everything from here on — the actual spawn and everything that depends
+  // on its result — runs as a detached continuation raced against
+  // `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc). The run row, the
+  // `running` column flip and the `user` echo above are already persisted,
+  // which is all a caller needs to render this task — a slow spawn (claude
+  // `--resume` alone can take 5-30s in practice) no longer holds this HTTP
+  // response open waiting for it. Ownership of releasing the
+  // `startingTaskIds` claim moves to the continuation's own `finally` right
+  // here — NOT when this function returns, and NOT when the race below
+  // resolves via the budget timing out — so a second overlapping start for
+  // this task keeps hitting the "already starting" guard for as long as the
+  // real spawn takes.
+  claimTransferred = true;
+  const continuation: Promise<{ ok: true } | { ok: false; message: string }> = (async () => {
+    try {
+      const { agent, message } = await spawnAgentOrFail(spawnArgs);
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(runId);
+      if (!agent) return { ok: false as const, message: message ?? "unknown error" };
+
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== runId || cancelledWhilePending) {
+        agent.kill();
+        if (harness.kind === "claude-code") await dropSession(taskId);
+        runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === runId) {
+          // A user Stop, not a delete/replace: settle the task like the done
+          // handler would for a cancelled run (`ready`, this run stays its
+          // latest) and say why nothing ran.
+          spawnArgs.onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, runId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === runId) {
+          // Force-archive in this window does not move the column, and this
+          // run never registers, so the done handler will not pull it to
+          // `ready` either. Left on `running`, unarchive shows Stop for a
+          // process that is already gone.
+          spawnArgs.onChunk("status", "task archived before the agent launched");
+          updateColumn(taskId, runId, "ready");
+        }
+        // H1: this run never registers, so no done handler will ever emit
+        // its terminal transition — do it here whenever the run is still the
+        // task's current one (a user Stop, or a force-archive during the
+        // pending window), gated exactly like the done handler's
+        // `isTerminalRun`. A delete/replace (`fresh.runId !== runId`) is not
+        // terminal for the task and stays silent, as before.
+        if (fresh && fresh.runId === runId) {
+          emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+        }
+        return { ok: true as const };
+      }
+
+      registerActiveRun(runId, taskId, fresh, agent);
+      // A stored `null` mode doesn't spawn as a literal "auto" for every
+      // kind (Phase 8 review #3) — `buildCommand` resolves it via
+      // `defaultModeFor`, which is `yolo` for fx since
+      // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
+      // that same resolution here so the opening breadcrumb reports what
+      // actually launched. Persisted (and sent with its row id) so a stream
+      // resumed after a reconnect sees it exactly once, like the drift lines
+      // below.
+      saveStatusLineQuietly(
+        runId,
+        taskId,
+        `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+      );
+      for (const line of worktreeDriftStatusLines(task, prepared)) {
+        appendRunStatusLine(taskId, runId, line);
+      }
+      attachDoneHandler(runId, taskId, agent);
+      return { ok: true as const };
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally and already
+      // records the run failed / bounces the task to `ready`) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[agetor] detached spawn continuation failed for task ${taskId} run ${runId}:`, err);
+      return { ok: false as const, message };
+    } finally {
+      releaseStartingClaim(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  if (!raced.settled) {
+    // Spawn is still running detached — `spawnAgentOrFail`'s existing
+    // failure handling (run `failed`, task back to `ready`, stderr chunk)
+    // simply happens after this response now, same as the ownership-guard
+    // cleanup above; the caller learns either outcome from the task's event
+    // stream / column, not from this result.
+    return { runId, pending: true, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  }
+  if (!raced.value.ok) return { error: `failed to start agent: ${raced.value.message}` };
+  return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  } finally {
+    if (!claimTransferred) releaseStartingClaim(taskId);
+  }
+}
+
+/** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
+ *  todo-family chunk triggers below — TodoWrite/TaskCreate/TaskUpdate chunks
+ *  are rare (most chunks are assistant text, thinking, or unrelated tool
+ *  calls), so a plain substring check keeps the hot path a single `includes`
+ *  away from a no-op. Markers are the literal serialized `"name":"<Tool>"`
+ *  envelope form (see `claude-tmux.ts`'s `JSON.stringify` of `tool_use`
+ *  blocks — no spaces), not a bare tool name substring: agetor dogfoods
+ *  itself, so an assistant/tool_result chunk quoting "TaskCreate" in prose
+ *  (e.g. describing this very code) is a real false positive with the bare
+ *  form, not a theoretical one.
+ *
+ *  Split by stream, mirroring `runs.todoRelevantEventsForTask`'s SQL LIKE
+ *  filter in db.ts (same split, same reason): a `tool_use` row carries
+ *  `"name":"<Tool>"`, but a `tool_result` row never does (`{toolUseId,
+ *  content, isError}`) — its ONLY todo-family shape `deriveTodoProgress`
+ *  ever consults is a `TaskCreate` result's `"Task #N created successfully"`
+ *  text, so that's the marker for the `tool_result` side. Without this
+ *  separate check, `tool_result` rows would never re-trigger the board
+ *  summary, and a TaskCreate's claude-assigned number wouldn't be reflected
+ *  until some unrelated LATER tool_use chunk happened to fire the recompute. */
+const TODO_FAMILY_TOOL_USE_MARKERS = ['"name":"TodoWrite"', '"name":"TaskCreate"', '"name":"TaskUpdate"'];
+const TODO_FAMILY_TOOL_RESULT_MARKER = "created successfully";
+
+function isTodoFamilyChunk(stream: RunEvent["stream"], data: string): boolean {
+  if (stream === "tool_use") return TODO_FAMILY_TOOL_USE_MARKERS.some((m) => data.includes(m));
+  if (stream === "tool_result") return data.includes(TODO_FAMILY_TOOL_RESULT_MARKER);
+  return false;
+}
+
+/**
+ * Re-derive and persist the board-level `tasks.todo_progress` summary after a
+ * todo-family `tool_use`/`tool_result` chunk lands. Works for every agent
+ * kind — chunks are a generic `{stream,data}` shape, and gating this on
+ * `kind` would be one more thing to keep in sync with whichever harnesses
+ * grow Task-tools-style tools next (plan §3).
+ *
+ * Must be called AFTER `runs.appendEvent` has persisted the chunk that
+ * triggered it (see the call site in `makeChunkHandler`, which appends
+ * before running any detection): `runs.todoRelevantEventsForTask` re-reads
+ * `run_events` synchronously via `bun:sqlite`, so the just-arrived chunk is
+ * already in the result set — there is no separate "append the current
+ * chunk in memory" step needed, and none is done here.
+ *
+ * Writes only when the derived summary actually changed (by value, not
+ * reference — `deriveTodoProgress` re-parses the whole history every call),
+ * so a `TaskUpdate` that round-trips to an unchanged summary (e.g. an
+ * unknown taskId, tolerated as a no-op by `deriveTodoProgress`) doesn't
+ * churn the row. Never throws — same "detection bugs must not break run
+ * settlement" contract as `detectCursorPlan` (plan §7); the caller wraps
+ * this in try/catch too, belt-and-braces.
+ */
+function maybeUpdateTodoProgress(taskId: string): void {
+  const events = runs.todoRelevantEventsForTask(taskId);
+  const summary = summarizeTodoProgress(deriveTodoProgress(events));
+  const task = tasks.get(taskId);
+  if (!task) return;
+  const current = task.todoProgress ?? null;
+  const changed = summary === null
+    ? current !== null
+    : current === null || current.completed !== summary.completed || current.total !== summary.total;
+  if (changed) tasks.update(taskId, { todoProgress: summary });
+}
+
+/**
+ * Claude-code-only: detect and persist `ExitPlanMode` plan history from the
+ * generic chunk stream, mirroring `detectCursorPlan`'s "pure helper in
+ * task-plans.ts + thin DB-touching wrapper here" split. Unlike cursor's
+ * detection (run-settlement only), this runs on every `tool_use`/
+ * `tool_result` chunk as it arrives — claude's plan-approval loop is a live
+ * keystroke-driven flow the run panel needs to reflect in near-real-time
+ * (plan §3/§6), not just after the run resolves.
+ *
+ * - `tool_use` chunk with `name === "ExitPlanMode"` → `upsertClaudePlanFromExitPlanMode`
+ *   records a `pending` plan keyed by the tool_use's `id`, superseding any
+ *   prior pending claude plan.
+ * - `tool_result` chunk whose `toolUseId` matches a `pending` claude plan →
+ *   `resolveClaudePlan` transitions it to `approved` (capturing an edited
+ *   plan when present) or `rejected`.
+ *
+ * Re-reads `tasks.get` rather than trusting a snapshot, same race-avoidance
+ * rationale as `detectCursorPlan`: `plans` can be mutated concurrently (e.g.
+ * a PATCH edit path on some other plan kind, or two chunks for the same task
+ * landing in close succession), and both `task-plans.ts` helpers are pure
+ * transforms over whatever array they're handed. Never throws — same
+ * try/catch-at-call-site contract as `detectCursorPlan`.
+ *
+ * Two cheap pre-filters keep `JSON.parse` off the common-case chunk (this
+ * runs on EVERY `tool_use`/`tool_result` chunk of every claude-code run —
+ * assistant text/thinking chunks never reach here at all, but tool chunks
+ * for ordinary tools like Read/Write/Bash are still the overwhelming
+ * majority, and a large `tool_result` — a big file read, a long command's
+ * output — is exactly the case where an unconditional parse is wasteful):
+ *  - `tool_use`: skip unless `data` contains the literal `"name":"ExitPlanMode"`
+ *    envelope substring (see `claude-tmux.ts`'s unspaced `JSON.stringify`).
+ *  - `tool_result`: skip unless the task already has a `pending` claude plan
+ *    — `resolveClaudePlan` only ever acts on a `tool_result` whose
+ *    `toolUseId` matches an existing pending plan, so with none pending
+ *    there is nothing this chunk could possibly resolve. This read is cheap
+ *    relative to parsing a potentially large result body, and results in
+ *    exactly one `tasks.get` either way (reused below, not re-fetched).
+ */
+function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["stream"], data: string): void {
+  let task: Task | null;
+  if (stream === "tool_use") {
+    if (!data.includes('"name":"ExitPlanMode"')) return;
+    task = null; // fetched below, after confirming the parse is worthwhile
+  } else if (stream === "tool_result") {
+    task = tasks.get(taskId);
+    if (!task || !task.plans.some((p) => p.status === "pending")) return;
+  } else {
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+
+  if (stream === "tool_use") {
+    if (chunk.name !== "ExitPlanMode") return;
+    const toolCallId = chunk.id;
+    if (typeof toolCallId !== "string" || toolCallId.length === 0) return;
+    const input = chunk.input;
+    if (!input || typeof input !== "object") return;
+    const plan = (input as Record<string, unknown>).plan;
+    if (typeof plan !== "string" || plan.trim() === "") return;
+
+    task = tasks.get(taskId);
+    if (!task) return;
+    const next = upsertClaudePlanFromExitPlanMode(task.plans, {
+      toolCallId,
+      runId,
+      content: plan,
+      now: Date.now(),
+    });
+    if (next !== task.plans) tasks.update(taskId, { plans: next });
+    return;
+  }
+
+  // tool_result — `task` was already fetched (and confirmed to have a
+  // pending plan) by the pre-filter above.
+  const toolUseId = chunk.toolUseId;
+  if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+  const content = chunk.content;
+  const resultText = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+        .map((x) => (x && typeof x === "object" && (x as { type?: string }).type === "text" ? (x as { text?: string }).text ?? "" : ""))
+        .join("")
+      : "";
+  if (!resultText) return;
+
+  const next = resolveClaudePlan(task!.plans, toolUseId, resultText, Date.now());
+  if (next !== task!.plans) tasks.update(taskId, { plans: next });
+}
+
+/** Literal envelope substring for a `SendUserFile` tool_use chunk (see
+ *  `claude-tmux.ts`'s unspaced `JSON.stringify({ id, name, input, … })`) —
+ *  same cheap-prefilter idea as `TODO_FAMILY_TOOL_USE_MARKERS`, keeping the
+ *  common case (every other tool) a single `includes` away from a no-op. */
+const SENT_FILES_TOOL_USE_MARKER = '"name":"SendUserFile"';
+
+/** Loose substring pre-check on a `tool_result` chunk's raw JSON, cheaper
+ *  than `JSON.parse` + `toolResultText` — a real delivery message always
+ *  contains this phrase (`SENT_FILES_DELIVERED_RE` anchors on it), so a
+ *  `tool_result` chunk lacking it can only matter when a `tool_use` for the
+ *  SAME run is still pending in {@link pendingSentFilesByRun} (checked
+ *  first, and cheaply, in `maybeTrackSentFiles` below). */
+const SENT_FILES_RESULT_TEXT_MARKER = "delivered to user";
+
+/** Per-run, in-memory `toolUseId → SentFilesRequest` scratch space — plan §3
+ *  decision 4. Populated from a `SendUserFile` `tool_use` chunk, consumed
+ *  (and removed) by its confirming `tool_result`. Capped at
+ *  {@link MAX_PENDING_SENT_FILES_PER_RUN} entries per run (oldest evicted
+ *  first via `Map`'s insertion-order iteration) so a pathological run that
+ *  never gets a matching result can't grow this unbounded; cleared entirely
+ *  once the run leaves `active` (both `attachDoneHandler` settle branches
+ *  below) since nothing can arrive for a run that's no longer running. */
+const pendingSentFilesByRun = new Map<string, Map<string, SentFilesRequest>>();
+const MAX_PENDING_SENT_FILES_PER_RUN = 64;
+
+function rememberSentFilesRequest(runId: string, toolUseId: string, req: SentFilesRequest): void {
+  let stash = pendingSentFilesByRun.get(runId);
+  if (!stash) {
+    stash = new Map();
+    pendingSentFilesByRun.set(runId, stash);
+  }
+  // A repeat tool_use id (shouldn't happen — ids are unique per call — but
+  // cheap to guard) re-inserts at the END of Map's iteration order, which is
+  // fine: it's still the same entry being tracked, just refreshed.
+  stash.delete(toolUseId);
+  stash.set(toolUseId, req);
+  if (stash.size > MAX_PENDING_SENT_FILES_PER_RUN) {
+    const oldestKey = stash.keys().next().value;
+    if (oldestKey !== undefined) stash.delete(oldestKey);
+  }
+}
+
+/**
+ * Detect and persist delivered `SendUserFile` files from the generic chunk
+ * stream — plan §3 decision 4, `docs/plans/send-files-to-user.md`. Runs for
+ * EVERY agent kind (unlike claude-only plan tracking): the fx driver emits
+ * a synthetic `SendUserFile` tool_use/tool_result pair in the exact same
+ * wire shape claude-tmux uses (`fx-acp.ts`'s dormant `resource_link`
+ * mapping), so gating this on `kind` would silently drop fx's sends.
+ *
+ * - `tool_use` whose data matches {@link SENT_FILES_TOOL_USE_MARKER} and
+ *   parses via `parseSentFilesToolUse` is stashed in
+ *   {@link pendingSentFilesByRun} keyed by its tool_use id — nothing is
+ *   persisted yet (persisting on request, not delivery, would count files
+ *   that were never actually delivered).
+ * - `tool_result` looks up its `toolUseId` in the stash first (the common
+ *   case — same run, no restart in between). On a miss, falls back to
+ *   `runs.findToolUseEvent` (a restart or reattach-replay dropped the
+ *   in-memory stash) — re-parsing the original tool_use from `run_events` —
+ *   but only when the result text itself looks like a delivery
+ *   confirmation ({@link SENT_FILES_DELIVERED_RE}), so an ordinary
+ *   tool_result for some unrelated tool never pays for the DB lookup. A
+ *   still-unresolved `toolUseId` (map miss + fallback miss, e.g. a
+ *   coincidental "delivered to user" phrase in some other tool's output
+ *   with no matching `SendUserFile` request) is a silent no-op.
+ * - A delivered (non-error, {@link parseSentFilesToolResult}'s content-aware
+ *   `delivered` check) result persists one {@link SentFileEntry} per
+ *   ENTRY IN `res.attachments` when that array is non-empty — claude's own
+ *   structured, authoritative record of what actually went out — and falls
+ *   back to one entry per `req.files` path only when `res.attachments` is
+ *   empty (an unrecognized-but-attachment-less success shape). This means a
+ *   request for N files whose attachments only confirm M < N of them
+ *   persists M entries, not N — attachments are the ground truth for "what
+ *   was delivered", the request is only "what was asked for". Persistence
+ *   goes through `tasks.mergeSentFiles` (dedupes by path — a replayed pair,
+ *   or the same file delivered twice, is idempotent) and fires the
+ *   live-only `files-sent` `GlobalEvent` with `count = entries.length`
+ *   (reflecting whichever source produced the entries). A non-delivered
+ *   result (`is_error`, or a non-error result that still didn't deliver —
+ *   e.g. a declined/interrupted call, see `sent-files.ts`) persists nothing
+ *   and fires nothing — it shouldn't inflate the badge.
+ *
+ * Relative paths (in `res.attachments` paths, or in `req.files` on the
+ * fallback) resolve against the run's cwd (`task.worktreePath ??
+ * task.workdir` — the same precedence `/open-path` uses); an already-
+ * absolute path passes through unchanged. When sourced from attachments,
+ * `size`/`mediaType`/`isImage` come straight off that attachment; on the
+ * `req.files` fallback (no attachments at all) they're `null`.
+ *
+ * Gated on `eventId !== null` at the very top: `null` means
+ * `runs.appendEvent`'s dedup path found the row already persisted (a
+ * reattach replay re-delivering a line this process already streamed
+ * before a restart) — that pair was already handled the first time
+ * through, so re-running detection here would be redundant work at best
+ * and, for the `tool_use` stash, would re-add an entry nothing will ever
+ * consume (its `tool_result` was already deduped away too, on the same
+ * replay). Never throws — the caller wraps this in try/catch, same
+ * "detection bugs must never break run settlement" contract as
+ * `maybeUpdateTodoProgress`/`maybeTrackClaudePlan` above.
+ */
+function maybeTrackSentFiles(
+  taskId: string,
+  runId: string,
+  stream: RunEvent["stream"],
+  data: string,
+  eventId: number | null,
+): void {
+  if (eventId === null) return;
+
+  if (stream === "tool_use") {
+    if (!data.includes(SENT_FILES_TOOL_USE_MARKER)) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") return;
+    const chunk = parsed as Record<string, unknown>;
+    const toolUseId = chunk.id;
+    const name = chunk.name;
+    if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+    if (typeof name !== "string") return;
+
+    const req = parseSentFilesToolUse(name, chunk.input);
+    if (!req) return;
+    rememberSentFilesRequest(runId, toolUseId, req);
+    return;
+  }
+
+  if (stream !== "tool_result") return;
+
+  const stash = pendingSentFilesByRun.get(runId);
+  const hasPending = !!stash && stash.size > 0;
+  if (!hasPending && !data.includes(SENT_FILES_RESULT_TEXT_MARKER)) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  const toolUseId = chunk.toolUseId;
+  if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+
+  let req: SentFilesRequest | null = stash?.get(toolUseId) ?? null;
+  if (req) {
+    stash!.delete(toolUseId);
+  } else {
+    if (!SENT_FILES_DELIVERED_RE.test(toolResultText(chunk.content))) return;
+    const fallback = runs.findToolUseEvent(runId, toolUseId);
+    if (!fallback) return;
+
+    let fallbackParsed: unknown;
+    try {
+      fallbackParsed = JSON.parse(fallback.data);
+    } catch {
+      return;
+    }
+    if (!fallbackParsed || typeof fallbackParsed !== "object") return;
+    const fallbackChunk = fallbackParsed as Record<string, unknown>;
+    const fallbackName = fallbackChunk.name;
+    if (typeof fallbackName !== "string") return;
+    req = parseSentFilesToolUse(fallbackName, fallbackChunk.input);
+    if (!req) return;
+  }
+
+  const isError = chunk.isError === true;
+  const attachments = sanitizeToolResultAttachments(chunk.attachments) ?? [];
+  const res = parseSentFilesToolResult(chunk.content, isError, attachments);
+  if (!res.delivered) return;
+
+  const task = tasks.get(taskId);
+  if (!task) return;
+  const cwd = task.worktreePath ?? task.workdir;
+
+  const now = Date.now();
+  const resolveAgainstCwd = (rawPath: string): string =>
+    isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+
+  // res.attachments is claude's own structured, authoritative record of what
+  // was actually delivered — prefer it over the request whenever it's
+  // non-empty: a request for N files whose attachments only confirm M < N
+  // of them persists M entries, carrying each attachment's real size/type,
+  // not N entries padded with nulls for files that may never have gone out.
+  // Fall back to req.files (no metadata) only when the result reports no
+  // attachments at all.
+  const entries: SentFileEntry[] = res.attachments.length > 0
+    ? res.attachments.map((a) => ({
+        path: resolveAgainstCwd(a.path),
+        size: a.size,
+        mediaType: a.mediaType,
+        isImage: a.isImage,
+        sentAt: now,
+        runId,
+      }))
+    : req.files.map((rawPath) => ({
+        path: resolveAgainstCwd(rawPath),
+        size: null,
+        mediaType: null,
+        isImage: null,
+        sentAt: now,
+        runId,
+      }));
+
+  tasks.mergeSentFiles(taskId, entries);
+  emitGlobal({
+    kind: "files-sent",
+    taskId,
+    runId,
+    count: entries.length,
+    caption: req.caption,
+    proactive: req.status === "proactive",
+    ts: now,
+  });
+}
+
+/**
+ * Per-run chunk handler. Appends every event to `run_events`, fans out to
+ * SSE listeners, and runs the claude API-error → `blocked` flip.
+ *
+ * Note: there is no longer a codex approval-prompt heuristic. Codex now runs
+ * non-interactively via `codex exec --json` (`--full-auto` auto-approves;
+ * `ask` falls back to a read-only sandbox), so it never emits an interactive
+ * "waiting on approval" prompt to its output stream — the old raw-stdout
+ * heuristic had no signal to match. `mode` is retained on the signature for
+ * symmetry with the claude path and possible future use.
+ */
+function makeChunkHandler(
+  runId: string,
+  taskId: string,
+  kind: AgentKind,
+  _mode: Task["mode"],
+) {
+  return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
+    let eventId: number | null;
+    try {
+      // A dedup hit (`null`) sends nothing: the row was delivered when it
+      // was first saved (e.g. a reattach replay re-delivering a line).
+      eventId = saveAndEmit({ runId, taskId, stream, data, lineUuid })?.id ?? null;
+    } catch (err) {
+      // A chunk can still arrive after deleteTask cascade-deleted this run
+      // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
+      // the insert then fails its run_events foreign key. There is nothing
+      // left to record it on, so drop it; any other failure still throws.
+      if (!runs.get(runId)) return;
+      throw err;
+    }
+    // Todo/task-tools board summary: re-derive + persist on any
+    // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
+    // substring pre-filter keeps the common case (unrelated chunks) a no-op.
+    if (isTodoFamilyChunk(stream, data)) {
+      try {
+        maybeUpdateTodoProgress(taskId);
+      } catch {
+        // Never let todo-progress derivation break run settlement.
+      }
+    }
+    // Unread-indicator watermark: bump on every top-level assistant event.
+    // `makeChunkHandler`'s closure has no `subagentId` — every call site that
+    // builds one (see the `onChunk` call sites above) is the MAIN-stream
+    // dispatcher for a task's own run. Subagent transcript lines never reach
+    // here at all: they're appended via a completely separate call site
+    // (`runs.appendEvent(fs.runId, stream, data, lineUuid, fs.subagentId)` in
+    // claude-subagents.ts) with their own `emitFn`, and the live-only
+    // `"subagent"` stream (lifecycle deltas) is explicitly never persisted
+    // (see `RunEventStream`'s doc comment in shared/types.ts) — so it can't
+    // reach `appendEvent` either. That makes every `stream === "assistant"`
+    // chunk seen here unconditionally "no subagent attribution" by
+    // construction; no extra `subagent_id` check is needed (or possible —
+    // this closure never receives one). `eventId` is `null` when
+    // `appendEvent`'s dedup (`INSERT OR IGNORE` on `line_uuid`) found the row
+    // already persisted — e.g. a reattach replay re-delivering a line this
+    // process already streamed before restart — in which case the watermark
+    // was already bumped by the original insert and must not be bumped
+    // again here.
+    if (stream === "assistant" && eventId != null) {
+      try {
+        tasks.noteAssistantEvent(taskId, eventId);
+      } catch {
+        // Never let unread-watermark tracking break run settlement.
+      }
+    }
+    // Claude plan history: ExitPlanMode tool_use/tool_result pairs, claude
+    // only — cursor's plan detection stays exclusively in `detectCursorPlan`
+    // at run settlement.
+    if (kind === "claude-code") {
+      try {
+        maybeTrackClaudePlan(taskId, runId, stream, data);
+      } catch {
+        // Never let plan-history tracking break run settlement.
+      }
+    }
+    // Sent-files ("Files sent to you" cards): SendUserFile tool_use/
+    // tool_result pairs, every agent kind (fx synthesizes the same pair).
+    try {
+      maybeTrackSentFiles(taskId, runId, stream, data, eventId);
+    } catch {
+      // Never let sent-files detection break run settlement.
+    }
+    // Claude API-error path: claude-tmux emits a sentinel status chunk on
+    // synthetic `isApiErrorMessage` lines (529, 400, …) and resolves the
+    // turn. Flip to `blocked` here so the card stops sitting in `running`,
+    // and mark the handle so `attachDoneHandler` doesn't bounce it back to
+    // `ready` when the resolution lands a moment later.
+    if (
+      kind === "claude-code"
+      && stream === "status"
+      && data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.apiError) {
+        handle.apiError = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "api-error");
+        }
+      }
+    }
+    // Session-died path (both agents): the driver emits this sentinel when a
+    // running turn's tmux session vanished. Flip to `blocked` so the card
+    // stops sitting in `running`, and mark the handle so `attachDoneHandler`
+    // keeps it there (and records `failed`) when the run settles a beat later.
+    if (stream === "status" && data.startsWith(SESSION_DIED_STATUS_PREFIX)) {
+      const handle = active.get(runId);
+      if (handle && !handle.sessionDied) {
+        handle.sessionDied = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "session-died");
+        }
+      }
+    }
+    // Turn-stall watchdog path (claude-code only today — codex/gemini turns
+    // are headless one-shots with no TUI to wedge on): the driver flags an
+    // in-flight turn whose transcript has gone silent past the stall
+    // threshold. Soft signal only — the session is alive, so no column flip,
+    // no handle flag, no settle; just mark/unmark the task so the API can
+    // decorate `stalledSince`.
+    if (stream === "status" && data.startsWith(TURN_STALLED_STATUS_PREFIX)) {
+      const task = tasks.get(taskId);
+      if (task && task.runId === runId) markStalled(taskId, Date.now());
+    }
+    if (stream === "status" && data.startsWith(TURN_STALL_RESUMED_STATUS_PREFIX)) {
+      clearStalled(taskId);
+    }
+    // Unknown-slash-command path (claude-code only): claude's TUI rejected
+    // the pasted message as an unknown slash command — no JSONL line was
+    // ever written for it, so claude-tmux's pane scraper is the only source
+    // of this sentinel. Flip to `blocked` here so the card stops sitting in
+    // `running`, and mark the handle so `attachDoneHandler` doesn't bounce
+    // it back to `ready` when the resolution lands a moment later.
+    if (
+      kind === "claude-code"
+      && stream === "status"
+      && data.startsWith(CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.unknownCommand) {
+        handle.unknownCommand = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "unknown-command");
+        }
+      }
+    }
+  };
+}
+
+function registerActiveRun(
+  runId: string,
+  taskId: string,
+  task: Task,
+  // NOT `ReturnType<typeof spawnAgent>` — `spawnAgent` itself resolves to
+  // `Promise<SpawnedAgent>` (wave 1 async contract); every caller here
+  // already passes the awaited value. Using the raw ReturnType would
+  // silently retype this as `Promise<SpawnedAgent>` the moment agents.ts
+  // lands its own async conversion, breaking every call site with no
+  // typecheck signal in THIS file (the mismatch would only surface as a
+  // runtime `.kill is not a function` once a Promise is stored and later
+  // used as if it were the resolved agent).
+  agent: SpawnedAgent,
+): void {
+  active.set(runId, {
+    taskId,
+    agent: task.agent,
+    kill: () => agent.kill(),
+    cancelled: false,
+    apiError: false,
+    sessionDied: false,
+    unknownCommand: false,
+    writeInput: (line) => agent.writeInput(line),
+    ...(agent.steer ? { steer: (line: string) => agent.steer?.(line) === true } : {}),
+  });
+}
+
+/**
+ * The run-row patch that records an agent's session id, per harness kind. An
+ * exhaustive switch (docs/plans/github-copilot-harness.md §3.8): the old
+ * ternary chain fell through to `fxSessionId` for any kind it didn't name, so
+ * a new kind silently wrote its id into fx's column. Adding a kind to
+ * `AgentKind` now fails the `never` assignment at compile time; a retired kind
+ * that reaches here at runtime (a `grok`/`kimi` harness row) throws, and the
+ * launch path's `spawnAgentOrFail` turns that into a failed run.
+ */
+function sessionIdPatchFor(kind: AgentKind, sessionId: string): Partial<Run> {
+  switch (kind) {
+    case "claude-code": return { claudeSessionId: sessionId };
+    case "codex": return { codexSessionId: sessionId };
+    case "cursor": return { cursorSessionId: sessionId };
+    case "gemini": return { geminiSessionId: sessionId };
+    case "antigravity": return { antigravitySessionId: sessionId };
+    case "opencode": return { opencodeSessionId: sessionId };
+    case "copilot": return { copilotSessionId: sessionId };
+    case "fx": return { fxSessionId: sessionId };
+    default: {
+      const unreachable: never = kind;
+      throw new Error(`unknown harness kind: ${String(unreachable)}`);
+    }
+  }
+}
+
+/**
+ * Copilot-only: the sink `spawnCopilotViaTmux` (and the fake driver, and the
+ * reattach path) feed with the subagents Copilot reports inline in its JSON
+ * stream. Mirrors what the claude subagent watcher does for its own rows —
+ * a `subagents` row (one tab), `runs.appendEvent` tagged with the row's id,
+ * the same `emit` fan-out, a `stream: "subagent"` lifecycle event — with a
+ * globally unique row id (`cp-<runId>-<toolCallId>`; tool call ids are only
+ * unique within a session). Every method is idempotent: a reattach replays
+ * the log from offset 0 and the driver may call any of them twice.
+ *
+ * `settled`/`settleAll` fire `maybeReleaseHeldTask`, the same release edge the
+ * claude watcher drives through `setSubagentSettleHook`, so a card held in
+ * `running` for a still-open subagent advances the moment the last one closes.
+ */
+function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagentSink {
+  const subagentIdFor = (toolCallId: string): string => `cp-${runId}-${toolCallId}`;
+  const emitLifecycle = (sub: Subagent, phase: SubagentEvent["phase"]): void => {
+    const payload: SubagentEvent = { phase, subagent: sub };
+    emit({
+      runId,
+      taskId,
+      stream: "subagent",
+      data: JSON.stringify(payload),
+      ts: Date.now(),
+      subagentId: sub.id,
+    });
+  };
+  const release = (): void => {
+    try {
+      maybeReleaseHeldTask(taskId);
+    } catch (e) {
+      console.error(`[agetor] copilot subagent settle hook threw for task ${taskId}:`, e);
+    }
+  };
+  return {
+    started(info) {
+      const id = subagentIdFor(info.toolCallId);
+      // A replayed `started` (reattach) finds the row already there — keep its
+      // status/timing and don't announce it a second time.
+      if (subagents.get(id)) return;
+      const sub: Subagent = {
+        id,
+        taskId,
+        runId,
+        // A dedicated kind (never "subagent") so the Claude watcher's seed
+        // skips the row — see `seedRow` in claude-subagents.ts. No source file
+        // of its own: its events live inline in the copilot run's log and are
+        // persisted by this sink, so `sourcePath` stays empty (which also keeps
+        // `subagentActivityWithin` from stat'ing the main log for it).
+        parentKind: "copilot_subagent",
+        agentType: info.agentType ?? info.name ?? null,
+        description: info.description || info.name || null,
+        spawnDepth: 1,
+        sourcePath: "",
+        toolUseId: info.toolCallId,
+        status: "running",
+        startedAt: Date.now(),
+        endedAt: null,
+      };
+      subagents.insertIfAbsent(sub);
+      emitLifecycle(sub, "started");
+    },
+    event(parentToolCallId, stream, data, lineUuid) {
+      const id = subagentIdFor(parentToolCallId);
+      try {
+        // Sends nothing for a replayed line (dedup hit).
+        saveAndEmit({ runId, taskId, stream, data, lineUuid, subagentId: id });
+      } catch (e) {
+        // The run row cascade-deleted under a live tail: cost one event, not
+        // the rest of the batch.
+        console.error(`[agetor] failed to persist copilot subagent event for ${id}:`, e);
+        return;
+      }
+    },
+    settled(toolCallId, status) {
+      const id = subagentIdFor(toolCallId);
+      const row = subagents.get(id);
+      if (!row || row.status !== "running") return;
+      const endedAt = Date.now();
+      subagents.setStatus(id, status, endedAt);
+      emitLifecycle({ ...row, status, endedAt }, "finished");
+      release();
+    },
+    settleAll(status) {
+      const open = subagents
+        .listForTask(taskId)
+        .filter((r) => r.runId === runId && r.status === "running");
+      if (open.length === 0) return;
+      const endedAt = Date.now();
+      subagents.settleRunningForRun(runId, status, endedAt);
+      for (const row of open) emitLifecycle({ ...row, status, endedAt }, "finished");
+      release();
+    },
+  };
+}
+
+/**
+ * Copilot-only: when a run resolves `succeeded`, check whether its LAST
+ * `tool_use` event is the synthetic `copilot_plan` the driver emits at the end
+ * of a successful Plan-mode turn (docs/plans/github-copilot-harness.md §3.3)
+ * and, if so, persist a `pending` `TaskPlan`. The plan's `toolCallId` is the
+ * synthetic tool_use's own id (`copilot-plan:<runId>`), which is the key
+ * RunPanel's `PlanCard` substitution matches on. Same contract as
+ * `detectCursorPlan`: re-reads the task fresh, idempotent by `toolCallId`,
+ * never throws.
+ */
+function detectCopilotPlan(task: Task, runId: string): void {
+  if (resolveHarness(task.agent)?.kind !== "copilot") return;
+
+  const lastToolUse = runs.lastToolUseData(runId);
+  if (lastToolUse === null) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lastToolUse);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  if (chunk.name !== COPILOT_PLAN_TOOL_NAME) return;
+
+  const callId = chunk.id;
+  if (typeof callId !== "string" || callId.length === 0) return;
+  const input = chunk.input;
+  if (!input || typeof input !== "object") return;
+  const plan = (input as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || plan.trim() === "") return;
+
+  const fresh = tasks.get(task.id);
+  if (!fresh) return;
+  const nextPlans = upsertDetectedPlan(fresh.plans, {
+    toolCallId: callId,
+    runId,
+    name: null,
+    content: plan,
+    now: Date.now(),
+  });
+  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+}
+
+/**
+ * Cursor-only: when a run resolves `succeeded`, check whether its LAST
+ * `tool_use` event is `createPlanToolCall` — cursor's "finished after
+ * planning" signature (plan §2, confirmed 5/5 on real runs) — and if so,
+ * persist a `TaskPlan` record on the task. Kind is resolved the same way
+ * `sendInput`'s cursor branch resolves it (`resolveHarness(task.agent)?.kind`)
+ * so an aliased harness (multi-account) is still recognized as cursor.
+ *
+ * Re-reads `tasks.get` rather than trusting the `task` snapshot the caller
+ * already has — `attachDoneHandler`'s two call sites for a given task can in
+ * principle race a concurrent `plans` write (e.g. a PATCH edit landing
+ * between the caller's fetch and this running), and `upsertDetectedPlan` is
+ * a pure transform over whatever `plans` array it's given, so reading fresh
+ * avoids clobbering that write.
+ *
+ * Never throws — the caller wraps this in try/catch too (belt-and-braces),
+ * but every internal failure mode (malformed JSON, missing/empty plan text,
+ * unexpected shapes) already resolves to a silent no-op here, matching plan
+ * §7: a detection failure must never break run settlement.
+ */
+function detectCursorPlan(task: Task, runId: string): void {
+  if (resolveHarness(task.agent)?.kind !== "cursor") return;
+
+  const lastToolUse = runs.lastToolUseData(runId);
+  if (lastToolUse === null) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lastToolUse);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  if (chunk.name !== "createPlanToolCall") return;
+
+  const callId = chunk.id;
+  if (typeof callId !== "string" || callId.length === 0) return;
+  const input = chunk.input;
+  if (!input || typeof input !== "object") return;
+  const createPlanToolCall = (input as Record<string, unknown>).createPlanToolCall;
+  if (!createPlanToolCall || typeof createPlanToolCall !== "object") return;
+  const args = (createPlanToolCall as Record<string, unknown>).args;
+  if (!args || typeof args !== "object") return;
+  const plan = (args as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || plan.trim() === "") return;
+  const nameRaw = (args as Record<string, unknown>).name;
+  const name = typeof nameRaw === "string" ? nameRaw : null;
+
+  const fresh = tasks.get(task.id);
+  if (!fresh) return;
+  const nextPlans = upsertDetectedPlan(fresh.plans, {
+    toolCallId: callId,
+    runId,
+    name,
+    content: plan,
+    now: Date.now(),
+  });
+  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+}
+
+/**
+ * Wire the per-run `done` promise to its terminal DB / event side-effects.
+ * Pulled out so `startTask` and `sendInput` (which also creates run rows for
+ * claude-code) can share the lifecycle handling.
+ */
+/**
+ * Refresh a worktree task's last-seen checkout after one of its runs settled
+ * (`tasks.setCheckoutBranch`, compare-then-write). Only a readable checkout is
+ * recorded — `null` on a detached HEAD — while an unreadable one (dir gone,
+ * git failed) leaves the stored value alone. Never throws: it runs
+ * fire-and-forget off `attachDoneHandler`.
+ */
+async function noteRunSettledCheckout(taskId: string): Promise<void> {
+  try {
+    const task = tasks.get(taskId);
+    if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
+    if (!existsSync(task.worktreePath)) return;
+    const live = await readCheckoutBranch(task.worktreePath);
+    if (live.ok) tasks.setCheckoutBranch(taskId, live.branch);
+  } catch (err) {
+    console.warn(`[agetor] could not record checkout branch for task ${taskId}:`, err);
+  }
+}
+
+function attachDoneHandler(
+  runId: string,
+  taskId: string,
+  // See `registerActiveRun`'s doc: `SpawnedAgent`, not
+  // `ReturnType<typeof spawnAgent>` — every caller passes the already-awaited
+  // agent handle, never the promise `spawnAgent` itself returns.
+  agent: SpawnedAgent,
+): void {
+  agent.done
+    // Async: `drainCodexQueue`/`drainCursorQueue`/`drainGeminiQueue`/
+    // `drainFxQueue` below now await their own spawn (wave 1's async
+    // `spawnAgentOrFail`). This callback is never itself awaited by anything
+    // (attachDoneHandler returns void; the `.then()`/`.catch()` chain is
+    // fire-and-forget from every caller's perspective, same as before), so
+    // making it `async` only changes how ITS OWN internal steps are
+    // sequenced — still strictly sequential, matching the pre-wave-1
+    // back-to-back synchronous calls exactly. A throw here still flows into
+    // the `.catch()` below exactly as a synchronous throw always did.
+    .then(async (code) => {
+      const handle = active.get(runId);
+      const wasCancelled = handle?.cancelled ?? false;
+      const wasApiError = handle?.apiError ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
+      active.delete(runId);
+      // Nothing can arrive for a run that's no longer running — drop its
+      // sent-files scratch space (plan §3 decision 4) so it can't leak.
+      pendingSentFilesByRun.delete(runId);
+
+      // API error / session-death / unknown-command override the exit-code
+      // mapping: the driver resolves the turn with code 0 (a clean end_turn
+      // was staged), but the run really failed — record it as such so the
+      // badge and history are honest.
+      const newStatus: RunStatus = wasCancelled
+        ? "cancelled"
+        : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
+        : code === 0 ? "succeeded" : "failed";
+      runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
+      // Run settle is a last-seen-checkout refresh point for every harness
+      // kind (the agent may have switched branches during the turn).
+      // Fire-and-forget: one `git symbolic-ref`, never on the settle path.
+      void noteRunSettledCheckout(taskId);
+      // Only flip the task's column when the run that just resolved is
+      // still the latest one. If the user pipelined a follow-up while
+      // this run was in flight, `task.runId` already points at the
+      // queued run — leave the task in `running` so the UI doesn't
+      // briefly bounce to `review`/`ready` between turns. The global
+      // run-status emit is gated on the same condition so the toast
+      // hook doesn't fire "succeeded" mid-conversation for a turn the
+      // user has already moved past.
+      const task = tasks.get(taskId);
+      // Cursor plan detection: runs whenever THIS run resolved `succeeded`,
+      // not gated on `isTerminalRun` — a folded/superseded run's tool_use
+      // history is just as real, and `upsertDetectedPlan`'s supersede
+      // transition already handles a newer plan landing while an older one
+      // is still pending. Wrapped so a detection bug can never break run
+      // settlement (plan §7 blast radius).
+      if (newStatus === "succeeded" && task) {
+        try {
+          detectCursorPlan(task, runId);
+          detectCopilotPlan(task, runId);
+        } catch {
+          // Never let plan detection break run settlement.
+        }
+      }
+      const isTerminalRun = !!task && task.runId === runId;
+      if (isTerminalRun) {
+        // A clean success with background agents still in flight is HELD in
+        // `running` rather than advanced to `review` — the run finished but the
+        // task's work hasn't. `runs.update(..., "succeeded")` already landed
+        // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
+        // the correct terminal status; whichever of the two fires last wins and
+        // both interleavings converge on the right column, so no lock is needed.
+        // Give the subagent watcher one synchronous cycle before asking it
+        // whether anything is still running. The rows that answer that
+        // question are created by the watcher's own poll, and a task that has
+        // not discovered a background agent yet polls on the SLOW/DEEP_IDLE
+        // tier (4-10s) — while this runs ~END_TURN_IDLE_FIRE_MS after the
+        // turn's end_turn. So an agent (or a `/workflow`) launched in the
+        // closing moments of a turn is usually NOT in the DB yet at this
+        // point, and the card would flip to `review` only to be dragged back
+        // by `pullBackParkedTask` a few seconds later — a visible bounce and a
+        // misleading breadcrumb. Pumping here reads the launch line that is
+        // already on disk and makes the hold decision deterministic.
+        try {
+          pumpWatcherForHoldCheck(taskId);
+        } catch {
+          // Belt-and-braces: the callee already swallows its own errors, but a
+          // watcher problem must never derail run settlement.
+        }
+        const holdForSubagents =
+          newStatus === "succeeded"
+          && !wasCancelled
+          && !wasApiError
+          && !wasSessionDied
+          && !wasUnknownCommand
+          && subagents.hasRunning(taskId);
+        if (holdForSubagents) {
+          const runningCount = subagents.runningCountForTask(taskId);
+          saveStatusLineQuietly(
+            runId,
+            taskId,
+            `background agents still running (${runningCount}) — holding in running`,
+          );
+        } else {
+          // Cancellation wins over api-error here, matching the newStatus
+          // resolution above — a user-cancelled run shouldn't land in
+          // `blocked` just because it had previously hit an API error.
+          const nextColumn: ColumnId = wasCancelled
+            ? "ready"
+            : (wasApiError || wasSessionDied || wasUnknownCommand) ? "blocked"
+            : newStatus === "succeeded" ? "review" : "ready";
+          updateColumn(taskId, runId, nextColumn);
+        }
+      }
+      saveStatusLineQuietly(runId, taskId, wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`);
+      if (isTerminalRun) {
+        emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+      } else {
+        reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
+      }
+      // fx-only: record/schedule an auto-resume for a fresh resumable pause,
+      // or clear a stale row — must run BEFORE drainFxQueue (plan §3 T2 item
+      // 4), since a queued follow-up's own spawn is what actually clears the
+      // row once it drains, and `recordFxPause` needs to see the queue as it
+      // stands right now to decide whether to skip scheduling.
+      noteFxRunSettled(task, runId, newStatus);
+      await drainFollowUpQueues(taskId, runId, wasCancelled);
+    })
+    .catch(async (err) => {
+      const handle = active.get(runId);
+      const wasCancelled = handle?.cancelled ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
+      active.delete(runId);
+      pendingSentFilesByRun.delete(runId);
+      const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
+      runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
+      void noteRunSettledCheckout(taskId);
+      const task = tasks.get(taskId);
+      const isTerminalRun = !!task && task.runId === runId;
+      if (isTerminalRun) {
+        // A session-death / unknown-command that reaches the reject path (not
+        // the case today — both drivers resolve on these — but keep the
+        // column consistent with the resolve path if a future refactor ever
+        // rejects instead).
+        updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
+      }
+      saveStatusLineQuietly(
+        runId,
+        taskId,
+        wasCancelled ? "cancelled" : String(err),
+        wasCancelled ? "status" : "stderr",
+      );
+      if (isTerminalRun) {
+        emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+      } else {
+        reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
+      }
+      // fx-only settlement hook — see the matching call/comment in the
+      // `.then` branch above.
+      noteFxRunSettled(task, runId, newStatus);
+      await drainFollowUpQueues(taskId, runId, wasCancelled);
+    });
+}
+
+/**
+ * After a run settles: spawn the next queued codex/cursor/gemini/antigravity/
+ * opencode/copilot/fx follow-up, if any (each drain is a no-op for a task of a different
+ * kind) — except when the run was stopped on a pipeline step task. Nothing
+ * may run on a stopped step's behalf, and a turn the queue started would read
+ * as the user resuming the step (a run with no `origin`), silently undoing
+ * the Stop the user pressed AFTER typing the message. Those follow-ups go to
+ * the step's backlog tray instead ({@link stashQueuedFollowUpsOfStoppedStep}).
+ * A Stop on an ordinary task keeps draining, as before.
+ */
+async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {
+  if (launchesFrozenFlag) {
+    // This process is exiting (`freezeLaunches`): a drained turn would be cut
+    // off, and an undrained queue dies with the process — keep the text.
+    fxPendingSteers.delete(runId);
+    stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
+    return;
+  }
+  if (wasCancelled && isPipelineStepTaskId(taskId)) {
+    // Dropped steers were re-queued in send order before `done` resolved.
+    fxPendingSteers.delete(runId);
+    stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+    return;
+  }
+  await drainCodexQueue(taskId);
+  await drainCursorQueue(taskId);
+  await drainGeminiQueue(taskId);
+  await drainAntigravityQueue(taskId);
+  await drainOpencodeQueue(taskId);
+  await drainCopilotQueue(taskId);
+  // Every steer this run accepted has now been reported (dropped ones before
+  // `done` resolved) or absorbed — forget the bookkeeping.
+  fxPendingSteers.delete(runId);
+  await drainFxQueue(taskId);
+}
+
+function isPipelineStepTaskId(taskId: string): boolean {
+  return tasks.get(taskId)?.pipelineParentId != null;
+}
+
+/**
+ * Remove and return every follow-up still queued for `taskId`, oldest first,
+ * as the text to put back in the backlog tray. Only one queue is ever
+ * non-empty for a task (one harness kind). Codex and Copilot keep the raw
+ * pre-`@`-expansion text (see `QueuedCodexLine`, `QueuedCopilotLine`); the
+ * other queues only hold the text the turn would have executed.
+ */
+function takeQueuedFollowUps(taskId: string): string[] {
+  const lines = [
+    ...(codexTurnQueue.get(taskId) ?? []).map((q) => q.raw),
+    ...(cursorTurnQueue.get(taskId) ?? []),
+    ...(geminiTurnQueue.get(taskId) ?? []),
+    ...(antigravityTurnQueue.get(taskId) ?? []),
+    ...(opencodeTurnQueue.get(taskId) ?? []),
+    ...(copilotTurnQueue.get(taskId) ?? []).map((q) => q.raw),
+    ...(fxTurnQueue.get(taskId) ?? []).map((q) => q.line),
+  ];
+  codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
+  geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
+  opencodeTurnQueue.delete(taskId);
+  copilotTurnQueue.delete(taskId);
+  fxTurnQueue.delete(taskId);
+  return lines;
+}
+
+/**
+ * A pipeline step task's run was stopped: move its queued follow-ups (and the
+ * fx steers the cancelled turn dropped, which `fxSteerDroppedHandler` put back
+ * in the queue in send order) into the step's backlog tray, in send order,
+ * and say so on the stopped run. Their `user` bubbles were written when they
+ * were sent, so nothing is lost; resending one from the tray resumes the
+ * step. A task gone or archived meanwhile keeps nothing
+ * (`restashPasteWithheldText`), and then no line is written.
+ */
+function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void {
+  stashQueuedFollowUps(taskId, runId, "this pipeline step was stopped", "to continue it");
+}
+
+/**
+ * Move every follow-up queued for `taskId` into its backlog tray, in send
+ * order, and say why on `runId` (when given): `<n> queued message(s) not sent
+ * — <why>; saved to your backlog, resend from the tray<tail>`. A task gone or
+ * archived keeps nothing (`restashPasteWithheldText`), and then no line is
+ * written.
+ */
+function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
+  const lines = takeQueuedFollowUps(taskId);
+  if (lines.length === 0) return;
+  let saved = false;
+  // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
+  for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
+  if (!saved || runId === null) return;
+  const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
+  const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
+  saveAndEmit({ runId, taskId, stream: "status", data });
+}
+
+/** Every task id with at least one queued follow-up, any harness. */
+function tasksWithQueuedFollowUps(): string[] {
+  const ids = new Set<string>();
+  for (const q of [
+    codexTurnQueue,
+    cursorTurnQueue,
+    geminiTurnQueue,
+    antigravityTurnQueue,
+    opencodeTurnQueue,
+    copilotTurnQueue,
+    fxTurnQueue,
+  ] as Map<string, unknown[]>[]) {
+    for (const [taskId, lines] of q) if (lines.length > 0) ids.add(taskId);
+  }
+  return [...ids];
+}
+
+/**
+ * The follow-ups queued behind a turn whose Stop landed before its agent
+ * launched (`consumePendingCancel`): `attachDoneHandler` never runs for that
+ * run, so they are dropped — or, on a pipeline step task, kept in its backlog
+ * tray like any other stopped step's queue
+ * ({@link stashQueuedFollowUpsOfStoppedStep}).
+ */
+function dropQueuedFollowUpsAfterPendingCancel(taskId: string, runId: string): void {
+  if (isPipelineStepTaskId(taskId)) stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+  else takeQueuedFollowUps(taskId);
+}
+
+/**
+ * Apply inline config edits to a live tmux session where possible — keeps
+ * the claude conversation alive (and its accumulated context) across
+ * mode/model/effort changes. Called by the PATCH /tasks/:id route after the
+ * DB row is updated.
+ *
+ *   • Agent change (claude ↔ codex ↔ cursor ↔ gemini): kills any claude tmux
+ *     session we had for this task. The new agent will spawn fresh on next Run.
+ *   • Same-agent mode / model / effort change on a live claude session: the
+ *     permission mode has no slash command, so we call `cycleToMode` which
+ *     sends Shift+Tab keystrokes (or `/plan` when the target is plan). Model
+ *     is mirrored via claude 2.1.246's `/model` PICKER, confirmed with `s`
+ *     (session-only — see `mirrorModelViaPicker` in claude-tmux.ts), never a
+ *     typed `/model <id>` (that rewrites the user's global claude default).
+ *     Effort is NEVER mirrored into the live session at all — a smoke test on
+ *     2.1.246 showed `CLAUDE_CODE_EFFORT_LEVEL` (the env var agetor pins at
+ *     spawn) takes precedence over every `/effort` form, so the old
+ *     slash-command mirror just desynced the row instead of changing
+ *     anything; only a breadcrumb records that the new value takes effect on
+ *     the NEXT run (docs/plans/model-effort-local-command-turns.md §10, owner
+ *     decisions 1 & 2). The session keeps running with the new posture in
+ *     every case.
+ *   • Anything else (codex, cursor, gemini; no live session): no-op — the
+ *     change just persists for the next spawn.
+ */
+export async function reconcileTaskSession(taskId: string, before: Task, after: Task): Promise<void> {
+  const beforeKind = resolveHarness(before.agent)?.kind ?? null;
+  const afterKind = resolveHarness(after.agent)?.kind ?? null;
+  // Treat any harness id change as a session-killing event for claude — the
+  // alias's HOME/env block changes, so the on-disk JSONL & login differ. Even
+  // same-kind alias swaps (claude-work → claude-personal) need a fresh tmux.
+  if (before.agent !== after.agent) {
+    // Any queued codex/cursor/gemini/antigravity/opencode/copilot/fx follow-ups
+    // belong to the old agent — drop them so a later drain doesn't spawn
+    // them against the new harness. Cleared BEFORE the session teardown
+    // below: OpenCode's graceful drop waits up to 5 s, and an in-flight
+    // turn settling inside that window would otherwise drain the queue
+    // onto the new harness.
+    codexTurnQueue.delete(taskId);
+    cursorTurnQueue.delete(taskId);
+    geminiTurnQueue.delete(taskId);
+    antigravityTurnQueue.delete(taskId);
+    opencodeTurnQueue.delete(taskId);
+    copilotTurnQueue.delete(taskId);
+    fxTurnQueue.delete(taskId);
+    if (beforeKind === "claude-code") await dropSession(taskId);
+    else if (beforeKind === "codex") await dropCodexSession(taskId);
+    else if (beforeKind === "cursor") await dropCursorSession(taskId);
+    else if (beforeKind === "gemini") await dropGeminiSession(taskId);
+    else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (beforeKind === "opencode") await dropOpencodeTask(taskId, "the task switched harness"); // graceful C-c, then kill (D-10)
+    else if (beforeKind === "copilot") {
+      await dropCopilotSession(taskId);
+      // Copilot subagent rows are settled only by the copilot driver's own
+      // sink. A row left `running` (e.g. by a run whose in-turn settleAll
+      // never landed) would otherwise hold the card forever under the next
+      // harness: the claude watcher skips `copilot_subagent` rows and
+      // `subagents.hasRunning` is task-wide.
+      orphanRunningSubagents(taskId);
+    }
+    else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
+    // Same reasoning for a pending fx auto-resume schedule: it belongs to
+    // the old fx session, and the new agent (fx or otherwise) has nothing to
+    // resume (plan §3 T2 item 8). Harmless no-op when there was none.
+    clearFxRecovery(taskId);
+    // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
+    // model/effort ids that belong to the old kind's option set; the
+    // next spawn would error or fall through to verbatim flags. Reset
+    // them server-side so direct API edits get the same safety the
+    // RunPanel's `onAgentChange` already applies client-side. Same-kind
+    // alias swaps keep the picks — those ids stay valid. The OpenCode
+    // server option goes back to its default too (D-4).
+    if (afterKind && beforeKind !== afterKind) {
+      const nextMode = defaultModeFor(afterKind);
+      tasks.update(taskId, {
+        mode: nextMode,
+        model: null,
+        effort: null,
+        speed: "off",
+        maxMode: false,
+        opencodeServer: "shared",
+      });
+    }
+    return;
+  }
+  if (afterKind !== "claude-code") return;
+  if (!(await sessionExists(taskId))) return;
+
+  // `after.mode` guard: a PATCH that clears the mode (mode → null) leaves
+  // the live session alone — the UI doesn't expose a "clear mode" control
+  // and there's no canonical "unset" mode to dial claude back to, so
+  // silently keeping the current posture is the least-surprising option.
+  if (before.mode !== after.mode && after.mode) {
+    const result = await cycleToMode(taskId, after.mode);
+    emitModeChangeStatus(taskId, after.mode, result);
+    // Only refresh the PreToolUse matcher when the mode change actually
+    // took effect. Otherwise we'd narrow the matcher (e.g. to bypass's
+    // narrow-no-mcp scope) while claude is still in the old mode — the
+    // hook stops firing for routine Bash but claude's own permission
+    // modal still pops inside tmux, deadlocking the run. The matcher is
+    // set at spawn-time by `ensureInstalledForCwd` (narrow for auto/
+    // bypass, full for everything else); leaving it in place on a
+    // failed cycle preserves the existing intercept-and-surface flow,
+    // which is the right fallback for "we couldn't switch modes."
+    if (result.ok) {
+      const cwd = after.worktreePath ?? after.workdir;
+      const refreshed = await ensureInstalledForCwd(cwd, after.mode);
+      if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
+    }
+  }
+  // Model mirror: claude 2.1.246's `/model` PICKER, confirmed with `s`
+  // (session-only), not a typed `/model <id>` — that writes the user's
+  // GLOBAL claude default, which a card click inside agetor must never do
+  // (docs/plans/model-effort-local-command-turns.md §10, owner decision 2,
+  // smoke-tested on claude 2.1.246). `claudeModelPickerFamily` maps the
+  // agetor id to the coarse family the picker actually offers as a row
+  // (`Opus`/`Sonnet`/`Fable`/`Haiku`); an id the 2.1.246 picker can't select
+  // exactly (an older pinned version within a family the picker only offers
+  // the CURRENT release of — including the now-superseded `fable-5`, demoted
+  // once `fable-5.1` took over the "Fable" row, and `opus-5`, demoted once
+  // `opus-5.5` took over the "Opus" row on claude 2.1.280 — `mythos-5`,
+  // `mythos-5.1`, or
+  // an unknown id) is a live-session no-op — the row already has the new id,
+  // only the mirror into the running session is skipped.
+  // `mirrorModelViaPicker`'s own resolved result already
+  // carries a `reason` for every `ok:false` outcome (no live session, a turn
+  // already in flight, a withheld keystroke, the picker never rendering, the
+  // target not being offered, or a keystroke itself failing), so
+  // `onPasteFailure` here has nothing further to report — a second
+  // breadcrumb from it would just duplicate the one below.
+  if (before.model !== after.model && after.model) {
+    const modelId = after.model;
+    const family = claudeModelPickerFamily(modelId);
+    if (!family) {
+      emitModelMirrorUnsupportedStatus(taskId, modelId);
+    } else {
+      const result = await mirrorModelViaPicker(taskId, family, { onPasteFailure: () => {} });
+      if (!result.ok) {
+        // `"no live session"` and `"turn in flight"` are not failures — they
+        // mean the mirror never got a chance to run at all (there is no
+        // session to drive, or the picker can't be opened without stepping
+        // on an in-progress turn), not that it tried and something broke.
+        // Route those to the same next-run wording `emitModelMirrorUnsupportedStatus`
+        // uses for a picker-incompatible id, rather than the ⚠️ failure
+        // framing, which is reserved for a mirror that actually attempted
+        // and failed (a withheld keystroke, the picker not appearing, the
+        // target family not offered, or a keystroke itself failing) — see
+        // finding #4, §10 re-review. Checked via a membership test rather
+        // than `result.reason === "no live session" || result.reason ===
+        // "turn in flight"` directly so this compiles independent of
+        // whether claude-tmux.ts's `MirrorModelFailureReason` union has
+        // landed `"turn in flight"` yet — the two files are being edited
+        // concurrently.
+        if (MODEL_MIRROR_NEXT_RUN_REASONS.has(result.reason)) {
+          emitModelMirrorNextRunStatus(taskId, modelId, result.reason);
+        } else {
+          emitModelMirrorFailureStatus(taskId, modelId, result.reason);
+        }
+      }
+    }
+  }
+  // Effort mirror: NONE. A smoke test on claude 2.1.246 showed
+  // `CLAUDE_CODE_EFFORT_LEVEL` (the env var agetor pins on the spawned
+  // process — see agents.ts) takes precedence over every `/effort` form —
+  // the old slash-command mirror printed "Not applied:
+  // CLAUDE_CODE_EFFORT_LEVEL=high overrides effort this session…" and
+  // desynced the row from the (unchanged) live session. So unlike model,
+  // effort is never pushed into a live session at all; only a breadcrumb
+  // records that the new value takes effect on the NEXT run
+  // (docs/plans/model-effort-local-command-turns.md §10, owner decision 1).
+  if (before.effort !== after.effort && after.effort) {
+    emitEffortPinnedStatus(taskId, after.effort, before.effort);
+  }
+}
+
+/**
+ * Surface a live-session model mirror that claude 2.1.246's `/model` picker
+ * can't perform exactly for this id (see `claudeModelPickerFamily`'s doc).
+ * The task row already has the new value — the PATCH that triggered this
+ * reconcile already committed — this is purely informational: the NEXT spawn
+ * (or a later change that lands on a picker-representable id) will pick it
+ * up. Mirrors `emitModeChangeStatus`'s append+emit pattern.
+ */
+function emitModelMirrorUnsupportedStatus(taskId: string, modelId: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `model ${modelId} applies on the next run — claude's picker can't select it for this session`;
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+}
+
+/**
+ * `mirrorModelViaPicker` reasons that mean "the mirror never got a chance to
+ * run at all" rather than "it ran and failed" (finding #4, §10 re-review):
+ * there was no live session to drive, or claude was mid-turn and opening the
+ * picker would have stepped on it. Both get the same informational
+ * next-run wording `emitModelMirrorNextRunStatus` gives a picker-
+ * incompatible id, NOT the ⚠️ framing `emitModelMirrorFailureStatus` reserves
+ * for an attempt that actually broke (a withheld keystroke, the picker never
+ * appearing, the target family not offered, or a keystroke itself failing).
+ *
+ * Deliberately a runtime `Set<string>` membership check rather than a
+ * `result.reason === "no live session" || result.reason === "turn in
+ * flight"` literal comparison: claude-tmux.ts (owned by a different agent in
+ * this same review pass) is concurrently adding `"turn in flight"` to
+ * `MirrorModelFailureReason`. A literal comparison against a string not yet
+ * in that union is a TS2367 compile error until that lands; `.has()` takes a
+ * plain `string` argument, so it type-checks either way and needs no
+ * follow-up edit once the union catches up.
+ */
+const MODEL_MIRROR_NEXT_RUN_REASONS = new Set(["no live session", "turn in flight"]);
+
+/**
+ * Surface a `mirrorModelViaPicker` outcome where the mirror never ran at all
+ * — see `MODEL_MIRROR_NEXT_RUN_REASONS`'s doc for which reasons land here vs.
+ * `emitModelMirrorFailureStatus`. The task row already has the new value;
+ * this is purely informational, mirroring `emitModelMirrorUnsupportedStatus`'s
+ * "applies on the next run" framing for a picker-incompatible id. Mirrors
+ * `emitModeChangeStatus`'s append+emit pattern.
+ */
+function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const detail = reason === "turn in flight" ? "claude is mid-turn" : reason;
+  const data = `model ${modelId} applies on the next run — ${detail}`;
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+}
+
+/**
+ * Surface a `mirrorModelViaPicker` failure that actually attempted and broke
+ * — a withheld keystroke (a blocking claude modal was still on the pane),
+ * the picker never rendering, the target family not being offered, or a
+ * keystroke itself failing. (`"no live session"` / `"turn in flight"` route
+ * to `emitModelMirrorNextRunStatus` instead — see
+ * `MODEL_MIRROR_NEXT_RUN_REASONS`.) The task row already has the new value;
+ * the live session kept its previous one until the user (or a later
+ * successful mirror) fixes it. Mirrors `emitModeChangeStatus`'s append+emit
+ * pattern.
+ */
+function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `⚠️ model change not applied — ${reason}; the task's model is ${modelId} but the session kept its previous one`;
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+}
+
+/**
+ * Surface that an `after.effort` change was recorded on the task row but
+ * deliberately never pushed into the live session — see this function's call
+ * site in `reconcileTaskSession` for why (`CLAUDE_CODE_EFFORT_LEVEL` always
+ * wins over every `/effort` form on claude 2.1.246). `getSessionLaunchEffort`
+ * reports what the live session was ACTUALLY pinned to at spawn;
+ * `beforeEffort` is only a fallback for the (shouldn't-happen) case where the
+ * in-memory session state has already been disposed. Mirrors
+ * `emitModeChangeStatus`'s append+emit pattern.
+ */
+function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: string | null): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const pinned = getSessionLaunchEffort(taskId) ?? beforeEffort ?? "its launch effort";
+  const data = `effort ${effortId} applies on the next run — this session is pinned to ${pinned} by CLAUDE_CODE_EFFORT_LEVEL`;
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+}
+
+/**
+ * Mirrors kanban/RunPanel.tsx's own effort-fallback effect (~4917-4928)
+ * EXACTLY, INCLUDING the retain rule (see plan §3 "Cascade rule" in
+ * docs/plans/add-gpt-6-astra.md): when a task's model changes, the
+ * previously-saved effort may no longer be valid for the new model (Haiku
+ * 4.5 takes no effort param at all; Sonnet 4.6 has no `xhigh`) — but an
+ * effort either the discovered or the curated set still supports
+ * (`retainableEfforts`, the union of both) is kept as-is; only an effort
+ * neither source supports triggers a fallback. This is deliberate: a
+ * discovery refresh that happens to omit an id the curated table still
+ * lists (e.g. `none` on GPT-5.6 Sol, which Codex's own catalog never lists
+ * but the API accepts) must not silently PATCH away an effort the user
+ * already chose. `undefined` means "no change needed" — the current effort
+ * (even `null`) is already retainable for `model`. Otherwise this is the
+ * value the effort column should be patched to alongside the model
+ * (including `null`, for the "model accepts no effort at all" case); the
+ * fallback itself narrows to the discovered-wins set (`supportedEfforts`),
+ * not the wider retainable union — new intent should reflect what's
+ * actually offered.
+ */
+function effortFallbackForModelChange(
+  kind: AgentKind,
+  model: string,
+  currentEffort: string | null,
+  discoveredEfforts?: readonly string[] | null,
+): string | null | undefined {
+  const offered = supportedEfforts(kind, model, discoveredEfforts);
+  if (currentEffort && retainableEfforts(kind, model, discoveredEfforts).has(currentEffort)) return undefined;
+  if (offered.length === 0) {
+    return currentEffort !== null ? null : undefined;
+  }
+  const fallback = offered.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : offered[0]!.id;
+  return currentEffort !== fallback ? fallback : undefined;
+}
+
+/**
+ * Sync `task.model` / `task.effort` from claude's OWN `/model` / `/effort`
+ * outcome (a typed command, a picker/slider card answer, or a terminal-side
+ * change — see `docs/plans/model-effort-local-command-turns.md` §10). This
+ * is the mirror image of `reconcileTaskSession`'s `/model`/`/effort`
+ * branch: that path takes an agetor-side change and pushes it INTO the
+ * session; this path takes a session-side change and pulls it back onto the
+ * task row. It must never call `reconcileTaskSession` / `sendSlashCommand`
+ * — the change already happened in the live session, so re-mirroring it
+ * would pop a spurious second "Switch model?"/"Change effort level?"
+ * confirm off the very update we're recording.
+ *
+ * No-op (returns false) when: the task doesn't exist, its agent isn't
+ * claude-code, the stdout doesn't parse to a known setting, the parsed
+ * value is unchanged, claude landed on a value agetor can't represent
+ * (`kind: "unrepresentable"` — a breadcrumb is still emitted so the drift
+ * isn't silent), or — for an effort outcome — the parsed id isn't supported
+ * by the task's current model (`supportedEfforts`, discovered-then-curated,
+ * the same contract the RunPanel picker filters against). Model equality is
+ * checked both by raw id AND via `toClaudeModelArg` so an alias (e.g. claude
+ * reporting "sonnet" resolved to agetor id `sonnet-5.5`) can never flip the
+ * stored id against an already-equivalent one. A `null` `task.model` (the
+ * row has never had an explicit model written to it — the task simply runs
+ * on claude's/agetor's default) is compared as if it already held
+ * `DEFAULT_MODEL["claude-code"]`: a bare `/model` immediately followed by Esc
+ * reports `Kept model as <the default's display name>`, which resolves to
+ * that same default id — without this, the row would get pinned to an
+ * explicit id it never asked for, just because the user opened and closed
+ * the picker without changing anything.
+ *
+ * A `Kept model as <X>` outcome (`ClaudeLocalModelOutcome.kept`) that DOES
+ * differ from the row is additionally gated on `info.viaMirror`: it only
+ * writes the row when agetor's own `mirrorModelViaPicker` provoked the
+ * `Switch model?` the user then declined. A user's own bare `/model` + Esc
+ * reports the same line but must NOT overwrite a next-run model the user
+ * deliberately chose in the dropdown (typically one the installed picker
+ * can't select at all) — that case emits a breadcrumb naming both values and
+ * returns false. See `SessionState.lastModelMirrorAt` in claude-tmux.ts for
+ * how the attribution is established, and `ClaudeLocalModelOutcome` for why
+ * the parse can't make this call itself.
+ *
+ * A model sync that lands on a model which no longer supports the task's
+ * saved effort adjusts the effort in the SAME `tasks.update` — mirroring
+ * `effortFallbackForModelChange` above (itself a mirror of the RunPanel's
+ * own effect) — rather than leaving a row with an impossible (model,
+ * effort) pair until the next unrelated PATCH happens to fix it. This
+ * cascaded effort adjustment is, like every other write this function makes,
+ * NEVER mirrored into the live session via `sendSlashCommand` — claude's own
+ * live model/effort pair is left exactly as claude set it; the row-side
+ * adjustment only governs what the model dropdown shows and what the NEXT
+ * spawn (or the next explicit `/effort` from the dropdown) will use. The
+ * breadcrumb says so explicitly ("for the next run") so the user doesn't
+ * read it as "agetor just changed your live effort".
+ *
+ * Returns true when a row actually changed (and a status breadcrumb was
+ * attempted on the task's most recent run, if one exists).
+ */
+export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo): boolean {
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if ((resolveHarness(task.agent)?.kind ?? null) !== "claude-code") return false;
+
+  const outcome = parseClaudeLocalSetting(info);
+  if (!outcome) return false;
+
+  const recent = runs.listForTask(taskId)[0];
+  const announce = (data: string) => {
+    if (!recent) return;
+    saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  };
+
+  if (outcome.kind === "unrepresentable") {
+    const current = outcome.setting === "model" ? task.model : task.effort;
+    announce(describeUnrepresentableLocalSetting(outcome, current));
+    return false;
+  }
+
+  let patch: Partial<Task>;
+  let breadcrumb: string;
+
+  if (outcome.kind === "model") {
+    // A never-set row (`task.model === null`) runs on the default model, so
+    // compare against DEFAULT_MODEL rather than `null`/"" — otherwise a bare
+    // `/model` + Esc ("Kept model as <default>") would pin an explicit id
+    // onto a task that never asked for one (see the function doc).
+    const effectiveCurrentModel = task.model ?? DEFAULT_MODEL["claude-code"];
+    const unchanged =
+      outcome.id === effectiveCurrentModel
+      || toClaudeModelArg(outcome.id) === toClaudeModelArg(effectiveCurrentModel);
+    if (unchanged) return false;
+
+    // `Kept model as <X>` is claude RESTATING the live session's model, not
+    // changing it (`ClaudeLocalModelOutcome.kept`). Two different events
+    // produce that line and only `info.viaMirror` tells them apart:
+    //
+    //   - viaMirror TRUE — agetor's own dropdown mirror
+    //     (`mirrorModelViaPicker`) popped `Switch model?` and the user
+    //     declined it. The row was already written optimistically by the
+    //     PATCH that triggered the mirror, so it is genuinely drifted and
+    //     falls through to the normal sync below.
+    //   - viaMirror FALSE — the user opened a bare `/model` themselves and
+    //     dismissed it (Esc). Syncing here DISCARDS a deliberate next-run
+    //     model choice: the live smoke had a row pinned to a model the
+    //     2.1.246 picker cannot select ("applies on the next run"), and a
+    //     later bare `/model` + Esc reported `Kept model as Sonnet 5`, which
+    //     silently overwrote it. Leave the row alone and explain the split.
+    //
+    // Reached only when the two genuinely differ (the `unchanged` early
+    // return above already covered the agree case), so the breadcrumb never
+    // fires on an ordinary open-and-dismiss of a row that matches the
+    // session. A `Set model to` outcome is a real change and is never gated.
+    if (outcome.kept && !info.viaMirror) {
+      announce(describeKeptModelNotSynced(outcome.id, effectiveCurrentModel));
+      return false;
+    }
+
+    patch = { model: outcome.id };
+    breadcrumb = describeLocalSettingSync(outcome);
+
+    const effortFallback = effortFallbackForModelChange(
+      "claude-code",
+      outcome.id,
+      task.effort,
+      getDiscoveredEfforts("claude-code", outcome.id, task.agent),
+    );
+    if (effortFallback !== undefined) {
+      patch.effort = effortFallback;
+      // "for the next run" — this cascaded adjustment is NEVER mirrored into
+      // the live session (see the function doc); it only governs the next
+      // spawn, so the wording must not read as "your live effort changed".
+      breadcrumb += effortFallback === null
+        ? `; effort cleared for the next run (not supported on ${outcome.id})`
+        : `; effort adjusted to ${effortFallback} for the next run (not supported on ${outcome.id})`;
+    }
+  } else {
+    // outcome.kind === "effort" — validate against the (agent, model) pair
+    // before writing, same discovered-wins-then-curated contract the
+    // RunPanel picker filters against (claude-code reports no discovered
+    // efforts today, so this is curated-only in practice — but it keeps one
+    // contract with every other `supportedEfforts` call site). A
+    // representable-but-unsupported id (claude accepted `/effort xhigh` on
+    // a model whose agetor entry doesn't list it) must not silently widen
+    // the task row past what the picker would ever allow.
+    const allowed = new Set(
+      supportedEfforts(
+        "claude-code",
+        task.model,
+        getDiscoveredEfforts("claude-code", task.model, task.agent),
+      ).map((o) => o.id),
+    );
+    if (!allowed.has(outcome.id)) {
+      const modelLabel = task.model ?? DEFAULT_MODEL["claude-code"];
+      announce(
+        `effort "${outcome.id}" isn't supported on ${modelLabel} in agetor — left as ${task.effort ?? "unset"}`,
+      );
+      return false;
+    }
+    if (outcome.id === task.effort) return false;
+    patch = { effort: outcome.id };
+    breadcrumb = describeLocalSettingSync(outcome);
+  }
+
+  // Direct DB update — deliberately NOT `reconcileTaskSession` /
+  // `sendSlashCommand`. The change came FROM claude; pushing it back in
+  // would re-trigger the very confirm modal we just resolved.
+  const updated = tasks.update(taskId, patch);
+  if (!updated) return false;
+
+  announce(breadcrumb);
+  return true;
+}
+
+/**
+ * Surface a `cycleToMode` outcome on the task's most recent run so the user
+ * sees it in the run panel. Both success and skip ride the `status` stream
+ * — skipping is an orchestrator-side decision (e.g. asking for `bypass` on
+ * a session that wasn't launched with the flag), not an agent error, so
+ * `stderr` would mislead the user into thinking claude crashed. We
+ * disambiguate with a "⚠️" prefix on the skip case. Silent when there's no
+ * run row to attach to (shouldn't happen — a live tmux session implies at
+ * least one prior run — but defensive).
+ */
+function emitModeChangeStatus(
+  taskId: string,
+  agetorMode: string,
+  result: CycleResult,
+): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const runId = recent.id;
+  const data = result.ok
+    ? (result.via === "noop"
+      ? null
+      : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
+    : formatModeChangeFailure(agetorMode, result);
+  if (!data) return;
+  saveAndEmit({ runId, taskId, stream: "status", data });
+}
+
+/**
+ * Tell the user when the PreToolUse hook matcher couldn't be rewritten
+ * after a successful mode change. The mode itself did take effect on the
+ * live session, so the user sees claude responding to the new posture —
+ * but the on-disk matcher is stale, which on the next spawn (or on a
+ * mid-session settings-reread, if claude does that) would surface routine
+ * tools as approvals (or, in the other direction, swallow ones the user
+ * wanted prompts for). The most common cause is the user having
+ * hand-edited `.claude/settings.local.json` into malformed JSON — point
+ * them at the file so they can fix it.
+ */
+function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+}
+
+/**
+ * Build the user-facing warning string for an unsuccessful `cycleToMode`
+ * outcome. Switch is exhaustive on `result.reason` (a literal union); the
+ * TS compiler flags any future reason that isn't handled here. The
+ * verification-* reasons carry the most diagnostic value — we surface
+ * the observed mode so the user can see exactly where claude landed.
+ */
+function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult, { ok: false }>): string {
+  const seen = result.lastObserved ?? "unknown";
+  switch (result.reason) {
+    case "verification timed out": {
+      // The auto opt-in modal is by far the most common reason a press
+      // produces no JSONL event, but only when the target is `auto`. For
+      // any other target the modal advice is misleading, so we drop it.
+      const tail = agetorMode === "auto"
+        ? " If this is the first time cycling to auto on this account, accept the opt-in prompt in the run panel and try again."
+        : "";
+      return `⚠️ mode change to ${agetorMode}: claude didn't acknowledge after ${result.attempts ?? "?"} attempt(s) (last seen: ${seen}).${tail}`;
+    }
+    case "verification mismatch":
+      return `⚠️ mode change to ${agetorMode} failed after ${result.attempts ?? "?"} attempt(s) (claude landed on ${seen}). Your account may not have access to this mode — pick a different one in the task details.`;
+    case "mode not in cycle":
+      return `⚠️ mode change to ${agetorMode} skipped: '${result.target ?? agetorMode}' isn't in this session's Shift+Tab cycle — stop the run and start again with that mode at launch.`;
+    case "no live session":
+    case "current mode unknown":
+      return `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
+    // T7's paste guard (docs/plans/model-effort-local-command-turns.md §10):
+    // `cycleToMode`'s `/plan` path withheld its own paste because a blocking
+    // claude modal (permission prompt, AskUserQuestion, another confirm) was
+    // still on the pane when the grace window elapsed — no keystrokes were
+    // sent at all, so the mode never changed. `ensureInstalledForCwd` is
+    // correctly skipped for this case too: it only runs under `result.ok`
+    // above, and this branch is exclusively reachable via `result.ok === false`.
+    case "paste withheld":
+      return `⚠️ ${agetorMode} mode not applied — claude is waiting on a prompt; answer it (or the terminal), then change the mode again.`;
+  }
+}
+
+/**
+ * Stop the active handle `h`'s task. `kill()` sends Ctrl+C to the tmux
+ * session, which also clears claude's queued-input buffer, so every queued
+ * run in this task is going down too. Mark each active handle as cancelled
+ * so their done handlers record "cancelled" (not "failed") when their
+ * slot's reject fires. Resolve any in-flight approval / question for this
+ * task BEFORE the interrupt — otherwise the hook script's curl and the MCP
+ * server's fetch would sit on a doomed HTTP response until their own
+ * timeouts. Shared by `cancelRun` (Stop button) and `archiveTask`
+ * (`stopRun`) so the two can't drift.
+ */
+function stopActiveHandle(h: ActiveRun, reason: string): void {
+  for (const [, handle] of active) {
+    if (handle.taskId === h.taskId) handle.cancelled = true;
+  }
+  cancelPendingForTask(h.taskId, reason);
+  h.kill();
+}
+
+/**
+ * Stop a task that's "held" (see `isHeldByBackgroundAgents`) — its terminal
+ * run already succeeded but background agents are still running, so there's
+ * no `active` handle to kill. Interrupt the live session and release the
+ * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
+ */
+async function stopHeldTask(taskId: string, reason: string): Promise<void> {
+  cancelPendingForTask(taskId, reason);
+  // Ordering rule (§7 of the async-warmup plan): the interrupt must complete
+  // — not fire-and-forget — before this returns, matching `deleteTask`'s and
+  // `enqueueArchiveTeardown`'s kill-before-teardown discipline. Awaited here
+  // rather than left as a bare call now that `interruptTaskSession` is async.
+  await interruptTaskSession(taskId);
+  orphanRunningSubagents(taskId);
+}
+
+export async function cancelRun(runId: string): Promise<boolean> {
+  const h = active.get(runId);
+  if (!h) {
+    // A held task (turn succeeded, background agents still running) has no
+    // `active` handle — `attachDoneHandler` dropped it before parking the card
+    // in `running`. Its Stop button must still do something, or a background
+    // agent that wedges without dying leaves the user no way out short of a
+    // restart. Interrupt the live session and release the hold; the run itself
+    // already succeeded, so the card advances to `review`.
+    const taskId = runs.get(runId)?.taskId;
+    if (!taskId) return false;
+    if (isHeldByBackgroundAgents(taskId)) {
+      // Before the interrupt: the runner queues its record of the stop
+      // ahead of the settle the hold's release triggers.
+      reportHeldStepStopped(taskId);
+      await stopHeldTask(taskId, "cancelled by user");
+      return true;
+    }
+    // A paused fx task has no `active` handle either — there's no live
+    // process to interrupt — but Stop should still do something when a
+    // pending auto-resume timer is what's left to act on (plan §3 T2 item 8):
+    // cancel the schedule rather than reporting failure.
+    if (fxAutoResumeTimers.has(taskId)) {
+      return cancelFxAutoResume(taskId, "stopped");
+    }
+    // Bounded-spawn pending window: the run is the task's current run and
+    // still `running`, but its agent hasn't registered yet. Record the
+    // cancel for the continuation (see `pendingCancelRunIds`) instead of
+    // reporting "nothing to stop".
+    const run = runs.get(runId);
+    if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
+      pendingCancelRunIds.add(runId);
+      cancelPendingForTask(taskId, "cancelled by user");
+      return true;
+    }
+    return false;
+  }
+  // Stop targets the whole task, not just one run.
+  stopActiveHandle(h, "cancelled by user");
+  return true;
+}
+
+/**
+ * Stop whatever run of `taskId` is live — the pipeline Stop's counterpart of
+ * {@link isAnyRunOfTaskLive}. Tries the task's current run first (which also
+ * covers a held task and a bounded-spawn pending window, see `cancelRun`);
+ * when that has nothing to stop, the newest run still registered in `active`
+ * (a displaced continuation). Only ONE run is cancelled: `stopActiveHandle`
+ * already flags every handle of the task cancelled, and for claude every run
+ * of a task shares one tmux session, where a second Ctrl+C on an idle prompt
+ * would exit the REPL. When the task only holds a spawn claim (no run minted
+ * yet), the Stop is recorded against the claim instead
+ * ({@link pendingCancelTaskIds}). Returns whether anything was stopped.
+ */
+export async function cancelLiveRunOfTask(taskId: string): Promise<boolean> {
+  const currentRunId = tasks.get(taskId)?.runId;
+  if (currentRunId && (await cancelRun(currentRunId))) return true;
+  let newest: string | null = null;
+  // `active` is a Map: insertion order is registration order, newest last.
+  for (const [runId, handle] of active) {
+    if (handle.taskId === taskId && runId !== currentRunId) newest = runId;
+  }
+  if (newest && (await cancelRun(newest))) return true;
+  // A spawn holds the task's claim but hasn't minted its run yet (codex's
+  // per-model CLI floor probe runs inside the claim, before the insert):
+  // there is no run to cancel, so record the Stop against the claim. The
+  // spawn path hands it to the run it mints (`adoptPendingTaskCancel`).
+  if (startingTaskIds.has(taskId)) {
+    pendingCancelTaskIds.add(taskId);
+    cancelPendingForTask(taskId, "cancelled by user");
+    return true;
+  }
+  return false;
+}
+
+/**
+ * `delivered: false` normally means dispatch never happened at all (task/run
+ * not found, worktree restore failed, unknown agent kind). For claude-code,
+ * `sendTurnInExistingSession` now AWAITS the paste's real `PasteOutcome`
+ * (docs/plans/model-effort-local-command-turns.md §10, "withheld sends
+ * surface at the HTTP layer") before resolving, so a THIRD case reaches this
+ * type: the message WAS recorded (the optimistic "user" bubble is already in
+ * the transcript, and — for an idle send — a new run row exists and the task
+ * moved to `running`) but the actual paste never reached claude because a
+ * blocking modal was still on the pane. That case sets `withheld: true`, and
+ * `handlePasteWithheld` has already tried to re-stash the text into the
+ * task's backlog tray and left its own status breadcrumb on the run by the
+ * time this resolves, so the caller doesn't need to do anything further with
+ * the text itself, just tell the user their message didn't reach the agent.
+ * `savedToBacklog` reports that re-stash truthfully: `false` when it was
+ * skipped because the task was deleted or archived underneath the send. A genuine tmux subprocess failure (not a modal
+ * withhold) keeps this plain `{ delivered: false, reason }` shape with no
+ * `withheld`/`savedToBacklog` flags.
+ *
+ * `unresolvedRefs` (delivered variant only, omitted when empty): the raw
+ * `@`-tokens (`token.raw` — e.g. `@nope.md`, `@"my file.md"`) the send-time
+ * expansion left verbatim because they didn't resolve against this task's
+ * cwd — a typo, a file not present in this cwd's tree, or an `@name`
+ * extension mention (`@github`) are all indistinguishable here; the server
+ * reports the fact, callers decide what's noise.
+ *
+ * `pending` (delivered variant only, omitted whenever falsy): set when the
+ * send hadn't finished within `SPAWN_RESPONSE_BUDGET_MS` — see that
+ * constant's doc. Two producers:
+ *   - claude's dead/no-session mint path (`sendClaudeTurn` →
+ *     `spawnResumedSession`) responded before its underlying `claude
+ *     --resume` spawn settled: the run row, the `running` column flip and
+ *     the `user` event are already persisted, `runId` names the new run, and
+ *     the spawn keeps running detached;
+ *   - `sendInput` itself, for ANY slow pre-dispatch work (the codex CLI
+ *     floor probe, waiting out a deferred archive teardown, restoring a
+ *     detached worktree, `@`-expansion, the dispatch). Here nothing is
+ *     promised to be persisted yet and `runId` is the run the message was
+ *     ADDRESSED to, not necessarily a new turn's run.
+ * Either way this is still `delivered: true`, not a new outcome kind. A
+ * pending answer cannot carry a later failure, so if the detached work ends
+ * in a refusal the raw (pre-expansion) message is re-stashed into the task's
+ * backlog tray and a live-only `send-failed` event is emitted — the CLI's
+ * `send` cannot observe that. A send that settles inside the budget never
+ * sets `pending` unless the claude mint path did.
+ */
+export type SendInputResult =
+  | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
+  | { delivered: false; reason: string; withheld?: true; savedToBacklog?: boolean; busy?: true };
+
+/**
+ * `SendInputResult.busy` — set ONLY by an idle-only send (`opts.onlyIfIdle`
+ * on {@link sendInput}) that was refused because the task still had a live
+ * run (or, for claude, a turn in flight / queued / awaiting a continuation's
+ * content). A busy refusal has no side effects: no run row, no `user` event,
+ * no queue entry, no steer, no backlog stash, no un-archive. It is the
+ * pipeline runner's handoff reminder that asks for this (a reminder pasted
+ * into a working session is folded into a turn that would have produced the
+ * handoff anyway, or splits it); every other caller omits the option and
+ * keeps its fold/queue/steer behavior.
+ */
+const IDLE_ONLY_BUSY_REASON = "the agent is busy with a turn — not sent";
+function idleOnlyBusyResult(): SendInputResult {
+  return { delivered: false, busy: true, reason: IDLE_ONLY_BUSY_REASON };
+}
+
+/**
+ * What a send answers once launches are frozen ({@link freezeLaunches}). An
+ * idle-only send also reads `busy`, so the pipeline runner retries its
+ * reminder with the next owner instead of blocking the step. Shared by
+ * `sendInput`'s entry check and the re-checks that follow its awaits.
+ */
+function frozenSendResult(onlyIfIdle: boolean): SendInputResult {
+  return onlyIfIdle
+    ? { delivered: false, busy: true, reason: LAUNCHES_FROZEN_REASON }
+    : { delivered: false, reason: LAUNCHES_FROZEN_REASON };
+}
+
+/** A send's answer when the task was archived while it was still awaiting. */
+const SEND_ARCHIVED_REASON = "task was archived before the message could be sent";
+
+/** What a per-kind `send*Turn` helper returns for an idle-only send it
+ *  refused (see {@link SendInputResult}'s `busy`). */
+interface IdleOnlyBusy {
+  busy: true;
+}
+function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
+  return typeof value === "object" && value !== null && (value as { busy?: unknown }).busy === true;
+}
+
+/** A cursor follow-up minted a run and then killed it before the child
+ *  was registered. Distinct from a `null` start-claim conflict. */
+type CursorTurnMiss = { declined: string };
+
+function isCursorTurnMiss(value: unknown): value is CursorTurnMiss {
+  return typeof value === "object" && value !== null && typeof (value as { declined?: unknown }).declined === "string"
+    && (value as { busy?: unknown }).busy !== true;
+}
+
+/**
+ * Forward a line of user-supplied input to the agent. Behavior depends on
+ * agent kind:
+ *
+ *   • claude-code: when the session is idle, each user message is its own
+ *     turn → its own run row (paste into the live tmux session + a new turn
+ *     slot via `sendTurn`). When a turn is already in flight, the message is
+ *     *folded* into the active run instead (`pasteFollowUp` — paste into the
+ *     session, record a user event on the current run, no new row/slot). This
+ *     keeps at most one in-flight run per task so claude coalescing queued
+ *     messages can't strand surplus run rows in `running`. See
+ *     `sendTurnInExistingSession`.
+ *
+ *   • codex: each follow-up is queued and spawned as its own `codex exec
+ *     resume <thread_id>` turn once the active turn resolves — codex `exec`
+ *     is a one-shot process, not a REPL, so there's no live stdin to write
+ *     to mid-turn. See `sendCodexTurn`/`drainCodexQueue`.
+ *
+ *   • cursor: same queue-and-resume shape as codex (`sendCursorTurn`/
+ *     `drainCursorQueue`). Each queued follow-up is a new `cursor-agent acp`
+ *     child that resumes with `session/load` of the stored session id.
+ *     Cursor is one-shot per turn.
+ *
+ *   • gemini: same queue-and-resume shape as codex (`sendGeminiTurn`/
+ *     `drainGeminiQueue`), spawning `gemini --resume <session-id>` for each
+ *     queued follow-up — gemini's CLI is one-shot per turn too.
+ *
+ *   • fx: same queue-and-resume shape as codex/cursor/gemini (`sendFxTurn`/
+ *     `drainFxQueue`), resuming via fx's ACP session id for each queued
+ *     follow-up — fx has no persistent REPL either (see fx-acp.ts). On fx
+ *     0.0.13 or later a message sent while a turn runs steers that turn
+ *     instead (`ActiveRun.steer`, no new run row) when nothing is queued
+ *     ahead of it; a steer fx drops is re-queued in send order
+ *     (`fxSteerDroppedHandler`).
+ *
+ * Archived / detached-worktree restore: a message to an archived task
+ * auto-unarchives it (sending is an unambiguous signal of continued
+ * interest), and if the task's worktree was detached (by archive) or is
+ * otherwise missing on disk, it's rematerialized via `prepareWorkdir` before
+ * dispatch — same deterministic path, branch, and history, so the resumed
+ * turn lands in the same place the agent left off. A hard restore failure
+ * (e.g. the branch was deleted or checked out elsewhere) is surfaced as a
+ * `delivered: false` result rather than silently falling back to an
+ * unisolated cwd.
+ *
+ * Bounded wait (opt-in, `opts.bounded`): only the HTTP route
+ * (`POST /runs/:id/input`) passes it, because only there is a held promise a
+ * held connection out of the webview's ~6-per-host budget. Internal callers
+ * (the pipeline handoff reminder, cursor plan approval, the ask-card
+ * fallback message) await the REAL outcome: they act on `delivered`, and a
+ * budget-expired `{ delivered: true, pending: true }` would read as success
+ * for a send that is about to be withheld (`PASTE_MODAL_GRACE_MS` equals the
+ * budget, so every withheld claude paste would) or refused. When bounded,
+ * this promise never stays open past `SPAWN_RESPONSE_BUDGET_MS`
+ * (measured from the call). Only the cheap `run not found` / `task not found`
+ * refusals are answered synchronously; everything after them — the codex CLI
+ * floor check, `pendingTeardown`, the pipeline-step guard, the worktree
+ * restore, `@`-expansion, the argv-overage re-check and the per-kind dispatch
+ * (including claude's `claude --resume` mint, which has taken 5-30s in
+ * practice) — runs as `sendInputInner`, raced against the budget. Settled in
+ * time → its result is returned unchanged. Otherwise this resolves
+ * `{ delivered: true, runId, pending: true }` and the work continues
+ * detached. `runId` is the run this message minted when the dispatch got as
+ * far as minting one (claude's idle mint persists the run row and points
+ * `task.runId` at it before the spawn), else the run the message was
+ * addressed to — see `pendingRunIdFor`. A late refusal is
+ * handled by `settleLateSend` (raw message re-stashed into the backlog +
+ * `send-failed` event).
+ *
+ * Ordering guarantee kept from before the split: the codex floor check runs
+ * BEFORE the archived-task auto-unarchive (both inside `sendInputInner`, in
+ * that order), so a send the CLI floor refuses — even a late-refused one —
+ * never un-archives the task or re-creates its worktree.
+ *
+ * Idle-only (opt-in, `opts.onlyIfIdle`): refuse with `{ delivered: false,
+ * busy: true }` instead of folding/queueing/steering when the task still has
+ * a live run — see {@link SendInputResult}. Only the pipeline runner's
+ * handoff reminder passes it (docs/plans/handoff-identification-fix.md RC4/
+ * D6); the HTTP route, cursor plan approval and the ask-card fallback do not.
+ * Checked twice: a cheap early pre-check at the top of `sendInputInner`
+ * (before the un-archive, teardown wait and worktree restore, so a refusal
+ * never causes those side effects), and the authoritative one inside each
+ * kind's `send*Turn` helper, in the same synchronous section as its busy/idle
+ * decision.
+ */
+export async function sendInput(
+  runId: string,
+  line: string,
+  opts: { bounded?: boolean; onlyIfIdle?: boolean } = {},
+): Promise<SendInputResult> {
+  const row = db.query<{ task_id: string; agent: string }, [string]>(
+    `SELECT task_id, agent FROM runs WHERE id = ?`,
+  ).get(runId);
+  if (!row) return { delivered: false, reason: "run not found" };
+
+  const task = tasks.get(row.task_id);
+  if (!task) return { delivered: false, reason: "task not found" };
+  if (launchesFrozenFlag) return frozenSendResult(opts.onlyIfIdle === true);
+
+  // Everything past the two cheap lookups above — the codex floor probe, the
+  // teardown wait, the worktree restore, `@`-expansion and the per-kind
+  // dispatch — can take seconds on a cold or contended machine, and the HTTP
+  // request that carries this call must not be held open for any of it (the
+  // webview's connection budget is ~6 per host; see
+  // `SPAWN_RESPONSE_BUDGET_MS`). So the whole tail runs as `sendInputInner`,
+  // raced against that budget measured from here. Settled in time → its
+  // result is returned byte-for-byte (including an inner `pending: true` the
+  // claude mint path produced on its own). Not settled → the caller is told
+  // `{ delivered: true, runId, pending: true }` NOW and the inner keeps
+  // running detached; `settleLateSend` then turns a late failure into a
+  // backlog re-stash plus a `send-failed` event so the message is never lost
+  // silently. `rawLine` is the pre-expansion text — the same text a draft or
+  // tray item was saved with, which is what the re-stash dedupes against.
+  const rawLine = line;
+  const sendStartedAt = Date.now();
+  const inner = sendInputInner(row, task, line, opts.onlyIfIdle === true).catch(
+    (err): SendInputResult => ({
+      delivered: false,
+      reason: err instanceof Error ? err.message : String(err),
+    }),
+  );
+  if (!opts.bounded) return inner;
+  const raced = await raceSpawnBudget(inner, SPAWN_RESPONSE_BUDGET_MS);
+  if (raced.settled) return raced.value;
+  void inner.then((result) => settleLateSend(row.task_id, rawLine, result)).catch((err) => {
+    console.error(`[agetor] late send settle failed for task ${row.task_id}:`, err);
+  });
+  return { delivered: true, runId: pendingRunIdFor(row.task_id, runId, sendStartedAt), pending: true };
+}
+
+/**
+ * The `runId` a budget-expired `sendInput` reports. Claude's idle mint
+ * (`spawnResumedSession`) persists the new run row and points `task.runId`
+ * at it BEFORE its own (inner) budget race starts — and that inner race only
+ * begins after the pre-dispatch awaits, so the outer race usually fires
+ * first even though a new run already exists. Reporting the addressed run in
+ * that case would hide the turn the caller's message just started, so: when
+ * the task's current run is a different run created during this send, that
+ * run is the answer; otherwise (nothing minted yet — still waiting on a
+ * teardown, a restore, a floor probe — or a fold/queue path that never mints
+ * synchronously) it is the run the message was addressed to.
+ */
+function pendingRunIdFor(taskId: string, addressedRunId: string, sendStartedAt: number): string {
+  try {
+    const current = tasks.get(taskId)?.runId;
+    if (current && current !== addressedRunId) {
+      const run = runs.get(current);
+      if (run && run.startedAt >= sendStartedAt) return current;
+    }
+  } catch (err) {
+    console.warn(`[agetor] pending runId lookup failed for task ${taskId}:`, err);
+  }
+  return addressedRunId;
+}
+
+/**
+ * Outcome handling for a `sendInput` that already answered `pending: true`
+ * (see there): the HTTP response that could have carried a failure is gone,
+ * so a refusal is converted into the two durable signals the sender can still
+ * see — the message back in the task's backlog tray (unless the dispatch
+ * itself already re-stashed it) and a live-only `send-failed` event the
+ * webview toasts. A delivered result needs nothing; a withheld one already
+ * went through `handlePasteWithheld`'s re-stash, whose outcome it carries as
+ * `savedToBacklog`. That flag is reported truthfully either way:
+ * `restashPasteWithheldText` skips a task that is gone or archived, in which
+ * case the toast says the text was NOT saved.
+ */
+function settleLateSend(taskId: string, rawLine: string, result: SendInputResult): void {
+  if (result.delivered) return;
+  const savedToBacklog = result.withheld === true
+    ? result.savedToBacklog === true
+    : restashPasteWithheldText(taskId, rawLine);
+  emitGlobal({ kind: "send-failed", taskId, reason: result.reason, savedToBacklog, ts: Date.now() });
+}
+
+/**
+ * The budgeted tail of {@link sendInput}: everything after the cheap
+ * `run not found` / `task not found` refusals. `row` and `task` are the
+ * caller's lookups (the task snapshot is only used for the pre-flight checks;
+ * later steps re-read it where a stale view would matter).
+ */
+async function sendInputInner(
+  row: { task_id: string; agent: string },
+  task: Task,
+  line: string,
+  onlyIfIdle: boolean,
+): Promise<SendInputResult> {
+  // The claim column, not the JSON blob. Migration 070 (and 078 for
+  // OpenCode) leaves a duplicate's losing row with the provenance set and
+  // the claim column NULL; Send would otherwise resume the winner's session.
+  const imported = importedSessionOf(task);
+  if (imported) {
+    const heldElsewhere = imported.kind === "opencode"
+      ? tasks.importedOpencodeSessionHeldElsewhere(row.task_id, imported.sessionId)
+      : tasks.importedSessionHeldElsewhere(row.task_id, imported.sessionId);
+    if (heldElsewhere) {
+      return {
+        delivered: false,
+        reason: imported.kind === "opencode" ? IMPORTED_OPENCODE_HELD_ELSEWHERE : IMPORTED_CLAUDE_HELD_ELSEWHERE,
+      };
+    }
+    if (imported.status === "importing") {
+      return {
+        delivered: false,
+        reason: imported.kind === "opencode"
+          ? "OpenCode history is still importing"
+          : "still importing this session's history",
+      };
+    }
+    if (imported.status === "failed") {
+      return { delivered: false, reason: imported.error ?? "import failed" };
+    }
+  }
+
+  // Idle-only early pre-check, BEFORE every side effect below (the archivedAt
+  // clear, the teardown wait, the worktree restore). It is a cheap fast path,
+  // not the decision: each kind's `send*Turn` re-checks in the same
+  // synchronous section as its busy/idle decision, because a continuation can
+  // still be adopted (or a turn started) during the awaits in between.
+  if (onlyIfIdle && isAnyRunOfTaskLive(row.task_id)) return idleOnlyBusyResult();
+
+  // Pre-flight 1b for a floored one-shot kind (codex, copilot) BEFORE any side effect
+  // below — the archivedAt clear and the worktree restore both mutate state,
+  // and a follow-up the CLI floor is going to refuse must not un-archive the
+  // task or re-create its worktree on the way to that refusal.
+  // `spawnCodexTurnNow` re-checks right before minting the run (the model is
+  // PATCH-able while a message sits in the queue), so this is the early
+  // gate, not the only one.
+  {
+    const taskHarness = resolveHarness(task.agent);
+    if (taskHarness?.kind === "codex" || taskHarness?.kind === "copilot") {
+      const floorError = await minCliVersionError(taskHarness, task.model ?? DEFAULT_MODEL[taskHarness.kind]);
+      if (floorError !== null) return { delivered: false, reason: floorError };
+    }
+  }
+
+  if (task.archivedAt != null) {
+    tasks.update(row.task_id, { archivedAt: null });
+  }
+
+  // Same race as unarchiveTask/startTask: a deferred archive teardown may
+  // still be removing this task's worktree — let it finish before the
+  // existsSync check decides whether a restore is needed.
+  await pendingTeardown(row.task_id);
+
+  // M-R5: a worktree-isolated pipeline step task shares its parent's worktree
+  // (D2) — the same refusal `startTaskInner`'s M6 guard makes. Restoring it
+  // from a follow-up send would hand this ONE step a private checkout
+  // (`prepareWorkdir`'s materialize branch) instead of the shared one; only
+  // the pipeline task's own Run/Retry re-materializes it.
+  if (
+    task.pipelineParentId
+    && task.isolation === "worktree"
+    && (!task.worktreePath || !existsSync(task.worktreePath))
+  ) {
+    return { delivered: false, reason: "step task's worktree is missing — run the pipeline task instead" };
+  }
+
+  if (task.worktreePath && !existsSync(task.worktreePath)) {
+    // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
+    // doesn't care about it, but keeping the object fresh avoids acting on a
+    // stale snapshot).
+    const fresh = tasks.get(row.task_id) ?? task;
+    try {
+      const restored = await prepareWorkdir(fresh);
+      if ("error" in restored) {
+        return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
+      }
+      noteRestoredCheckout(fresh.id, restored);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { delivered: false, reason: `worktree restore failed: ${msg}` };
+    }
+  }
+
+  // Single choke point for `@`-token expansion on every follow-up path:
+  // webview sends, the backlog tray, the diff composer, ask-card free-text
+  // answers, and the CLI all funnel through `sendInput`, so expanding here
+  // once — rather than in each per-kind `send*Turn` below — covers all of
+  // them with no per-caller change. Re-read the task (rather than reuse the
+  // `task` fetched above) because the worktree-restore branch just above may
+  // have materialized `worktreePath` for the first time; a stale read would
+  // expand against a cwd that didn't exist yet.
+  const cwdTask = tasks.get(row.task_id) ?? task;
+  // Keep the pre-expansion text around: a claude paste that gets withheld by
+  // the modal guard re-stashes into the task's backlog tray (see
+  // `handlePasteWithheld`/`restashPasteWithheldText`), and that re-stash must
+  // dedupe against the RAW `@token` text a draft/tray item was saved with
+  // (plan §3.2) — re-stashing the EXPANDED absolute-path text would never
+  // match, producing a duplicate backlog entry every time the same message is
+  // retried (R2, code review).
+  const rawLine = line;
+  // Resolved through the disclaimed task-dir helper (D25), same as `startTask`.
+  const expanded = await expandAtReferencesDetailedAsync(
+    line,
+    cwdTask.worktreePath ?? cwdTask.workdir,
+    resolveAtPathsInTaskDir,
+  );
+  line = expanded.text;
+  const unresolvedRefs = expanded.unresolved;
+
+  const harness = resolveHarness(row.agent);
+  const kind = harness?.kind;
+
+  // Re-check the argv-launch budget AFTER expansion, mirroring `startTask`'s
+  // pre-check (R5, code review): expanding a handful of short `@tokens` into
+  // long absolute paths can push a follow-up over gemini's one-shot argv cap
+  // even though the raw text the user typed comfortably fit under it. Must
+  // run before the per-kind dispatch below — once a kind's `send*Turn` is
+  // called it may already queue behind (or fold into) a live session with no
+  // way to un-send. A prompt that was ALREADY over budget with no `@` tokens
+  // involved (`rawOverage` truthy too) is left alone here, same as
+  // `startTask`'s identical carve-out.
+  if (kind) {
+    const expandedOverage = promptByteOverage(kind, line);
+    const rawOverage = line === rawLine ? expandedOverage : promptByteOverage(kind, rawLine);
+    if (expandedOverage && !rawOverage) {
+      return {
+        delivered: false,
+        reason:
+          `message is ${expandedOverage.bytes - expandedOverage.limit} bytes over `
+          + `${harness?.label ?? row.agent}'s ${expandedOverage.limit}-byte launch limit after expanding `
+          + `@ file references — shorten it or reference fewer files`,
+      };
+    }
+  }
+
+  // Archive can land while this send is already inside an await —
+  // `pendingTeardown`, the missing-worktree restore, or `@` expansion.
+  // The unarchive above already ran, and `pendingTeardown` only waits on
+  // the promise it captured, so a later archive's stamp is invisible
+  // unless we read the row again in the same turn as the spawn. Spawning
+  // anyway leaves an archived task with a live agent; the restart-followup
+  // answer route then reports a failed delivery with no reason of its own.
+  const readyToSpawn = tasks.get(row.task_id);
+  if (!readyToSpawn) return { delivered: false, reason: "task not found" };
+  if (readyToSpawn.archivedAt != null) {
+    return { delivered: false, reason: SEND_ARCHIVED_REASON };
+  }
+  // `sendInput` checked the freeze on entry, before every await above (the
+  // codex floor probe, the teardown wait, the worktree restore, `@`
+  // expansion). `freezeLaunches` may have landed during any of them, and a
+  // claim taken after it is exactly what the exit would cut off. Checked here
+  // in the same synchronous section as the dispatch — which, for every kind
+  // but claude, goes straight on to its `startingTaskIds` claim; claude
+  // re-checks after its own `has-session` await (`claudeSendRefusal`).
+  if (launchesFrozenFlag) return frozenSendResult(onlyIfIdle);
+
+  if (kind === "claude-code") {
+    const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
+    if (!result) return { delivered: false, reason: "internal: task lookup failed" };
+    if (!result.delivered) {
+      if ("busy" in result) return idleOnlyBusyResult();
+      if (result.withheld) {
+        return {
+          delivered: false,
+          withheld: true,
+          savedToBacklog: result.savedToBacklog,
+          reason: result.savedToBacklog
+            ? "claude is waiting on a prompt — your message was saved to the backlog tray"
+            : "claude is waiting on a prompt — your message was not delivered, and the task was archived or deleted before it could be saved to the backlog tray",
+        };
+      }
+      return { delivered: false, reason: result.reason };
+    }
+    return {
+      delivered: true,
+      runId: result.runId,
+      ...(unresolvedRefs.length ? { unresolvedRefs } : {}),
+      ...(result.pending ? { pending: true as const } : {}),
+    };
+  }
+  // The four `send*Turn` helpers below return `null` in two cases: the task
+  // vanished between `sendInput`'s own lookup above and their internal
+  // re-fetch (a genuine, rare lookup race), or their `spawn*TurnNow` call
+  // found `startingTaskIds` already claimed for this task and declined to
+  // mint a second run rather than risk the double-mint race `startingTaskIds`
+  // exists to close (see that set's doc, near `startTask`). The second case
+  // is overwhelmingly the common one in practice, so the message leads with
+  // it — matching the wording claude's own idle-mint guard already uses —
+  // while still being accurate ("try again") for the rare lookup race too.
+  if (kind === "codex") {
+    const result = await sendCodexTurn(row.task_id, line, rawLine, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    // Pre-flight 1b refused the turn before any run row was minted (see
+    // `minCliVersionError`) — surface its message as the decline reason.
+    if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "cursor") {
+    const result = await sendCursorTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    if (isCursorTurnMiss(result)) return { delivered: false, reason: result.declined };
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "gemini") {
+    const result = await sendGeminiTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "antigravity") {
+    const result = await sendAntigravityTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "opencode") {
+    const result = await sendOpencodeTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "copilot") {
+    const result = await sendCopilotTurn(row.task_id, line, rawLine, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    // Pre-flight 1b refused the turn before any run row was minted.
+    if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "fx") {
+    const result = await sendFxTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  return { delivered: false, reason: `unknown agent kind for "${row.agent}"` };
+}
+
+/**
+ * Per-task queue of follow-up lines received while a codex turn is in flight.
+ * codex `exec` can't take conversational input mid-turn (it's not a REPL), so
+ * we hold the message and spawn a fresh `codex exec resume` turn for it once
+ * the active turn resolves (`drainCodexQueue`, called from
+ * `attachDoneHandler`). This is the codex analogue of claude's fold-while-busy
+ * — but codex turns are discrete processes, so it's a real FIFO, not a
+ * paste-into-the-live-session fold.
+ */
+const codexTurnQueue = new Map<string, QueuedCodexLine[]>();
+
+/**
+ * One queued codex follow-up. `expanded` is what the turn executes (the
+ * `@`-token-expanded text `sendInput` produced); `raw` is the pre-expansion
+ * text the user typed, kept so a refused queued turn can be restashed into
+ * the backlog tray under the exact text a draft/tray item was saved with —
+ * `restashPasteWithheldText` dedupes on byte equality, and the expanded
+ * absolute paths would never match (same rule as claude's withheld pastes,
+ * see `sendInput`'s `rawLine`).
+ */
+interface QueuedCodexLine {
+  raw: string;
+  expanded: string;
+}
+
+/**
+ * `spawnCodexTurnNow`'s "refused before minting a run" result — today only
+ * Pre-flight 1b (`minCliVersionError`): the task's model needs a newer codex
+ * CLI than the one installed. `declined` is the user-facing message.
+ * Distinct from the `null` "another turn is already starting" decline so
+ * `sendInput` can report the real reason.
+ */
+interface CodexTurnDecline {
+  declined: string;
+}
+
+/**
+ * Send a follow-up to a codex task. Each follow-up is its own run row + its own
+ * `codex exec resume <thread_id>` turn (sequential-turn model). When a turn is
+ * already running, the message is queued; otherwise it spawns immediately.
+ * Returns the run id the message was attached to, or null on lookup failure —
+ * or when `spawnCodexTurnNow` declined to mint a run because `startingTaskIds`
+ * was already claimed for this task (see that set's doc, near `startTask`).
+ * Returns a `CodexTurnDecline` when Pre-flight 1b refused the turn (no run
+ * row, no user event — the caller's draft is untouched).
+ */
+async function sendCodexTurn(
+  taskId: string,
+  line: string,
+  rawLine: string = line,
+  onlyIfIdle = false,
+): Promise<string | CodexTurnDecline | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send (`sendInput`'s `onlyIfIdle`): refuse BEFORE the queue push,
+  // the user event or a spawn — same synchronous section as the busy check.
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = codexTurnQueue.get(taskId) ?? [];
+    q.push({ raw: rawLine, expanded: line });
+    codexTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnCodexTurnNow(task, taskId, line);
+}
+
+/** Env escape hatch for `minCliVersionError` — see its doc. */
+const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
+
+/**
+ * Pre-flight 1b — per-model minimum CLI version (`MODEL_MIN_CLI_VERSION` in
+ * `shared/types.ts`, today only codex's GPT-6 rows). OpenAI's codex model
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, so codex's own
+ * error can't be trusted as a diagnosis — and it would arrive only after the
+ * run row (and, on a first run, the worktree) already exist. Callers refuse
+ * the launch up front with this message instead: the installed version, the
+ * floor, and an upgrade command (`status.installHint` when the probe offered
+ * one, else `upgradeHintFor(kind, status.path)`). See
+ * docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ *
+ * Resolves the model's minimum-CLI-version verdict for a harness. Returns the
+ * user-facing error string when the probed CLI version parses AND is below
+ * `MODEL_MIN_CLI_VERSION[kind][model]`; null otherwise (no floor, unparseable
+ * version, or the `AGETOR_SKIP_CLI_VERSION_FLOOR` escape hatch). Never throws.
+ *
+ * Strictly FAIL-OPEN: `cliVersionSatisfies` returns null when the probed
+ * version doesn't parse (every `/bin/echo` test override, a stub binary), and
+ * null never blocks; a probe that throws is treated the same way.
+ * `AGETOR_SKIP_CLI_VERSION_FLOOR` set to `1`/`true`/`on`/`yes`
+ * (case-insensitive, read at call time) disables the check outright — the
+ * floors were verified on a ChatGPT-plan account, and an API-key codex
+ * account on an older CLI may not be gated the same way.
+ *
+ * `status` is the caller's already-probed `checkHarness` result; when omitted
+ * this probes itself — but only when the model actually has a floor (the
+ * version probe is cheap and isn't cached for codex).
+ *
+ * Callers — every path that can launch a floored model must call this before
+ * minting a run row: `startTaskInner` (a task's first run and every re-run),
+ * `spawnCodexTurnNow` (every follow-up codex turn — codex is one-shot per
+ * turn and the model is PATCH-able between turns with no live session to
+ * reconcile), and `POST /projects/clone` (the explainer launch, validated
+ * before the clone side effect). Only codex carries floors today, so only
+ * codex's one-shot spawn path is wired; a future floor for another kind
+ * (cursor/gemini/fx are one-shot per turn too) must wire that kind's own
+ * `spawn*TurnNow`/`spawnFxRun` the same way. claude-code's follow-ups paste
+ * into a live REPL whose model was fixed at spawn, so they'd need no check.
+ */
+export async function minCliVersionError(
+  harness: Harness,
+  modelId: string,
+  status?: HarnessStatus,
+): Promise<string | null> {
+  try {
+    const skip = process.env[SKIP_CLI_VERSION_FLOOR_ENV]?.trim().toLowerCase();
+    if (skip === "1" || skip === "true" || skip === "on" || skip === "yes") return null;
+    const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
+    if (floor === undefined) return null;
+    const probed = status ?? await checkHarness(harness);
+    if (cliVersionSatisfies(probed.version, floor) !== false) return null;
+    const modelLabel = AGENT_OPTIONS[harness.kind]?.models.find((m) => m.id === modelId)?.label ?? modelId;
+    return formatMinCliVersionError({
+      harnessLabel: harness.label,
+      installedRaw: probed.version ?? "",
+      modelLabel,
+      kind: harness.kind,
+      floor,
+      // `installHint` is null for an available harness, so this is normally
+      // the path-aware upgrade command (brew vs npm vs self-update).
+      installHint: probed.installHint ?? upgradeHintFor(harness.kind, probed.path),
+    });
+  } catch (err) {
+    console.warn(`[agetor] minimum-CLI-version pre-flight failed open for ${harness.id}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Spawn a fresh codex turn that resumes the task's prior conversation via
+ * `codex exec resume <thread_id>`. New run row, new tmux session (the previous
+ * turn's exited), same `thread_id` carried forward.
+ *
+ * Re-runs Pre-flight 1b (`minCliVersionError`) before minting the run row:
+ * codex is one-shot per turn, so every follow-up spawns `codex exec --model
+ * <task.model>` afresh — and the model is PATCH-able between turns with no
+ * live session to reconcile — so a too-old CLI would otherwise hit codex's
+ * misleading ChatGPT-account 400 after the run row exists. A refusal returns
+ * a `CodexTurnDecline` with nothing written.
+ *
+ * `drained` is the queued follow-up `drainCodexQueue` took off the queue to
+ * spawn this turn. When a pipeline Stop recorded against this call's claim
+ * (during the floor probe) cancels the turn before it launches, the message
+ * never reached the agent, so it goes back to the head of the queue and on
+ * to the step's backlog tray with the rest
+ * ({@link dropQueuedFollowUpsAfterPendingCancel}). A user send passes none.
+ */
+async function spawnCodexTurnNow(
+  task: Task,
+  taskId: string,
+  line: string,
+  drained?: QueuedCodexLine,
+): Promise<string | CodexTurnDecline | null> {
+  // Claim the unified "starting" slot before touching the DB — see
+  // `startingTaskIds`'s doc (near `startTask`) for the double-mint race this
+  // closes: a second overlapping call could otherwise race in behind
+  // `tasks.update` below and reach `spawnAgentOrFail` too, minting a second
+  // run row and (via the driver's own session pre-kill) tearing down this
+  // turn's tmux session mid-spawn. `null` is unambiguous here — every other
+  // return path below yields `newRunId`, so a caller seeing `null` knows
+  // this call never touched the DB and should treat it as "try again".
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorThreadId = lastSessionIdForTask(task, "codex_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    // Pre-flight 1b — before any state mutation (see this function's doc).
+    // The `startingTaskIds` claim above is in-memory only and released by the
+    // `finally`, so an overlapping send still gets the "already starting"
+    // decline while the version probe runs.
+    if (harness) {
+      const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind]);
+      if (floorError !== null) return { declined: floorError };
+    }
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      // Carry the thread id forward up front so a reattach mid-turn finds it even
+      // before this run's own `thread.started` re-emits it. onSessionId below
+      // re-stamps the same value (idempotent).
+      codexSessionId: priorThreadId,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    const stoppedDuringClaim = adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "codex";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk(
+      "status",
+      priorThreadId
+        ? `resuming codex thread ${priorThreadId.slice(0, 8)}…`
+        : "no prior codex thread — starting fresh",
+    );
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { codexSessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorThreadId,
+      },
+    });
+    if (!agent) {
+      // spawnAgentOrFail already failed this run row and bounced the task to
+      // `ready` — attachDoneHandler (the only caller of drainCodexQueue) never
+      // runs, so any follow-ups queued behind this one would otherwise be
+      // stranded and resurface out of order on a later, unrelated turn. The
+      // dropped messages were already recorded as `user` events on their
+      // originating run, so dropping the queue here is more honest than
+      // re-delivering them later.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      codexTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      // A drained follow-up stopped during the claim goes first, in send
+      // order (see this function's doc).
+      if (stoppedDuringClaim && drained && isPipelineStepTaskId(taskId)) {
+        codexTurnQueue.set(taskId, [drained, ...(codexTurnQueue.get(taskId) ?? [])]);
+      }
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After a codex turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op for claude tasks (their queue is always empty) and
+ * while a run is still active for the task.
+ */
+async function drainCodexQueue(taskId: string): Promise<void> {
+  const q = codexTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from codex while a turn was
+  // in flight — abandon the stale queue. Without this guard, draining after a
+  // codex→claude switch would spawn the follow-up against the new claude
+  // harness with a codex thread id (`claude --resume <codexThreadId>`), which
+  // claude rejects.
+  if (!task || resolveHarness(task.agent)?.kind !== "codex") {
+    codexTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) codexTurnQueue.delete(taskId);
+  if (next === undefined) return;
+  const result = await spawnCodexTurnNow(task, taskId, next.expanded, next);
+  if (result === null || typeof result !== "object") return;
+  // Pre-flight 1b refused the queued follow-up (the task's model needs a
+  // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
+  // previous turn ran). Every message still queued behind it would be
+  // refused the same way, so move them all — the refused one first — to the
+  // backlog tray (they were already shown as `user` bubbles when queued, so
+  // nothing is lost and they can be resent after upgrading) and explain why
+  // on the task's most recent run.
+  const stranded = [next, ...(codexTurnQueue.get(taskId) ?? [])];
+  codexTurnQueue.delete(taskId);
+  // `backlog.add` PREPENDS (newest draft on top), so restash in reverse send
+  // order: the refused line lands on top and the tray reads chronologically.
+  // Restash the RAW text (see `QueuedCodexLine`) so the tray's dedupe matches
+  // a draft saved with the same `@token`s.
+  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  if (lastRunId) {
+    const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
+    const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
+  }
+}
+
+
+/**
+ * Per-task queue of follow-up lines received while a cursor turn is in
+ * flight. Each turn is one `cursor-agent acp` child (not a REPL), so we
+ * hold the message and spawn the next turn once the active one resolves
+ * (`drainCursorQueue`, called from `attachDoneHandler`). That turn resumes
+ * with ACP `session/load` of the stored session id. Structural clone of
+ * `codexTurnQueue` — see that comment for the full rationale.
+ */
+const cursorTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to a cursor task. Each follow-up is its own run row and
+ * its own `cursor-agent acp` turn, resumed with `session/load` of the stored
+ * session id (sequential-turn model). When a turn is already running, the
+ * message is queued; otherwise it spawns immediately. Returns the run id
+ * the message was attached to, or null on lookup failure — or when
+ * `spawnCursorTurnNow` declined to mint a run
+ * because `startingTaskIds` was already claimed for this task (see that
+ * set's doc, near `startTask`). A `{ declined }` result means the run was
+ * minted and then killed before the child registered, so the line was
+ * not written as a user message.
+ */
+async function sendCursorTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | CursorTurnMiss | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = cursorTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    cursorTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnCursorTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh cursor turn that resumes the task's prior conversation.
+ * New run row; the previous turn's child has exited. The stored session id
+ * is carried forward as `resumeSessionId`, and the ACP driver resumes with
+ * `session/load`.
+ */
+async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | CursorTurnMiss | null> {
+  // Claim the unified "starting" slot before touching the DB — see
+  // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
+  // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
+  // unambiguous: other paths return a run id or a decline reason.
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "cursor_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      // Carry the session id forward up front so a reattach mid-turn finds it
+      // even before this run's own first event re-emits it. onSessionId below
+      // re-stamps the same value (idempotent).
+      cursorSessionId: priorSessionId,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "cursor";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    // The user line is written only after the child is registered. Archive,
+    // delete, and Stop during the handshake must not leave the answer on a
+    // cancelled run that the ask card can no longer retry.
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming cursor session ${priorSessionId.slice(0, 8)}…`
+        : "no prior cursor session — starting fresh",
+    );
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent, message } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { cursorSessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        // Same generic resume-session field claude-code and codex already
+        // thread through `spawnAgent`. Cursor does not put it on argv: the
+        // ACP driver reads `resumeSessionId` and calls `session/load`.
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+      // failed this run and attachDoneHandler (the only caller of
+      // drainCursorQueue) never runs, so drop the queue rather than let queued
+      // follow-ups resurface out of order on a later turn.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      cursorTurnQueue.delete(taskId);
+      return { declined: message };
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return { declined: "the turn was cancelled before Cursor started" };
+    }
+    // Ownership guard, the same rule as `startTaskInner`'s continuation.
+    // The ACP handshake is the slow part of this spawn: the run row exists
+    // and the child is already up, but `registerActiveRun` has not run, so
+    // delete and force-archive (whose `active.has(task.runId)` check is
+    // false in this window) do not see a handle to kill. Registering
+    // afterwards would leave that child running on a task that is gone,
+    // archived, or no longer on this run.
+    const fresh = tasks.get(taskId);
+    if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
+      agent.done.catch(() => {});
+      agent.kill();
+      runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+      // This run never registers, so nothing will drain the follow-up queue.
+      // Delete and archive already dropped it; a runId mismatch means a
+      // newer turn owns the task and must keep whatever it queued.
+      if (!fresh || fresh.archivedAt != null) cursorTurnQueue.delete(taskId);
+      if (fresh && fresh.runId === newRunId) {
+        // This run never registers, so `attachDoneHandler` — which is what
+        // moves a cancelled terminal run to `ready` — will not run. Archive
+        // itself does not touch the column. Left on `running`, unarchive
+        // shows Stop for a process that is already gone and has no handle.
+        onChunk("status", "task archived before the agent launched");
+        updateColumn(taskId, newRunId, "ready");
+        emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+      }
+      return { declined: "the turn was cancelled before Cursor started" };
+    }
+    onChunk("user", normalizeUserText(line));
+    registerActiveRun(newRunId, taskId, fresh, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After a cursor turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op for claude/codex/gemini tasks (their queue is
+ * always empty) and while a run is still active for the task.
+ */
+async function drainCursorQueue(taskId: string): Promise<void> {
+  const q = cursorTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from cursor while a turn
+  // was in flight — abandon the stale queue. Without this guard, draining
+  // after a cursor→claude/codex/gemini switch would spawn the follow-up
+  // against the new harness with a cursor session id, which the new harness
+  // rejects.
+  if (!task || resolveHarness(task.agent)?.kind !== "cursor") {
+    cursorTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) cursorTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnCursorTurnNow(task, taskId, next);
+}
+
+
+/**
+ * Per-task queue of follow-up lines received while a gemini turn is in
+ * flight. Gemini's CLI is one-shot per turn (not a REPL), so — exactly like
+ * codex — we hold the message and spawn a fresh `--resume <uuid>` turn for it
+ * once the active turn resolves (`drainGeminiQueue`, called from
+ * `attachDoneHandler`).
+ */
+const geminiTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to a gemini task. Each follow-up is its own run row + its
+ * own `gemini --resume <uuid>` turn (sequential-turn model, same as codex).
+ * When a turn is already running, the message is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
+ * lookup failure — or when `spawnGeminiTurnNow` declined to mint a run
+ * because `startingTaskIds` was already claimed for this task (see that
+ * set's doc, near `startTask`).
+ */
+async function sendGeminiTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = geminiTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    geminiTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnGeminiTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh gemini turn that resumes the task's prior conversation via
+ * `gemini --resume <uuid>`. New run row, new tmux session (the previous
+ * turn's exited), same self-issued session uuid carried forward — unlike
+ * codex's thread id (discovered post-hoc from `thread.started`), gemini's
+ * session id is already known synchronously, so it's stamped on the new run
+ * row directly rather than via an `onSessionId` re-stamp.
+ */
+async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+  // Claim the unified "starting" slot before touching the DB — see
+  // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
+  // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
+  // unambiguous: every other return path below yields `newRunId`.
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "gemini_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: priorSessionId,
+      fxSessionId: null,
+      antigravitySessionId: null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "gemini";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming gemini session ${priorSessionId.slice(0, 8)}…`
+        : "no prior gemini session — starting fresh",
+    );
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      // Normally re-stamps the same `priorSessionId` already written above
+      // (idempotent) — kept for the edge case where a task somehow has no
+      // prior session id yet (spawnAgent mints a fresh uuid via
+      // crypto.randomUUID() when resumeSessionId is absent, and this is the
+      // only way that freshly-minted id gets persisted).
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { geminiSessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+      // failed this run and attachDoneHandler (the only caller of
+      // drainGeminiQueue) never runs, so drop the queue rather than let queued
+      // follow-ups resurface out of order on a later turn. Reachable in
+      // practice via GEMINI_PROMPT_ARGV_MAX_BYTES on a long follow-up.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      geminiTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After a gemini turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, or if
+ * the task's agent was switched away from gemini mid-flight.
+ */
+async function drainGeminiQueue(taskId: string): Promise<void> {
+  const q = geminiTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from gemini while a turn
+  // was in flight — abandon the stale queue. Without this guard, draining
+  // after a gemini→claude switch would spawn the follow-up against the new
+  // claude harness with a gemini session id, which claude rejects.
+  if (!task || resolveHarness(task.agent)?.kind !== "gemini") {
+    geminiTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) geminiTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnGeminiTurnNow(task, taskId, next);
+}
+
+
+/**
+ * Per-task queue of follow-up lines received while an antigravity turn is in
+ * flight. Antigravity's CLI is one-shot per turn, so — exactly like
+ * gemini/codex — we hold the message and spawn a fresh `--conversation <id>`
+ * turn for it once the active turn resolves (`drainAntigravityQueue`, called from
+ * `attachDoneHandler`).
+ */
+const antigravityTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to an antigravity task. Each follow-up is its own run row + its
+ * own `agy --conversation <id>` turn (sequential-turn model, same as gemini/codex).
+ * When a turn is already running, the message is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
+ * lookup failure — or when `spawnAntigravityTurnNow` declined to mint a run
+ * because `startingTaskIds` was already claimed for this task.
+ */
+async function sendAntigravityTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = antigravityTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    antigravityTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnAntigravityTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh antigravity turn that resumes the task's prior conversation via
+ * `agy --conversation <id>`. New run row, new tmux session (the previous
+ * turn's exited), prior conversation id carried forward.
+ */
+async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "antigravity_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "antigravity";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming antigravity conversation ${priorSessionId.slice(0, 8)}…`
+        : "no prior antigravity conversation — starting fresh",
+    );
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { antigravitySessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      antigravityTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After an antigravity turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, or if
+ * the task's agent was switched away from antigravity mid-flight.
+ */
+async function drainAntigravityQueue(taskId: string): Promise<void> {
+  const q = antigravityTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "antigravity") {
+    antigravityTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) antigravityTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnAntigravityTurnNow(task, taskId, next);
+}
+
+/**
+ * Per-task queue of follow-up lines received while an OpenCode turn is in
+ * flight. `opencode run` is one-shot per turn, so — like antigravity/gemini/
+ * codex — the message is held and a fresh `opencode run -s <id>` turn is
+ * spawned for it once the active turn resolves (`drainOpencodeQueue`, called
+ * from `attachDoneHandler`). Cleared on delete, archive and agent switch.
+ */
+const opencodeTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to an OpenCode task. Each follow-up is its own run row and
+ * its own `opencode run -s <id>` turn. When a turn is already running the
+ * message is queued (its user bubble recorded on the active run); otherwise
+ * it spawns immediately. Returns the run id the message was attached to, or
+ * null on lookup failure — or when `spawnOpencodeTurnNow` declined to mint a
+ * run because `startingTaskIds` was already claimed for this task.
+ */
+async function sendOpencodeTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = opencodeTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    opencodeTurnQueue.set(taskId, q);
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnOpencodeTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh OpenCode turn that resumes the task's prior session via
+ * `-s <id>` — the newest `opencode_session_id` recorded by THIS harness
+ * (D-15). New run row, new tmux session (the previous turn's exited). The
+ * CLI line comes from the cached `--version` probe (D-2: a follow-up must
+ * not pay a 2 s probe per message).
+ */
+async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "opencode_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+      opencodeSessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "opencode";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const cliVersion = await cachedCliVersion(harness);
+    onChunk("status", opencodeTurnBreadcrumb(harness, task, cliVersion));
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming OpenCode session ${priorSessionId.slice(0, 8)}…`
+        : "no prior OpenCode session — starting fresh",
+    );
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { opencodeSessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+        cliVersion,
+        opencodeServer: task.opencodeServer,
+        title: task.title,
+      },
+    });
+    if (!agent) {
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      opencodeTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After an OpenCode turn resolves, spawn the next queued follow-up (if any)
+ * as a fresh resume turn. No-op while a run is still active for the task, or
+ * if the task's agent was switched away from opencode mid-flight.
+ */
+async function drainOpencodeQueue(taskId: string): Promise<void> {
+  const q = opencodeTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "opencode") {
+    opencodeTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) opencodeTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnOpencodeTurnNow(task, taskId, next);
+}
+
+/**
+ * Tear down a task's OpenCode session (D-10) and orphan any subagent row the
+ * killed turn left `running`: the drop resolves the tail WITHOUT
+ * `beforeSettle`, so no final refresh will ever settle those rows, and a
+ * `running` row would hold the task's next turn — on any harness — in
+ * `running` forever (`isTaskHeldByBackgroundAgents`).
+ */
+async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
+  await dropOpencodeSession(taskId);
+  orphanRunningOpencodeSubagents(taskId, reason);
+}
+
+/**
+ * Reattach to an OpenCode turn whose tmux session survived an agetor restart
+ * (boot reconcile). Wires the same subagent hooks `spawnAgent` does, with the
+ * CLI line and server mode the turn launched with, read back from its own
+ * D-19 status line (`task.opencodeServer` may have changed since, and the
+ * installed CLI may have been upgraded under the live turn). With no such
+ * line the turn is treated as v2 Shared: a child left unfinished at settle
+ * is then orphaned and re-checked (spike A6), never called stopped.
+ */
+async function reattachOpencodeTurn(
+  runId: string,
+  taskId: string,
+  harnessId: string,
+  sessionName: string,
+  cwd: string,
+  onChunk: ReturnType<typeof makeChunkHandler>,
+): Promise<SpawnedAgent | null> {
+  const harness = resolveHarness(harnessId);
+  if (!harness) return null;
+  const turn = opencodeTurnOfRun(runId);
+  const major = turn?.major ?? opencodeMajor(await cachedCliVersion(harness));
+  const standalone = turn?.server === "standalone";
+  const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone });
+  return reattachOpencodeSession({
+    taskId,
+    runId,
+    sessionName,
+    onChunk,
+    seenLineUuids: runs.seenLineUuidsForTask(taskId),
+    major,
+    onSubagent,
+    beforeSettle,
+  });
+}
+
+/** Display label for an OpenCode model id: the sentinel's "OpenCode
+ *  default", a curated row's label, a discovered label, else the id. */
+function opencodeModelLabel(harness: Harness, model: string | null): string {
+  const id = model ?? OPENCODE_DEFAULT_MODEL;
+  const curated = AGENT_OPTIONS.opencode.models.find((m) => m.id === id);
+  if (curated) return curated.label;
+  const discovered = getHarnessDiscoveredModels(harness.id).find((m) => m.id === id)
+    ?? getDiscoveredModels("opencode").find((m) => m.id === id);
+  return discovered?.label ?? id;
+}
+
+/**
+ * D-19: the opening status line of every OpenCode turn
+ * (`formatOpencodeTurnBreadcrumb`). The server is the EFFECTIVE one (a
+ * harness with a home always runs Standalone; v1 has none → `n/a`), and the
+ * effort is the one actually passed (the sentinel model carries no variant
+ * → `auto`). The line is also the run's durable record of its server mode,
+ * read back by `opencodeTurnOfRun` (teardown, boot, reattach).
+ */
+function opencodeTurnBreadcrumb(harness: Harness, task: Task, cliVersion: string | null): string {
+  const major = opencodeMajor(cliVersion);
+  const server = opencodeEffectiveServerFor(harness, task, cliVersion);
+  const model = task.model ?? DEFAULT_MODEL.opencode;
+  const effort = model === OPENCODE_DEFAULT_MODEL ? "auto" : (task.effort?.trim() || "auto");
+  const mode = task.mode ?? defaultModeFor("opencode");
+  return formatOpencodeTurnBreadcrumb({ major, server, modelLabel: opencodeModelLabel(harness, model), effort, mode });
+}
+
+/**
+ * The task's current harness id — `task.agent` resolved, so a legacy row
+ * that stores a bare kind reads as that kind's built-in id.
+ */
+function taskHarnessId(task: Pick<Task, "agent">): string {
+  return resolveHarness(task.agent)?.id ?? task.agent;
+}
+
+/**
+ * Harness-scoped resume (D-15, docs/plans/add-opencode-harness.md): the
+ * newest session id recorded in `column` across the task's runs **by the
+ * harness `harnessId`**. A same-kind harness switch (the built-in → an
+ * additional account of the same kind) therefore starts fresh instead of
+ * resuming the other account's session, and switching back resumes the
+ * original. A run row's `agent` resolves through `resolveHarness`, so a
+ * legacy row that stored a bare kind matches that kind's built-in id; a row
+ * whose harness no longer exists matches only its raw stored id. Iterates
+ * across runs (not just the latest) because a row may not have had its id
+ * stamped — the prior conversation still resumes from any earlier run.
+ */
+export function findLastSessionIdForHarness(taskId: string, column: SessionIdColumn, harnessId: string): string | null {
+  const resolved = new Map<string, string>();
+  for (const row of runs.sessionIdsForTask(taskId, column)) {
+    let rowHarnessId = resolved.get(row.agent);
+    if (rowHarnessId === undefined) {
+      rowHarnessId = resolveHarness(row.agent)?.id ?? row.agent;
+      resolved.set(row.agent, rowHarnessId);
+    }
+    if (rowHarnessId === harnessId) return row.sessionId;
+  }
+  return null;
+}
+
+/** {@link findLastSessionIdForHarness} for the task's current harness. */
+function lastSessionIdForTask(task: Task, column: SessionIdColumn): string | null {
+  return findLastSessionIdForHarness(task.id, column, taskHarnessId(task));
+}
+
+/**
+ * One queued copilot follow-up — same raw/expanded split as
+ * `QueuedCodexLine`: `expanded` is what the turn executes, `raw` is the text
+ * the user typed, kept so a floor-refused queued turn restashes under the
+ * exact text a draft/tray item was saved with.
+ */
+interface QueuedCopilotLine {
+  raw: string;
+  expanded: string;
+}
+
+/**
+ * `spawnCopilotTurnNow`'s "refused before minting a run" result — Pre-flight
+ * 1b (`minCliVersionError`): the task's model needs a newer Copilot CLI than
+ * the one installed. Distinct from the `null` "another turn is already
+ * starting" decline so `sendInput` can report the real reason.
+ */
+interface CopilotTurnDecline {
+  declined: string;
+}
+
+/**
+ * Per-task queue of follow-up lines received while a copilot turn is in
+ * flight. `copilot -p` is one-shot per invocation (not a REPL), so — queue
+ * semantics modelled on codex's, incl. the per-model CLI-floor re-check and
+ * `declined` handling — the message is held and a fresh `copilot --session-id
+ * <id>` turn is spawned for it once the active turn resolves
+ * (`drainCopilotQueue`, called from `attachDoneHandler`).
+ */
+const copilotTurnQueue = new Map<string, QueuedCopilotLine[]>();
+
+/**
+ * Send a follow-up to a copilot task. Each follow-up is its own run row + its
+ * own `copilot --session-id <id>` turn (sequential-turn model). When a turn is
+ * already running the message is queued; otherwise it spawns immediately.
+ * Returns the run id the message was attached to, a `CopilotTurnDecline` when
+ * Pre-flight 1b refused the turn (no run row, no user event), or null on a
+ * lookup failure / when `spawnCopilotTurnNow` declined because
+ * `startingTaskIds` was already claimed for this task.
+ */
+async function sendCopilotTurn(
+  taskId: string,
+  line: string,
+  rawLine: string = line,
+  onlyIfIdle = false,
+): Promise<string | CopilotTurnDecline | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (task.runId && active.has(task.runId)) {
+    const q = copilotTurnQueue.get(taskId) ?? [];
+    q.push({ raw: rawLine, expanded: line });
+    copilotTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  return spawnCopilotTurnNow(task, taskId, line);
+}
+
+/** Most-recent copilot session id the task has on THIS harness (a different
+ *  harness has a different `COPILOT_HOME`, which can't see it). The shared
+ *  harness-scoped lookup, so a legacy bare-kind `agent` value still matches. */
+function findLastCopilotSessionId(taskId: string, harnessId: string): string | null {
+  return findLastSessionIdForHarness(taskId, "copilot_session_id", harnessId);
+}
+
+/** Harness id of the task's most recent copilot session recorded on a harness
+ *  OTHER than `harnessId`, or null. Only used to explain why nothing resumes. */
+function findCopilotSessionHarnessElsewhere(taskId: string, harnessId: string): string | null {
+  const row = db.query<{ agent: string }, [string, string]>(
+    `SELECT agent FROM runs
+     WHERE task_id = ? AND agent != ? AND copilot_session_id IS NOT NULL
+     ORDER BY started_at DESC, rowid DESC
+     LIMIT 1`,
+  ).get(taskId, harnessId);
+  return row?.agent ?? null;
+}
+
+/** Test seam: under `AGETOR_COPILOT_DRIVER=fake` nothing writes
+ *  `<COPILOT_HOME>/session-state/<id>/`, so the existence check is skipped
+ *  unless this is `1` (lets a test drive the "session not found" path). */
+const COPILOT_FAKE_REQUIRE_SESSION_DIR_ENV = "AGETOR_COPILOT_FAKE_REQUIRE_SESSION_DIR";
+
+function copilotSessionDirExists(harness: Harness, sessionId: string): boolean {
+  if (
+    process.env.AGETOR_COPILOT_DRIVER === "fake"
+    && process.env[COPILOT_FAKE_REQUIRE_SESSION_DIR_ENV] !== "1"
+  ) {
+    return true;
+  }
+  try {
+    const home = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    return existsSync(join(home, "session-state", sessionId));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decide which Copilot session (if any) a follow-up turn resumes, plus the
+ * status line explaining it. The id is scoped to the task's CURRENT harness
+ * (`runs.agent`): switching to another Copilot harness — a different
+ * `COPILOT_HOME`, possibly a different account — can't carry the context, so
+ * it starts fresh and says so; likewise when the id's session dir is gone
+ * from this account's `COPILOT_HOME`. Copilot always gets a `--session-id`
+ * (the prior id when resuming, else a fresh uuid minted by `spawnAgent`).
+ */
+function resolveCopilotResume(taskId: string, harness: Harness): { sessionId: string | null; note: string } {
+  const own = findLastCopilotSessionId(taskId, harness.id);
+  if (own) {
+    if (copilotSessionDirExists(harness, own)) {
+      return { sessionId: own, note: `resuming GitHub Copilot session ${own.slice(0, 8)}…` };
+    }
+    return {
+      sessionId: null,
+      note: `previous Copilot session ${own.slice(0, 8)}… not found for this account — starting fresh`,
+    };
+  }
+  const elsewhere = findCopilotSessionHarnessElsewhere(taskId, harness.id);
+  if (elsewhere) {
+    return {
+      sessionId: null,
+      note: `previous GitHub Copilot context is on harness "${elsewhere}" — starting a fresh session (context didn't carry over)`,
+    };
+  }
+  return { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
+}
+
+/**
+ * Spawn a fresh copilot turn that resumes the task's prior session via
+ * `--session-id <prior>` (see `resolveCopilotResume`). New run row, new tmux
+ * session (the previous turn's exited). Re-runs Pre-flight 1b before minting
+ * the run row — the model is PATCH-able between turns — and returns a
+ * `CopilotTurnDecline` with nothing written on a refusal.
+ */
+async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Promise<string | CopilotTurnDecline | null> {
+  // Claim the unified "starting" slot — see `spawnCodexTurnNow`.
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    // Pre-flight 1b — before any state mutation.
+    if (harness) {
+      const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind]);
+      if (floorError !== null) return { declined: floorError };
+    }
+
+    const resume = harness ? resolveCopilotResume(taskId, harness) : { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
+    const priorSessionId = resume.sessionId;
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+      // Carry the id forward up front so a reattach mid-turn finds it before
+      // the driver's own `onSessionId` re-stamps it (idempotent). Null when
+      // this turn starts fresh — `onSessionId` fills in the minted uuid.
+      copilotSessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "copilot";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk("status", resume.note);
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, sessionIdPatchFor(harness.kind, sessionId));
+      },
+      copilotSubagents: makeCopilotSubagentSink(newRunId, taskId),
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      // spawnAgentOrFail already failed this run row and bounced the task to
+      // `ready` (a tmux launch failure surfaces here too). attachDoneHandler —
+      // the only drain caller — never runs, so drop the queue rather than
+      // strand follow-ups that would resurface out of order on a later turn.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      copilotTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After a copilot turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, and the
+ * stale queue is abandoned if the task's agent was switched away from copilot
+ * mid-flight. A queued follow-up Pre-flight 1b refuses moves — with everything
+ * queued behind it — to the backlog tray with a status line, as codex's does.
+ */
+async function drainCopilotQueue(taskId: string): Promise<void> {
+  const q = copilotTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "copilot") {
+    copilotTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) copilotTurnQueue.delete(taskId);
+  if (next === undefined) return;
+  const result = await spawnCopilotTurnNow(task, taskId, next.expanded);
+  if (result === null) {
+    // Another spawn holds the `startingTaskIds` claim; its own done handler
+    // drains the queue, so put the line back at the front instead of losing it.
+    const rest = copilotTurnQueue.get(taskId) ?? [];
+    copilotTurnQueue.set(taskId, [next, ...rest]);
+    return;
+  }
+  if (typeof result !== "object") return;
+  const stranded = [next, ...(copilotTurnQueue.get(taskId) ?? [])];
+  copilotTurnQueue.delete(taskId);
+  // `backlog.add` PREPENDS, so restash in reverse send order: the refused line
+  // lands on top and the tray reads chronologically. RAW text, so the tray's
+  // dedupe matches a draft saved with the same `@token`s.
+  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  if (lastRunId) {
+    const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
+    const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
+  }
+}
+
+/**
+ * Per-task queue of follow-up lines received while an fx turn is in flight.
+ * fx is driven over ACP/stdio (`fx-acp.ts`), one turn per spawn — no
+ * persistent REPL, no tmux session — so exactly like codex/cursor/gemini we
+ * hold the message and spawn a fresh resumed turn once the active turn
+ * resolves (`drainFxQueue`, called from `attachDoneHandler`). On fx 0.0.13 or
+ * later a follow-up usually steers the running turn instead
+ * (`ActiveRun.steer`) and only lands here when steering isn't possible (older
+ * fx, still in the handshake, over 64 KiB), when an earlier follow-up is
+ * already waiting here (a later message never steers past it) — or when fx
+ * didn't take the steer before the turn ended (`fxSteerDroppedHandler`,
+ * re-queued in send order unless the task was torn down or moved to another
+ * fx harness).
+ */
+const fxTurnQueue = new Map<string, QueuedFxLine[]>();
+
+/** One queued fx follow-up. `echoed` marks a steer fx dropped: its `user`
+ *  bubble was already written on the run it steered, so the turn that sends
+ *  it must not write a second one. `seq` is the order the user sent it in
+ *  (`fxSendSeq`) — a dropped steer re-enters the queue at the position it
+ *  was sent, not behind follow-ups that were queued after it. */
+interface QueuedFxLine {
+  line: string;
+  seq: number;
+  echoed?: boolean;
+}
+
+/** Monotonic send order across every fx follow-up (queued or steered). */
+let fxSendSeq = 0;
+
+/** Steers fx accepted on a still-running run, keyed by that run's id, with
+ *  the send order each was given — so `fxSteerDroppedHandler` can re-queue a
+ *  dropped one in place. Absorbed steers are never reported back; the run's
+ *  entry is forgotten once it settles (`attachDoneHandler`). */
+const fxPendingSteers = new Map<string, { text: string; seq: number }[]>();
+
+/** Inserts `item` into `q` keeping it ordered by `seq`. */
+function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
+  const at = q.findIndex((existing) => existing.seq > item.seq);
+  if (at === -1) q.push(item);
+  else q.splice(at, 0, item);
+}
+
+/**
+ * The `onSteerDropped` callback an fx spawn carries: a steer fx didn't take
+ * before its turn ended is queued as the task's next turn (no second `user`
+ * bubble — see {@link QueuedFxLine}). The driver calls it BEFORE the run's
+ * `done` resolves, so the `drainFxQueue` that `attachDoneHandler` runs after
+ * every settle (cancelled included) picks it up. Dropped instead when the
+ * task is gone, archived, being deleted, or no longer on the fx harness the
+ * run was spawned with (`harnessId`) — the same teardowns that clear
+ * `fxTurnQueue` outright (archive/delete/agent switch kill the run and
+ * `dropFxSession` after clearing the queue, and both report a still-pending
+ * steer dropped). A switch to ANOTHER fx harness counts as a teardown too:
+ * the queued turn would resume the old harness's session id under the new
+ * harness's account. A Stop is not a teardown: its dropped steers re-queue
+ * and drain like any other queued follow-up — except on a pipeline step
+ * task, whose queue a Stop moves into the backlog tray
+ * (`drainFollowUpQueues`): the steer is still queued in send order so it
+ * lands there with the rest, but the handler reports `false`. Returns whether
+ * the text will be sent as the next turn — the driver only tells the user
+ * "sending it as the next turn" when it will.
+ */
+function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string): (text: string) => boolean {
+  return (text) => {
+    // Recover the send order this steer was given when fx accepted it.
+    const pending = fxPendingSteers.get(runId);
+    const idx = pending?.findIndex((p) => p.text === text) ?? -1;
+    const seq = idx >= 0 ? pending!.splice(idx, 1)[0]!.seq : ++fxSendSeq;
+    // `isTaskTearingDown` covers the window where a delete has started (its
+    // queue clear already ran) but the row still exists — `deleteTask` kills
+    // the run and `dropFxSession`s before `tasks.delete`.
+    if (isTaskTearingDown(taskId)) return false;
+    const task = tasks.get(taskId);
+    if (!task || task.archivedAt != null) return false;
+    const current = resolveHarness(task.agent);
+    if (current?.kind !== "fx" || current.id !== harnessId) return false;
+    const q = fxTurnQueue.get(taskId) ?? [];
+    insertBySendOrder(q, { line: text, seq, echoed: true });
+    fxTurnQueue.set(taskId, q);
+    // Exiting (`freezeLaunches`): the drain stashes it into the backlog
+    // instead of sending it as the next turn, so don't announce that.
+    if (launchesFrozenFlag) return false;
+    // The driver calls this before `done` resolves, so the handle is still
+    // registered: a stopped step's queue goes to the backlog, not a turn.
+    return !(active.get(runId)?.cancelled === true && task.pipelineParentId != null);
+  };
+}
+
+/**
+ * Pending auto-resume timer for a paused fx task, one per task id (plan
+ * `docs/plans/fx-recovery-follow-ups.md` §3.2, T2). Every timer stored here
+ * is `.unref()`'d (never what keeps the process alive) and identity-checked
+ * on fire — the callback compares itself against whatever is CURRENTLY in
+ * this map for the task id before acting, so a stale callback from a timer
+ * that was already cancelled-and-replaced (or cancelled outright, if
+ * `clearTimeout` itself somehow didn't prevent the fire) can never double-act.
+ * See `armFxAutoResumeTimer`/`cancelFxAutoResumeTimer`.
+ */
+const fxAutoResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Synchronous double-resume guard for `resumeFxRecovery` (moved here from
+ * the route's own `fxResumesInFlight` set — see that function's doc): claimed
+ * before any `await`, so two POSTs (or a POST racing the auto-resume timer)
+ * landing on the same task can't both pass the function's internal gating and
+ * both spawn a continue-recovery run against fx's single checkpoint.
+ */
+const resumingTaskIds = new Set<string>();
+
+/**
+ * Read the fx auto-resume preference pair, with the `AGETOR_FX_AUTO_RESUME_
+ * DELAY_MS` env var (test seam — an integer number of milliseconds, `>= 0`)
+ * overriding the preference-derived delay when set. Preferences are read
+ * fresh on every call (no caching) — this only ever runs at pause-record time
+ * and re-arm time, not on any hot path.
+ */
+function fxAutoResumePrefs(): { enabled: boolean; delayMs: number } {
+  const { enabled, delaySec } = parseFxAutoResumePrefs(preferences.list());
+  let delayMs = delaySec * 1000;
+  const envOverride = process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS;
+  if (envOverride !== undefined) {
+    const parsed = Number.parseInt(envOverride, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) delayMs = parsed;
+  }
+  return { enabled, delayMs };
+}
+
+/**
+ * Arm (or re-arm) the auto-resume timer for `taskId` to fire at `at` (ms
+ * epoch) — shared by `recordFxPause` (fresh schedule) and `rearmFxAutoResumes`
+ * (boot re-arm). Any existing timer for the task is cleared first, so calling
+ * this twice for the same task never leaves two timers racing. The armed
+ * timer identity-checks itself against the map before acting (see
+ * `fxAutoResumeTimers`'s doc) and is `.unref()`'d.
+ */
+function armFxAutoResumeTimer(taskId: string, at: number): void {
+  const existing = fxAutoResumeTimers.get(taskId);
+  if (existing) clearTimeout(existing);
+  const delayMs = Math.max(0, at - Date.now());
+  const handle = setTimeout(() => {
+    if (fxAutoResumeTimers.get(taskId) !== handle) return;
+    fxAutoResumeTimers.delete(taskId);
+    void fireFxAutoResume(taskId, at);
+  }, delayMs);
+  handle.unref();
+  fxAutoResumeTimers.set(taskId, handle);
+}
+
+/** Cancel any pending auto-resume timer for `taskId` — timer bookkeeping
+ *  only, never touches the persisted `fxRecovery` row. See `clearFxRecovery`
+ *  for the DB-clearing counterpart, and `cancelFxAutoResume` for the
+ *  user-facing cancel (which does both, plus a status line and event). */
+function cancelFxAutoResumeTimer(taskId: string): void {
+  const existing = fxAutoResumeTimers.get(taskId);
+  if (existing) {
+    clearTimeout(existing);
+    fxAutoResumeTimers.delete(taskId);
+  }
+}
+
+/** Cancel the task's auto-resume timer AND clear its persisted `fxRecovery`
+ *  row outright — no status line, no `autoResumeStopped` reason, no event:
+ *  this is the "the pause chain is over, full stop" reset used by
+ *  `spawnFxRun`'s `{line}` row lifecycle, `startTask` (starting an fx task
+ *  fresh), `reconcileTaskSession` (agent switch), `archiveTask`, and
+ *  `deleteTask`. Contrast `cancelFxAutoResume`, the user-facing cancel that
+ *  keeps the row (just nulls its schedule) and leaves a breadcrumb. */
+function clearFxRecovery(taskId: string): void {
+  cancelFxAutoResumeTimer(taskId);
+  tasks.setFxRecovery(taskId, null);
+}
+
+/** Append a plain status line to an already-settled (or otherwise
+ *  not-currently-spawning) run and broadcast it live over the run's SSE
+ *  channel — the same `runs.appendEvent` + `emit` pair used post-hoc
+ *  elsewhere (e.g. `pullBackParkedTask`, fx's auto-resume breadcrumbs) for a
+ *  status line landing on a run with no active `onChunk` handler in scope.
+ *  Exported for `pipeline-runner.ts`'s handoff-reminder status lines, which
+ *  land on a step task's run from outside any spawn — `runs.appendEvent`
+ *  alone would persist the line but never reach a live SSE subscriber. */
+export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
+  saveAndEmit({ runId, taskId, stream: "status", data });
+}
+
+/** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
+ *  every existing fx call site reads unchanged; new callers should use the
+ *  generic export directly. */
+function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+  appendRunStatusLine(taskId, runId, data);
+}
+
+/**
+ * Send a follow-up to an fx task. Each follow-up is its own run row + its own
+ * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
+ * a turn is already running, the message steers it (fx 0.0.13 or later, no
+ * new run row) or, when it can't, is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
+ * lookup failure — or when `spawnFxRun` declined to mint a run because
+ * `startingTaskIds` was already claimed for this task (see that set's doc,
+ * near `startTask`).
+ */
+async function sendFxTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: refuse before ANY side effect — including the auto-resume
+  // timer cancel below, the steer attempt and the queue push (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  // A follow-up message is an implicit cancel of any pending auto-resume
+  // schedule (plan §3.4 / T2 item 8) — whichever branch below runs, the
+  // pause chain is over. The full row clear happens once the turn actually
+  // spawns, via `spawnFxRun`'s `{ line }` row lifecycle (immediately below
+  // for the idle branch, or later via `drainFxQueue` for the queued one) —
+  // here it's just the timer, so a still-in-flight schedule can't fire while
+  // this follow-up is in transit.
+  cancelFxAutoResumeTimer(taskId);
+  const activeHandle = task.runId ? active.get(task.runId) : undefined;
+  if (task.runId && activeHandle) {
+    // fx 0.0.13 or later: steer the running turn first — the message joins
+    // this turn and gets no run row of its own. `steer` is absent (older fx,
+    // other fakes) or returns false (no capability, still in the handshake,
+    // over 64 KiB) when that isn't possible; then queue exactly as before. A
+    // steer fx later drops comes back through `fxSteerDroppedHandler`. Never
+    // steer past a non-empty queue: an earlier message that had to queue
+    // (sent during the handshake, over 64 KiB, or still waiting behind a turn
+    // the queue started) must reach the model before this one does.
+    const seq = ++fxSendSeq;
+    const queueEmpty = (fxTurnQueue.get(taskId)?.length ?? 0) === 0;
+    if (queueEmpty && activeHandle.steer?.(line) === true) {
+      const pending = fxPendingSteers.get(task.runId) ?? [];
+      pending.push({ text: line, seq });
+      fxPendingSteers.set(task.runId, pending);
+    } else {
+      const q = fxTurnQueue.get(taskId) ?? [];
+      q.push({ line, seq });
+      fxTurnQueue.set(taskId, q);
+    }
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; a queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    saveAndEmit({ runId, taskId, stream: "user", data });
+    return runId;
+  }
+  // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
+  // #10) so `resumeFxRecovery` can tell a real spawn from a run row that's
+  // already `failed`; a follow-up send has no separate "spawn failed" status
+  // to report through — the failure is already visible on the run row and
+  // its `stderr`/status chunks, same as before this change — so this caller
+  // keeps returning the bare run id string, mapping `null` (already
+  // starting) through unchanged.
+  const result = await spawnFxRun(task, taskId, { line });
+  return result ? result.runId : null;
+}
+
+/**
+ * The two shapes `spawnFxRun` can start: an ordinary follow-up carrying a
+ * user-typed `line` (echoed as a `user` bubble, sent as the turn's prompt),
+ * or a `continueRecovery` turn that resumes a PAUSED model response (see
+ * `resumeFxRecovery`, plan §3.5) with no new prompt at all — fx's own
+ * checkpoint supplies the continuation. `origin`/`attempt`/`max` are set only
+ * when `resumeFxRecovery` was itself invoked by the auto-resume engine
+ * (`fireFxAutoResume`) — they change nothing about the spawn itself, only the
+ * opening status line text (plan §3 T2 item 6), so a transcript reader can
+ * tell an automatic resume apart from a manual click.
+ */
+type FxTurn =
+  | { line: string; echoed?: boolean }
+  | { continueRecovery: true; origin?: "manual" | "auto"; attempt?: number; max?: number };
+
+/**
+ * Spawn a fresh fx turn that resumes the task's prior conversation via fx's
+ * ACP session id. New run row, new spawn — fx has no persistent tmux session
+ * to reuse (see fx-acp.ts) — same session id carried forward. Like codex's
+ * thread id, fx's session id is DISCOVERED post-hoc (from ACP's `session/new`
+ * response), so it's carried forward on the insert below and re-stamped
+ * (idempotently) once `onSessionId` fires again for this turn.
+ *
+ * Handles both {@link FxTurn} variants; everything (the `startingTaskIds`
+ * claim, the run-row insert, the column flip/emit, `spawnAgentOrFail` /
+ * `registerActiveRun` / `attachDoneHandler`, and the queue-drop-on-spawn-
+ * failure) is identical between them. They differ only in: whether a `user`
+ * bubble is echoed (never for `continueRecovery` — nothing was typed — nor
+ * for a dropped steer, `echoed: true`, whose bubble already exists), the
+ * status line, the prompt text handed to the driver (`""` for
+ * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
+ * downstream when `continueRecovery` is set, per ACP's continue-recovery
+ * shape), and `opts.continueRecovery`.
+ *
+ * Return shape (Phase 8 review #10 fix): `null` still means "declined to
+ * mint a run because `startingTaskIds` was already claimed for this task" —
+ * the pre-existing "already starting" signal every caller already checks
+ * for. Every OTHER path now returns `{ runId, spawned, error? }` instead of
+ * a bare `runId` string, because the two failure branches below (missing
+ * harness; `spawnAgentOrFail` throw) used to return the SAME `newRunId` a
+ * successful spawn does, even though the run row they just wrote is already
+ * `failed` and no agent process is running. `resumeFxRecovery` used to take
+ * that truthy `runId` at face value and report `{ ok: true, runId }` for a
+ * resume that never started — see that function's doc for the HTTP-layer
+ * fallout. `spawned: false` carries a human-readable `error` (the harness
+ * text, or `spawnAgentOrFail`'s own `message`) so callers can surface real
+ * failure text instead of pretending the turn is running.
+ */
+async function spawnFxRun(
+  task: Task,
+  taskId: string,
+  turn: FxTurn,
+): Promise<{ runId: string; spawned: boolean; error?: string } | null> {
+  // Claim the unified "starting" slot before touching the DB — see
+  // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
+  // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
+  // unambiguous: every other return path below yields `newRunId`.
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "fx_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: priorSessionId,
+      antigravitySessionId: null,
+      // Durable "nobody asked for this turn" marker — the pipeline runner
+      // reads it to tell an automatic resume from a user-started turn.
+      origin: "continueRecovery" in turn && turn.origin === "auto" ? "auto-resume" : null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "fx";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    if ("line" in turn) {
+      // A dropped steer's bubble already sits on the run it steered.
+      if (turn.echoed !== true) onChunk("user", normalizeUserText(turn.line));
+      onChunk(
+        "status",
+        priorSessionId
+          ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
+          : "no prior fx session — starting fresh",
+      );
+      // A fresh follow-up turn is spawning — the pause chain (if any) is
+      // over: whatever checkpoint fx had, this new prompt supersedes it, and
+      // there's nothing left to auto-resume (plan §3 T2 item 7).
+      clearFxRecovery(taskId);
+    } else {
+      // `resumeFxRecovery` already checked `lastSessionIdForTask(task, "fx_session_id")` is
+      // non-null before ever calling this — `priorSessionId` here is a
+      // fresh re-read of the same query, not the value that check saw, so
+      // the `?? ""` stays purely defensive against a same-instant race
+      // rather than a case this path expects to hit.
+      const sessionPrefix = (priorSessionId ?? "").slice(0, 8);
+      onChunk(
+        "status",
+        turn.origin === "auto"
+          ? `auto-resuming paused fx response (${turn.attempt}/${turn.max}) in session ${sessionPrefix}…`
+          : `resuming paused fx response in session ${sessionPrefix}…`,
+      );
+      // A continue-recovery turn is now in flight for this pause — cancel
+      // any pending timer (the resume is happening right now, manually or
+      // automatically) but KEEP the row (just clear its schedule) rather than
+      // wipe it outright: `noteFxRunSettled`/`recordFxPause` read the row's
+      // `autoResumeCount` when this run settles, and if it pauses again that
+      // read is what continues the chain's count instead of restarting it at
+      // 0. Re-read fresh rather than trusting `task.fxRecovery` — a manual
+      // resume may have just mutated the row moments ago in `resumeFxRecovery`
+      // (plan §3 T2 item 7).
+      cancelFxAutoResumeTimer(taskId);
+      const currentRec = tasks.get(taskId)?.fxRecovery;
+      if (currentRec) {
+        tasks.setFxRecovery(taskId, { ...currentRec, autoResume: null, autoResumeStopped: undefined });
+      }
+    }
+
+    if (!harness) {
+      const error = `harness "${task.agent}" not found — cannot resume`;
+      onChunk("stderr", error);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      tasks.update(taskId, { column: "ready", runId: null });
+      return { runId: newRunId, spawned: false, error };
+    }
+
+    const { agent, message } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: "line" in turn ? turn.line : "",
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { fxSessionId: sessionId });
+      },
+      onSteerDropped: fxSteerDroppedHandler(taskId, newRunId, harness.id),
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+        ...("continueRecovery" in turn ? { continueRecovery: true } : {}),
+      },
+    });
+    if (!agent) {
+      // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+      // failed this run and attachDoneHandler (the only caller of
+      // drainFxQueue) never runs, so drop the queue rather than let queued
+      // follow-ups resurface out of order on a later turn.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+      fxTurnQueue.delete(taskId);
+      return {
+        runId: newRunId,
+        spawned: false,
+        error: message || "fx could not be started — see the run's status line",
+      };
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return { runId: newRunId, spawned: false, error: "cancelled by user before the agent launched" };
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return { runId: newRunId, spawned: true };
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * After an fx turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, or if
+ * the task's agent was switched away from fx mid-flight.
+ */
+async function drainFxQueue(taskId: string): Promise<void> {
+  const q = fxTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from fx while a turn was
+  // in flight — abandon the stale queue. Without this guard, draining after
+  // an fx→claude switch would spawn the follow-up against the new claude
+  // harness with an fx session id, which claude rejects.
+  if (!task || resolveHarness(task.agent)?.kind !== "fx") {
+    fxTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) fxTurnQueue.delete(taskId);
+  if (next !== undefined) {
+    await spawnFxRun(task, taskId, next.echoed ? { line: next.line, echoed: true } : { line: next.line });
+  }
+}
+
+
+/**
+ * The single source of truth for "does this task have a resumable fx pause
+ * right now, and which run/payload is it?" — extracted from what used to be
+ * `resumeFxRecovery`'s own inline gating (plan §3 T2 item 3) so
+ * `noteFxRunSettled`/`recordFxPause` (deciding whether to schedule an
+ * auto-resume) and `rearmFxAutoResumes` (deciding whether a persisted
+ * schedule still points at something real) can mirror the exact same check
+ * `resumeFxRecovery` itself uses, without duplicating the run/sentinel
+ * lookup. Returns `null` when the task's latest run isn't `failed`, or its
+ * last `FX_RECOVERY_STATUS_PREFIX` sentinel isn't resumable
+ * (`isFxRecoveryResumable`) — same two SQL lookups `resumeFxRecovery` always
+ * ran, just named and reusable now.
+ */
+function latestResumableFxPause(taskId: string): { runId: string; payload: FxRecoveryPayload } | null {
+  const latestRun = db.query<{ id: string; status: string; agent: string }, [string]>(
+    `SELECT id, status, agent FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
+  ).get(taskId);
+  if (!latestRun || latestRun.status !== "failed") return null;
+  // Harness-scoped (D-15): a pause recorded by another fx harness belongs to
+  // that account's session, which this harness can't continue — the resume
+  // would pick this harness's own session id (or none).
+  const task = tasks.get(taskId);
+  if (!task || (resolveHarness(latestRun.agent)?.id ?? latestRun.agent) !== taskHarnessId(task)) return null;
+
+  const sentinel = runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
+  const payload = sentinel ? parseFxRecoveryPayload(sentinel.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
+  if (!payload || !isFxRecoveryResumable(payload)) return null;
+
+  return { runId: latestRun.id, payload };
+}
+
+/** The task's fx `--version` line through the 60 s probe cache, or `null`
+ *  (also for a task whose harness isn't fx: no other CLI's version counts).
+ *  A probe that throws (the spawn itself failing, e.g. EACCES) reads as
+ *  unknown too, so the boot sweep, a detached auto-resume and a manual
+ *  Resume keep today's behaviour instead of rejecting. */
+async function fxCliVersion(task: Task): Promise<string | null> {
+  const harness = resolveHarness(task.agent);
+  if (harness?.kind !== "fx") return null;
+  try {
+    return await cachedCliVersion(harness);
+  } catch {
+    return null;
+  }
+}
+
+/** Same, without probing: the last version `checkHarness` saw, or `null`. */
+function peekFxCliVersion(task: Task): string | null {
+  const harness = resolveHarness(task.agent);
+  return harness?.kind === "fx" ? peekCachedCliVersion(harness) : null;
+}
+
+/**
+ * fx-only settlement hook (plan §3 T2 item 4) — called from BOTH
+ * `attachDoneHandler` branches (`.then` and `.catch`) right after the run's
+ * status/column are persisted and BEFORE `drainFxQueue` runs, so a queued
+ * follow-up (whose own spawn clears this row — see `spawnFxRun`'s `{ line }`
+ * row lifecycle) always sees this hook's decision land first. A no-op for
+ * every non-fx task.
+ *
+ * Takes the already-fetched `task` from the caller (Phase 8 review #4) rather
+ * than re-reading by id — `attachDoneHandler` already has it in scope at both
+ * call sites, and a second unconditional `tasks.get` here was a redundant
+ * query on every single run settlement, fx or not. The kind check below reads
+ * from that (possibly a beat stale by the time earlier settlement steps ran)
+ * object — `task.agent`/its harness kind cannot change mid-settlement, so
+ * staleness there is harmless. Freshness only actually matters for the
+ * decision that follows, so THAT re-reads explicitly, right where it's used.
+ *
+ * Two outcomes: the run that just settled IS the task's latest resumable
+ * pause (`newStatus === "failed"` and `latestResumableFxPause` names this
+ * exact `runId`) → `recordFxPause` records/schedules it. Otherwise, if the
+ * task was carrying a stale `fxRecovery` row from an earlier pause in this
+ * chain, it's cleared via `clearFxRecovery` (not a bare `tasks.setFxRecovery(
+ * taskId, null)` — Phase 8 review #5: a bare DB clear left the in-memory
+ * `fxAutoResumeTimers` entry armed, so a run that settled for an unrelated
+ * reason while an auto-resume timer from an earlier pause was still pending
+ * could let that timer fire later against a row that no longer says
+ * `autoResume`, doing nothing useful but leaking the timer past this task's
+ * own settlement) — a run that recovered, or failed for an unrelated reason,
+ * or succeeded outright, all end the chain the same way.
+ */
+function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus): void {
+  if (!task || resolveHarness(task.agent)?.kind !== "fx") return;
+  const taskId = task.id;
+  const pause = newStatus === "failed" ? latestResumableFxPause(taskId) : null;
+  if (pause && pause.runId === runId) {
+    // fx 0.0.15+ can't continue the pause, so record nothing: no badge, no
+    // auto-resume, and RunPanel drops its Resume button on the same version.
+    // Synchronous, so it reads the last probed version (the start pre-flight
+    // primed it); unknown keeps today's behaviour.
+    if (!fxSupportsContinueRecovery(peekFxCliVersion(task))) {
+      appendFxStatusLine(taskId, runId, FX_RESUME_UNSUPPORTED_TEXT);
+      if (tasks.get(taskId)?.fxRecovery != null) clearFxRecovery(taskId);
+      return;
+    }
+    recordFxPause(taskId, runId, pause.payload);
+    return;
+  }
+  // Freshness matters here: `task.fxRecovery` may already be behind by the
+  // time this runs (earlier settlement steps in the same handler — column
+  // update, plan detection — could have touched the row), so re-read before
+  // deciding whether a stale row needs clearing.
+  const fresh = tasks.get(taskId);
+  if (fresh?.fxRecovery != null) clearFxRecovery(taskId);
+}
+
+/**
+ * Record a freshly-paused fx run and, unless auto-resume is disabled, the
+ * chain has hit its cap, or a follow-up is already queued (see below),
+ * schedule the next auto-resume attempt. Called only from `noteFxRunSettled`
+ * once it has confirmed `runId` IS the task's current resumable pause.
+ *
+ * `autoResumeCount` carries forward from the task's PRIOR `fxRecovery` row
+ * when one exists — a non-null `prev` means this run was itself a
+ * continue-recovery turn that paused again, so the chain continues counting
+ * rather than resetting to 0 (only a full `clearFxRecovery` — a normal turn,
+ * recovery, archive/delete/switch — resets the count, by clearing the row
+ * entirely).
+ *
+ * `attempt` convention (Phase 8 review #6) — every `fx-auto-resume`
+ * `GlobalEvent` and every `TaskFxRecovery.autoResume` row carries an
+ * `attempt` field, but what it COUNTS differs by state, so read it against
+ * the state it's attached to, not in isolation:
+ *   - `scheduled` / `fired` → the ordinal of the attempt being armed (here)
+ *     or fired (`fireFxAutoResume`) — i.e. `autoResumeCount + 1` at the
+ *     moment the timer is set, echoed back unchanged when it fires.
+ *   - `disabled` → the ordinal that WOULD have been scheduled had the
+ *     preference been on (`autoResumeCount + 1`) — there is no real attempt
+ *     to number, so this reports what was skipped.
+ *   - `exhausted` → always `FX_AUTO_RESUME_MAX` (the cap itself, same value
+ *     as `max`), not `autoResumeCount` — the row only reaches this branch
+ *     once `autoResumeCount` has already climbed to the cap, so the two are
+ *     numerically identical today, but pinning it to the named constant
+ *     documents the intent ("we stopped AT the cap") instead of leaning on
+ *     an incidental equality between a counter and a constant.
+ */
+function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload): void {
+  const prev = tasks.get(taskId)?.fxRecovery ?? null;
+  const autoResumeCount = prev?.autoResumeCount ?? 0;
+
+  const base: TaskFxRecovery = {
+    state: "paused",
+    runId,
+    pausedAt: Date.now(),
+    autoResume: null,
+    autoResumeCount,
+  };
+  if (payload.cause !== undefined) base.cause = payload.cause;
+  if (payload.attempt !== undefined) base.attempt = payload.attempt;
+  if (payload.attemptLimit !== undefined) base.attemptLimit = payload.attemptLimit;
+  if (payload.message !== undefined) base.message = payload.message;
+
+  // A follow-up is already queued for this task — it will consume the
+  // checkpoint (and clear this row via `spawnFxRun`'s `{ line }` row
+  // lifecycle) a beat from now, via `drainFxQueue` right after this hook
+  // returns. Persist the row so `autoResumeCount` still carries forward if
+  // THAT turn also pauses, but skip the schedule/status-line/event — there's
+  // nothing here for the user to act on (plan §3 T2 item 4).
+  if ((fxTurnQueue.get(taskId)?.length ?? 0) > 0) {
+    tasks.setFxRecovery(taskId, base);
+    return;
+  }
+
+  const prefs = fxAutoResumePrefs();
+  if (!prefs.enabled) {
+    // `disabled`: the ordinal that would have run — see this function's
+    // "attempt convention" doc.
+    const attempt = autoResumeCount + 1;
+    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "disabled" });
+    appendFxStatusLine(taskId, runId, "auto-resume disabled in Settings — resume manually");
+    emitGlobal({ kind: "fx-auto-resume", taskId, state: "disabled", attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+    return;
+  }
+
+  if (autoResumeCount >= FX_AUTO_RESUME_MAX) {
+    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "exhausted" });
+    appendFxStatusLine(
+      taskId,
+      runId,
+      `auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts — resume manually once the limit clears`,
+    );
+    emitGlobal({
+      kind: "fx-auto-resume",
+      taskId,
+      state: "exhausted",
+      // `exhausted`: the cap itself, not `autoResumeCount` — see this
+      // function's "attempt convention" doc.
+      attempt: FX_AUTO_RESUME_MAX,
+      max: FX_AUTO_RESUME_MAX,
+      ts: Date.now(),
+    });
+    return;
+  }
+
+  const { delayMs } = prefs;
+  const at = Date.now() + delayMs;
+  const delaySec = Math.round(delayMs / 1000);
+  // `scheduled`: the ordinal being armed — see this function's "attempt
+  // convention" doc.
+  const attempt = autoResumeCount + 1;
+  tasks.setFxRecovery(taskId, { ...base, autoResume: { at, attempt, max: FX_AUTO_RESUME_MAX, delaySec } });
+  appendFxStatusLine(taskId, runId, `auto-resume scheduled in ${delaySec} s (${attempt}/${FX_AUTO_RESUME_MAX})`);
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "scheduled", at, attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+  armFxAutoResumeTimer(taskId, at);
+}
+
+/**
+ * Fire one auto-resume attempt (plan §3 T2 item 5). Identity-checking and
+ * removing the timer entry itself is the caller's job (`armFxAutoResumeTimer`'s
+ * `setTimeout` callback) — by the time this runs, the timer that scheduled it
+ * is already gone from `fxAutoResumeTimers`. Re-validates against a fresh
+ * read before acting: the persisted schedule must still name this exact `at`
+ * (a cancel, a manual resume, or a re-arm since this timer was set would have
+ * changed or nulled it), the task must not be archived, and no turn may
+ * already be in flight — all of which can legitimately have changed in the
+ * time between arming and firing.
+ *
+ * The `attempt` this emits/persists is "the ordinal being fired" — see the
+ * convention note on `recordFxPause`. If `resumeFxRecovery` itself rejects
+ * the attempt (a gate flipped between arming and firing, or the spawn threw),
+ * that's a genuine failure of THIS auto-resume attempt, not a user cancel —
+ * the row is marked `autoResumeStopped: "failed"` (not `"cancelled"`, which
+ * is reserved for an explicit user/Stop cancel via `cancelFxAutoResume`) so
+ * the notice/badge can tell the two apart.
+ */
+async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
+  const before = tasks.get(taskId);
+  if (!before) return;
+  // Probed before the re-validation below, so nothing can change between
+  // those checks and acting on them.
+  const supported = fxSupportsContinueRecovery(await fxCliVersion(before));
+  const task = tasks.get(taskId);
+  const rec = task?.fxRecovery ?? null;
+  if (!task || !rec?.autoResume || rec.autoResume.at !== at) return;
+  if (task.archivedAt != null) return;
+  if (task.runId && active.has(task.runId)) return;
+  if (!supported) {
+    // fx was upgraded to 0.0.15+ after this pause was scheduled.
+    clearFxRecovery(taskId);
+    appendFxStatusLine(taskId, rec.runId, `auto-resume skipped — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+    return;
+  }
+
+  const { max } = rec.autoResume;
+  const attempt = rec.autoResumeCount + 1;
+  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeCount: attempt });
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "fired", attempt, max, ts: Date.now() });
+
+  const result = await resumeFxRecovery(taskId, { origin: "auto", attempt, max });
+  if (!result.ok) {
+    appendFxStatusLine(taskId, rec.runId, `auto-resume could not start: ${result.error}`);
+    const latest = tasks.get(taskId)?.fxRecovery;
+    if (latest) tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "failed" });
+  }
+}
+
+/**
+ * User-facing cancel of a pending auto-resume schedule (plan §3 T2 item 8) —
+ * used by the `DELETE /tasks/:id/fx-auto-resume` route (notice button,
+ * context-menu entry, `agetor resume <id> --cancel`) and by `cancelRun` when
+ * Stop targets a paused task with a pending timer instead of a live run.
+ * `reason` distinguishes an explicit cancel from a Stop-triggered one at the
+ * call site; both persist the same `autoResumeStopped: "cancelled"` value —
+ * `TaskFxRecovery`'s reason union has no separate "stopped" state, since
+ * "cancelled" already answers "why isn't a timer pending" either way.
+ * Returns `false` (no-op, nothing touched) when the task has no pending
+ * schedule — the caller (`DELETE` route) maps that to 400.
+ *
+ * `reason` is intentionally not threaded into the persisted value or event —
+ * both call sites mean the same thing to the schedule itself ("no timer is
+ * pending because the user acted"), it just documents at the call site
+ * *which* user action did it.
+ *
+ * Cancel semantics (Phase 8 review #8): this only cancels the ONE pending
+ * timer — it is not a durable "never auto-resume this task again" switch. If
+ * the same pause chain later produces another failed-and-resumable run (e.g.
+ * a manual Resume that itself re-pauses), `recordFxPause` schedules again
+ * from scratch, same as it would after any other terminal reason
+ * (`exhausted`/`disabled`) clears. The Settings `fxAutoResume` preference is
+ * the actual off switch — toggling it off is what stops every future
+ * schedule from being armed at all, on this task and every other one.
+ */
+export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stopped"): boolean {
+  const rec = tasks.get(taskId)?.fxRecovery ?? null;
+  cancelFxAutoResumeTimer(taskId);
+  if (!rec?.autoResume) return false;
+
+  const { attempt, max } = rec.autoResume;
+  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: "cancelled" });
+  appendFxStatusLine(taskId, rec.runId, "auto-resume cancelled");
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "cancelled", attempt, max, ts: Date.now() });
+  return true;
+}
+
+/**
+ * Re-arm in-memory auto-resume timers for every task that still has one
+ * pending, at boot (plan §3 T2 item 9) — in-memory `setTimeout` handles never
+ * survive a process restart, so without this a pause recorded in a prior
+ * process would sit forever with a persisted `autoResume.at` that nothing
+ * will ever fire. Called right after `reconcileOrphans()` in both boot paths
+ * (`index.ts`, `headless.ts`), so reattach/orphan resolution — which can
+ * itself flip a run's status — settles first.
+ *
+ * For each pending row: if the task's CURRENT latest resumable pause no
+ * longer matches the `runId` the schedule was recorded for (recovered,
+ * superseded by a newer pause some other way, or otherwise stale), the row
+ * is cleared outright rather than re-armed for a pause that's gone. A
+ * schedule whose `at` has already passed (agetor was down through it) is
+ * re-armed with a short, staggered delay — `now + 5000 + i * 2000` per
+ * overdue entry, persisted back onto the row so its countdown reads
+ * correctly — rather than firing every overdue task in the same tick.
+ * Returns the count actually armed (clears don't count).
+ *
+ * Every persisted pause — scheduled or not — is cleared once the task's fx is
+ * 0.0.15 or later, which can't continue it (`fxSupportsContinueRecovery`), so
+ * an upgrade doesn't leave a paused badge and a Resume that can only fail.
+ */
+export async function rearmFxAutoResumes(): Promise<number> {
+  const rows = tasks.listFxRecovery();
+  const now = Date.now();
+  let armed = 0;
+  let staggerIndex = 0;
+  for (const { id: taskId, fxRecovery: rec } of rows) {
+    const task = tasks.get(taskId);
+    if (task && !fxSupportsContinueRecovery(await fxCliVersion(task))) {
+      clearFxRecovery(taskId);
+      if (rec.autoResume) {
+        appendFxStatusLine(taskId, rec.runId, `auto-resume cancelled — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+      }
+      continue;
+    }
+    if (!rec.autoResume) continue;
+    const pause = latestResumableFxPause(taskId);
+    if (!pause || pause.runId !== rec.runId) {
+      tasks.setFxRecovery(taskId, null);
+      continue;
+    }
+    const schedule = rec.autoResume;
+    if (!schedule) continue; // checked above — narrows the type only.
+    let at = schedule.at;
+    if (at <= now) {
+      at = now + 5000 + staggerIndex * 2000;
+      staggerIndex++;
+      tasks.setFxRecovery(taskId, { ...rec, autoResume: { ...schedule, at } });
+    }
+    armFxAutoResumeTimer(taskId, at);
+    armed++;
+  }
+  return armed;
+}
+
+/** Test/shutdown hook: clear every in-memory auto-resume timer without
+ *  touching any persisted `fxRecovery` row. Mirrors the "stop timers, leave
+ *  the DB alone" shape tests need to reset module state between runs. */
+export function stopFxAutoResumeTimers(): void {
+  for (const timer of fxAutoResumeTimers.values()) clearTimeout(timer);
+  fxAutoResumeTimers.clear();
+}
+
+/**
+ * Continue a PAUSED fx model response (plan `docs/plans/fix-fx-harness-rate-
+ * limit.md` §2 "Resume evidence", §3 decision 5) — the Vercel AI Gateway hit
+ * its free-tier rate limit, fx retried up to its attempt cap, and gave up
+ * with a durable, resumable checkpoint (`FxRecoveryPayload.state ===
+ * "paused"`, `requiredAction === "continue_later"`). Resuming replays that
+ * checkpoint via a fresh `session/resume` + `session/prompt {..,
+ * _meta:{fx:{continueRecovery:true}}}` turn (see `spawnFxRun`'s
+ * `continueRecovery` variant and fx-acp.ts) — no new prompt is sent, so the
+ * user's next real message still lands on the same conversation.
+ *
+ * Called from two places: a manual resume (`opts.origin` omitted or
+ * `"manual"` — the `/tasks/:id/fx-resume` route, `agetor resume`, the
+ * webview's Resume button) and the auto-resume engine's own timer
+ * (`fireFxAutoResume`, `opts.origin: "auto"` with `attempt`/`max` naming
+ * which attempt this is — plan `docs/plans/fx-recovery-follow-ups.md` §3 T2
+ * item 6). The two differ only in: a manual resume additionally cancels any
+ * pending auto-resume timer up front (the user acting IS an implicit
+ * cancel — a scheduled auto-resume must not also fire later and double-spawn
+ * a turn against the checkpoint this manual resume is about to consume) with
+ * no status line of its own (`spawnFxRun`'s own row lifecycle for the
+ * `continueRecovery` branch already leaves the row in the right shape); and
+ * the opening status line `spawnFxRun` writes differs (see `FxTurn`'s doc).
+ *
+ * Claims the module-level `resumingTaskIds` set synchronously, before any
+ * `await` — this is what used to be the `/fx-resume` route's own
+ * `fxResumesInFlight` claim, moved here so the auto-resume timer and every
+ * HTTP caller share ONE guard against a double-resume race (two POSTs, or a
+ * POST racing the timer, landing on the same task). Released in `finally`.
+ *
+ * Every OTHER gating check below runs BEFORE `spawnFxRun` is ever called,
+ * because an ungated call would spawn a real run row (flipping the card to
+ * `running`, opening a live fx ACP process) only to have fx's own
+ * `session/prompt` answer `-32602 "No paused model response to continue"` —
+ * a run failing for a reason agetor could have caught synchronously against
+ * data it already has. Order matters: existence and archival first (cheap,
+ * no DB scan), then the harness-kind check (a non-fx task can never have a
+ * recovery sentinel, but checking first gives a clearer error than "no
+ * paused response"), then in-flight (nothing to gate against once a turn is
+ * already running), then the run/sentinel/session-id lookups that actually
+ * decide resumability (`latestResumableFxPause`, extracted from what used to
+ * be this function's own inline lookup — see that function's doc).
+ *
+ * `spawnFxRun` can still fail AFTER all of the above passes (missing
+ * harness — effectively unreachable here since the `kind !== "fx"` check
+ * just above resolves the identical harness synchronously, with no `await`
+ * in between for it to vanish; or `spawnAgentOrFail` throwing, e.g. a
+ * transient spawn error) — Phase 8 review #10: that failure used to be
+ * invisible, because `spawnFxRun` returned the SAME truthy `runId` a real
+ * spawn does even on those branches, so this function reported `{ ok: true,
+ * runId }` for a resume that never started. The caller (`POST
+ * /tasks/:id/fx-resume`, `agetor resume`, the webview's Resume button,
+ * `fireFxAutoResume`) has no way to see the run row's own `failed` status the
+ * way a live run panel does, so a `spawned: false` result is now surfaced as
+ * a real HTTP failure (500 — the request was well-formed and passed every
+ * gate, but the server genuinely couldn't start the turn) rather than a
+ * false 200. The run row `spawnFxRun` already wrote (status `failed`, with
+ * the failure reason on its `stderr`/status chunks) is kept as-is — it's the
+ * durable record of the failed resume attempt, not rolled back or deleted
+ * here.
+ */
+export async function resumeFxRecovery(
+  taskId: string,
+  opts?: { origin?: "manual" | "auto"; attempt?: number; max?: number },
+): Promise<
+  { ok: true; runId: string } | { ok: false; status: 400 | 404 | 409 | 500; error: string }
+> {
+  if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
+  if (resumingTaskIds.has(taskId)) {
+    return { ok: false, status: 409, error: "a resume is already in flight for this task" };
+  }
+  resumingTaskIds.add(taskId);
+  try {
+    let task = tasks.get(taskId);
+    if (!task) return { ok: false, status: 404, error: "not found" };
+    if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    if (resolveHarness(task.agent)?.kind !== "fx") {
+      return { ok: false, status: 400, error: "only fx tasks can resume a paused response" };
+    }
+    // fx 0.0.15+ answers `continueRecovery` with -32602 on every ACP session
+    // agetor opens, so refuse before minting a run row, and drop the pause so
+    // the badge and menu entry go too. Re-read after the probe's await.
+    const supported = fxSupportsContinueRecovery(await fxCliVersion(task));
+    task = tasks.get(taskId);
+    if (!task) return { ok: false, status: 404, error: "not found" };
+    if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    // The entry check above ran before the probe's await; a freeze can land
+    // during it. Nothing awaits between here and `spawnFxRun`'s claim, so this
+    // is the last point a refusal can still be clean (it also keeps the
+    // manual-resume side effects below from running on a core that is exiting).
+    if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
+    if (!supported) {
+      if (task.fxRecovery != null) clearFxRecovery(taskId);
+      return { ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT };
+    }
+    if ((task.runId && active.has(task.runId)) || startingTaskIds.has(taskId)) {
+      return { ok: false, status: 409, error: "a turn is already in flight for this task" };
+    }
+
+    if (!latestResumableFxPause(taskId)) {
+      return { ok: false, status: 400, error: "no paused fx response to resume" };
+    }
+
+    if (lastSessionIdForTask(task, "fx_session_id") === null) {
+      return { ok: false, status: 400, error: "no fx session to resume" };
+    }
+
+    const origin = opts?.origin ?? "manual";
+    if (origin === "manual") {
+      // The user acting is an implicit cancel of any pending auto-resume
+      // schedule — see this function's doc. No status line: `spawnFxRun`'s
+      // own `continueRecovery` row lifecycle (below) already leaves the row
+      // in the post-cancel shape once the run actually starts; this just
+      // closes the window between "gating passed" and "spawnFxRun runs" so
+      // a timer can't fire in between.
+      cancelFxAutoResumeTimer(taskId);
+      const rec = task.fxRecovery;
+      if (rec?.autoResume) {
+        tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: undefined });
+        task = tasks.get(taskId) ?? task;
+      }
+    }
+
+    const result = await spawnFxRun(task, taskId, {
+      continueRecovery: true,
+      ...(origin === "auto" ? { origin, attempt: opts?.attempt, max: opts?.max } : {}),
+    });
+    if (result === null) {
+      return { ok: false, status: 409, error: "a turn is already starting for this task" };
+    }
+    if (!result.spawned) {
+      return {
+        ok: false,
+        status: 500,
+        error: result.error ?? "fx could not be started — see the run's status line",
+      };
+    }
+    return { ok: true, runId: result.runId };
+  } finally {
+    resumingTaskIds.delete(taskId);
+  }
+}
+
+/**
+ * Outcome of dispatching one claude-code follow-up turn (`sendClaudeTurn` /
+ * `sendTurnInExistingSession`). Both now AWAIT the paste's real
+ * `PasteOutcome` before resolving (docs/plans/model-effort-local-command-
+ * turns.md §10, "withheld sends surface at the HTTP layer") instead of
+ * reporting success purely optimistically. `runId` always names the run the
+ * message was recorded against — the folded run for a busy session, or the
+ * freshly-created row for an idle send/respawn — even when the paste itself
+ * never reached the pane: the optimistic "user" bubble (and, for an idle
+ * send, the whole run-row-insert + column-flip) has already happened by the
+ * time this resolves, and is never rolled back.
+ *
+ *   • `delivered: true` — the paste landed (or no `pasteOutcome` was offered
+ *     to await, e.g. `spawnResumedSession`'s fresh-spawn path, which has no
+ *     live modal to withhold against). `pending: true` rides along on this
+ *     variant only, and only from `spawnResumedSession`'s fresh-spawn path:
+ *     the message WAS recorded (run row inserted, task flipped to `running`,
+ *     `user` event appended) but the actual `claude --resume` process spawn
+ *     is still running detached past `SPAWN_RESPONSE_BUDGET_MS` — see that
+ *     constant's doc. Omitted (never `false`) whenever the spawn settled
+ *     within budget, so this result stays byte-identical to before the
+ *     budget existed on the fast path.
+ *   • `delivered: false; withheld: true` — the underlying `PasteOutcome` was
+ *     specifically the modal-guard withhold (a blocking claude modal was
+ *     still on the pane when the paste's grace window elapsed). This is the
+ *     ONLY case `sendInput` reports as `{ withheld: true, savedToBacklog,
+ *     ... }` rather than a plain failure — `handlePasteWithheld` (wired as
+ *     `onPasteFailure` below) has already tried the backlog re-stash and left
+ *     its own status breadcrumb on the run by the time this resolves;
+ *     `savedToBacklog` is what that re-stash returned (`false` when the task
+ *     was gone or archived).
+ *   • `delivered: false; reason` — a genuine tmux subprocess failure
+ *     (`load-buffer`/`paste-buffer`/`send-keys` exiting non-zero), not a
+ *     modal withhold. `handlePasteWithheld` still re-stashes and leaves its
+ *     own breadcrumb for this case too; this result just doesn't get the
+ *     withheld/savedToBacklog framing.
+ */
+type ClaudeTurnResult =
+  | { runId: string; delivered: true; pending?: true }
+  | { runId: string; delivered: false; busy: true }
+  | { runId: string; delivered: false; withheld: true; savedToBacklog: boolean }
+  | { runId: string; delivered: false; withheld: false; reason: string };
+
+/**
+ * Whether a claude send must stop before it pastes into the session or claims
+ * the task's "starting" slot, or `null` to go on. Called with a task row read
+ * in the SAME synchronous section as that paste/claim, after the awaits that
+ * precede it (`sessionLiveness`'s `has-session` fork, `pasteFollowUp`): a
+ * freeze ({@link freezeLaunches}) or an archive can land during either, and
+ * `sendInputInner`'s own checks ran before them. A frozen idle-only send reads
+ * `busy`, like `sendInput`'s entry check; an archived task gets the same
+ * non-delivered answer `sendInputInner` gives, with no paste and no run row.
+ */
+function claudeSendRefusal(task: Task, onlyIfIdle: boolean): ClaudeTurnResult | null {
+  const runId = task.runId ?? "";
+  if (launchesFrozenFlag) {
+    return onlyIfIdle
+      ? { runId, delivered: false, busy: true }
+      : { runId, delivered: false, withheld: false, reason: LAUNCHES_FROZEN_REASON };
+  }
+  if (task.archivedAt != null) {
+    return { runId, delivered: false, withheld: false, reason: SEND_ARCHIVED_REASON };
+  }
+  return null;
+}
+
+/**
+ * Bound how long `sendTurnInExistingSession` waits for a paste's real
+ * `PasteOutcome` before treating it as delivered. This is a driver-bug
+ * backstop, not a latency budget — a normal send resolves within the paste
+ * guard's own grace window (`PASTE_MODAL_GRACE_MS`, 1.5s) plus at most one
+ * poll tick, comfortably under even the old 5s bound. But the same per-task
+ * tmux op chain (`queueTmuxOp`) can queue a `/model` picker mirror
+ * (`mirrorModelViaPicker`) AHEAD of this paste — its own poll-for-the-picker
+ * window plus arrow-walk plus confirm can run ~4.7s before this paste's op
+ * even starts, and THEN this paste still has to clear its own 1.5s modal
+ * grace on top of that. A 5s bound could time out on that ordinary
+ * (non-buggy) queueing delay and report a real withhold as delivered — the
+ * worst possible outcome, a lost message the user is told was sent. 15s
+ * gives that queueing headroom while still bounding a genuinely stuck
+ * driver. If a driver-side bug ever left it unsettled even past that,
+ * hanging every claude follow-up send would be far worse than the rare case
+ * of reporting an actually-withheld paste as delivered, so a timeout
+ * resolves to `undefined` ("no answer") rather than rejecting —
+ * `resolveClaudeTurnOutcome` treats that identically to a genuine
+ * `{ ok: true }`.
+ */
+const PASTE_OUTCOME_TIMEOUT_MS = 15_000;
+
+/**
+ * Claude's idle/dead-session mint paths (`sendClaudeTurn`'s fresh-spawn
+ * branch, via `spawnResumedSession`, and `sendTurnInExistingSession`'s idle
+ * branch) claim the unified `startingTaskIds` set declared near `startTask`
+ * above — see that doc comment for the full double-mint race this closes.
+ * Before wave 1, `sendClaudeTurn` read `sessionLiveness` (and
+ * `sessionExists`) SYNCHRONOUSLY, so the whole stretch from that read through
+ * the new run row's `tasks.update` executed as one uninterrupted tick of JS;
+ * `sessionLiveness` becoming genuinely async (a real tmux probe) opened a
+ * real event-loop gap that made this claim necessary. Scoped to ONLY the
+ * idle/dead-session paths — the fold-while-busy path (`pasteFollowUp`, above
+ * the idle branch in `sendTurnInExistingSession`) is unaffected and still
+ * allows any number of concurrent follow-ups to fold onto the one active
+ * run. (This used to be a claude-only `startingClaudeIdleTurns` set; it was
+ * folded into `startingTaskIds` so a `startTask` and a claude idle-send can't
+ * each claim their own disjoint keyspace and both mint.)
+ */
+
+/**
+ * Await a paste's `pasteOutcome` (from `sendTurn`/`pasteFollowUp`, §10
+ * "withheld sends surface at the HTTP layer") and translate it into the
+ * `ClaudeTurnResult` `sendInput`'s caller sees. `handlePasteWithheld` (passed
+ * as `onPasteFailure` at both `sendTurnInExistingSession` call sites) has
+ * ALREADY done the backlog re-stash + run status breadcrumb by the time this
+ * resolves — this helper only shapes the HTTP-facing result; it never
+ * stashes anything itself, so there's no double-stash. `stashed` reads what
+ * that re-stash returned: claude-tmux fires `onPasteOutcome` (which settles
+ * `pasteOutcome`) and then `onPasteFailure` in the same synchronous call, so
+ * the hook has run by the time this `await` resumes; `null` (it never ran)
+ * reads as not saved.
+ */
+async function resolveClaudeTurnOutcome(
+  runId: string,
+  pasteOutcome: Promise<{ ok: boolean; op?: string; stderr?: string }> | undefined,
+  stashed: () => boolean | null = () => null,
+): Promise<ClaudeTurnResult> {
+  if (!pasteOutcome) return { runId, delivered: true };
+  // `clearTimeout` once the race settles — whichever side wins, the loser's
+  // timer must not linger. Left running it would (a) hold the Bun test
+  // runner open for up to `PASTE_OUTCOME_TIMEOUT_MS` past the real outcome on
+  // every test that exercises this path, and (b) is simply wasted work once
+  // the real answer is already in hand.
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), PASTE_OUTCOME_TIMEOUT_MS);
+  });
+  const outcome = await Promise.race([pasteOutcome, timeout]);
+  clearTimeout(timer!);
+  if (!outcome || outcome.ok) return { runId, delivered: true };
+  if (outcome.op === "modal-guard") {
+    return { runId, delivered: false, withheld: true, savedToBacklog: stashed() === true };
+  }
+  // Prefer the driver's own descriptive `stderr` (finding #5, §10 re-review)
+  // — e.g. "paste dropped: the session was torn down or replaced before the
+  // keystrokes went out" for a dropped queued op, which reads correctly
+  // rather than the generic `tmux <op>` framing implying a real tmux
+  // subprocess failure. Falls back to the op-based message for an older/
+  // synthesized outcome with no `stderr`.
+  return {
+    runId,
+    delivered: false,
+    withheld: false,
+    reason: outcome.stderr || `paste failed: tmux ${outcome.op ?? "unknown"}`,
+  };}
+
+/**
+ * Send a follow-up prompt to a claude task. Always creates a new run row so
+ * the run history shows each user message as its own entry.
+ *
+ *   • If we hold live in-memory session state AND the tmux session is not
+ *     unambiguously gone, we paste the prompt into it as a fresh turn
+ *     (`sendTurn`).
+ *   • Otherwise (session gone, or a tmux session that outlived our process
+ *     after a restart with no in-memory state) we spawn a brand-new session
+ *     resuming via `claude --resume <sessionId>` so claude reloads the prior
+ *     conversation from its JSONL and keeps going.
+ *
+ * Returns null only on internal lookup failure (missing task row). Sessions
+ * are always recoverable as long as the task itself still exists.
+ *
+ * `rawLine` is `line` BEFORE `sendInput` expanded its `@tokens` into absolute
+ * paths — threaded through so a withheld paste (see `sendTurnInExistingSession`
+ * → `handlePasteWithheld`) re-stashes the RAW text into the task's backlog,
+ * matching the `@token` form a draft/tray item was saved with (plan §3.2).
+ * Optional and defaults to `line` for callers with nothing to distinguish
+ * (there are none in production — `sendInput` always passes it — but keeping
+ * it optional avoids forcing every test/helper caller to thread a value that
+ * happens to equal `line` anyway).
+ *
+ * The dead/no-session mint branch (`spawnResumedSession`) may resolve before
+ * its underlying `claude --resume` spawn has actually settled — bounded by
+ * `SPAWN_RESPONSE_BUDGET_MS` — in which case the returned `ClaudeTurnResult`
+ * carries `pending: true` alongside `delivered: true`. The fold-while-busy
+ * paste path (`pasteFollowUp`, above) never does this — a live-session paste
+ * is fast and has no comparable spawn to bound.
+ */
+async function sendClaudeTurn(
+  taskId: string,
+  line: string,
+  rawLine?: string,
+  onlyIfIdle = false,
+): Promise<ClaudeTurnResult | null> {
+  if (!tasks.get(taskId)) return null;
+
+  // Route to the live-session paste path unless we're SURE the session is
+  // dead. `sessionLiveness` (not the raw `sessionExists` boolean it replaces
+  // here) distinguishes an unambiguous `gone` from an `unreachable` probe —
+  // the same tri-state #88 introduced for the death watch, because a bare
+  // `.ok` boolean conflates "session absent" with "tmux hiccuped" (busy-server
+  // EAGAIN under load). Boot reconciliation no longer sweeps idle sessions, so
+  // a tmux session can outlive our process with no SessionState — in which
+  // case `sendTurn` would reject with "no live session" — so we also require
+  // in-memory state. `unreachable` (inconclusive) deliberately still takes the
+  // non-destructive paste path: if the session really is dead the paste fails
+  // gracefully and the death-watch/boot-reconcile recovers it later; routing
+  // it to `spawnResumedSession` instead would risk its unconditional
+  // pre-kill (`spawnClaudeViaTmux`) tearing down a live, possibly mid-turn
+  // session over a transient probe failure. Only an unambiguous `gone` (or no
+  // in-memory state at all) reaches the destructive respawn path.
+  //
+  // No task snapshot crosses that await (docs/plans/handoff-identification-
+  // fix.md RC2): `sendTurnInExistingSession` drains the JSONL and re-reads the
+  // task itself, in the same synchronous section as its fold/mint decision,
+  // so a continuation adopted DURING the `has-session` fork is seen.
+  if (hasSessionState(taskId) && (await sessionLiveness(sessionNameFor(taskId))) !== "gone") {
+    return sendTurnInExistingSession(taskId, line, rawLine, { onlyIfIdle });
+  }
+  // Dead/no session: about to mint a brand-new run. Re-read the task (the
+  // liveness await above may have let it change) and claim the unified
+  // per-task "starting" slot first — see `startingTaskIds`'s doc (near
+  // `startTask`) for why this is needed now that `sessionLiveness` above is
+  // a genuine await.
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // The `has-session` await above is where a freeze or an archive can land.
+  const refusal = claudeSendRefusal(task, onlyIfIdle);
+  if (refusal) return refusal;
+  // Idle-only send: a fake-driver or no-state task can still have an active
+  // run here (`hasSessionState` is false for it), and minting would create a
+  // second concurrent run. Refuse before the claim and any run-row insert.
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) {
+    return { runId: task.runId ?? "", delivered: false, busy: true };
+  }
+  if (startingTaskIds.has(taskId)) {
+    return {
+      runId: task.runId ?? "",
+      delivered: false,
+      withheld: false,
+      reason: "another message is already starting a new turn for this task — try again in a moment",
+    };
+  }
+  startingTaskIds.add(taskId);
+  // A fresh spawn has no live modal to withhold a keystroke against, so
+  // there's no `pasteOutcome` to await here — always delivered. Unlike
+  // before `SPAWN_RESPONSE_BUDGET_MS` existed, this call is NOT wrapped in a
+  // `try/finally` that releases the `startingTaskIds` claim once it returns:
+  // `spawnResumedSession` may now return before its underlying spawn has
+  // settled (see `pending` below), and releasing the claim here would let a
+  // second overlapping send start racing behind a spawn that's still in
+  // flight. `spawnResumedSession` itself owns releasing the claim — via its
+  // detached continuation's own `finally` on the slow path, or synchronously
+  // before returning on every path that never reaches that continuation
+  // (missing harness, a synchronous throw during its own setup).
+  const { runId, pending } = await spawnResumedSession(task, taskId, line);
+  return { runId, delivered: true, ...(pending ? { pending: true as const } : {}) };
+}
+
+/**
+ * `rawLine` is `line` before `@token` expansion — see `sendClaudeTurn`'s doc
+ * for why a withheld paste must re-stash that raw form, not the expanded one.
+ */
+async function sendTurnInExistingSession(
+  taskId: string,
+  line: string,
+  rawLine?: string,
+  opts: { onlyIfIdle?: boolean } = {},
+): Promise<ClaudeTurnResult> {
+  // The fold-vs-mint decision below is ONE synchronous section (no `await`
+  // until `pasteFollowUp` / the claim + run insert): drain whatever the
+  // session's JSONL has gained that the tailer hasn't dispatched yet, THEN
+  // read the task fresh. Draining first matters because a
+  // `<task-notification>` line that is already on disk but untailed would
+  // otherwise be adopted as a continuation only after this send had decided
+  // "idle" and minted a second concurrent run (RC2); reading fresh matters
+  // because `sendClaudeTurn` awaits a `has-session` fork before getting here
+  // and a continuation adopted during it (`startContinuationRun` sets
+  // `task.runId` and registers `active` synchronously) is invisible to any
+  // snapshot taken before the await. `drainSessionJsonl` is a no-op without a
+  // live session and never fires a staged end_turn.
+  drainSessionJsonl(taskId);
+  const task = tasks.get(taskId);
+  if (!task) {
+    return { runId: "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
+  }
+  // Same section as the paste/claim below, after `sendClaudeTurn`'s await.
+  const refusal = claudeSendRefusal(task, opts.onlyIfIdle === true);
+  if (refusal) return refusal;
+  // Fold-while-busy: if a turn is already in flight, paste the message into
+  // the live session and record it on the ACTIVE run — no new run row, no new
+  // turn slot. Claude's TUI queues the keystrokes and replays them as part of
+  // the current response. This keeps at most one in-flight run per task, which
+  // is what prevents the stranding bug: claude can coalesce several queued
+  // messages into fewer `end_turn` events than messages, and one slot per
+  // message would leave the surplus slots (and their run rows) stuck `running`
+  // forever. `active.has(task.runId)` is true iff the latest run hasn't
+  // resolved yet (registerActiveRun adds; attachDoneHandler deletes on done) —
+  // a more reliable "in flight" signal than the polled `task.column`.
+  const busy = !!task.runId && active.has(task.runId);
+  // Idle-only send (the pipeline handoff reminder): never fold into, queue
+  // behind or interleave with a working session. Any live run of the task
+  // (including one displaced as `task.runId`), or turn activity the session
+  // itself still tracks (in flight, a queued slot, a continuation awaiting
+  // content), refuses with no side effects — nothing below has run yet.
+  if (opts.onlyIfIdle && (isAnyRunOfTaskLive(taskId) || sessionHasTurn(taskId))) {
+    return { runId: task.runId ?? "", delivered: false, busy: true };
+  }
+  if (busy && task.runId) {
+    const activeRunId = task.runId;
+    // What `handlePasteWithheld` reported, for `savedToBacklog`.
+    let stashed: boolean | null = null;
+    // `onPasteFailure` covers T7's paste guard (docs/plans/model-effort-
+    // local-command-turns.md §10): a blocking claude modal was still on the
+    // pane when the queued paste's grace window elapsed, so this follow-up
+    // was never actually delivered to the live session — re-stash it into
+    // the task's backlog tray (rather than lose it outright) and say so on
+    // the run, since the "user" bubble below is appended optimistically
+    // before the paste's real outcome is known.
+    const pasted = await pasteFollowUp(taskId, line, {
+      onPasteFailure: (outcome) => {
+        stashed = handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome);
+      },
+    });
+    // `pasteFollowUp` returns `false` only when no live session exists (falls
+    // through to the idle/respawn path below); otherwise `{ delivered: true;
+    // pasteOutcome }` — `pasted` is truthy in that branch, so a plain
+    // truthiness check narrows away the `false` case without needing to read
+    // a `.delivered` field off it.
+    if (pasted) {
+      const data = normalizeUserText(line);
+      // Record the user bubble optimistically — `pasteFollowUp` only confirms a
+      // live session exists, not that claude consumed the keystrokes. If the
+      // user hits Stop before claude drains its input buffer, Ctrl+C clears the
+      // queued message (see `cancelRun`) and this bubble has no reply. That's the
+      // same optimism `sendTurn` already runs with; the bubble correctly reflects
+      // that the user did send the message.
+      saveAndEmit({ runId: activeRunId, taskId, stream: "user", data });
+      return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome, () => stashed);
+    }
+  }
+
+  // Idle (or the paste raced a vanishing session): about to mint a brand-new
+  // run row. Claim the unified per-task "starting" slot first — see
+  // `startingTaskIds`'s doc (near `startTask`) for why this is needed now
+  // that `sendClaudeTurn`'s `sessionLiveness` read is a genuine await: two
+  // overlapping sends can both arrive here having each independently
+  // observed "idle" from their own stale snapshot.
+  //
+  // When the busy branch above fell through, `pasteFollowUp` was awaited: a
+  // freeze or an archive may have landed during it, so look again — freshly —
+  // before claiming. (With no await since the check at the top this is the
+  // same answer, read again.)
+  const latest = tasks.get(taskId);
+  if (!latest) {
+    return { runId: task.runId ?? "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
+  }
+  const lateRefusal = claudeSendRefusal(latest, opts.onlyIfIdle === true);
+  if (lateRefusal) return lateRefusal;
+  if (startingTaskIds.has(taskId)) {
+    return {
+      runId: task.runId ?? "",
+      delivered: false,
+      withheld: false,
+      reason: "another message is already starting a new turn for this task — try again in a moment",
+    };
+  }
+  startingTaskIds.add(taskId);
+  try {
+    // One run row per user turn — the runs list mirrors the conversation
+    // history at turn granularity. The race that used to make a fast claude
+    // reply land the new row as "succeeded" before the UI ever observed the
+    // "running" transition no longer matters: the unified task-level event
+    // stream surfaces the new user/assistant messages live regardless of
+    // which run row they belong to.
+    const newRunId = randomUUID();
+    const now = Date.now();
+    const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: inheritedSessionId,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const harness = resolveHarness(task.agent);
+    const kind: AgentKind = harness?.kind ?? "claude-code";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+
+    // What `handlePasteWithheld` reported, for `savedToBacklog`.
+    let stashed: boolean | null = null;
+    const agent = await sendTurn(taskId, line, onChunk, {
+      onPasteFailure: (outcome) => {
+        stashed = handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome);
+      },
+    });
+    // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
+    // interrupt the turn (Ctrl+C, the session stays alive — same as a normal
+    // Stop) and settle the run `cancelled` instead of registering it. The
+    // message was already pasted, so `delivered` stays truthful.
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      return { runId: newRunId, delivered: true };
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome, () => stashed);
+  } finally {
+    releaseStartingClaim(taskId);
+  }
+}
+
+/**
+ * Shared `onPasteFailure` hook for BOTH claude paste paths in
+ * `sendTurnInExistingSession` above — the fold-while-busy follow-up (via
+ * `pasteFollowUp`) and a fresh idle turn (via `sendTurn`): a blocking claude
+ * modal (T7's paste guard, docs/plans/model-effort-local-command-turns.md
+ * §10) was still on the pane when the queued paste's grace window elapsed,
+ * so `text` was never actually delivered to the live session as intended.
+ * The optimistic "user" bubble the caller already appended stays in the
+ * transcript (matching every other optimistic-paste case), but `text` itself
+ * would otherwise be lost. `outcome.op`/`outcome.phase` say WHERE the
+ * withhold happened:
+ *
+ *   - `outcome.op !== "modal-guard"` (finding #5, §10 re-review): a REAL
+ *     tmux subprocess failure — `load-buffer`/`paste-buffer`/`send-keys`
+ *     exited non-zero (dead server, socket gone, session vanished mid-op) —
+ *     forwarded verbatim by `sendTurn`/`pasteFollowUp` with no `phase` at
+ *     all (only the driver's own synthesized `"modal-guard"` outcomes carry
+ *     one). Falling through to the phase-based branches below used to
+ *     mislabel this as "claude is waiting on a prompt", which it isn't. The
+ *     driver's `reportPasteFailure` already emitted a `"paste failed: tmux
+ *     <op> — …"` status chunk on this run before calling `onPasteFailure`,
+ *     so this branch does NOT repeat that wording — it re-stashes `text`
+ *     and adds a separate, backlog-focused status.
+ *   - `"pre-enter"`: the bracketed paste itself landed — `text` is already
+ *     sitting in claude's input box, just missing its trailing Enter. Also
+ *     re-stashed (finding #3, §10 re-review): the driver's composer-clear
+ *     flow now actively CLEARS this leftover text with `Escape Escape`
+ *     before the session's next paste (finding #2, §10 re-review), so
+ *     leaving it un-stashed here would mean it's silently wiped with no
+ *     record once that clear runs. `restashPasteWithheldText`'s dedupe
+ *     (a scan of the WHOLE backlog, not just its most-recent item — finding
+ *     #3, §10 re-review) still prevents pile-up across repeated pre-enter
+ *     withholds of the same message.
+ *   - `"composer-dirty"`: an EARLIER withheld message is still sitting in
+ *     claude's input box (mid-turn there's no safe way to clear it), so this
+ *     NEW paste was withheld before ever reaching the pane. Re-stashed like
+ *     `"pre-paste"`, with its own status wording naming the earlier message.
+ *   - `"pre-paste"` (or a missing `phase` on an otherwise-`"modal-guard"`
+ *     outcome, which shouldn't happen in practice): nothing reached the pane
+ *     at all — re-stash `text` into the task's backlog tray so it isn't
+ *     lost outright.
+ *
+ * Re-stashing dedupes against every existing backlog item (not just the
+ * most-recently-added one at `task.backlog[0]` — items are unshifted onto
+ * the front, see `backlog.add` in db.ts), so a paste that keeps failing
+ * across retries with the same text doesn't pile up duplicate drafts, AND so
+ * resending a withheld message straight from the tray (`sendBacklogItem` in
+ * RunPanel.tsx) doesn't leave a duplicate sitting behind the original
+ * (finding #3, §10 re-review) — that item is very often NOT at index 0 by
+ * the time its resend is withheld again, since other drafts may have been
+ * added or reordered since.
+ *
+ * `backlog.add` is called directly rather than through the server's
+ * `backlogGuard` (an HTTP-route-level check, not something this internal
+ * plumbing goes through) — that's safe ONLY because every caller of this
+ * function is reachable exclusively through `sendInput`, which auto-
+ * unarchives the task before dispatching a turn. This function still
+ * re-checks `tasks.get(taskId)?.archivedAt == null` immediately before
+ * adding, in case a concurrent `archiveTask` raced the unarchive between
+ * `sendInput`'s check and this callback (`onPasteFailure` fires
+ * synchronously inside the tmux call chain, not on the same tick as
+ * `sendInput`'s own unarchive) — skip + log rather than resurrect an
+ * archived task's backlog out from under an in-flight archive.
+ *
+ * `text` is already the fully-composed message (references, if any, are
+ * flattened into it client-side before it ever reaches `sendInput` — see
+ * the `/runs/:id/input` route), so there's nothing further to pass through —
+ * except that both call sites in `sendTurnInExistingSession` deliberately
+ * pass the PRE-expansion (`rawLine ?? line`) text, not the `@token`-expanded
+ * one `sendInput` actually hands to claude (R2, code review): a draft/tray
+ * backlog item is saved with the raw `@token` form, and this function's own
+ * dedupe (`restashPasteWithheldText`'s `item.text === text` scan) would never
+ * match an expanded absolute-path re-stash against it, producing a duplicate
+ * entry every time the same withheld message is retried.
+ *
+ * Returns whether the text is now in the backlog tray (`false` when the
+ * re-stash was skipped for a gone/archived task) — threaded into
+ * `SendInputResult.savedToBacklog` so no surface claims a save that didn't
+ * happen.
+ */
+function handlePasteWithheld(
+  taskId: string,
+  runId: string,
+  text: string,
+  outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
+): boolean {
+  let data: string;
+  let saved: boolean;
+  if (outcome.op !== "modal-guard") {
+    // A genuine tmux subprocess failure, not a modal withhold (finding #5,
+    // §10 re-review) — see this function's doc for why this must be checked
+    // BEFORE the phase-based branches below. Prefers the driver's own
+    // descriptive `stderr` — e.g. "paste dropped: the session was torn down
+    // or replaced before the keystrokes went out" for a dropped queued op —
+    // over a generic "the paste … failed" line that would otherwise misread
+    // a dropped op (session disposed/respawned mid-flight) as an ordinary
+    // tmux subprocess failure.
+    saved = restashPasteWithheldText(taskId, text);
+    data = `message saved to your backlog — ${outcome.stderr || "the paste to claude's session failed"}; resend from the tray`;
+  } else if (outcome.phase === "pre-enter") {
+    // Re-stashed (finding #3, §10 re-review) — see this function's doc.
+    saved = restashPasteWithheldText(taskId, text);
+    data =
+      "paste withheld: claude opened a prompt before your message was sent — it's saved to your backlog (claude's input box will be cleared before your next send); resend from the tray";
+  } else if (outcome.phase === "composer-dirty") {
+    saved = restashPasteWithheldText(taskId, text);
+    data = "paste withheld: claude's input box still holds an earlier message — saved this one to your backlog; resend from the tray once claude is idle";
+  } else {
+    // "pre-paste", or a missing phase (an older/synthesized outcome) —
+    // nothing reached the pane at all.
+    saved = restashPasteWithheldText(taskId, text);
+    data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
+  }
+  // The re-stash is skipped for a task archived (or deleted) underneath the
+  // send — never claim a save that didn't happen.
+  if (!saved) data = "message not delivered — the task was archived before it could be saved to your backlog";
+  saveAndEmit({ runId, taskId, stream: "status", data });
+  return saved;
+}
+
+/** Re-stash a withheld paste's text into the task's backlog tray, deduping
+ *  against the most-recently-added item so retries of the same failed paste
+ *  don't pile up duplicate drafts. Skips (and logs) rather than adding when
+ *  the task is gone or archived — see `handlePasteWithheld`'s doc for why
+ *  that race is possible despite `sendInput` auto-unarchiving up front.
+ *  Returns whether the text is now in the tray (freshly added, or already
+ *  there); `false` when it was skipped — `settleLateSend` reports that
+ *  truthfully in `send-failed.savedToBacklog`. */
+function restashPasteWithheldText(taskId: string, text: string): boolean {
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null) {
+    console.warn(`[agetor] handlePasteWithheld: task ${taskId} not found or archived — skipping backlog re-stash`);
+    return false;
+  }
+  // Scan the WHOLE backlog, not just `task.backlog[0]` (finding #3, §10
+  // re-review) — a repeated withhold of the same message is the common case
+  // this dedupes, but the item can easily have moved off the front by then
+  // (another draft added in between, or a manual reorder), and checking only
+  // the front would silently let a duplicate through in exactly that case.
+  const alreadyStashed = task.backlog.some((item) => item.text === text);
+  if (!alreadyStashed) backlog.add(taskId, { text });
+  return true;
+}
+
+/** Test hook: exercise `handlePasteWithheld` directly against a real task
+ *  row without driving a full tmux paste-failure scenario. Not part of the
+ *  public surface. */
+export function __handlePasteWithheldForTest(
+  taskId: string,
+  runId: string,
+  text: string,
+  outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
+): boolean {
+  return handlePasteWithheld(taskId, runId, text, outcome);
+}
+
+/**
+ * Factory installed via `setContinuationRunFactory` (module init, above).
+ * claude-tmux's `dispatchLine` calls this when a genuinely-new content line
+ * arrives on a task's session with no turn in flight and nothing queued to
+ * receive it — the case a post-`end_turn` background-task auto-continuation
+ * produces (claude legitimately resolved the visible turn, then kept talking
+ * once the delegated work finished). Mirrors the idle branch of
+ * `sendTurnInExistingSession` above (run-row insert with an inherited
+ * `claudeSessionId`, column pull-back to `running`, chunk handler, active-run
+ * registration) minus the `sendTurn`/keystroke-paste step — claude is already
+ * mid-response, so there's no prompt to send, only a new run row to listen
+ * with.
+ *
+ * Returns `null` for a task the caller can't safely adopt a run for, which
+ * falls back to claude-tmux's pre-existing `lastChunk` routing:
+ *   - the synthetic `"__rebuild__"` taskId `rebuildEventsFromJsonl` uses for
+ *     its local, DB-detached synthetic SessionState — that id can never
+ *     resolve to a real task row via `tasks.get` either, but the check is
+ *     spelled out explicitly so it's visible here (and testable) rather than
+ *     relying on that incidental fact alone;
+ *   - an unknown task (deleted out from under a live session); or
+ *   - an archived task (no new run should reopen the card).
+ *   - a non-claude-code task: continuations are a claude-JSONL concept (a
+ *     background-task auto-continuation observed via `dispatchLine`'s tail of
+ *     the session's own JSONL); codex is one-shot per turn and has no
+ *     equivalent notion of "kept talking after end_turn", so there's nothing
+ *     to adopt a run for. Only claude-tmux's `dispatchLine` calls this
+ *     factory today, so this is defense in depth rather than a live path.
+ *
+ * `trigger` names what started the turn, so the run's opening status line
+ * says what actually happened (`CONTINUATION_STATUS_TEXT`):
+ *   - `"notification"` (default) — a `<task-notification>` line, a
+ *     background task finishing → `auto-continued after background task`.
+ *     Also the fake driver's / pipeline-handoff adoption path
+ *     (`openContinuationRun`).
+ *   - `"user"` — a `user` line agetor didn't paste, i.e. typed in the
+ *     attached terminal → `turn started from the terminal`.
+ *   - `"assistant"` — an `assistant` line with no turn open → `Claude
+ *     continued on its own`.
+ * Claude's compaction-summary `user` lines never reach here: claude-tmux's
+ * `isContinuationContentEvent` excludes them.
+ */
+function startContinuationRun(
+  taskId: string,
+  trigger: ContinuationTrigger = "notification",
+): ContinuationHooks | null {
+  if (taskId === "__rebuild__") return null;
+  // D12 (docs/plans/handoff-identification-fix.md): an agetor-initiated turn
+  // that is being minted right now (`startingTaskIds` is held across
+  // `sendTurnInExistingSession`'s `sendTurn`, whose `flushSync` can dispatch
+  // a notification line, and across fresh/`--resume` spawns) OWNS the content
+  // that arrives in that window. Adopting a continuation here would overwrite
+  // the `task.runId` the mint just pointed at its own run and leave two
+  // in-flight runs for one Claude turn. Decline: the line falls to the
+  // tailer's `lastChunk` routing, then `sendTurn` pushes its slot and the
+  // rest of the (folded) turn lands on the minted run.
+  if (startingTaskIds.has(taskId)) return null;
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null) return null;
+  if (resolveHarness(task.agent)?.kind !== "claude-code") return null;
+
+  const newRunId = randomUUID();
+  const now = Date.now();
+  const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
+  runs.insert({
+    id: newRunId,
+    taskId,
+    agent: task.agent,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: inheritedSessionId,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    antigravitySessionId: null,
+    origin: "continuation",
+  });
+  const prevColumn: ColumnId = task.column;
+  // Continuation turns always pull the card to `running`, regardless of
+  // prior column (mirrors the idle branch above, and matches the owner
+  // decision in the plan: the session genuinely resumed talking, so the
+  // card must reflect that live activity).
+  tasks.update(taskId, { column: "running", runId: newRunId });
+
+  const harness = resolveHarness(task.agent);
+  const kind: AgentKind = harness?.kind ?? "claude-code";
+  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  // The opening status line names the trigger, and the pipeline runner's
+  // `running` column listener reads it to tell a turn typed in the terminal
+  // from an automatic one — so it must exist before that event goes out.
+  onChunk("status", CONTINUATION_STATUS_TEXT[trigger] ?? CONTINUATION_STATUS_TEXT.notification);
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  return {
+    onChunk,
+    onAdopted: (handle) => {
+      registerActiveRun(newRunId, taskId, task, handle);
+      attachDoneHandler(newRunId, taskId, handle);
+    },
+  };
+}
+
+/**
+ * Spawn a brand-new tmux session for the task, resuming the previous run's
+ * claude conversation via `claude --resume <sessionId>`. claude loads the
+ * full prior conversation from its own JSONL (text + thinking + tool_use +
+ * tool_result history) so we don't have to prepend any context text to the
+ * new prompt — the next message is just the user's new line.
+ *
+ * Falls back to a fresh session (no --resume) when we don't have a tracked
+ * sessionId on any prior run — that path exists for legacy rows created
+ * before the claude_session_id column was added.
+ *
+ * Reuses the existing worktree (`task.worktreePath`) so the agent operates
+ * on the same checkout as before.
+ *
+ * Only the run-row insert, the column flip and the `user`/`status` echoes
+ * are synchronous. The actual `claude --resume` spawn — which in practice
+ * has taken 5-30s in the packaged app (see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2) — runs as a
+ * detached continuation raced against `SPAWN_RESPONSE_BUDGET_MS`: this
+ * function returns as soon as either the spawn settles or the budget
+ * elapses, whichever comes first. `sendClaudeTurn` (this function's only
+ * caller) has already claimed `startingTaskIds` for `taskId` before calling
+ * in; releasing that claim is THIS function's responsibility on every
+ * return path — either synchronously (missing-harness branch) or via the
+ * continuation's own `finally` once the real spawn settles, never merely
+ * once this promise resolves. See `startingTaskIds`'s doc (near `startTask`)
+ * for why the claim must outlive a budget-triggered early return.
+ */
+async function spawnResumedSession(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
+  try {
+    return await spawnResumedSessionInner(task, taskId, line);
+  } catch (err) {
+    // A synchronous throw anywhere before the continuation was created
+    // (below) means no continuation exists to release the claim in its own
+    // `finally` — release it here instead, matching this function's
+    // pre-budget behavior, where any such throw propagated straight through
+    // `sendClaudeTurn`'s old `finally { startingTaskIds.delete(taskId) }`.
+    // Once the continuation exists, `raceSpawnBudget` never rejects (it
+    // never throws itself, and the continuation catches its own errors), so
+    // this catch can't fire for anything the continuation is responsible
+    // for — no double-delete risk.
+    releaseStartingClaim(taskId);
+    throw err;
+  }
+}
+
+async function spawnResumedSessionInner(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
+  const priorSessionId = lastSessionIdForTask(task, "claude_session_id");
+  const cwd = task.worktreePath ?? task.workdir;
+
+  const newRunId = randomUUID();
+  const now = Date.now();
+  runs.insert({
+    id: newRunId,
+    taskId,
+    agent: task.agent,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: priorSessionId,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    antigravitySessionId: null,
+  });
+  const prevColumn: ColumnId = task.column;
+  tasks.update(taskId, { column: "running", runId: newRunId });
+  adoptPendingTaskCancel(taskId, newRunId);
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  const harness = resolveHarness(task.agent);
+  const kind: AgentKind = harness?.kind ?? "claude-code";
+  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  onChunk("user", normalizeUserText(line));
+  onChunk(
+    "status",
+    priorSessionId
+      ? `resuming claude session ${priorSessionId.slice(0, 8)}…`
+      : "no prior claude session — starting fresh",
+  );
+
+  if (!harness) {
+    onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+    runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
+    tasks.update(taskId, { column: "ready", runId: null });
+    // No continuation was ever created for this run — release the claim
+    // `sendClaudeTurn` took before calling in, right here.
+    releaseStartingClaim(taskId);
+    return { runId: newRunId };
+  }
+
+  // Everything past this point — the spawn itself and everything that
+  // depends on its result — is the detached continuation raced below.
+  const continuation: Promise<void> = (async () => {
+    try {
+      const { agent } = await spawnAgentOrFail({
+        taskId,
+        runId: newRunId,
+        harness,
+        prompt: line,
+        cwd,
+        onChunk,
+        onSessionId: (sessionId) => {
+          runs.update(newRunId, { claudeSessionId: sessionId });
+        },
+        opts: {
+          mode: task.mode,
+          model: task.model ?? DEFAULT_MODEL[harness.kind],
+          effort: task.effort,
+          speed: task.speed,
+          maxMode: task.maxMode,
+          resumeSessionId: priorSessionId,
+        },
+      });
+      // claude has no turn queue (spawnResumedSession is only reached from
+      // the idle branch of sendInput) — nothing to drop on failure here;
+      // `spawnAgentOrFail`'s own catch already recorded the run failed and
+      // bounced the task back to `ready`.
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(newRunId);
+      if (!agent) return;
+
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live tmux session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId || cancelledWhilePending) {
+        agent.kill();
+        await dropSession(taskId);
+        runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
+          onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === newRunId) {
+          // Same settlement as `startTaskInner`: archive does not move the
+          // column, and this run never registers, so nothing else will.
+          onChunk("status", "task archived before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
+        }
+        // H1: same terminal emit as `startTaskInner`'s continuation — this
+        // run never registers, so nothing else will ever announce it.
+        if (fresh && fresh.runId === newRunId) {
+          emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+        }
+        return;
+      }
+
+      registerActiveRun(newRunId, taskId, fresh, agent);
+      attachDoneHandler(newRunId, taskId, agent);
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      console.warn(`[agetor] detached claude resume spawn failed for task ${taskId} run ${newRunId}:`, err);
+    } finally {
+      releaseStartingClaim(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  return raced.settled ? { runId: newRunId } : { runId: newRunId, pending: true };
+}
+
+
+export interface CreateTaskInput extends Partial<Task> {
+  title: string;
+  prompt: string;
+  /** Optional ref name (branch / tag / sha). Defaults to "HEAD". Resolved to a sha at create time. */
+  baseRef?: string;
+  /**
+   * Check the worktree out on this pre-existing branch (e.g. a PR's head
+   * branch) instead of minting a fresh one. Requires worktree isolation and
+   * a git `workdir`; sets `task.branchSource = "existing"` and pins `baseRef`
+   * to the branch's current sha rather than resolving `baseRef`/`branch`
+   * from a template.
+   */
+  existingBranch?: string;
+  /**
+   * Issue URL this task is created from — validated with `parseIssueUrl` and
+   * same-repo-checked against `workdir`'s remote (see `createTask`'s body).
+   * Also settable via the inherited `Partial<Task>` field; listed here too
+   * so its doc comment lives next to `issueSnapshot`, which only makes sense
+   * alongside it.
+   */
+  issueUrl?: string | null;
+  /**
+   * Full markdown snapshot of the issue + its comment thread
+   * (`renderIssueThreadMarkdown`). When present (and `issueUrl` validates),
+   * written to `dataDir/issue-threads/<taskId>/<ISSUE_SNAPSHOT_FILENAME>`
+   * and appended to the task's references so the agent can read the full
+   * thread regardless of the prompt's inline cap. Ignored (no-op, not an
+   * error) when `issueUrl` is absent or fails validation.
+   */
+  issueSnapshot?: string;
+  /**
+   * Bind this task to a reusable {@link AgentProfile} at create time
+   * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
+   * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
+   * `speed`/`maxMode`/`opencodeServer` from the profile — any of those seven
+   * fields also present in the body are ignored — and stores both the id and a point-in-time
+   * `AgentProfileSnapshot` on the new row. Also settable via the inherited
+   * `Partial<Task>` field; listed here too so its doc comment lives next to
+   * the override it triggers. An unresolvable id fails the whole create with
+   * `{ error }` rather than silently falling back to "no agent".
+   */
+  agentProfileId?: string | null;
+  /**
+   * The OpenCode server mode (D-4). Ignored when a profile (or a pipeline's
+   * start step) supplies one; otherwise a valid value is stored and anything
+   * else reads as `"shared"`. The routes validate it with
+   * `parseOpencodeServerInput` and 400 junk before calling. Stored, and
+   * ignored, on a task of another kind — like `maxMode`.
+   */
+  opencodeServer?: OpencodeServerMode;
+  /**
+   * Bind this task to a {@link Pipeline} at create time (docs/plans/pipelines.md
+   * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
+   * set). The created row is a **pipeline task**: `startTask` routes it to
+   * `startPipelineRun` instead of spawning an agent, and its own
+   * agent/model/effort/mode/speed/maxMode fields are cosmetic, mirroring the
+   * graph's start step (A1). Also settable via the inherited `Partial<Task>`
+   * field; listed here too so its doc comment lives next to the validation it
+   * triggers. An unresolvable id, a graph with no resolvable start step, or
+   * any step with no resolvable agent fails the whole create with `{ error }`.
+   */
+  pipelineId?: string | null;
+}
+
+/**
+ * Server-internal knobs for {@link createTask} that must never be reachable
+ * from a request body — `POST /tasks` spreads its JSON body straight into
+ * `CreateTaskInput`, so anything on that type is client-supplied.
+ */
+export interface CreateTaskInternal {
+  /**
+   * A profile the caller has ALREADY resolved and validated (e.g.
+   * `POST /projects/clone`, which checks the profile's harness and the
+   * model's CLI floor BEFORE the multi-second `cloneRepo` side effect). When
+   * present it is used as-is and the bound `agentProfileId` is taken from
+   * it, so the task binds to exactly the profile that was validated even if
+   * the row was edited or deleted in the meantime — otherwise `createTask`
+   * would re-read `agentProfiles.get(agentProfileId)` after the side effect
+   * and could bind a different profile (or fail) after the clone already
+   * happened. Absent it, `input.agentProfileId` is looked up as before and
+   * an unknown id still fails the create.
+   */
+  resolvedAgentProfile?: AgentProfile;
+}
+
+/**
+ * The kind-default effort id for `model` — "kind default if offered, else
+ * strongest offered id, else null" (mirrors the picker's own rule). Shared by
+ * `createTask` (no-profile, no-explicit-effort path) and by
+ * `startTaskInner`'s live-profile refresh, which both need to fill in an
+ * effort when neither the caller nor a bound {@link AgentProfile} supplied
+ * one — a profile's own `effort: null` means "no opinion", not "no effort
+ * flag", so a model that requires one (see `buildCommand`'s
+ * "effort is required for …" throw) must still get a real default here.
+ * Discovered efforts (e.g. Codex's own app-server catalog) win over the
+ * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
+ * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
+ */
+export function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
+  if (support.length === 0) return null;
+  return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
+}
+
+/**
+ * Create a task. When `isolation === "worktree"` and `workdir` is a git repo,
+ * resolves the requested base (default "HEAD") to a concrete sha now, so re-runs
+ * always start from the same commit even after the source repo moves. Returns
+ * `{ error }` if a non-default base ref was specified but can't be resolved
+ * (typo, deleted branch, etc.).
+ */
+export async function createTask(
+  input: CreateTaskInput,
+  internal: CreateTaskInternal = {},
+): Promise<{ task: Task } | { error: string }> {
+  const now = Date.now();
+  // Only the trimmed, explicitly-provided workdir counts as user intent. We
+  // still fall back to process.cwd() for the task itself so direct API
+  // callers don't break, but we DON'T register that fallback as a project —
+  // the projects list should only contain folders the user actually chose.
+  const explicitWorkdir = input.workdir?.trim() ? input.workdir.trim() : null;
+  const workdir = explicitWorkdir ?? process.cwd();
+  const isolation = input.isolation ?? "worktree";
+  const requestedRef = input.baseRef?.trim() || "HEAD";
+  const existingBranch = input.existingBranch?.trim() || null;
+
+  let baseRef: string | null = null;
+  let plannedBranch: string | null = null;
+  let branchSource: Task["branchSource"] = "created";
+  const workdirRoot = isolation === "worktree" ? await repoRoot(workdir) : null;
+
+  if (existingBranch) {
+    if (isolation !== "worktree" || !workdirRoot) {
+      return {
+        error: `existingBranch requires worktree isolation and a git repo — "${workdir}" isn't one, or isolation is "${isolation}"`,
+      };
+    }
+    if (existingBranch.startsWith("-")) {
+      return { error: `invalid branch name: ${existingBranch}` };
+    }
+    const validated = validateBranchName(existingBranch);
+    if (!validated.ok) {
+      return { error: `invalid branch name "${existingBranch}": ${validated.reason}` };
+    }
+    const collision = tasks.list().some(
+      (t) => !t.archivedAt && t.workdir === workdir && t.branch === existingBranch,
+    );
+    if (collision) {
+      return { error: `another task already has "${existingBranch}" checked out in ${workdir}` };
+    }
+    await fetchBranch(workdir, existingBranch);
+    const sha =
+      (await resolveRef(workdir, `refs/remotes/origin/${existingBranch}`)) ??
+      (await resolveRef(workdir, `refs/heads/${existingBranch}`));
+    if (!sha) {
+      return { error: `branch not found: "${existingBranch}" (checked origin and local refs)` };
+    }
+    baseRef = sha;
+    plannedBranch = existingBranch;
+    branchSource = "existing";
+  } else if (workdirRoot) {
+    const sha = await resolveRef(workdir, requestedRef);
+    if (!sha) {
+      if (requestedRef !== "HEAD") {
+        return { error: `base ref "${requestedRef}" not found in ${workdir}` };
+      }
+    } else {
+      baseRef = sha;
+    }
+  }
+
+  // Projects table is populated EXCLUSIVELY through the explicit folder
+  // picker (POST /projects/pick) — never auto-added from a task's workdir.
+  // Previously we upserted on every task create, which silently surfaced
+  // worktree temp paths and stray ad-hoc dirs in the sidebar.
+
+  const id = randomUUID();
+
+  // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
+  // `agentProfileId` — a pipeline task never launches an agent of its own
+  // (the runner drives hidden step tasks instead), but its own
+  // agent/model/effort/mode/speed/maxMode fields still cosmetically mirror
+  // the graph's start step (A1) so every existing per-task surface that
+  // reads those fields (board filters, badges, CLI `ls`) keeps working
+  // unchanged. Validated up front, before `profile` below, so a bad
+  // pipeline id (or a step with no resolvable agent) fails the create
+  // outright, the same way a bad `agentProfileId` already does.
+  let pipeline: Pipeline | null = null;
+  const requestedPipelineId = input.pipelineId?.trim();
+  if (requestedPipelineId) {
+    if (input.agentProfileId?.trim()) {
+      return { error: "a task can't bind both a pipeline and an agent" };
+    }
+    pipeline = pipelines.get(requestedPipelineId);
+    if (!pipeline) return { error: "unknown pipeline" };
+    const start = resolveStartStep(pipeline.graph);
+    if (!start) return { error: "pipeline has no resolvable start step" };
+    for (const step of pipeline.graph.steps) {
+      if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
+      if (!agentProfiles.get(step.agentProfileId)) {
+        return { error: `agent for step "${step.name}" no longer exists` };
+      }
+    }
+  }
+
+  // Agent profile override (docs/plans/agent-profiles.md D2/D3): resolved
+  // BEFORE the harness/model/effort defaulting below, since a bound profile
+  // wins outright over any of those six body-provided fields. An
+  // unresolvable id fails the whole create rather than silently degrading to
+  // "no agent" — the caller explicitly asked for a profile that doesn't
+  // exist (deleted between the picker fetching the list and the submit
+  // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
+  let profile: AgentProfile | null = null;
+  const requestedProfileId = input.agentProfileId?.trim();
+  if (internal.resolvedAgentProfile) {
+    // Caller-validated snapshot wins over a re-read (see CreateTaskInternal).
+    profile = internal.resolvedAgentProfile;
+  } else if (requestedProfileId) {
+    profile = agentProfiles.get(requestedProfileId);
+    if (!profile) {
+      return { error: `unknown agent profile "${requestedProfileId}"` };
+    }
+  }
+  // Cosmetic defaults source for agent/model/effort/mode/speed/maxMode: a
+  // bound profile wins as before; otherwise a pipeline task's start-step
+  // profile fills the same role (A1) — but `profile` itself stays null
+  // below, so the task row is never recorded as BOUND to that profile
+  // (`agentProfileId`/`agentProfile` stay null; only `pipelineId` marks
+  // this row as a pipeline task). Every step above already validated that
+  // `pipeline`'s start step has an `agentProfileId` that resolves, so the
+  // `agentProfiles.get` here can't fail.
+  const pipelineStartProfile: AgentProfile | null = pipeline
+    ? agentProfiles.get(resolveStartStep(pipeline.graph)!.agentProfileId!)
+    : null;
+  const defaultsProfile: AgentProfile | null = profile ?? pipelineStartProfile;
+
+  // Resolve the harness so we can default model/effort by kind. A bad alias
+  // id is rejected up-front rather than persisted and surfacing as a launch
+  // failure later. Falls back to the built-in claude-code id when the caller
+  // omits `agent` entirely. A bound profile's own harness always wins over
+  // `input.agent`.
+  const agentId = defaultsProfile ? defaultsProfile.harness : (input.agent ?? "claude-code");
+  const harness = resolveHarness(agentId);
+  if (!harness) {
+    return { error: `unknown harness "${agentId}"` };
+  }
+  const kind = harness.kind;
+  const model = defaultsProfile ? defaultsProfile.model : (input.model ?? DEFAULT_MODEL[kind]);
+  // Discovered efforts (e.g. Codex's own app-server catalog) win when the
+  // harness reported a non-empty list for this model; the curated
+  // MODEL_EFFORT_SUPPORT table is only the fallback (see
+  // `supportedEfforts`/`getDiscoveredEfforts`). The default effort is the
+  // kind default (`DEFAULT_EFFORT[kind]`) when it's among the offered ids,
+  // else the strongest offered id — mirroring the picker's own "kind default
+  // if offered, else first row" rule. Haiku 4.5 (and any future model whose
+  // effort support list is empty either way) sends null effort.
+  //
+  // Deliberate side effect versus the old direct-table read: an *unlisted*
+  // gemini model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
+  // read `undefined` for an unknown key, which failed the `Array.isArray`
+  // check and fell through to `DEFAULT_EFFORT[kind]`), while a *listed*
+  // gemini model (whose curated set is `[]`) stored `null`. Routing through
+  // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
+  // what the PATCH null-clear guard and every picker already compute for an
+  // unknown id, so this closes a known inconsistency, on purpose. fx is
+  // different: 40 of its 42 curated models advertise real efforts
+  // (`MODEL_EFFORT_SUPPORT.fx`, refreshed against fx 0.0.14's
+  // `models[].efforts` on 2026-10-22 and extended 2026-10-26), so both a
+  // listed and an unlisted fx model resolve through `supportedEfforts` to
+  // `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model — or the
+  // `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of those
+  // 40; only the remaining 2 no-effort fx models (`minimax/minimax-m3`,
+  // `anthropic/claude-haiku-4.5`) resolve to `null`. That whole computation
+  // is `defaultEffortFor` below.
+  //
+  // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
+  // the Settings form only ever offers `supportedEfforts` rows, so a stored
+  // value is already sane, and re-validating here would just re-litigate the
+  // same "discovered can understate the live API" problem the PATCH route's
+  // null-clear guard already carves an exception for. A profile whose own
+  // `effort` is `null` ("no opinion") still needs a real default when the
+  // model requires one — `buildCommand` throws "effort is required for …"
+  // otherwise — so it falls through to the same `defaultEffortFor` the
+  // no-profile path uses. Only the resolved task-row `effort` gets this
+  // treatment; `agentProfileSnapshot` below is built straight from `profile`
+  // and keeps the raw `null`.
+  let effort: string | null;
+  if (defaultsProfile) {
+    effort = defaultsProfile.effort ?? defaultEffortFor(kind, model, harness.id);
+  } else if (input.effort !== undefined && input.effort !== null) {
+    effort = input.effort;
+  } else {
+    effort = defaultEffortFor(kind, model, harness.id);
+  }
+
+  // Validate taskType against the known set so a bogus value can't poison
+  // the row (the picker only ever sends one of the canonical ids, but
+  // direct API callers don't have that constraint).
+  const requestedType = input.taskType;
+  const taskType: TaskType =
+    requestedType && TASK_TYPES.some((t) => t.id === requestedType)
+      ? requestedType
+      : DEFAULT_TASK_TYPE;
+
+  // Pin the branch name now so renaming the task later (before the first run)
+  // doesn't produce a different name on each start attempt. Only set when the
+  // workdir is a git repo. An explicit override (from the New Task sidebar's
+  // editable branch field) wins when valid; otherwise the name is composed from
+  // the project's branch nomenclature (falling back to the built-in defaults).
+  // Either way, any branch-template tags (`<slug>`, `<project_name>`, `<type>`,
+  // `<date>`, `<timestamp>`, `<token>`) are resolved server-side (the server is
+  // authoritative for direct API callers and for `<timestamp>` at true creation
+  // time) BEFORE validation, and the resolved name is made unique within the
+  // repo so two same-title/type tasks don't collide on one branch. Skipped
+  // entirely when `existingBranch` already pinned `plannedBranch` above.
+  if (!existingBranch && workdirRoot) {
+    const override = typeof input.branch === "string" ? input.branch.trim() : "";
+    const token = id.replace(/-/g, "").slice(0, 6);
+    const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
+    let desired: string;
+    if (override) {
+      const rendered = renderBranchTemplate(override, ctx);
+      const v = validateBranchName(rendered);
+      if (!v.ok) {
+        const detail = rendered !== override
+          ? `invalid branch name "${rendered}" (from template "${override}"): ${v.reason}`
+          : `invalid branch name "${override}": ${v.reason}`;
+        return { error: detail };
+      }
+      desired = rendered;
+    } else {
+      const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
+      // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
+      // creation — fall back to the legacy scheme if it produced an illegal name.
+      if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
+    }
+    const taken = new Set(
+      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+    );
+    plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+  }
+
+  // Issue provenance (docs/plans/new-task-from-git-issue.md): validated once,
+  // at create time only — `issueUrl` is never patchable afterward (kept out
+  // of the PATCH allow-list in server.ts). A bad or wrong-repo URL rejects
+  // the whole create, since "View issue" and the PR-body "Closes #N" prefill
+  // both trust this field being correct. The stored value is the
+  // `normalizeIssueUrl` form (lowercased host, no query/hash/slug tail), not
+  // the raw string the caller sent — so the durable field is always
+  // canonical and directly comparable via `normalizeIssueUrl`/`sameIssueUrl`
+  // elsewhere, regardless of which slug/query the user happened to paste.
+  let validatedIssueUrl: string | null = null;
+  let parsedIssue: ReturnType<typeof parseIssueUrl> = null;
+  const rawIssueUrl = input.issueUrl?.trim() || "";
+  if (rawIssueUrl) {
+    parsedIssue = parseIssueUrl(rawIssueUrl);
+    if (!parsedIssue) return { error: "issueUrl is not a recognized issue URL" };
+    const repoInfo = await providerRepoForDir(workdir);
+    if (!repoInfo) return { error: `${workdir} has no ${parsedIssue.provider} remote for that issue` };
+    const sameRepo = repoInfo.provider === parsedIssue.provider
+      && `${repoInfo.owner}/${repoInfo.name}`.toLowerCase() === `${parsedIssue.owner}/${parsedIssue.repo}`.toLowerCase();
+    if (!sameRepo) {
+      return {
+        error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but the project's remote is ${repoInfo.owner}/${repoInfo.name}`,
+      };
+    }
+    validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
+  }
+
+  // Point-in-time capture of the bound profile (null when none). Taken here,
+  // right before insert, using the SAME `harness` this create already
+  // resolved above — never a second lookup — so the snapshot's
+  // `harnessKind`/`harnessLabel` can't drift from what the task row itself
+  // just got assigned.
+  const agentProfileSnapshot: AgentProfileSnapshot | null = profile
+    ? snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now)
+    : null;
+
+  const task = tasks.insert({
+    id,
+    title: input.title,
+    prompt: input.prompt,
+    column: input.column ?? "backlog",
+    agent: agentId,
+    workdir,
+    isolation,
+    taskType,
+    branch: plannedBranch,
+    branchSource,
+    worktreePath: null,
+    baseRef,
+    // No PR exists for a brand-new task; set server-side by pull-create.
+    prUrl: null,
+    issueUrl: validatedIssueUrl,
+    mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
+    model,
+    effort,
+    speed: defaultsProfile ? defaultsProfile.speed : isSpeed(input.speed) ? input.speed : "off",
+    maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
+    // D-4: a bound profile's (or a pipeline start step's) value, else a
+    // valid body value (the route already 400s junk), else "shared".
+    opencodeServer: defaultsProfile
+      ? (defaultsProfile.opencodeServer ?? "shared")
+      : input.opencodeServer !== undefined && OPENCODE_SERVER_MODES.includes(input.opencodeServer)
+        ? input.opencodeServer
+        : "shared",
+    agentProfileId: profile?.id ?? null,
+    agentProfile: agentProfileSnapshot,
+    // Pipeline binding (D1): only the parent row carries `pipelineId` (set
+    // above once, validated) — a brand-new task is never itself a hidden
+    // step (`pipelineParentId`/`pipelineStepId` are only ever set by the
+    // runner's own `launchStep`, never by `createTask`). `pipelineRun`
+    // starts idle (`snapshot: null`) until the first Run.
+    pipelineId: pipeline?.id ?? null,
+    pipelineRun: pipeline ? initialPipelineRunState(pipeline) : null,
+    pipelineParentId: null,
+    pipelineStepId: null,
+    references: input.references ?? [],
+    // Brand-new tasks start with an empty backlog; drafts are added later from
+    // the run panel.
+    backlog: [],
+    // Composer draft starts empty; autosaved from the run panel thereafter.
+    draft: null,
+    // Brand-new tasks have no detected Cursor/claude plans yet — populated
+    // later by `attachDoneHandler` (cursor) or the chunk handler (claude).
+    plans: [],
+    // Brand-new tasks have no todo-family tool activity yet — populated
+    // later by the chunk handler's `maybeUpdateTodoProgress`.
+    todoProgress: null,
+    runId: null,
+    // Derived at fetch time via SQL EXISTS — supply `false` here so the
+    // `Task` shape is complete; `tasks.insert` re-fetches and the real
+    // value flows back to the caller.
+    hasOpenableRun: false,
+    // Derived from the in-memory interactions Maps in `interactions.ts`; a
+    // brand-new task has no pending interactions, so 0 is the correct seed.
+    pendingInteractionCount: 0,
+    // Derived from the in-memory terminal manager in `terminals.ts`; a
+    // brand-new task has no open terminals, so 0 is the correct seed.
+    openTerminalCount: 0,
+    createdAt: now,
+    updatedAt: now,
+    archivedAt: null,
+  });
+
+  // Write the full thread snapshot (issue body + every fetched comment) to
+  // its own per-task directory and reference it, so the agent can read the
+  // complete thread regardless of the prompt's inline cap. Best-effort: the
+  // prompt already carries an inline excerpt, so a write failure shouldn't
+  // fail task creation — just log and hand back the task as-is.
+  if (validatedIssueUrl && parsedIssue && input.issueSnapshot) {
+    try {
+      const snapshotDir = join(dataDir, "issue-threads", task.id);
+      mkdirSync(snapshotDir, { recursive: true });
+      const snapshotPath = join(snapshotDir, ISSUE_SNAPSHOT_FILENAME(parsedIssue.number));
+      writeFileSync(snapshotPath, input.issueSnapshot);
+      if (!task.references.some((r) => r.path === snapshotPath)) {
+        const updated = tasks.update(task.id, {
+          references: [...task.references, { path: snapshotPath, isDirectory: false }],
+        });
+        if (updated) return { task: updated };
+      }
+    } catch (e) {
+      console.warn(`[agetor] failed to write issue thread snapshot for task ${task.id}:`, e);
+    }
+  }
+
+  return { task };
+}
+
+/**
+ * Shared teardown job for archiving a task — tmux/codex session kill, then
+ * open terminal tabs, then `detachWorktree` — in that exact order, because a
+ * live shell cwd'd inside the worktree would block `git worktree remove`.
+ * Both `archiveTask` (the fresh-archive path AND the already-archived
+ * re-enqueue path below) and the boot-time `sweepArchivedTeardowns` route
+ * through this one function so the three call sites can never drift apart.
+ *
+ * The harness kind is resolved synchronously here, before the job closure is
+ * built and handed to `enqueueTeardown` — same as the original inline code,
+ * just no longer duplicated at each call site.
+ *
+ * `enqueueTeardown` deliberately swallows job errors to keep its per-workdir
+ * FIFO chain alive for every other task queued behind this one (see its doc
+ * comment) — so it can't just return the `detachWorktree` result. Instead the
+ * result is captured in a closure variable (`result`, exposed via the
+ * returned getter) that a caller reads AFTER awaiting `promise`. This is the
+ * same idiom `deleteOrphanWorktree` already uses to get a real outcome out of
+ * a swallowed job.
+ */
+function enqueueArchiveTeardown(
+  task: Task,
+  opts?: { force?: boolean },
+): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
+  const kind = resolveHarness(task.agent)?.kind;
+  let result: WorktreeTeardownResult | undefined;
+  const promise = enqueueTeardown(task.id, task.workdir, async () => {
+    // `enqueueTeardown` only guarantees this job runs after everything already
+    // queued for `task.workdir` — it can sit behind other jobs for seconds,
+    // and `task` was captured at ENQUEUE time by every call site (fresh
+    // archive, already-archived re-enqueue, boot sweep). The
+    // `pendingTeardown(taskId)` discipline elsewhere only protects
+    // materialize-AFTER-teardown; it does nothing about the opposite
+    // interleaving: `sendInput`/`startTask` clear `archivedAt` and start
+    // `prepareWorkdir`'s multi-second `git worktree add` BEFORE a fresh
+    // `archiveTask` call (e.g. the Worktrees page's delete button) can see the
+    // half-built directory and enqueue a teardown job right behind it. By the
+    // time that job reaches the front of the queue, the task has moved on —
+    // tearing down with the stale `task` snapshot would rip out a worktree the
+    // agent is (or is about to be) running in. So re-read the row here, at job
+    // execution time, and bail if it moved: gone entirely, un-archived
+    // (`archivedAt == null` — both `sendInput` and `startTask` clear it
+    // *before* calling `prepareWorkdir`, so this check is the same signal that
+    // closes the window), or a run has since started. A bail is reported as
+    // `"failed"` (not `"no-worktree"`/`"already-absent"`, which the client
+    // reads as silent success) because the directory is still there — the
+    // caller should retry, not assume it's clean.
+    //
+    // The live-run check keys on `cancelled`, NOT on `active.has(runId)`:
+    // `archiveTask({ stopRun: true })` — what the Worktrees page's delete
+    // button always sends — stops the run via `stopActiveHandle`, which
+    // flags the handle `cancelled` and kills it, but the `active.delete`
+    // only happens later in the async exit handler. A bare `active.has`
+    // would therefore see the run we ourselves just stopped, bail, and
+    // report a bogus failure for every delete of a *running* worktree. A
+    // handle that's present and NOT cancelled is the real signal: a run
+    // that started after we enqueued, which we must not tear down under.
+    const cur = tasks.get(task.id);
+    const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
+    if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
+      result = { removed: false, reason: "failed" };
+      return;
+    }
+    // Terminals → sessions → worktree. Terminal tabs hold only PTYs rooted
+    // in the worktree dir, not a tmux session, so they can die independently
+    // of (and, under the scheduler, sooner than) the drop*Session awaits
+    // below — killing them first is what keeps `killTerminalsForTask`'s own
+    // completion honest relative to the drop*Session ordering guarantee the
+    // next paragraph documents, and both must still land before the
+    // worktree is detached/removed.
+    await killTerminalsForTask(cur.id);
+    // Same contract as deleteTask: dropSession is non-throwing (it
+    // best-efforts tmux teardown internally). Don't wrap — a silent catch
+    // would hide a regression in claude-tmux from the next reviewer. Awaited
+    // (wave 1 made every drop* async) so the session kill genuinely completes
+    // BEFORE detachWorktree below — ordering rule from
+    // docs/plans/fix-archive-teardown-queue.md, still load-bearing now that
+    // "complete" means "the awaited promise settled" rather than "the
+    // synchronous call returned".
+    if (kind === "claude-code") await dropSession(cur.id);
+    else if (kind === "codex") await dropCodexSession(cur.id);
+    else if (kind === "cursor") await dropCursorSession(cur.id);
+    else if (kind === "gemini") await dropGeminiSession(cur.id);
+    else if (kind === "antigravity") await dropAntigravitySession(cur.id);
+    else if (kind === "opencode") await dropOpencodeTask(cur.id, "the task was archived"); // graceful C-c, then kill (D-10)
+    else if (kind === "copilot") await dropCopilotSession(cur.id);
+    else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
+    // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
+    // — a step's own archive teardown must never detach it out from under
+    // the parent (or any sibling step still using it). The parent's own
+    // teardown (this same function, called for the parent row) removes the
+    // worktree exactly as before; only a step row's call skips the detach.
+    // Archive is the last moment the live checkout can be read — once the
+    // directory is detached git can't tell which branch it was on. Record it
+    // (D6) so unarchive re-attaches onto the same branch and a later delete
+    // of the archived task can still name it. An unreadable checkout leaves
+    // the previously recorded value in place.
+    if (!cur.pipelineParentId && cur.isolation === "worktree" && cur.worktreePath && existsSync(cur.worktreePath)) {
+      const live = await readCheckoutBranch(cur.worktreePath);
+      if (live.ok) tasks.setCheckoutBranch(cur.id, live.branch);
+    }
+    result = cur.pipelineParentId
+      ? { removed: false, reason: "no-worktree" }
+      : await detachWorktree(cur, { force: opts?.force });
+  });
+  return { promise, result: () => result };
+}
+
+/**
+ * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
+ * AND any open terminal tabs (both best-effort) so no background shell outlives
+ * the user's interest in the task — once archived the card is hidden, so the
+ * user can no longer reach those shells to close them — then **detach** the
+ * worktree from disk (`detachWorktree`): the checkout is removed to reclaim
+ * space, but the branch, every commit, the run/run_events history, and
+ * claude's external JSONL transcript all survive untouched. Sending a
+ * follow-up message or unarchiving later rematerializes the worktree at the
+ * same deterministic path (`prepareWorkdir`'s re-attach path) and resumes the
+ * conversation right where it left off.
+ *
+ * Only allowed when the task is in the `done` column — archive is the
+ * terminal step of the explicit review → done → archive flow. Pass
+ * `{ force: true }` to bypass ONLY that column gate (e.g. the Worktrees page's
+ * delete action, which archives a stale worktree's task regardless of where
+ * it sits on the board) — the active-run rejection, `archivedAt` stamping,
+ * and deferred teardown below are unchanged either way.
+ *
+ * Pass `{ stopRun: true }` to archive a task with an in-flight (or
+ * held-by-background-agents) run anyway: the run is stopped exactly the way
+ * the Stop button stops it (`stopActiveHandle`/`stopHeldTask`, shared with
+ * `cancelRun`) before the normal archive path below proceeds. Without it,
+ * the active-run guard stays in place as a backstop.
+ *
+ * Every archive that is allowed to proceed also clears pending interactions,
+ * including when no run is active. A Cursor question rebuilt after a restart
+ * has no live child; leaving that card up lets Submit un-archive the task
+ * and start a turn. The card is resolved as cancelled and the stored
+ * `cursor_asks` outcome is `cancelled`. A refused archive (still running,
+ * not in Done, or a pipeline step) leaves the card in place. The clear runs
+ * before the already-archived return and before any later await, so a submit
+ * during cascade or teardown cannot race it.
+ *
+ * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
+ * changes in the checkout rather than leaving it in place (threaded straight
+ * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
+ * opt-in from the Worktrees page, since it's a destructive, unrecoverable
+ * discard of anything not committed.
+ *
+ * Pass `{ awaitTeardown: true }` to block until the deferred teardown above
+ * has actually run and get its real `WorktreeTeardownResult` back as
+ * `teardown` — the Worktrees page's delete action needs to know the
+ * directory is truly gone before it refreshes the list, unlike the kanban
+ * archive button, which stays fire-and-forget by leaving this unset.
+ */
+export async function archiveTask(
+  taskId: string,
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
+): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  // Pipeline step tasks can't be archived individually (D9, docs/plans/pipelines.md)
+  // — their lifecycle belongs to the parent pipeline task. `fromPipeline` is
+  // set only by `cascadePipelineArchive` (pipeline-runner.ts), which is the
+  // one legitimate caller archiving a step row directly, as part of
+  // archiving the whole pipeline. `server.ts`'s route already 409s a direct
+  // step-archive request before ever reaching here; this is defense in
+  // depth against any other internal caller making the same mistake.
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — there is
+  // no pipeline task left to "act on instead", so refusing here would leave
+  // it permanently unarchivable.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+    return { error: `step task belongs to a pipeline — act on the pipeline task ${task.pipelineParentId} instead` };
+  }
+  if (task.column !== "done" && !opts?.force) {
+    return { error: "only tasks in Done can be archived" };
+  }
+  // Defence-in-depth: column='done' should imply no live run, but column is
+  // freely PATCHable (drag-to-Done on a running card is allowed today). If a
+  // run is still active, refuse rather than killing tmux out from under it —
+  // the exit handler would then flip the now-archived task to 'ready' and
+  // leave the row in a contradictory state — UNLESS the caller explicitly
+  // asked us to stop it first (`stopRun`), in which case we do exactly what
+  // the Stop button does before proceeding.
+  if (task.runId && active.has(task.runId)) {
+    if (!opts?.stopRun) {
+      return { error: "task is still running — cancel the run before archiving" };
+    }
+    stopActiveHandle(active.get(task.runId)!, "task archived");
+  } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
+    await stopHeldTask(taskId, "task archived");
+  }
+  // Idle archive (a restarted Cursor question, a done-column archive, a
+  // repeat archive) has no live handle, so the branches above never clear
+  // the card. `stopActiveHandle` / `stopHeldTask` already cancelled when
+  // they ran; a second call is a no-op. Must stay synchronous and ahead of
+  // the already-archived return: a surviving restart-followup submit calls
+  // `sendInput`, which un-archives the task and starts a turn.
+  cancelPendingForTask(taskId, "task archived");
+  if (task.archivedAt != null) {
+    // Already archived is normally a cheap no-op — repeat-archives (e.g. a
+    // double click) shouldn't re-enqueue teardown work every time. But when
+    // the worktree is STILL on disk, the previous teardown either never ran
+    // (this instance crashed before the boot sweep got to it) or never
+    // finished — and this is exactly the reported bug: the Worktrees page's
+    // "archive & delete" action calls archive on a row that's already
+    // archived, and the old bare `return { task }` here meant that row could
+    // never be cleaned up. Re-enqueue instead, gated on the same
+    // `worktreePath && existsSync(...)` condition `sweepArchivedTeardowns`
+    // already uses at boot, so an ordinary repeat-archive with nothing left
+    // to remove stays a bare return.
+    if (task.worktreePath && existsSync(task.worktreePath)) {
+      const { promise, result } = enqueueArchiveTeardown(task, { force: opts?.forceWorktree });
+      if (opts?.awaitTeardown) {
+        await promise;
+        // A requested outcome should never come back silently absent — if
+        // the job threw and enqueueTeardown swallowed it, `result()` is
+        // still undefined here, so report it as a failed removal instead of
+        // omitting `teardown` from the response.
+        return { task, teardown: result() ?? { removed: false, reason: "failed" } };
+      }
+      void promise;
+    } else if (opts?.awaitTeardown) {
+      // Same "never come back silently absent" contract as the branch above,
+      // for the case where there was never anything to tear down. Both
+      // outcomes are successes for the client (nothing left to remove) — this
+      // only stops the response from omitting `teardown` when it was asked
+      // for, matching `WorktreeTeardownResult`'s documented contract.
+      return {
+        task,
+        teardown: task.worktreePath
+          ? { removed: false, reason: "already-absent" }
+          : { removed: false, reason: "no-worktree" },
+      };
+    }
+    return { task };
+  }
+  const updated = tasks.update(taskId, { archivedAt: Date.now() });
+  if (!updated) return { error: "task not found" };
+  // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
+  // step task first — `cascadePipelineArchive` is best-effort per step (a
+  // step that fails to archive is logged, not thrown), so one stuck step
+  // never blocks the parent's own archive below. No-op for an ordinary task
+  // (`pipelineId` null). M7: run under this parent's `withPipelineLock` so
+  // the cascade can't interleave its per-step archive calls with a live
+  // settle/advance event (pipeline-runner.ts's own `runExclusive`) racing to
+  // read-modify-write the same `pipelineRun` JSON blob.
+  if (updated.pipelineId) {
+    await withPipelineLock(updated.id, () => cascadePipelineArchive(updated.id));
+  }
+  // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
+  // inline rather than folded into the deferred job.
+  codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
+  geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
+  opencodeTurnQueue.delete(taskId);
+  copilotTurnQueue.delete(taskId);
+  fxTurnQueue.delete(taskId);
+  // Same for a pending fx auto-resume schedule — an archived task has
+  // nothing left to resume (plan §3 T2 item 8).
+  clearFxRecovery(taskId);
+  // Deferred: the actual teardown (tmux kill, terminal shells, worktree
+  // detach) is pushed onto this task's source-workdir teardown queue rather
+  // than awaited here, so `archiveTask` can flip the DB column and return in
+  // milliseconds. Archiving several tasks against the same workdir back-to-
+  // back no longer blocks each POST on tmux kills (async `Bun.spawn` now,
+  // but still real wall-clock latency) or `git worktree remove --force`/
+  // `prune` — those still run (serialized per
+  // workdir, see `enqueueTeardown`), just off the request's critical path;
+  // tasks in a different workdir proceed independently. Callers that must
+  // not race a deferred teardown (unarchive, start, delete, terminal open, the boot sweep)
+  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
+  // exception: the Worktrees page explicitly wants to block on this specific
+  // teardown to get a truthful result back.
+  const { promise, result } = enqueueArchiveTeardown(updated, { force: opts?.forceWorktree });
+  if (opts?.awaitTeardown) {
+    await promise;
+    return { task: updated, teardown: result() ?? { removed: false, reason: "failed" } };
+  }
+  void promise;
+  return { task: updated };
+}
+
+/**
+ * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
+ * missing-worktree branch, a terminal open) record the branch the worktree is
+ * on, and surface `prepareWorkdir`'s `warning` — a re-attach couldn't bring
+ * the worktree back exactly as recorded (recorded checkout missing or
+ * unattachable, task branch recreated from base) — as a status line on the
+ * task's latest run (console only when the task has never run). Only a
+ * re-attach sets `warning`, and later prepares take the reuse path, so this
+ * is the one chance to say it.
+ */
+export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
+  const checkout = recordableCheckout(prepared);
+  if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+  if (!prepared.warning) return;
+  const latest = runs.listForTask(taskId)[0];
+  if (latest) appendRunStatusLine(taskId, latest.id, prepared.warning);
+  else console.warn(`[agetor] task ${taskId}: ${prepared.warning}`);
+}
+
+/**
+ * Reverse of `archiveTask`: clear the timestamp and, best-effort, restore the
+ * worktree if `archiveTask` detached it (or it's otherwise missing on disk).
+ * Restore failure doesn't block the unarchive — the card comes back either
+ * way; a later send/start/terminal-open retries the restore lazily.
+ */
+export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.archivedAt == null) return { task };
+  // Wait out any teardown archiveTask deferred for this task BEFORE deciding
+  // whether the worktree needs restoring. Without this, a still-in-flight
+  // `detachWorktree` could delete the worktree right after the `existsSync`
+  // check below decided it was still present (or right after a restore
+  // recreated it), leaving the task unarchived but pointing at a directory
+  // that's about to vanish out from under it.
+  await pendingTeardown(taskId);
+  const updated = tasks.update(taskId, { archivedAt: null });
+  if (!updated) return { error: "task not found" };
+  // A step row's worktree belongs to its pipeline parent (D2) — restoring
+  // it here (were a step row ever unarchived on its own, which the normal
+  // UI never does) would be redundant at best and racy at worst against the
+  // parent's own restore; only the parent's own worktree is materialized.
+  if (updated.worktreePath && updated.branch && !updated.pipelineParentId && !existsSync(updated.worktreePath)) {
+    try {
+      const restored = await prepareWorkdir(updated);
+      if ("error" in restored) {
+        console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
+      } else {
+        noteRestoredCheckout(taskId, restored);
+      }
+    } catch (err) {
+      console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}:`, err);
+    }
+  }
+  return { task: updated };
+}
+
+/**
+ * Which branches deleting `task` would remove — the read behind
+ * `GET /tasks/:id/teardown-preview` (the delete confirm and `agetor rm`) and
+ * the plan `deleteTask` itself executes, so the two always agree.
+ *
+ * Drift is tolerated (D3/D5): besides `task.branch`, delete also removes the
+ * branch the worktree is actually on when that is a different named branch —
+ * read live from the worktree while it still exists, else the recorded
+ * `checkoutBranch` (an archived task's detached worktree). `planTeardownBranches`
+ * drops the repo's default branch, a PR-head task's own branch, and any branch
+ * another task in the same repo holds as its `branch` or last-seen checkout
+ * (archived rows included; pipeline step rows excluded — they mirror their
+ * parent's names and would otherwise shadow the parent's own delete). A task
+ * with no worktree to remove (never materialized, isolation "none", or a
+ * pipeline step whose worktree is the parent's) deletes nothing. Read-only.
+ */
+export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownPreview> {
+  const taskBranch = task.branch ?? null;
+  if (task.isolation !== "worktree" || !task.worktreePath || task.pipelineParentId) {
+    return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
+  }
+  // A successful read of a detached HEAD (`{ok: true, branch: null}`) is a
+  // KNOWN state — the worktree is on no named branch — so the recorded
+  // last-seen checkout must not stand in for it (D5: the recorded value is
+  // used only when the live branch can't be read).
+  let liveBranch: string | null = null;
+  let liveKnown = false;
+  if (existsSync(task.worktreePath)) {
+    const live = await readCheckoutBranch(task.worktreePath);
+    if (live.ok) {
+      liveBranch = live.branch;
+      liveKnown = true;
+    }
+  }
+  const root = await repoRoot(task.workdir);
+  const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
+  const heldByOthers = new Set<string>();
+  for (const other of tasks.list()) {
+    if (other.id === task.id || other.pipelineParentId) continue;
+    if (other.workdir !== task.workdir && (!root || (await repoRoot(other.workdir)) !== root)) continue;
+    if (other.branch) heldByOthers.add(other.branch);
+    if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
+  }
+  const plan = planTeardownBranches({
+    taskBranch,
+    branchSource: task.branchSource,
+    liveBranch,
+    lastSeen: liveKnown ? null : task.checkoutBranch ?? null,
+    defaultBranch,
+    heldByOthers,
+  });
+  return { ...plan, liveBranch, taskBranch };
+}
+
+/**
+ * Delete a task and best-effort tear down its worktree. Kills any active run
+ * first so we don't leave a stale process around.
+ *
+ * Pass `{ fromPipeline: true }` when the caller is `cascadePipelineDelete`
+ * (pipeline-runner.ts) deleting a step task as part of deleting the whole
+ * pipeline task — the one legitimate way a step row gets deleted directly.
+ * Without it, a step task (`pipelineParentId` set) is refused: delete the
+ * pipeline task instead (D9, docs/plans/pipelines.md). `server.ts`'s route
+ * already 409s a direct step-delete request before ever reaching here; this
+ * is defense in depth against any other internal caller making the same
+ * mistake. A pipeline PARENT task (`pipelineId` set) instead cascades —
+ * every step task is deleted first, best-effort, before the parent's own
+ * teardown below.
+ */
+export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
+  const task = tasks.get(taskId);
+  if (!task) return;
+  // M7: exempt an ORPHANED step (its parent row no longer exists) — same
+  // rationale as the matching exemption in `archiveTask`.
+  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+    console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
+    return;
+  }
+  // M-R7: `cascadePipelineDelete` tombstones the parent id FIRST (so a
+  // racing launch bails) — but a throw anywhere between that tombstone and
+  // the `tasks.delete` at the bottom (a step delete, a teardown, the issue
+  // snapshot removal) would otherwise leave a still-existing parent row
+  // permanently tombstoned: every later Run/Retry/Advance on it refused with
+  // "pipeline task no longer exists" while the card sat on the board. Undo
+  // the tombstone on any such throw and re-raise, so the parent stays
+  // launchable and the user can simply retry the delete.
+  const isPipelineParent = task.pipelineId != null;
+  deletingTaskIds.add(taskId);
+  try {
+  if (isPipelineParent) {
+    // M7: run under this parent's `withPipelineLock` so the cascade can't
+    // interleave its per-step delete calls with a live settle/advance event
+    // (pipeline-runner.ts's own `runExclusive`) racing to read-modify-write
+    // the same `pipelineRun` JSON blob.
+    await withPipelineLock(taskId, () => cascadePipelineDelete(taskId));
+  }
+  if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
+  // Resolve any pending interactions for this task so hook scripts / MCP
+  // children blocked on agetor unblock immediately. Done before dropSession
+  // so the curl / fetch awaiters return before tmux kills them.
+  cancelPendingForTask(taskId, "task deleted");
+  // Kill the task's tmux session before tearing down the worktree so we don't
+  // leave an orphaned session behind. For claude it outlives individual runs;
+  // for codex/cursor/gemini it only exists during an in-flight turn —
+  // dropCodexSession/dropCursorSession/dropGeminiSession also clear any
+  // in-memory tailer. fx has no tmux session at all (ACP/stdio) — dropFxSession
+  // just clears its in-memory state. No-op when no session exists.
+  const deleteKind = resolveHarness(task.agent)?.kind;
+  codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
+  geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
+  opencodeTurnQueue.delete(taskId);
+  copilotTurnQueue.delete(taskId);
+  fxTurnQueue.delete(taskId);
+  // Same for a pending fx auto-resume schedule, before the task row itself
+  // goes (plan §3 T2 item 8).
+  clearFxRecovery(taskId);
+  // Routed through the same per-workdir teardown queue archiveTask uses —
+  // DELETE's semantics are unchanged (still awaited before `tasks.delete`
+  // below), but this serializes it behind any archive teardown already in
+  // flight for another task in the SAME source workdir, so two `git worktree
+  // remove`/`prune` calls against the same repo never contend on git's locks
+  // at the same time. A delete against an unrelated workdir is unaffected.
+  await enqueueTeardown(taskId, task.workdir, async () => {
+    // Terminals → sessions → worktree. Terminal tabs hold only PTYs rooted
+    // in the worktree dir, not a tmux session, so they can die independently
+    // of (and sooner than) the drop*Session awaits below — kill them first,
+    // then the drop*Session calls (awaited — wave 1 made every drop* async —
+    // so the session kill genuinely completes, not just gets kicked off,
+    // same ordering discipline as enqueueArchiveTeardown above), then remove
+    // the worktree. A live shell still sitting in the worktree dir would
+    // block `git worktree remove`, so both kills must land before it.
+    await killTerminalsForTask(taskId);
+    if (deleteKind === "claude-code") await dropSession(taskId);
+    else if (deleteKind === "codex") await dropCodexSession(taskId);
+    else if (deleteKind === "cursor") await dropCursorSession(taskId);
+    else if (deleteKind === "gemini") await dropGeminiSession(taskId);
+    else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted"); // graceful C-c, then kill (D-10)
+    else if (deleteKind === "copilot") await dropCopilotSession(taskId);
+    else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
+    // A step task's worktree is the shared parent's (D2) — never remove it
+    // out from under the parent (or any sibling step) just because one step
+    // row is being deleted as part of the parent's own cascade.
+    // The branch plan is computed here — after the agent and every shell are
+    // gone (nothing can switch the checkout any more) and before the
+    // directory is removed (the last moment the live branch is readable) —
+    // with the same function the delete-confirm preview used.
+    // Re-read the row: a terminal open that was mid-`prepareWorkdir` when
+    // the delete started may have materialized the worktree and persisted
+    // its path since `task` was captured — the stale snapshot would leave
+    // that directory and its branch behind.
+    if (!task.pipelineParentId) {
+      const cur = tasks.get(taskId) ?? task;
+      const plan = await teardownBranchesForTask(cur);
+      await removeWorktree(cur, { branches: plan.branches });
+    }
+  });
+  // Refs are otherwise path-only — agetor never copies anything to disk for
+  // them — except the per-task issue-thread snapshot directory (written by
+  // `createTask` when `issueSnapshot` is provided), which is the one thing
+  // under `dataDir` this task might own. Best-effort: a task without one
+  // (the common case) makes this a no-op, and a failure here shouldn't block
+  // the delete itself.
+  try {
+    rmSync(join(dataDir, "issue-threads", taskId), { recursive: true, force: true });
+  } catch (e) {
+    console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
+  }
+  tasks.delete(taskId);
+  } catch (err) {
+    if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
+    throw err;
+  } finally {
+    deletingTaskIds.delete(taskId);
+  }
+}
+
+/**
+ * Clean up a worktree that a refused terminal open materialized (created or
+ * re-attached) while the task was being archived or deleted. The open had
+ * persisted the path before it noticed, but the archive/delete teardown may
+ * already have run on a snapshot without it, so nothing else would remove
+ * the directory — and for a deleted task there is no row left for the boot
+ * sweep to find either.
+ *
+ * Queued on the task's teardown FIFO, so it runs after the archive/delete
+ * teardown already queued for the same workdir and `pendingTeardown(task.id)`
+ * covers it. At run time: a row that is live again (unarchived, or a delete
+ * that failed) owns the worktree through its persisted path, so nothing is
+ * done; an archived row gets the archive's branch-preserving detach; a deleted
+ * task gets the delete's removal, branches planned exactly as delete plans
+ * them. Best-effort, never throws.
+ */
+export function discardRefusedWorktree(
+  task: Task,
+  prepared: { worktreePath: string; branch: string | null },
+): Promise<void> {
+  return enqueueTeardown(task.id, task.workdir, async () => {
+    const cur = tasks.get(task.id);
+    if (cur && cur.archivedAt == null) return;
+    if (!existsSync(prepared.worktreePath)) return;
+    const target: Task = { ...(cur ?? task), worktreePath: prepared.worktreePath, branch: prepared.branch };
+    if (cur) {
+      await detachWorktree(target);
+      return;
+    }
+    const plan = await teardownBranchesForTask(target);
+    await removeWorktree(target, { branches: plan.branches });
+  });
+}
+
+/**
+ * Boot-time healing pass for teardowns that never ran: if agetor quit or
+ * crashed between an `archiveTask` response landing (DB flipped, teardown
+ * enqueued) and the deferred job actually executing, the in-memory queue is
+ * gone on restart but the worktree is still sitting on disk. This also heals
+ * the pre-existing crash-mid-archive case that could strand a worktree even
+ * before teardown was deferred (a crash between the DB update and the old
+ * synchronous `detachWorktree` call).
+ *
+ * `tasks.list()` already includes archived rows (no archived filter in its
+ * query), so a plain scan is enough. Re-enqueues the identical teardown job
+ * `archiveTask` would have run — session drop keyed to the task's own id,
+ * `killTerminalsForTask`, `detachWorktree` — through the same per-workdir
+ * queue (keyed on each task's own `workdir`), so it's serialized against
+ * anything already in flight for that source repo without waiting on
+ * unrelated repos' backlogs. Kills are always keyed to a specific task id
+ * from this instance's own DB; this never enumerates or kills `agetor-*`
+ * tmux sessions directly (the shared-socket rule reconcileOrphans documents
+ * above applies here too).
+ *
+ * Fire-and-forget from the caller's perspective — returns the count enqueued,
+ * not a promise, since it only needs to kick the jobs off.
+ */
+export function sweepArchivedTeardowns(): number {
+  let enqueued = 0;
+  for (const task of tasks.list()) {
+    if (task.archivedAt == null) continue;
+    // A step task's `worktreePath` is a copy of its pipeline parent's — the
+    // parent's own row (also archived, also swept by this same loop) is
+    // what actually owns and tears it down; enqueuing a redundant no-op job
+    // per step just adds queue churn.
+    if (task.pipelineParentId) continue;
+    if (!task.worktreePath) continue;
+    if (!existsSync(task.worktreePath)) continue;
+    // Defensive: an archived task shouldn't have a live run (archiveTask
+    // refuses to archive one), but mirror that guard here too rather than
+    // risk tearing down a worktree out from under an in-flight run.
+    if (task.runId && active.has(task.runId)) continue;
+    // No `force` — an explicit owner decision (see the plan doc): discarding
+    // uncommitted work with no human in the loop, unattended at boot, is not
+    // a trade worth making. A dirty worktree just stays stuck until the user
+    // forces it from the Worktrees page.
+    enqueueArchiveTeardown(task);
+    enqueued++;
+  }
+  return enqueued;
+}
+
+/**
+ * Idle-session reaper (T4, `docs/plans/reduce-cpu-and-memory.md` §3.1). Kills
+ * the tmux session backing a claude-code task's REPL once it's sat idle —
+ * no turn in flight, nothing waiting on the user, no session activity — for
+ * `IDLE_SESSION_REAP_MS` (30min), reclaiming the ~300–500MB "node" process
+ * and every per-session timer (`disposeSessionState`, invoked via
+ * `dropSession`). A follow-up sent afterward still works: `sendClaudeTurn`
+ * falls back to `spawnResumedSession` (`claude --resume <id>`) whenever
+ * `hasSessionState` is false, so this is invisible to the user beyond a
+ * slightly slower first reply.
+ *
+ * Candidates come ONLY from this instance's own DB — this must never
+ * enumerate-and-kill tmux sessions (the shared-socket rule documented on
+ * `reconcileOrphans` above applies here identically: a blind sweep would
+ * reap a sibling agetor instance's or a `bun test` run's sessions). Probing
+ * a specific candidate task id we already own (`probeSessionActivity`,
+ * `sessionIdleInfo`) is fine — that's a keyed lookup, not a sweep. Codex and
+ * gemini are never candidates: their sessions are one-shot per turn and
+ * self-dispose (`codex-tmux.ts`, `gemini-tmux.ts`), so there's nothing to
+ * reap.
+ *
+ * Two performance properties keep a sweep from becoming a synchronous burst
+ * that stalls the main process for the duration of the scan (previously: N
+ * non-archived claude tasks × ~5 DB queries + a blocking tmux probe each, all
+ * in one event-loop turn):
+ *  - **Cheap pre-filter.** `candidateIds` is derived entirely from the rows
+ *    `tasks.list()` already fetched (no per-candidate `tasks.get` yet) and
+ *    excludes any task that plainly can't own a session: archived, non-claude,
+ *    or — the key trim — neither holding in-memory `SessionState` nor ever
+ *    having started a run (`hasSessionState(t.id) || t.runId != null`). A
+ *    never-started task fails both and drops out before it costs anything
+ *    more than an array filter.
+ *  - **Per-candidate yield.** `await Bun.sleep(0)` at the top of every loop
+ *    iteration hands control back to the event loop between candidates, so
+ *    HTTP requests, SSE pushes, and session tailers keep running throughout a
+ *    sweep instead of queuing up behind it. This is what makes the pre-kill
+ *    re-check below load-bearing rather than defensive-only: with real
+ *    yields between iterations, a message that lands mid-sweep (starts a
+ *    turn, opens a pending interaction) MUST be caught by a guard re-read
+ *    immediately before the kill, not just the one the loop started with.
+ *
+ * Every guard is re-checked against a freshly-read task row immediately
+ * before the kill, not from the snapshot the loop started with. Guard work
+ * itself is hoisted to avoid redundant reads: `isReapable` takes the already
+ * -fetched `Task` row and calls the pure `isTaskHeldByBackgroundAgents(task)`
+ * predicate directly rather than the taskId-keyed `isHeldByBackgroundAgents`
+ * wrapper, which would otherwise re-fetch the same row internally.
+ *
+ * Called once ~30s after boot (letting boot reattach settle first) and then
+ * on a `SESSION_REAP_SWEEP_MS` interval from `src/bun/index.ts` and
+ * `src/bun/headless.ts`.
+ */
+export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
+  if (reapInFlight) return { reaped: [] };
+  reapInFlight = true;
+  try {
+    const reaped: string[] = [];
+    const candidateIds = tasks
+      .list()
+      .filter(
+        (t) =>
+          t.archivedAt == null
+          && resolveHarness(t.agent)?.kind === "claude-code"
+          && (hasSessionState(t.id) || t.runId != null),
+      )
+      .map((t) => t.id);
+
+    const isReapable = (task: Task): boolean => {
+      if (task.runId && active.has(task.runId)) return false;
+      if (isTaskHeldByBackgroundAgents(task)) return false;
+      // `isTaskHeldByBackgroundAgents` only covers the `running`-column
+      // #92 hold (main run succeeded, subagents still finishing) — it
+      // requires `task.column === "running"`. Since #93
+      // (`signalSubagentApiError`), a task can leave the `active` map via
+      // `blocked` instead: one subagent's API error aborts the main turn
+      // while SIBLING subagents are still legitimately running and tailed.
+      // That case slips past the check above (column is `blocked`, not
+      // `running`), so re-check independently of column/hold state — a
+      // task with any running subagent row must never have its tmux
+      // session reaped out from under agents still writing to it.
+      if (subagents.hasRunning(task.id)) return false;
+      if (countPendingForTask(task.id) > 0) return false;
+      return true;
+    };
+
+    for (const taskId of candidateIds) {
+      // Yield between candidates — see the perf-properties doc above. Safe
+      // because every guard is re-checked against a fresh row immediately
+      // before the kill below.
+      await Bun.sleep(0);
+
+      const task = tasks.get(taskId);
+      if (!task || !isReapable(task)) continue;
+
+      const idleInfo = sessionIdleInfo(taskId);
+      let idleLongEnough: boolean;
+      if (idleInfo) {
+        idleLongEnough = idleInfo.idleMs >= IDLE_SESSION_REAP_MS;
+      } else {
+        // No in-memory SessionState — e.g. a done/review task whose session
+        // survived a restart (boot reconciliation only reattaches `running`
+        // rows). Probe tmux directly for the session's own activity clock
+        // (`#{session_activity}`) instead of the previous `task.updatedAt`
+        // heuristic, which could read stale on a task nobody touched through
+        // agetor but that's still being used interactively in its terminal.
+        // `null` means the session is already gone (or unreachable) — nothing
+        // to reap. `attached === true` means a human has the pane open right
+        // now — never reap that regardless of how long it's been idle by the
+        // clock. Otherwise require BOTH tmux's activity clock AND the task
+        // row's `updatedAt` past the threshold before reaping a session we
+        // have no in-memory visibility into — the extra-conservative choice
+        // called out in the review: a session could be driven by something
+        // other than agetor (a human at the tmux client) bumping tmux's
+        // activity clock without ever updating our DB row, or vice versa.
+        const activity = await probeSessionActivity(taskId);
+        if (!activity) continue;
+        if (activity.attached) continue;
+        idleLongEnough =
+          Date.now() - activity.activityAt >= IDLE_SESSION_REAP_MS
+          && Date.now() - task.updatedAt >= IDLE_SESSION_REAP_MS;
+      }
+      if (!idleLongEnough) continue;
+
+      // Re-check immediately before the kill against a fresh row — closes
+      // the window between the idle check above (which may itself have
+      // awaited a yield or a tmux probe) and the kill below.
+      const fresh = tasks.get(taskId);
+      if (!fresh || !isReapable(fresh)) continue;
+
+      await dropSession(taskId);
+      reaped.push(taskId);
+
+      const recent = runs.listForTask(taskId)[0];
+      if (recent) {
+        const data = lastSessionIdForTask(fresh, "claude_session_id")
+          ? "session hibernated after 30m idle — next message will resume it"
+          : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
+        // Idempotence backstop: a re-reap regression (e.g. the tmux 3.6a
+        // `display-message` exact-match bug worked around in
+        // `probeSessionActivity`, which made every probe look like "never
+        // attached, idle since 1970" and re-reaped every candidate on every
+        // sweep) must not re-spam the run with duplicate hibernate
+        // breadcrumbs. A legitimate later hibernate always has intervening
+        // events (resuming creates a new run / new events), so "the last
+        // persisted event for this run is this exact breadcrumb" is safe to
+        // treat as "already reaped, skip" — both the append AND the emit,
+        // since an emit without persistence would still paint a new chip
+        // client-side on every sweep.
+        if (runs.lastEventData(recent.id) !== data) {
+          saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+        }
+      }
+    }
+
+    if (reaped.length > 0) {
+      console.log(`[agetor] reaped ${reaped.length} idle claude session(s)`);
+    }
+    return { reaped };
+  } finally {
+    reapInFlight = false;
+  }
+}
+
+/**
+ * Enumerate every git worktree materialized on disk under `WORKTREES_DIR` and
+ * cross-reference it against `tasks.list()` (the directory basename equals
+ * the owning task's id by construction — see `worktreePath` in worktree.ts).
+ * Backs `GET /worktrees`.
+ *
+ * Deliberately fs + DB only — no git subprocesses — so this stays cheap
+ * enough to poll. Staleness is classified per `WorktreeStaleReason`:
+ *  - `"orphaned"` — no task row for the dir (crash/failed teardown leftover).
+ *  - `"archived"` — the owning task is archived but the dir is still present
+ *    (teardown pending, failed, or skipped because the worktree was dirty).
+ *  - `"inactive"` — not archived, no run in flight, no background
+ *    agents/workflows still running, and the task hasn't been touched in
+ *    over `WORKTREE_STALE_AFTER_MS`.
+ *
+ * Returns `[]` when `WORKTREES_DIR` doesn't exist yet (no worktree has ever
+ * been created). Non-directory entries and dotfiles are skipped.
+ */
+export function listWorktrees(): WorktreeInfo[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(WORKTREES_DIR);
+  } catch {
+    return [];
+  }
+  const taskById = new Map(tasks.list().map((t) => [t.id, t]));
+  // One grouped query for the whole listing (same pattern the `/tasks` route
+  // uses, backed by migration 042's partial index) instead of a per-row
+  // lookup — cheap enough to run unconditionally, unlike a git subprocess.
+  const runningByTask = subagents.runningCountsByTask();
+  const out: WorktreeInfo[] = [];
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    const dirPath = join(WORKTREES_DIR, name);
+    let isDir = false;
+    try {
+      isDir = statSync(dirPath).isDirectory();
+    } catch {
+      continue; // vanished between readdir and stat — skip rather than error
+    }
+    if (!isDir) continue;
+
+    const task = taskById.get(name);
+    const staleReasons: WorktreeStaleReason[] = [];
+    // Same active-run check archiveTask uses for its defence-in-depth guard.
+    const runActive = !!(task?.runId && active.has(task.runId));
+    // Background agents/workflows (subagent rows) still writing to the
+    // worktree must hold off the "inactive" flag even though the main run's
+    // own `active` slot is long gone. Sourced from the grouped map above, so
+    // this is a lookup, not a query — always `false` for an orphan (no task).
+    const heldByBackgroundAgents = !!task && (runningByTask.get(task.id) ?? 0) > 0;
+    if (!task) {
+      // No owning row — nothing else applies (can't be archived or idle-by-age).
+      staleReasons.push("orphaned");
+    } else {
+      // A worktree can carry both reasons at once (archived AND past the
+      // inactivity threshold), so these are independent checks, not a chain.
+      if (task.archivedAt != null) staleReasons.push("archived");
+      if (
+        !runActive
+        && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS
+        && !heldByBackgroundAgents
+      ) {
+        staleReasons.push("inactive");
+      }
+    }
+
+    out.push({
+      id: name,
+      path: dirPath,
+      taskId: task?.id ?? null,
+      taskTitle: task?.title ?? null,
+      column: task?.column ?? null,
+      archivedAt: task?.archivedAt ?? null,
+      taskUpdatedAt: task?.updatedAt ?? null,
+      branch: task?.branch ?? null,
+      // Owned worktree: the task's own workdir. Orphan: best-effort parse of
+      // the `.git` pointer file — plain fs, no git subprocess.
+      workdir: task?.workdir ?? parseWorktreeGitPointer(dirPath),
+      runActive,
+      heldByBackgroundAgents,
+      stale: staleReasons.length > 0,
+      staleReasons,
+    });
+  }
+  return out;
+}
+
+/**
+ * Resolve a worktree id (a directory basename under `WORKTREES_DIR`) to its
+ * absolute path, with the confinement checks shared by every worktree-id
+ * endpoint: no `/`, `\`, `..`, or empty string, and the resolved path must
+ * be a direct child of `WORKTREES_DIR`, never the directory itself (guards
+ * against ids like `"."` that pass the substring checks but normalize to
+ * `WORKTREES_DIR` — an `rm -rf` there would delete every task's worktree).
+ * Factored out of `deleteOrphanWorktree` so `worktreeGitStatus` shares the
+ * exact same guard rather than a hand-copied one that could drift.
+ */
+function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+    return { error: "invalid worktree id" };
+  }
+  const dirPath = join(WORKTREES_DIR, id);
+  if (basename(dirPath) !== id) {
+    return { error: "invalid worktree id" };
+  }
+  return { dir: dirPath };
+}
+
+/**
+ * Delete an orphaned worktree directory — one with no owning task row, so
+ * there's no ticket for `archiveTask` to archive. Used by the Worktrees
+ * page's delete action for `WorktreeInfo` rows where `taskId` is null.
+ *
+ * Refuses (rather than silently no-oping) when a task row for `id` still
+ * exists — that worktree is owned, and the caller should archive the task
+ * instead, which routes through the normal teardown path. `id` is validated
+ * via `resolveWorktreeDir` so the resolved path can never escape
+ * `WORKTREES_DIR`.
+ *
+ * Awaits `pendingTeardown(id)` before touching the directory — the fleet
+ * invariant every worktree-touching path follows, in case a stale teardown
+ * from a task that used to own this id is still draining. Never kills any
+ * tmux session: an orphan has no owning task, and the fleet rule forbids
+ * enumerate-and-kill of `agetor-*` sessions on the shared tmux socket.
+ */
+export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | { error: string }> {
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+  const dirPath = resolved.dir;
+
+  let isDir = false;
+  try {
+    isDir = statSync(dirPath).isDirectory();
+  } catch {
+    return { error: "worktree not found" };
+  }
+  if (!isDir) return { error: "worktree not found" };
+  if (tasks.get(id)) {
+    return { error: "this worktree is owned by an active task — archive the task instead" };
+  }
+
+  await pendingTeardown(id);
+
+  // Best-effort: find the source repo before the dir is gone so we can prune
+  // its stale `.git/worktrees/<id>` registration afterwards.
+  const sourceRoot = parseWorktreeGitPointer(dirPath);
+
+  // Run the rm + prune on the source repo's teardown FIFO (keyed by
+  // sourceRoot, same as archiveTask/deleteTask's teardown) so an orphan
+  // cleanup can't contend on git's `.git/worktrees/.lock` with a concurrent
+  // same-repo archive/delete teardown. `enqueueTeardown` swallows job errors
+  // — a single misbehaving teardown must not break the chain for every task
+  // queued behind it — so the closure-captured `result` is how we still
+  // surface a failed rm to the caller after the await. When the source repo
+  // can't be determined, key by `dirPath` instead: there's no shared lock
+  // domain to serialize against, so this degrades to a private one-entry
+  // chain, behaviorally the same as running it inline.
+  //
+  // Caveat: archive/delete key their chains by the raw `task.workdir` string,
+  // whereas `sourceRoot` here is the realpath'd repo root git wrote into the
+  // `.git` pointer. If those aren't byte-identical (trailing slash, a symlinked
+  // path, or a workdir that's a repo *subdir*), the orphan prune lands on a
+  // different FIFO and could still race that repo's `.git/worktrees/.lock` —
+  // the same best-effort limitation `teardownTails` already documents. Harmless
+  // (a lost lock just skips one prune; the next worktree op in that repo clears
+  // the stale registration), so not worth resolving the root to reconcile keys.
+  let result: { ok: true } | { error: string } = { ok: true };
+  await enqueueTeardown(id, sourceRoot ?? dirPath, async () => {
+    try {
+      await rm(dirPath, { recursive: true, force: true });
+    } catch (err) {
+      result = { error: `failed to remove worktree directory: ${err instanceof Error ? err.message : String(err)}` };
+      return; // don't prune if the removal failed
+    }
+    if (sourceRoot) await pruneWorktrees(sourceRoot);
+  });
+
+  return result;
+}
+
+/**
+ * On-demand live git status for a single worktree — dirty / ahead / merged —
+ * composing `hasUncommittedChanges`, `getAheadCount`, and
+ * `isMergedIntoDefaultBranch`. Deliberately not part of `listWorktrees` (fs +
+ * DB only, safe to poll): each of these spawns a git subprocess, so this is
+ * fetched per row on demand instead. Backs `GET /worktrees/:id/git-status`.
+ *
+ * Shares `resolveWorktreeDir`'s confinement with `deleteOrphanWorktree`, but
+ * — unlike delete — does not refuse task-owned ids: git status is useful for
+ * both orphan and task-backed worktrees, so callers can check staleness
+ * before deciding whether to archive.
+ *
+ * For a task-backed id, resolves the live worktree dir + pinned base ref
+ * from the task row (`worktreePath ?? workdir`, `baseRef`). For an orphan id
+ * (no task row), uses the `WORKTREES_DIR/id` path directly with no base ref
+ * — `getAheadCount` degrades to its unknown-but-not-blocking `0` in that
+ * case, same contract as everywhere else `baseRef` may be null.
+ */
+export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus | { error: string }> {
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+
+  const task = tasks.get(id);
+  const dir = task ? task.worktreePath ?? task.workdir : resolved.dir;
+  const baseRef = task ? task.baseRef ?? null : null;
+
+  const dirty0 = await hasUncommittedChanges(dir);
+  if (dirty0 === null) {
+    return { dirty: false, ahead: 0, merged: null, ignored: true, branch: null };
+  }
+
+  // Only the live branch name is needed here, so `readCheckoutBranch` (one
+  // `git symbolic-ref`) rather than `headBranchState`, whose repo check and
+  // default-branch lookup would cost a few more spawns per Worktrees row.
+  // Detached or unreadable both show as no branch.
+  const [aheadResult, merged, live] = await Promise.all([
+    getAheadCount(dir, baseRef),
+    isMergedIntoDefaultBranch(dir),
+    readCheckoutBranch(dir),
+  ]);
+
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false, branch: live.ok ? live.branch : null };
+}
+
+/**
+ * Test-only escape hatch (mirrors the `__testing` convention already used in
+ * agent-status.ts / interactions.ts / model-discovery.ts / agent-discovery.ts).
+ * Exposes `spawnFxRun` directly so its "harness not found" failure branch
+ * (Phase 8 review #10 — `spawned: false`, see that function's doc) can be
+ * exercised deterministically. That branch is NOT reachable through
+ * `resumeFxRecovery` itself: `resumeFxRecovery`'s own `kind !== "fx"` gate
+ * resolves the identical harness synchronously, with no `await` in between
+ * for the harness row to vanish before `spawnFxRun` re-resolves it — so any
+ * call that gets past that gate is guaranteed a resolvable harness. Calling
+ * `spawnFxRun` directly with a task whose `agent` doesn't resolve sidesteps
+ * that gate and hits the branch under test. See
+ * orchestrator-fx.test.ts's "spawnFxRun / resumeFxRecovery: not-spawned
+ * mapping" tests.
+ *
+ * `pendingFxAutoResume` additionally exposes whether an in-memory
+ * auto-resume timer is currently armed for a task — `fxAutoResumeTimers`
+ * itself is module-private, so tests need this to assert a timer was (or
+ * wasn't) armed/cancelled without reaching into the DB row alone (the row
+ * can be in the "scheduled" shape even in the brief window before/after the
+ * in-memory timer is armed — see `recordFxPause`/`cancelFxAutoResume`).
+ *
+ * `noteFxRunSettled` is exposed too (Phase 8 review #5's regression test):
+ * every REAL spawn path that could reach it (startTaskInner, both of
+ * `spawnFxRun`'s row lifecycles) already disarms any still-pending
+ * auto-resume timer for the task before its own run can settle, so there is
+ * no way to drive "a run settles while an unrelated timer from an earlier
+ * pause is still armed" through the public API alone — calling the hook
+ * directly is the only deterministic way to exercise that branch.
+ */
+function pendingFxAutoResume(taskId: string): boolean {
+  return fxAutoResumeTimers.has(taskId);
+}
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };

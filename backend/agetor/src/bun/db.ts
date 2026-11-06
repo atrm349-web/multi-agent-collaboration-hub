@@ -1,0 +1,4124 @@
+import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import path from "node:path";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
+import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
+import { isSpeed, speedFromFast } from "../shared/speed.ts";
+import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
+import { migrate } from "./migrate.ts";
+import { migrations } from "./migrations/index.ts";
+import { coreCredsPath } from "./core-creds.ts";
+// Interactions live in-memory in `interactions.ts`. The import creates a
+// cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
+// because both modules access each other's exports exclusively from
+// function bodies that run after module init — never at top level. Do
+// NOT add a top-level call site in either direction (e.g. a `const x =
+// tasks.get(...)` at module scope in interactions.ts) — under ESM live
+// bindings the unresolved cycle becomes an undefined-binding crash at
+// import time. Keep both sides lazy.
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
+// Same lazy-cycle contract as interactions.ts above: terminals.ts imports
+// `tasks` from this module, and we call `countTerminals` only inside `toTask`
+// (a function body), never at top level. Do not hoist this call site.
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
+
+// Hard guard against test fixtures silently leaking into the user's real
+// SQLite db. `bun test` runs every *.test.ts file in one process, so the
+// first import of db.ts wins — any test file that sets AGETOR_DATA_DIR in
+// `beforeAll` (instead of at top level) loses the race and writes to
+// ~/.agetor/agetor.sqlite. We discovered this the painful way: 10 fixture
+// tasks + dozens of phantom projects polluted the production kanban.
+// Under NODE_ENV=test, if no AGETOR_DATA_DIR was set we auto-allocate a
+// throwaway dir — guarantees we never touch ~/.agetor under tests even if
+// some test file forgot the top-level setup. Logged so the gap is visible
+// in CI output.
+if (process.env.NODE_ENV === "test" && !process.env.AGETOR_DATA_DIR) {
+  process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-test-auto-"));
+  console.warn(
+    `[agetor:db] NODE_ENV=test with no AGETOR_DATA_DIR — auto-allocated `
+    + `${process.env.AGETOR_DATA_DIR}. Set it at the TOP of the test file `
+    + `(not in beforeAll) to silence this warning.`,
+  );
+}
+const DATA_DIR = process.env.AGETOR_DATA_DIR
+  ?? path.join(homedir(), ".agetor");
+mkdirSync(DATA_DIR, { recursive: true });
+
+export const dataDir = DATA_DIR;
+
+/** Pidfile path. Written at boot by `index.ts`, read by `wipe-dev.ts` for
+ *  liveness checks. Single source of truth so a future rename doesn't
+ *  leave silent stragglers. */
+export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
+
+/** Core credentials file (port + per-launch API token + owner pid/kind),
+ *  written after the API server binds and read by the CLI/daemon to discover
+ *  and authenticate to the running core. See `core-creds.ts`. */
+export const credsFilePath = coreCredsPath(DATA_DIR);
+
+export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
+db.exec("PRAGMA journal_mode = WAL;");
+// WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
+// app. WAL already makes every transaction atomic and the database consistent
+// across an app crash AND a power loss; NORMAL merely stops forcing an fsync
+// at every commit (FULL — the default — does). That fsync was being paid on
+// every streamed `run_events` row and every unread-watermark bump: dozens of
+// disk flushes a minute while an agent works, buying durability for the last
+// few milliseconds of a log that is re-derivable from the agent's own JSONL.
+// A battery/CPU win with no correctness cost — the only thing NORMAL gives
+// up is that a kernel panic mid-stream may roll back the final commit(s).
+db.exec("PRAGMA synchronous = NORMAL;");
+db.exec("PRAGMA foreign_keys = ON;");
+
+const applied = migrate(db, migrations);
+if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
+
+type TaskRow = {
+  id: string; title: string; prompt: string; column: string; agent: string;
+  workdir: string; isolation: string;
+  task_type: string;
+  branch: string | null; worktree_path: string | null; base_ref: string | null;
+  branch_source: string;
+  pr_url: string | null;
+  issue_url: string | null;
+  mode: string | null; model: string | null; effort: string | null;
+  // Speed tier (migration 072, which dropped the old cursor-only `fast`
+  // INTEGER column) — a CHECK keeps it to `off | fast | ultrafast`, but
+  // `toTask` still validates through `isSpeed` before trusting it.
+  speed: string;
+  max_mode: number;
+  refs: string;
+  backlog: string;
+  draft: string | null;
+  plans: string;
+  todo_progress: string | null;
+  // Files delivered to the user via `SendUserFile` (migration 050). Written
+  // exclusively by `tasks.mergeSentFiles`'s targeted UPDATE, never by the
+  // generic `insert`/`update` paths below — see the comment on the `update`
+  // SET clause for why.
+  sent_files: string | null;
+  // fx's paused-recovery state + auto-resume schedule (migration 051),
+  // `TaskFxRecovery` JSON — written exclusively by `tasks.setFxRecovery`'s
+  // targeted UPDATE, never by the generic `insert`/`update` paths below
+  // (same rationale as `sent_files` above: an unrelated PATCH must not
+  // clobber a live auto-resume timer). NULL for every task that isn't
+  // currently paused.
+  fx_recovery: string | null;
+  // The agent profile this task was launched from (migration 053), if any —
+  // a soft reference to `agent_profiles.id` plus a point-in-time JSON
+  // snapshot (`AgentProfileSnapshot`). Written exclusively by `tasks.insert`
+  // (at create time) and `tasks.setAgentProfile`'s targeted UPDATE, never by
+  // the generic `insert`/`update` SET clause below — same rationale as
+  // `sent_files`/`fx_recovery` above: an unrelated PATCH landing mid-first-run
+  // must not clobber the snapshot. Both NULL means "no agent".
+  agent_profile_id: string | null;
+  agent_profile: string | null;
+  // Pipeline binding (migration 058) — see the migration's doc comment for
+  // the full split. `pipeline_id`/`pipeline_run` live on a pipeline PARENT
+  // task, written by `tasks.insert` (create time) and `tasks.setPipelineRun`
+  // (targeted UPDATE); `pipeline_parent_id`/`pipeline_step_id` live on a
+  // hidden STEP task, written only by `tasks.insert`. None of the four are
+  // touched by the generic `insert`/`update` SET clause below.
+  pipeline_id: string | null;
+  pipeline_run: string | null;
+  pipeline_parent_id: string | null;
+  pipeline_step_id: string | null;
+  // The branch agetor last observed checked out in the task's worktree
+  // (migration 063; NULL = never observed, or detached HEAD at the last
+  // observation). Written exclusively by `tasks.insert` (create time) and
+  // `tasks.setCheckoutBranch`'s targeted UPDATE, never by the generic
+  // `update` SET clause below — same rationale as `sent_files`/`fx_recovery`.
+  checkout_branch: string | null;
+  // Provenance for a Claude Code session imported from outside Agetor
+  // (migration 068). Written exclusively by `tasks.setImportedClaude`, never
+  // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
+  // clause — same rationale as `fx_recovery`/`checkout_branch`.
+  imported_claude: string | null;
+  // Which OpenCode server an opencode task's turns use (migration 079,
+  // `OpencodeServerMode`). Patchable — the generic `update` SET clause
+  // writes it. A CHECK keeps it to `shared | standalone`; `toTask` still
+  // validates before trusting it.
+  opencode_server: string;
+  // Provenance for an OpenCode session imported from outside Agetor
+  // (migration 079, `ImportedOpencodeSession` JSON). Written exclusively by
+  // `tasks.setImportedOpencode`, never by `tasks.insert` or the generic
+  // `update` SET clause — same rationale as `imported_claude`. Its claim
+  // column `imported_opencode_session_id` is never read into `Task`.
+  imported_opencode: string | null;
+  // Unread-indicator watermark pair (migration 045). Not spread into `Task`
+  // directly — only the derived `unread` boolean is (see `toTask`). Written
+  // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
+  // the generic `insert`/`update` paths (see those methods for why).
+  last_assistant_event_id: number | null;
+  last_seen_event_id: number | null;
+  run_id: string | null; created_at: number; updated_at: number;
+  archived_at: number | null;
+  /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
+   *  a correlated subquery in `list` / `get` — see those for the full SQL. */
+  has_openable_run?: number;
+};
+
+/** Statuses that mean "this task has produced something worth re-opening
+ *  the panel for". Failed / cancelled are explicit restart cases and
+ *  don't qualify — the user almost always wants to re-Run those.
+ *  Literals are inlined into the SQL (rather than `?`-bound) so the
+ *  parameter tuple stays empty and bun:sqlite's parameter-typing stays
+ *  simple. */
+const OPENABLE_STATUSES_SQL = `('succeeded', 'running', 'orphaned')`;
+
+const parseRefs = (raw: string): TaskReference[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((r): TaskReference[] => {
+      if (!r || typeof r !== "object") return [];
+      const path = (r as { path?: unknown }).path;
+      if (typeof path !== "string" || !path) return [];
+      const isDirectory = Boolean((r as { isDirectory?: unknown }).isDirectory);
+      return [{ path, isDirectory }];
+    });
+  } catch { return []; }
+};
+
+/** Coerce the raw refs value (already a TaskReference[]-ish) through the same
+ *  sanitizer `parseRefs` applies to on-disk JSON, so a backlog item's refs are
+ *  validated identically whether they come from the DB column or a fresh
+ *  client payload. */
+const sanitizeRefs = (value: unknown): TaskReference[] =>
+  Array.isArray(value) ? parseRefs(JSON.stringify(value)) : [];
+
+const parseBacklog = (raw: string): BacklogMessage[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((m): BacklogMessage[] => {
+      if (!m || typeof m !== "object") return [];
+      const id = (m as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) return [];
+      const text = (m as { text?: unknown }).text;
+      const createdAt = (m as { createdAt?: unknown }).createdAt;
+      return [{
+        id,
+        text: typeof text === "string" ? text : "",
+        references: sanitizeRefs((m as { references?: unknown }).references),
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
+/** Every status a {@link TaskPlan} may carry. A row with an unrecognized
+ *  status (future/foreign build, hand-edited DB) coerces to a NON-actionable
+ *  state — "approved" when approvedAt proves an approval happened, else
+ *  "superseded" — never "pending": approve is non-idempotent (writes a file,
+ *  messages a live agent), so corruption must not resurrect an approve button.
+ *  Losing the record entirely would still be worse, so it is kept. `rejected`
+ *  (claude-code `ExitPlanMode` plans only — a resolved-but-not-approved
+ *  outcome) is a real, non-corrupt terminal status, not a fallback target. */
+const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded", "rejected"]);
+
+const parsePlans = (raw: string): TaskPlan[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((p): TaskPlan[] => {
+      if (!p || typeof p !== "object") return [];
+      const id = (p as { id?: unknown }).id;
+      const toolCallId = (p as { toolCallId?: unknown }).toolCallId;
+      const runId = (p as { runId?: unknown }).runId;
+      const content = (p as { content?: unknown }).content;
+      if (typeof id !== "string" || !id) return [];
+      if (typeof toolCallId !== "string" || !toolCallId) return [];
+      if (typeof runId !== "string" || !runId) return [];
+      if (typeof content !== "string") return [];
+      const name = (p as { name?: unknown }).name;
+      const editedContent = (p as { editedContent?: unknown }).editedContent;
+      const status = (p as { status?: unknown }).status;
+      const createdAt = (p as { createdAt?: unknown }).createdAt;
+      const approvedAt = (p as { approvedAt?: unknown }).approvedAt;
+      const approvedEdited = (p as { approvedEdited?: unknown }).approvedEdited;
+      const filePath = (p as { filePath?: unknown }).filePath;
+      return [{
+        id,
+        toolCallId,
+        runId,
+        name: typeof name === "string" ? name : null,
+        content,
+        editedContent: typeof editedContent === "string" ? editedContent : null,
+        // An unknown/corrupt status must never coerce to "pending" — that
+        // would resurrect an already-approved (or superseded) plan as
+        // actionable again, and `approvePlan`/the approve route are
+        // non-idempotent (a second approval re-sends the message). Fall
+        // back on whether `approvedAt` is set: a numeric timestamp means it
+        // really was approved, so keep it "approved"; otherwise treat the
+        // corrupt row as history that's no longer actionable.
+        status: typeof status === "string" && PLAN_STATUSES.has(status)
+          ? (status as TaskPlan["status"])
+          : typeof approvedAt === "number"
+            ? "approved"
+            : "superseded",
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+        approvedAt: typeof approvedAt === "number" ? approvedAt : null,
+        approvedEdited: approvedEdited === true,
+        filePath: typeof filePath === "string" ? filePath : null,
+      }];
+    });
+  } catch { return []; }
+};
+
+/** Parse the stored draft JSON, tolerating NULL (no draft), malformed JSON,
+ *  and legacy/bad shapes — all collapse to `null` rather than throwing.
+ *  References are sanitized through the same `sanitizeRefs` path as backlog
+ *  items. An apparently-well-formed but effectively-empty draft (blank text,
+ *  no references) also normalizes to `null` so a stray write can't leave a
+ *  zombie draft that silently reappears in the composer. Non-empty text is
+ *  otherwise preserved verbatim — no trimming of the stored value. */
+const parseDraft = (raw: unknown): TaskDraft | null => {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const text = (parsed as { text?: unknown }).text;
+    const draft: TaskDraft = {
+      text: typeof text === "string" ? text : "",
+      references: sanitizeRefs((parsed as { references?: unknown }).references),
+    };
+    if (!draft.text.trim() && draft.references.length === 0) return null;
+    return draft;
+  } catch { return null; }
+};
+
+/** Parse the stored `todo_progress` JSON, tolerating NULL (no todo-family
+ *  tool call observed yet), malformed JSON, and unexpected shapes — all
+ *  collapse to `null` rather than throwing, same treatment as `parseDraft`.
+ *  Only `{ completed: number, total: number }` is accepted, and only when
+ *  both are non-negative integers with `completed <= total`
+ *  (`{completed:9,total:0}` or a negative count is exactly as invalid as a
+ *  missing/wrong-typed field) — anything else is discarded wholesale rather
+ *  than partially trusted, since a corrupt summary is worse than none. */
+const parseTodoProgress = (raw: string | null): Task["todoProgress"] => {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const completed = (parsed as { completed?: unknown }).completed;
+    const total = (parsed as { total?: unknown }).total;
+    if (
+      typeof completed !== "number" || !Number.isInteger(completed) || completed < 0
+      || typeof total !== "number" || !Number.isInteger(total) || total < 0
+      || completed > total
+    ) return null;
+    return { completed, total };
+  } catch { return null; }
+};
+
+/** Parse the stored `sent_files` JSON, tolerating NULL (no `SendUserFile`
+ *  delivery observed yet), malformed JSON, and a non-array top level — all
+ *  collapse to `null`, same treatment as `parseTodoProgress`. Unlike that
+ *  parser, a well-formed array with some malformed items is partially
+ *  trusted: each item is validated independently and a malformed one is
+ *  dropped rather than invalidating the whole list (an array that ends up
+ *  empty after dropping still returns `[]`, not `null` — the distinction
+ *  `sanitizeToolResultAttachments` in `shared/sent-files.ts` also draws).
+ *  Field rules mirror `SentFileEntry`: `path` a non-empty string; `size` a
+ *  finite number `>= 0` else `null`; `mediaType` a string else `null`;
+ *  `isImage` a boolean else `null`; `sentAt` a finite number (required —
+ *  there's nothing sane to default a missing delivery timestamp to);
+ *  `runId` a string (required). */
+const parseSentFiles = (raw: unknown): SentFileEntry[] | null => {
+  if (raw === null || raw === undefined) return null;
+  let parsed: unknown;
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+
+  const out: SentFileEntry[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+
+    const path = rec.path;
+    if (typeof path !== "string" || path.length === 0) continue;
+
+    const rawSize = rec.size;
+    const size = typeof rawSize === "number" && Number.isFinite(rawSize) && rawSize >= 0
+      ? rawSize
+      : null;
+
+    const rawMediaType = rec.mediaType;
+    const mediaType = typeof rawMediaType === "string" ? rawMediaType : null;
+
+    const rawIsImage = rec.isImage;
+    const isImage = typeof rawIsImage === "boolean" ? rawIsImage : null;
+
+    const sentAt = rec.sentAt;
+    if (typeof sentAt !== "number" || !Number.isFinite(sentAt)) continue;
+
+    const runId = rec.runId;
+    if (typeof runId !== "string") continue;
+
+    out.push({ path, size, mediaType, isImage, sentAt, runId });
+  }
+  return out;
+};
+
+/** Every {@link AgentKind} value a stored `harnessKind` may legitimately
+ *  carry — derived from {@link AGENT_OPTIONS}'s own keys rather than
+ *  hardcoded, so a sixth agent kind can't silently null every existing
+ *  snapshot (`AGENT_OPTIONS` is the single source of truth `AgentKind`
+ *  itself is keyed against in `shared/types.ts`). A snapshot whose
+ *  `harnessKind` isn't one of these is treated as corrupt (see
+ *  {@link parseAgentProfileSnapshot}) rather than cast blindly, since it
+ *  drives `AgentIcon`/`defaultModeFor`-style lookups on the client. */
+const AGENT_KINDS = new Set<string>(Object.keys(AGENT_OPTIONS));
+
+/**
+ * Normalize a raw `skills` value (from a JSON blob — either an
+ * {@link AgentProfile} row or a task's {@link AgentProfileSnapshot}) into the
+ * same shape `agentProfiles.insert`/`update` enforce: each entry run through
+ * {@link normalizeSkillName} (dropping anything that normalizes to `""`),
+ * deduplicated (first occurrence wins), and capped at
+ * `AGENT_PROFILE_LIMITS.skills`. A non-array input yields `[]`.
+ */
+const sanitizeSkillsList = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+    if (out.length >= AGENT_PROFILE_LIMITS.skills) break;
+  }
+  return out;
+};
+
+/**
+ * Parse a task's stored `agent_profile` JSON column into an
+ * {@link AgentProfileSnapshot}, tolerating NULL (no agent bound), malformed
+ * JSON, and unexpected shapes — all collapse to `null`, same treatment as
+ * `parseSentFiles`/`parseTaskFxRecovery`. Every field is validated
+ * defensively since the snapshot drives display (chip, transcript preamble)
+ * without any further lookup: `id`/`name`/`harness`/`model` must be strings,
+ * `harnessKind` must be a known {@link AgentKind}, `harnessLabel` is a
+ * cosmetic display string that must not be load-bearing — a missing or
+ * non-string value falls back to the (already-validated) `harness` id rather
+ * than nulling the whole snapshot, `effort`/`mode` a string or `null`,
+ * `speed` read through {@link readSnapshotSpeed} (a valid tier, else the
+ * legacy pre-072 `fast` boolean, else `"off"`) and emitted alongside its
+ * derived `fast`, `maxMode` coerced to a boolean, `instructions` a string
+ * (default `""`), `skills` sanitized via {@link sanitizeSkillsList}, and
+ * `capturedAt` a number (default `0`), and `opencodeServer`, when present, a
+ * valid `OpencodeServerMode` (invalid reads as `"shared"`; absent — every
+ * snapshot frozen before migration 079 — stays absent and means `"shared"`).
+ */
+const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  return sanitizeAgentProfileSnapshot(parsed);
+};
+
+/** A snapshot's speed tier: its own `speed` when that is a valid tier, else
+ *  the legacy `fast` boolean every snapshot written before migration 072
+ *  carries (`true` → `"fast"`), else `"off"`. Frozen snapshots (a task's
+ *  `agent_profile` column, a pipeline run's `snapshot.profiles`) are never
+ *  rewritten by a migration, so this read is the only upgrade path. */
+const readSnapshotSpeed = (rec: Record<string, unknown>): Speed =>
+  isSpeed(rec.speed) ? rec.speed : speedFromFast(rec.fast === true);
+
+/** A row's `speed` column (validated — the CHECK already guards it, but a
+ *  hand-edited row must not reach a launch as an unknown tier) plus the
+ *  derived `fast` every Task / AgentProfile response carries for older
+ *  clients (D13). Shared by `toTask` and `toAgentProfile`. */
+const speedFields = (raw: string): { speed: Speed; fast: boolean } => {
+  const speed: Speed = isSpeed(raw) ? raw : "off";
+  return { speed, fast: speed !== "off" };
+};
+
+/** The object-level half of {@link parseAgentProfileSnapshot} — shared with
+ *  `sanitizeRunSnapshot`'s `profiles` map, whose entries are already-parsed
+ *  objects rather than a JSON column. */
+const sanitizeAgentProfileSnapshot = (parsed: unknown): AgentProfileSnapshot | null => {
+  if (!parsed || typeof parsed !== "object") return null;
+  const rec = parsed as Record<string, unknown>;
+
+  const id = rec.id;
+  const name = rec.name;
+  const harness = rec.harness;
+  const model = rec.model;
+  const harnessKind = rec.harnessKind;
+  if (typeof id !== "string" || !id) return null;
+  if (typeof name !== "string" || !name) return null;
+  if (typeof harness !== "string" || !harness) return null;
+  if (typeof model !== "string" || !model) return null;
+  if (typeof harnessKind !== "string" || !AGENT_KINDS.has(harnessKind)) return null;
+
+  const harnessLabel = typeof rec.harnessLabel === "string" && rec.harnessLabel ? rec.harnessLabel : harness;
+  const effort = rec.effort;
+  const mode = rec.mode;
+  const instructions = rec.instructions;
+  const capturedAt = rec.capturedAt;
+  const speed = readSnapshotSpeed(rec);
+
+  return {
+    id,
+    name,
+    harness,
+    harnessKind: harnessKind as AgentKind,
+    harnessLabel,
+    model,
+    effort: typeof effort === "string" ? effort : null,
+    mode: typeof mode === "string" ? mode : null,
+    speed,
+    fast: speed !== "off",
+    maxMode: rec.maxMode === true,
+    // Absent (every snapshot frozen before migration 079) stays absent —
+    // readers treat that as "shared" — so a stored snapshot round-trips
+    // unchanged; an invalid value reads as "shared".
+    ...(rec.opencodeServer !== undefined ? { opencodeServer: readOpencodeServer(rec.opencodeServer) } : {}),
+    instructions: typeof instructions === "string" ? instructions : "",
+    skills: sanitizeSkillsList(rec.skills),
+    capturedAt: typeof capturedAt === "number" ? capturedAt : 0,
+  };
+};
+
+const isFiniteNumber = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+const isPlainObject = (x: unknown): x is Record<string, unknown> =>
+  typeof x === "object" && x !== null && !Array.isArray(x);
+
+const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled"]);
+const PIPELINE_BLOCK_KINDS = new Set<string>([
+  "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete",
+]);
+
+/** A stored `Handoff` is trusted structurally, not deeply — it was produced
+ *  by `parseHandoff` (`shared/pipeline.ts`) before ever reaching this
+ *  column, so re-validating every field here would just duplicate that
+ *  parser. Anything that isn't a plain object collapses to `null`. */
+const sanitizeStoredHandoff = (raw: unknown): Handoff | null => (isPlainObject(raw) ? (raw as unknown as Handoff) : null);
+
+/** One entry of `PipelineRunState.active` — dropped wholesale (not
+ *  partially trusted) when any of its three required fields is the wrong
+ *  shape, since a malformed active-step entry is unusable for orchestration
+ *  either way. */
+const sanitizeActiveStep = (raw: unknown): PipelineActiveStep | null => {
+  if (!isPlainObject(raw)) return null;
+  const { stepId, taskId, seq } = raw as Record<string, unknown>;
+  if (typeof stepId !== "string" || !stepId) return null;
+  if (typeof taskId !== "string" || !taskId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  return { stepId, taskId, seq };
+};
+
+const sanitizeJoinArrival = (raw: unknown): PipelineJoinArrival | null => {
+  if (!isPlainObject(raw)) return null;
+  const { fromStepId, seq } = raw as Record<string, unknown>;
+  if (typeof fromStepId !== "string" || !fromStepId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  return { fromStepId, seq, handoff: sanitizeStoredHandoff((raw as Record<string, unknown>).handoff) };
+};
+
+const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
+  if (!isPlainObject(raw)) return {};
+  const out: PipelineRunState["joins"] = {};
+  for (const [stepId, value] of Object.entries(raw)) {
+    if (!isPlainObject(value)) continue;
+    const rawArrivals = (value as Record<string, unknown>).arrivals;
+    const arrivals = Array.isArray(rawArrivals)
+      ? rawArrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+      : [];
+    out[stepId] = { arrivals };
+  }
+  return out;
+};
+
+/** `PipelineBlock.pending` — the run-level launch (a step-cap/profile-missing
+ *  retry, or a join-incomplete launch) Retry would re-attempt. Dropped
+ *  wholesale (never persisted as a half-valid shape) when `stepId` is
+ *  missing/empty; `arrivals` reuses `sanitizeJoinArrival`, same as
+ *  `sanitizeJoins` above, silently dropping any junk entry. */
+const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: PipelineJoinArrival[] } | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const stepId = rec.stepId;
+  if (typeof stepId !== "string" || !stepId) return null;
+  const arrivals = Array.isArray(rec.arrivals)
+    ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+    : [];
+  return { stepId, arrivals };
+};
+
+const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const kind = rec.kind;
+  if (typeof kind !== "string" || !PIPELINE_BLOCK_KINDS.has(kind)) return null;
+  const taskId = typeof rec.taskId === "string" ? rec.taskId : null;
+  const stepId = typeof rec.stepId === "string" ? rec.stepId : null;
+  const message = typeof rec.message === "string" ? rec.message : "";
+  const pending = sanitizeBlockPending(rec.pending);
+  return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}) };
+};
+
+const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);
+
+/** {@link PipelineStepRecord.responseKind}'s value set — see {@link
+ *  StepResponseKind} in `src/shared/types.ts`. */
+const STEP_RESPONSE_KINDS = new Set<string>([
+  "handoff", "handoff-blocked", "handoff-missing", "handoff-invalid", "user-ask", "error", "cancelled",
+]);
+
+/** An unrecognized/malformed `responseKind` collapses to `null` (same as a
+ *  record written before this field existed) rather than dropping the whole
+ *  history entry — it's purely a UI label, never consulted for control flow
+ *  by `resolveNextSteps`/`deriveRunStatus`/etc. */
+const sanitizeResponseKind = (raw: unknown): NonNullable<PipelineStepRecord["responseKind"]> | null =>
+  typeof raw === "string" && STEP_RESPONSE_KINDS.has(raw)
+    ? (raw as NonNullable<PipelineStepRecord["responseKind"]>)
+    : null;
+
+const STEP_REMINDER_REASONS = new Set<string>(["handoff-missing", "handoff-invalid", "handoff-next-unknown"]);
+
+/** {@link PipelineStepRecord.reminder} — the one-shot automatic handoff
+ *  reminder the runner records against an execution (`pipeline-runner.ts`'s
+ *  `handleRunStatus`). A malformed value collapses to `null` (treated the
+ *  same as "never reminded") rather than dropping the whole history entry —
+ *  the worst case is one extra reminder attempt, never a control-flow bug.
+ *  `delivered` defaults to `true` for a row written before that field
+ *  existed — every reminder ever persisted so far was in fact delivered (the
+ *  runner only records one once `sendInput` succeeds), so a missing value is
+ *  a pre-field row, not evidence of a failed send. */
+const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["reminder"]> | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const at = rec.at;
+  const reason = rec.reason;
+  const detail = rec.detail;
+  const runId = rec.runId;
+  const deliveredRaw = rec.delivered;
+  if (!isFiniteNumber(at)) return null;
+  if (typeof reason !== "string" || !STEP_REMINDER_REASONS.has(reason)) return null;
+  if (typeof detail !== "string") return null;
+  if (runId !== null && typeof runId !== "string") return null;
+  if (deliveredRaw !== undefined && typeof deliveredRaw !== "boolean") return null;
+  const delivered = typeof deliveredRaw === "boolean" ? deliveredRaw : true;
+  return {
+    at,
+    reason: reason as "handoff-missing" | "handoff-invalid" | "handoff-next-unknown",
+    runId: runId ?? null,
+    detail,
+    delivered,
+  };
+};
+
+/** One completed/cancelled execution in `PipelineRunState.history` — dropped
+ *  wholesale when its identity fields (`stepId`/`taskId`/`seq`/`startedAt`)
+ *  are malformed, since a history entry with no usable identity can't be
+ *  attributed to any step anyway; every other field defaults leniently. */
+const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const stepId = rec.stepId;
+  const taskId = rec.taskId;
+  const seq = rec.seq;
+  const startedAt = rec.startedAt;
+  if (typeof stepId !== "string" || !stepId) return null;
+  if (typeof taskId !== "string" || !taskId) return null;
+  if (!isFiniteNumber(seq)) return null;
+  if (!isFiniteNumber(startedAt)) return null;
+
+  const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
+  const outcome = typeof rec.outcome === "string" && STEP_RECORD_OUTCOMES.has(rec.outcome)
+    ? (rec.outcome as PipelineStepRecord["outcome"])
+    : null;
+  const nextStepIds = Array.isArray(rec.nextStepIds)
+    ? rec.nextStepIds.filter((x): x is string => typeof x === "string")
+    : [];
+
+  return {
+    seq, stepId, taskId, startedAt, endedAt, outcome,
+    handoff: sanitizeStoredHandoff(rec.handoff),
+    nextStepIds,
+    responseKind: sanitizeResponseKind(rec.responseKind),
+    reminder: sanitizeStepReminder(rec.reminder),
+    // Always emitted (like responseKind/reminder above) so the read shape is
+    // stable: a record saved before these fields existed reads null/false/null.
+    handoffRunId: typeof rec.handoffRunId === "string" ? rec.handoffRunId : null,
+    handoffFromOtherRun: rec.handoffFromOtherRun === true,
+    attemptStartedAt: isFiniteNumber(rec.attemptStartedAt) ? rec.attemptStartedAt : null,
+    stoppedAt: isFiniteNumber(rec.stoppedAt) ? rec.stoppedAt : null,
+    stoppedRunId: typeof rec.stoppedRunId === "string" ? rec.stoppedRunId : null,
+  };
+};
+
+/** Sanitize a `PipelineRunState.snapshot`-shaped value: `null`/non-object
+ *  collapses to `null` (no snapshot yet — the run hasn't been started).
+ *  `profiles` is kept lenient — "a record of objects" per the design, not
+ *  re-validated field-by-field against `AgentProfileSnapshot` — since it was
+ *  written by our own `snapshotFromProfile` and deep-validating it here
+ *  would only duplicate that call site.
+ *
+ *  m18: unlike `parsePipelineGraph` (the `pipelines` table's own live `graph`
+ *  column, still deep-validated via `validatePipelineGraph` on every read —
+ *  see that function's doc), a run snapshot's `graph` is validated at run
+ *  start by `startPipelineRun` (which refuses to start the run at all on a
+ *  bad graph) and captured exactly once at that point, and nothing ever
+ *  mutates a `pipeline_run` column's snapshot after it's written —
+ *  re-validating the whole graph on every read (every task poll, every
+ *  pipeline route) only spends cycles re-checking something that can't have
+ *  changed. Only shape-check enough to make it safe to hand to the
+ *  step-resolution helpers (`resolveNextSteps`/`stepNameById`/…), which
+ *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
+ *  object with array `steps`/`edges` collapses the whole snapshot to `null`
+ *  (an un-runnable snapshot is as good as none) exactly like before. */
+/** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
+ *  with a string `id` and a `position` that's a plain object with numeric
+ *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
+ *  a `position` with non-numeric coordinates) is unsafe to hand to the
+ *  pipeline editor or the step-resolution helpers (shared by `parsePipelineGraph`
+ *  below and `sanitizeRunSnapshot`), which index into both
+ *  fields unconditionally. */
+const isShapeSafePipelineStep = (x: unknown): boolean => {
+  if (!isPlainObject(x)) return false;
+  if (typeof x.id !== "string") return false;
+  const pos = x.position;
+  if (!isPlainObject(pos)) return false;
+  return isFiniteNumber(pos.x) && isFiniteNumber(pos.y);
+};
+
+/** Minimal shape check for one `PipelineGraph.edges` entry — a plain object
+ *  with string `from`/`to`. */
+const isShapeSafePipelineEdge = (x: unknown): boolean =>
+  isPlainObject(x) && typeof x.from === "string" && typeof x.to === "string";
+
+const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  // L-S7: the same per-entry shape checks `parsePipelineGraph` applies to
+  // the live template graph — a `steps` entry without a string `id` or a
+  // numeric `position`, or an `edges` entry without string `from`/`to`,
+  // collapses the whole snapshot to null rather than reaching the
+  // step-resolution helpers that index into those fields unconditionally.
+  if (
+    !isPlainObject(rec.graph) ||
+    !Array.isArray(rec.graph.steps) ||
+    !Array.isArray(rec.graph.edges) ||
+    !rec.graph.steps.every(isShapeSafePipelineStep) ||
+    !rec.graph.edges.every(isShapeSafePipelineEdge)
+  ) {
+    return null;
+  }
+  const graph = rec.graph as unknown as PipelineGraph;
+
+  // Each profile goes through the same sanitizer a task's own
+  // `agent_profile` column uses, so a run frozen before migration 072 (whose
+  // profiles carry only the legacy `fast` boolean) reads back with a real
+  // `speed`. An entry that sanitizer refuses is still kept (the lenient
+  // "record of objects" contract above — a step launch reads its fields
+  // straight off it), with only its speed pair normalized.
+  const profiles: PipelineRunSnapshot["profiles"] = {};
+  if (isPlainObject(rec.profiles)) {
+    for (const [id, value] of Object.entries(rec.profiles)) {
+      if (!isPlainObject(value)) continue;
+      const speed = readSnapshotSpeed(value);
+      profiles[id] = sanitizeAgentProfileSnapshot(value)
+        ?? ({ ...value, speed, fast: speed !== "off", ...(value.opencodeServer !== undefined ? { opencodeServer: readOpencodeServer(value.opencodeServer) } : {}) } as unknown as AgentProfileSnapshot);
+    }
+  }
+
+  const maxSteps = isFiniteNumber(rec.maxSteps) ? rec.maxSteps : PIPELINE_LIMITS.maxStepsDefault;
+  const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
+
+  return { graph, profiles, maxSteps, capturedAt };
+};
+
+/**
+ * Parse a pipeline task's stored `pipeline_run` JSON column into a
+ * {@link PipelineRunState}, tolerating NULL (not a pipeline task, or a
+ * pipeline task that predates a column backfill — neither happens in
+ * practice since `pipeline_run` is always written at insert time for a
+ * pipeline-bound task, but the parser is defensive like every other JSON
+ * column in this file), malformed JSON, and unexpected shapes — all
+ * collapse to `null`. Only `pipelineId` is hard-required (a non-empty
+ * string); every other field defaults leniently so a partially-corrupt run
+ * row degrades gracefully instead of vanishing outright — see the
+ * per-collection sanitizers above for exactly what's dropped vs. defaulted.
+ */
+export const parsePipelineRunState = (raw: string | null): PipelineRunState | null => {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  const rec = parsed;
+
+  const pipelineId = rec.pipelineId;
+  if (typeof pipelineId !== "string" || !pipelineId) return null;
+
+  const pipelineName = typeof rec.pipelineName === "string" ? rec.pipelineName : "";
+  const status: PipelineRunStatus = typeof rec.status === "string" && PIPELINE_RUN_STATUSES.has(rec.status)
+    ? (rec.status as PipelineRunStatus)
+    : "idle";
+
+  const active = Array.isArray(rec.active)
+    ? rec.active.map(sanitizeActiveStep).filter((a): a is PipelineActiveStep => a !== null)
+    : [];
+  const blocked = Array.isArray(rec.blocked)
+    ? rec.blocked.map(sanitizeBlock).filter((b): b is PipelineBlock => b !== null)
+    : [];
+  const history = Array.isArray(rec.history)
+    ? rec.history.map(sanitizeStepRecord).filter((h): h is PipelineStepRecord => h !== null)
+    : [];
+
+  // L-S4: both counters are (safe) integers by construction — the runner
+  // only ever increments them by one — so a fractional, negative, or
+  // beyond-2^53 stored value is corruption, not a real run. `capExtensions` is additionally capped at
+  // `PIPELINE_LIMITS.capExtensionsMax` so `effectiveStepCap` can never scale
+  // a run's allowance by an absurd factor off a hand-edited row.
+  const stepCount = Number.isSafeInteger(rec.stepCount) && (rec.stepCount as number) >= 0 ? (rec.stepCount as number) : 0;
+  const startedAt = isFiniteNumber(rec.startedAt) ? rec.startedAt : null;
+  const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
+
+  return {
+    pipelineId,
+    pipelineName,
+    snapshot: sanitizeRunSnapshot(rec.snapshot),
+    status,
+    active,
+    joins: sanitizeJoins(rec.joins),
+    blocked,
+    history,
+    stepCount,
+    startedAt,
+    endedAt,
+    capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
+      ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
+      : undefined,
+    // A row written before the marker existed (no key at all): a `cancelled`
+    // run was stopped, so it reads as stopped when it ended. Any other value
+    // (an explicit `null` — every write since stores the key — or junk) is a
+    // cleared marker and stays `null`, so it round-trips and is never
+    // mistaken for a legacy row on the next read.
+    stopRequestedAt: isFiniteNumber(rec.stopRequestedAt)
+      ? rec.stopRequestedAt
+      : !("stopRequestedAt" in rec) && status === "cancelled"
+        ? (endedAt ?? 0)
+        : null,
+  };
+};
+
+/** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
+ *  multi-row query does one pass over each in-memory registry instead of a
+ *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
+ *  scans on every 2s `/tasks` poll, before this). Single-task reads
+ *  (`tasks.get`, `insert`, `update`) omit this and fall back to the
+ *  per-task counters — called far less often than the poll. */
+interface TaskCounts {
+  pending?: Map<string, number>;
+  terminals?: Map<string, number>;
+}
+
+const IMPORTED_CLAUDE_STATUSES = new Set(["importing", "ready", "failed"]);
+
+/** Tolerant read of `tasks.imported_claude`. Bad JSON, or a shape missing a
+ *  required field, reads as null — never throws. */
+function parseImportedClaude(raw: string | null | undefined): ImportedClaudeSession | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.sessionId !== "string" || o.sessionId.length === 0) return null;
+  if (typeof o.configDir !== "string" || o.configDir.length === 0) return null;
+  if (typeof o.status !== "string" || !IMPORTED_CLAUDE_STATUSES.has(o.status)) return null;
+  if (typeof o.importedAt !== "number" || !Number.isFinite(o.importedAt)) return null;
+  if (typeof o.backfillOffset !== "number" || !Number.isFinite(o.backfillOffset) || o.backfillOffset < 0) return null;
+  const gitBranch = o.gitBranch === null ? null : typeof o.gitBranch === "string" ? o.gitBranch : undefined;
+  if (gitBranch === undefined) return null;
+  const error = o.error === null ? null : typeof o.error === "string" ? o.error : undefined;
+  if (error === undefined) return null;
+  return {
+    sessionId: o.sessionId,
+    gitBranch,
+    importedAt: o.importedAt,
+    configDir: o.configDir,
+    status: o.status as ImportedClaudeSession["status"],
+    backfillOffset: o.backfillOffset,
+    error,
+  };
+}
+
+const IMPORTED_OPENCODE_STATUSES = new Set(["importing", "ready", "failed"]);
+
+/** Tolerant read of `tasks.imported_opencode`, same contract as
+ *  {@link parseImportedClaude}: bad JSON, or a shape missing a required
+ *  field, reads as null — never throws. */
+function parseImportedOpencode(raw: string | null | undefined): ImportedOpencodeSession | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.sessionId !== "string" || o.sessionId.length === 0) return null;
+  if (typeof o.harnessId !== "string" || o.harnessId.length === 0) return null;
+  if (typeof o.directory !== "string" || o.directory.length === 0) return null;
+  if (typeof o.status !== "string" || !IMPORTED_OPENCODE_STATUSES.has(o.status)) return null;
+  if (typeof o.importedAt !== "number" || !Number.isFinite(o.importedAt)) return null;
+  const error = o.error === null ? null : typeof o.error === "string" ? o.error : undefined;
+  if (error === undefined) return null;
+  return {
+    sessionId: o.sessionId,
+    harnessId: o.harnessId,
+    directory: o.directory,
+    importedAt: o.importedAt,
+    status: o.status as ImportedOpencodeSession["status"],
+    error,
+  };
+}
+
+/** A row's `opencode_server` column, or a snapshot's `opencodeServer` field:
+ *  a valid {@link OpencodeServerMode}, else `"shared"` (the column default).
+ *  Shared by `toTask`, `toAgentProfile` and the profile-snapshot reader. */
+const readOpencodeServer = (raw: unknown): OpencodeServerMode =>
+  (OPENCODE_SERVER_MODES as readonly unknown[]).includes(raw) ? (raw as OpencodeServerMode) : "shared";
+
+const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
+  id: r.id,
+  title: r.title,
+  prompt: r.prompt,
+  column: r.column as Task["column"],
+  agent: r.agent as Task["agent"],
+  workdir: r.workdir,
+  isolation: r.isolation as Task["isolation"],
+  taskType: r.task_type as TaskType,
+  branch: r.branch,
+  branchSource: r.branch_source as Task["branchSource"],
+  worktreePath: r.worktree_path,
+  baseRef: r.base_ref,
+  prUrl: r.pr_url,
+  issueUrl: r.issue_url,
+  mode: r.mode,
+  model: r.model,
+  effort: r.effort,
+  ...speedFields(r.speed),
+  maxMode: r.max_mode === 1,
+  opencodeServer: readOpencodeServer(r.opencode_server),
+  references: parseRefs(r.refs),
+  backlog: parseBacklog(r.backlog),
+  draft: parseDraft(r.draft),
+  plans: parsePlans(r.plans),
+  runId: r.run_id,
+  // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
+  // join (e.g. insert/update returning the freshly-written shape, where
+  // no runs exist yet → false is the right default).
+  hasOpenableRun: r.has_openable_run === 1,
+  pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
+  openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
+  todoProgress: parseTodoProgress(r.todo_progress),
+  sentFiles: parseSentFiles(r.sent_files),
+  fxRecovery: parseTaskFxRecovery(r.fx_recovery),
+  agentProfileId: r.agent_profile_id ?? null,
+  agentProfile: parseAgentProfileSnapshot(r.agent_profile),
+  pipelineId: r.pipeline_id ?? null,
+  pipelineRun: parsePipelineRunState(r.pipeline_run),
+  pipelineParentId: r.pipeline_parent_id ?? null,
+  pipelineStepId: r.pipeline_step_id ?? null,
+  checkoutBranch: r.checkout_branch ?? null,
+  importedClaude: parseImportedClaude(r.imported_claude),
+  importedOpencode: parseImportedOpencode(r.imported_opencode),
+  // Derived, never stored: a monotonic-id watermark comparison, race-free by
+  // construction (see migration 045's doc comment). NULL
+  // `last_assistant_event_id` (no assistant event ever observed) always
+  // reads as false, matching "an upgraded/brand-new DB starts all-read".
+  unread: r.last_assistant_event_id != null && r.last_assistant_event_id > (r.last_seen_event_id ?? 0),
+  // Derived, never stored: whether the task has ever observed a top-level
+  // assistant event — the gate for "Mark as unread" (there's nothing to
+  // honestly re-flag on a task that's never gotten a response).
+  hasAssistantMessages: r.last_assistant_event_id != null,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+  archivedAt: r.archived_at,
+});
+
+/** Send and Retry use this when another task holds the session claim.
+ *  A duplicate import's losing row still has `importedClaude` after the
+ *  backfill (migration 070); that JSON is not permission to resume. */
+export const IMPORTED_CLAUDE_HELD_ELSEWHERE =
+  "another task already holds this Claude session";
+
+/** Another task already holds this Claude session id.
+ *  Follow-up runs reuse `runs.claude_session_id`, so that column is not the
+ *  claim — `tasks.imported_claude_session_id` (migration 069) is. */
+export class ImportedClaudeSessionTaken extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string) {
+    super("session is already imported");
+    this.name = "ImportedClaudeSessionTaken";
+    this.sessionId = sessionId;
+  }
+}
+
+/** Send and Retry use this when another task holds the OpenCode session
+ *  claim — the OpenCode counterpart of {@link IMPORTED_CLAUDE_HELD_ELSEWHERE}. */
+export const IMPORTED_OPENCODE_HELD_ELSEWHERE =
+  "another task already holds this OpenCode session";
+
+/** Another task already holds this OpenCode session id
+ *  (`tasks.imported_opencode_session_id`, migration 079) — the OpenCode
+ *  counterpart of {@link ImportedClaudeSessionTaken}. */
+export class ImportedOpencodeSessionTaken extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string) {
+    super("session is already imported");
+    this.name = "ImportedOpencodeSessionTaken";
+    this.sessionId = sessionId;
+  }
+}
+
+// LEFT JOIN + aggregation, so the runs scan happens once instead of once
+// per task row. `MAX(...)` over a boolean gives us 1 if any matching run
+// exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
+const TASKS_SELECT = `
+  SELECT tasks.*,
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+    FROM tasks
+    LEFT JOIN runs ON runs.task_id = tasks.id
+`;
+
+export const tasks = {
+  // Computes the pending-interaction and open-terminal grouped counts ONCE
+  // for the whole result set (two single-pass scans over their respective
+  // in-memory maps) instead of once per row via `toTask`'s per-task fallback
+  // — this is the hot path hit by the 2s `/tasks` poll.
+  list(): Task[] {
+    const rows = db.query<TaskRow, []>(
+      `${TASKS_SELECT}
+         GROUP BY tasks.id
+         ORDER BY tasks.created_at DESC`,
+    ).all();
+    const pending = pendingCountsByTask();
+    // D11: a pipeline parent task never has interactions registered against
+    // its own (hidden, agent-less) id — every interaction happens on the
+    // currently-active hidden step task. Fold each step's pending count into
+    // its parent's here, in the same O(n) pass, so the parent card's
+    // "waiting on you" glow is honest without every consumer (board, CLI,
+    // TUI) having to know about the parent/step split.
+    for (const r of rows) {
+      if (!r.pipeline_parent_id) continue;
+      const stepCount = pending.get(r.id);
+      if (!stepCount) continue;
+      pending.set(r.pipeline_parent_id, (pending.get(r.pipeline_parent_id) ?? 0) + stepCount);
+    }
+    const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
+    return rows.map((r) => toTask(r, counts));
+  },
+  /** Primary-key existence. Import backfill uses this instead of `get`,
+   *  which joins runs and parses the whole row, once per transcript line. */
+  exists(id: string): boolean {
+    if (!id) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM tasks WHERE id = ? LIMIT 1`,
+    ).get(id);
+    return row != null;
+  },
+  /** Tasks whose import is still `importing`. Reads only the provenance
+   *  column and parses it in process, so a malformed blob cannot abort boot
+   *  the way `json_extract` would, and resume does not pay for `list()`'s
+   *  runs join or badge scans. */
+  importingClaudeIds(): string[] {
+    const rows = db.query<{ id: string; imported_claude: string }, []>(
+      `SELECT id, imported_claude FROM tasks WHERE imported_claude IS NOT NULL`,
+    ).all();
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (parseImportedClaude(row.imported_claude)?.status === "importing") ids.push(row.id);
+    }
+    return ids;
+  },
+  /** Tasks whose OpenCode import is still `importing` — the
+   *  {@link importingClaudeIds} counterpart, same in-process parse. */
+  importingOpencodeIds(): string[] {
+    const rows = db.query<{ id: string; imported_opencode: string }, []>(
+      `SELECT id, imported_opencode FROM tasks WHERE imported_opencode IS NOT NULL`,
+    ).all();
+    const ids: string[] = [];
+    for (const row of rows) {
+      if (parseImportedOpencode(row.imported_opencode)?.status === "importing") ids.push(row.id);
+    }
+    return ids;
+  },
+  get(id: string): Task | null {
+    const row = db.query<TaskRow, [string]>(
+      `${TASKS_SELECT}
+         WHERE tasks.id = ?
+         GROUP BY tasks.id`,
+    ).get(id);
+    if (!row) return null;
+    const task = toTask(row);
+    // M17: a single-task read must show the same honest "waiting on you"
+    // total `list()` already computes in its batched D11 pass above — every
+    // consumer of `GET /tasks/:id` (and anything built on it, like
+    // `withRunningSubagents` or `GET /tasks/:id/pipeline`) would otherwise
+    // disagree with the board's 2s `/tasks` poll about whether a pipeline
+    // parent has anything pending. Gated on `pipeline_id` (only ever set on
+    // a real pipeline parent row, never on a step) so an ordinary task's
+    // `get` pays no extra query.
+    if (!row.pipeline_id) return task;
+    let stepPending = 0;
+    for (const step of this.stepsForParent(id)) stepPending += step.pendingInteractionCount;
+    return stepPending > 0
+      ? { ...task, pendingInteractionCount: task.pendingInteractionCount + stepPending }
+      : task;
+  },
+  /** Every hidden step task of a pipeline parent (`pipeline_parent_id =
+   *  parentId`), oldest first — the order steps were inserted in, which is
+   *  also execution order for a linear run (a fan-out/join run interleaves
+   *  by `created_at` same as any other insert order). Used by the pipeline
+   *  runner and `GET /tasks/:id/pipeline`. Reuses `TASKS_SELECT` (not a bare
+   *  `SELECT *`) so `hasOpenableRun` is computed the same way it is for
+   *  every other task read in this file. */
+  stepsForParent(parentId: string): Task[] {
+    const rows = db.query<TaskRow, [string]>(
+      `${TASKS_SELECT}
+         WHERE tasks.pipeline_parent_id = ?
+         GROUP BY tasks.id
+         ORDER BY tasks.created_at ASC, tasks.id ASC`,
+    ).all(parentId);
+    return rows.map((r) => toTask(r));
+  },
+  insert(t: Task): Task {
+    db.run(
+      `INSERT INTO tasks
+         (id, title, prompt, "column", agent, workdir, isolation, task_type,
+          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, speed, max_mode, opencode_server, refs, backlog, draft, plans, todo_progress,
+          agent_profile_id, agent_profile,
+          pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
+          checkout_branch,
+          last_assistant_event_id, last_seen_event_id,
+          run_id, created_at, updated_at, archived_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
+        t.taskType,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.speed, t.maxMode ? 1 : 0,
+        readOpencodeServer(t.opencodeServer),
+        JSON.stringify(t.references ?? []),
+        JSON.stringify(t.backlog ?? []),
+        t.draft ? JSON.stringify(t.draft) : null,
+        JSON.stringify(t.plans ?? []),
+        t.todoProgress ? JSON.stringify(t.todoProgress) : null,
+        t.agentProfileId ?? null,
+        t.agentProfile ? JSON.stringify(t.agentProfile) : null,
+        t.pipelineId ?? null,
+        t.pipelineRun ? JSON.stringify(t.pipelineRun) : null,
+        t.pipelineParentId ?? null,
+        t.pipelineStepId ?? null,
+        t.checkoutBranch ?? null,
+        // A brand-new task has never had an assistant event or a mark-seen
+        // — both start NULL, which `toTask` reads as `unread: false`.
+        null, null,
+        t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
+      ],
+    );
+    // Round-trip via `get` so the returned shape carries the computed
+    // hasOpenableRun field (false for a brand-new task — but callers
+    // that mutate t shouldn't accidentally get a stale shape).
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+  },
+  /** `fast` is excluded from the patch type: it is only the derived echo of
+   *  `speed` (the column migration 072 dropped), so a caller changes the tier
+   *  through `speed` alone. */
+  update(id: string, patch: Partial<Omit<Task, "fast">>): Task | null {
+    const current = this.get(id);
+    if (!current) return null;
+    const next: Task = { ...current, ...patch, id, updatedAt: Date.now() };
+    // Deliberately does NOT touch last_assistant_event_id/last_seen_event_id
+    // — those two columns are written exclusively by `noteAssistantEvent` /
+    // `markSeen` below via their own targeted UPDATEs. `Task` only exposes
+    // the derived `unread` boolean (see `toTask`), never the raw watermark
+    // ints, so there is nothing for a generic patch to carry for these
+    // columns anyway; omitting them from the SET clause is what makes an
+    // unrelated field edit (title, column, …) leave the watermark untouched.
+    // `sent_files` (migration 050) joins them as a third server-managed
+    // column this clause skips — it's written only by `tasks.mergeSentFiles`
+    // below via its own targeted UPDATE, on the same rationale: an unrelated
+    // PATCH must not clobber a concurrent `SendUserFile` delivery, and (like
+    // the watermarks) the write must not bump `updated_at` either, or the
+    // board would re-render every task on every 2s poll.
+    // `fx_recovery` (migration 051) joins the same skip list for the same
+    // reason again: it's written only by `tasks.setFxRecovery` below via its
+    // own targeted UPDATE, and a generic PATCH (title, column, mode, …)
+    // landing mid-pause must never silently cancel a live auto-resume
+    // schedule or wipe the paused badge — that write also never bumps
+    // `updated_at`.
+    // `agent_profile_id`/`agent_profile` (migration 053) join the same skip
+    // list too: they're written only by `tasks.insert` (create time) and
+    // `tasks.setAgentProfile` below via its own targeted UPDATE. A generic
+    // PATCH must never clobber the point-in-time snapshot — most pointedly,
+    // the copy-down of the profile's own fields (agent/model/effort/mode/
+    // speed/maxMode) that `startTask` performs right before a task's first
+    // run must not race a concurrent unrelated edit into silently detaching
+    // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
+    // this write never bumps `updated_at` either.
+    // `pipeline_id`/`pipeline_run`/`pipeline_parent_id`/`pipeline_step_id`
+    // (migration 058) join the same skip list: the first two are written
+    // only by `tasks.insert` (create time) and `tasks.setPipelineRun` below
+    // via its own targeted UPDATE, the last two only by `tasks.insert` and
+    // never change again. A generic PATCH must never clobber a live run's
+    // progress or a step task's fixed pipeline identity, and (like every
+    // other server-managed column above) none of these writes bump
+    // `updated_at`.
+    // `checkout_branch` (migration 063) joins the same skip list: it's
+    // written only by `tasks.insert` (create time) and
+    // `tasks.setCheckoutBranch` below via its own targeted UPDATE. A generic
+    // PATCH must never overwrite the last-observed checkout with whatever
+    // stale copy the caller read earlier, and (like every other
+    // server-managed column above) the write never bumps `updated_at`.
+    // `imported_claude` (migration 068) and `imported_claude_session_id`
+    // (migration 069) join the same skip list: both are written only by
+    // `tasks.setImportedClaude` below, in one UPDATE. A generic PATCH must
+    // never clobber an in-flight history backfill or drop the session claim,
+    // and that write never bumps `updated_at`. `tasks.insert` leaves both
+    // columns NULL.
+    // `imported_opencode`/`imported_opencode_session_id` (migration 079)
+    // join the same skip list on the same rationale: both are written only
+    // by `tasks.setImportedOpencode` below. `opencode_server` (also 078) is
+    // NOT skipped — it is an ordinary patchable launch field like `speed`.
+    db.run(
+      `UPDATE tasks SET
+         title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, opencode_server=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         run_id=?, updated_at=?, archived_at=?
+       WHERE id=?`,
+      [
+        next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
+        next.taskType,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.speed, next.maxMode ? 1 : 0,
+        readOpencodeServer(next.opencodeServer),
+        JSON.stringify(next.references ?? []),
+        JSON.stringify(next.backlog ?? []),
+        next.draft ? JSON.stringify(next.draft) : null,
+        JSON.stringify(next.plans ?? []),
+        next.todoProgress ? JSON.stringify(next.todoProgress) : null,
+        next.runId, next.updatedAt, next.archivedAt ?? null, id,
+      ],
+    );
+    // Re-fetch so hasOpenableRun reflects the row state immediately after
+    // this UPDATE. Note: callers that update the task AND mutate runs in
+    // the same db transaction (e.g. orchestrator's startTask) get a value
+    // computed at the moment `update` runs — if a `runs.insert` follows,
+    // the returned Task's hasOpenableRun won't see it. Subsequent
+    // `tasks.get` / `tasks.list` calls after the txn commits will.
+    return this.get(id) ?? next;
+  },
+  delete(id: string) {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  },
+  /**
+   * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
+   * catches up to `last_assistant_event_id` in a single guarded UPDATE, so
+   * the read-then-write is atomic (no SELECT + UPDATE race) and the
+   * statement no-ops entirely when the task is already caught up (the
+   * common case — the panel-open/close effect fires on every selection
+   * change). Called from `POST /tasks/:id/seen` on both open and close of
+   * the run panel (plan §3). Returns the freshly updated Task, or null if
+   * the task doesn't exist.
+   */
+  markSeen(taskId: string): Task | null {
+    // No-op when already caught up, and no `updated_at` bump either way:
+    // the watermark is server-managed read-state, not a task mutation, and
+    // touching `updated_at` here would defeat `reconcileById`'s identity
+    // preservation (every panel open/close would re-render the board).
+    db.run(
+      `UPDATE tasks SET
+         last_seen_event_id = last_assistant_event_id
+       WHERE id = ?
+         AND last_assistant_event_id IS NOT NULL
+         AND COALESCE(last_seen_event_id, 0) < last_assistant_event_id`,
+      [taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Mark a task's unread watermark back to un-caught-up: `last_seen_event_id`
+   * is set to `last_assistant_event_id - 1` (not `0` or `NULL`) so exactly
+   * the latest assistant message reads as unread — matching "one new
+   * message" semantics for a future unread count, rather than an arbitrary
+   * pile of history. Single guarded UPDATE, atomic (no SELECT + UPDATE
+   * race). The `>=` guard makes this a no-op when the task is already
+   * unread, so it can never move an already-lower watermark back up (e.g. a
+   * stale double-click on "Mark as unread"). A task with no assistant event
+   * yet (`last_assistant_event_id IS NULL`) is also a no-op — there is
+   * nothing to honestly re-flag. Called from `DELETE /tasks/:id/seen`
+   * (board's task context menu). Returns the freshly updated Task, or null
+   * if the task doesn't exist.
+   */
+  markUnread(taskId: string): Task | null {
+    // No `updated_at` bump, same reason as `markSeen`: this is server-managed
+    // read-state, not a task mutation, and touching `updated_at` would defeat
+    // `reconcileById`'s identity preservation.
+    db.run(
+      `UPDATE tasks SET
+         last_seen_event_id = last_assistant_event_id - 1
+       WHERE id = ?
+         AND last_assistant_event_id IS NOT NULL
+         AND COALESCE(last_seen_event_id, 0) >= last_assistant_event_id`,
+      [taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Monotonic bump of the unread watermark's producer side — called by the
+   * orchestrator's chunk handler after persisting a top-level (non-subagent)
+   * `assistant` event. Only writes when `eventId` is strictly greater than
+   * the current value (or the column is still NULL), so an out-of-order
+   * call — e.g. two chunks racing, or a reattach replay re-delivering an
+   * older id — can never move the watermark backwards and spuriously
+   * re-flag a task the user already caught up on.
+   */
+  noteAssistantEvent(taskId: string, eventId: number): void {
+    // Deliberately does NOT bump `updated_at`: this fires on every assistant
+    // chunk of a streaming task, and moving `updated_at` would change the
+    // row's JSON on every 2s poll — defeating `reconcileById`'s identity
+    // preservation and re-rendering the card/column/RunPanel while a task
+    // merely streams. The `unread` flip itself changes the JSON when it
+    // matters.
+    db.run(
+      `UPDATE tasks SET
+         last_assistant_event_id = ?
+       WHERE id = ? AND (last_assistant_event_id IS NULL OR last_assistant_event_id < ?)`,
+      [eventId, taskId, eventId],
+    );
+  },
+  /**
+   * Merge newly delivered `SendUserFile` files into a task's persisted
+   * `sent_files` column — called by the orchestrator's chunk handler once a
+   * `tool_result` confirms delivery (never on the tool_use alone). Reads the
+   * row's current `sent_files`, merges via the shared
+   * {@link mergeSentFilesShared} (dedupe by path, latest `sentAt` wins,
+   * capped to `MAX_SENT_FILES`), and writes the result back with a single
+   * targeted `UPDATE` — same pattern as `markSeen`/`markUnread`/
+   * `noteAssistantEvent` above: no `updated_at` bump (this is server-managed
+   * delivery state, not a task mutation, and bumping it would re-render
+   * every task on every 2s poll), and it bypasses the generic `update`'s SET
+   * clause entirely so a concurrent unrelated PATCH can't race it. An empty
+   * `incoming` is a no-op that still returns the current `Task` (mirrors
+   * `mergeSentFilesShared([...], [])` returning `existing` unchanged, minus
+   * the wasted UPDATE). Returns `null` when the task doesn't exist.
+   */
+  mergeSentFiles(taskId: string, incoming: SentFileEntry[]): Task | null {
+    const current = this.get(taskId);
+    if (!current) return null;
+    if (incoming.length === 0) return current;
+
+    const merged = mergeSentFilesShared(current.sentFiles ?? [], incoming);
+    db.run(
+      `UPDATE tasks SET sent_files = ? WHERE id = ?`,
+      [JSON.stringify(merged), taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Overwrite a task's persisted fx pause + auto-resume state in one
+   * targeted `UPDATE` — same pattern as `mergeSentFiles` above: no
+   * `updated_at` bump (server-managed state, not a task mutation — bumping
+   * it would re-render every task on every 2s poll) and it bypasses the
+   * generic `update`'s SET clause entirely so a concurrent unrelated PATCH
+   * can't race it. Called by the orchestrator at every point in the fx
+   * pause lifecycle (§3 of `docs/plans/fx-recovery-follow-ups.md`):
+   * recording a fresh pause, updating the `autoResume` schedule/counter as
+   * the auto-resume engine schedules/fires/cancels a timer, and clearing
+   * the row (`value: null`) once the pause chain ends. Doesn't check
+   * whether the task exists first — an `UPDATE ... WHERE id = ?` against a
+   * missing id simply matches zero rows, same as every other targeted
+   * UPDATE in this file.
+   */
+  setFxRecovery(taskId: string, value: TaskFxRecovery | null): void {
+    db.run(
+      `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
+      [value ? JSON.stringify(value) : null, taskId],
+    );
+  },
+  /**
+   * Write (or clear) a task's imported-Claude provenance in one targeted
+   * UPDATE. No `updated_at` bump — same pattern as `setFxRecovery`. The
+   * generic `update` SET clause skips this column, so this is the only
+   * writer. A missing task id matches zero rows.
+   *
+   * Binding a `sessionId` that another task already holds throws
+   * {@link ImportedClaudeSessionTaken}. The unique index on
+   * `imported_claude_session_id` (migration 069) makes that write the atomic
+   * claim: two commits cannot both succeed. The column is a copy of
+   * `value.sessionId`, written in this same UPDATE — `tasks.insert` and
+   * `tasks.update` leave it alone. Rewriting the same task's own session id
+   * (backfill offset, status) does not conflict.
+   *
+   * `opts.claim === false` writes the JSON only and leaves
+   * `imported_claude_session_id` untouched. A duplicate that lost the claim
+   * can be marked failed without taking the session id.
+   */
+  setImportedClaude(
+    taskId: string,
+    value: ImportedClaudeSession | null,
+    opts?: { claim?: boolean },
+  ): Task | null {
+    const claim = opts?.claim !== false;
+    try {
+      if (value && !claim) {
+        db.run(
+          `UPDATE tasks SET imported_claude = ? WHERE id = ?`,
+          [JSON.stringify(value), taskId],
+        );
+      } else {
+        db.run(
+          `UPDATE tasks SET imported_claude = ?, imported_claude_session_id = ? WHERE id = ?`,
+          [value ? JSON.stringify(value) : null, value ? value.sessionId : null, taskId],
+        );
+      }
+    } catch (err) {
+      if (value && claim && isUniqueConstraintError(err)) throw new ImportedClaudeSessionTaken(value.sessionId);
+      throw err;
+    }
+    return this.get(taskId);
+  },
+  /** The task whose imported-Claude claim holds `sessionId`, if any.
+   *  Served by `tasks_imported_claude_session_uidx`. A session that is owned
+   *  only as a normal run (no provenance yet) is not returned — callers that
+   *  mean "any run" also check `runs.hasClaudeSessionId`. */
+  findByImportedSessionId(sessionId: string): Task | null {
+    if (!sessionId) return null;
+    const row = db.query<{ id: string }, [string]>(
+      `SELECT id FROM tasks WHERE imported_claude_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row ? this.get(row.id) : null;
+  },
+  /** True when `sessionId` is claimed by a task other than `taskId`.
+   *  Callers that resume an imported session (Send, Retry) must refuse:
+   *  the losing row of a duplicate still carries the session id inside
+   *  `imported_claude` after migration 070 left its claim column NULL. */
+  importedSessionHeldElsewhere(taskId: string, sessionId: string): boolean {
+    if (!sessionId) return false;
+    const holder = this.findByImportedSessionId(sessionId);
+    return holder != null && holder.id !== taskId;
+  },
+  /** Every non-null `tasks.imported_claude_session_id`. Served by
+   *  `tasks_imported_claude_session_uidx`. The claim is written before the
+   *  seed run, so a crash between those writes still owns the session id.
+   *  Pair with `runs.claudeSessionIds` via {@link hiddenClaudeSessionIds}. */
+  importedClaudeSessionIds(): Set<string> {
+    const rows = db.query<{ imported_claude_session_id: string }, []>(
+      `SELECT imported_claude_session_id FROM tasks WHERE imported_claude_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.imported_claude_session_id));
+  },
+  /**
+   * Write (or clear) a task's imported-OpenCode provenance in one targeted
+   * UPDATE — the OpenCode counterpart of {@link setImportedClaude}, same
+   * contract: no `updated_at` bump, the only writer of `imported_opencode`
+   * and `imported_opencode_session_id` (migration 079), a missing task id
+   * matches zero rows.
+   *
+   * Binding a `sessionId` another task already holds throws
+   * {@link ImportedOpencodeSessionTaken} — the unique index
+   * `tasks_imported_opencode_session_uidx` makes the write the atomic claim.
+   * `opts.claim === false` writes the JSON only and leaves the claim column
+   * untouched, so a duplicate that lost the claim can be marked failed.
+   */
+  setImportedOpencode(
+    taskId: string,
+    value: ImportedOpencodeSession | null,
+    opts?: { claim?: boolean },
+  ): Task | null {
+    const claim = opts?.claim !== false;
+    try {
+      if (value && !claim) {
+        db.run(
+          `UPDATE tasks SET imported_opencode = ? WHERE id = ?`,
+          [JSON.stringify(value), taskId],
+        );
+      } else {
+        db.run(
+          `UPDATE tasks SET imported_opencode = ?, imported_opencode_session_id = ? WHERE id = ?`,
+          [value ? JSON.stringify(value) : null, value ? value.sessionId : null, taskId],
+        );
+      }
+    } catch (err) {
+      if (value && claim && isUniqueConstraintError(err)) throw new ImportedOpencodeSessionTaken(value.sessionId);
+      throw err;
+    }
+    return this.get(taskId);
+  },
+  /** The task whose imported-OpenCode claim holds `sessionId`, if any.
+   *  Served by `tasks_imported_opencode_session_uidx`. A session owned only
+   *  as a normal run is not returned — see `runs.hasOpencodeSessionId`. */
+  findTaskByImportedOpencodeSession(sessionId: string): Task | null {
+    if (!sessionId) return null;
+    const row = db.query<{ id: string }, [string]>(
+      `SELECT id FROM tasks WHERE imported_opencode_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row ? this.get(row.id) : null;
+  },
+  /** True when `sessionId` is claimed by a task other than `taskId`. Send
+   *  and Retry on an imported OpenCode session must refuse in that case. */
+  importedOpencodeSessionHeldElsewhere(taskId: string, sessionId: string): boolean {
+    if (!sessionId) return false;
+    const holder = this.findTaskByImportedOpencodeSession(sessionId);
+    return holder != null && holder.id !== taskId;
+  },
+  /** Every non-null `tasks.imported_opencode_session_id`. Served by
+   *  `tasks_imported_opencode_session_uidx`. Pair with
+   *  `runs.opencodeSessionIdsOwned` via {@link hiddenOpencodeSessionIds}. */
+  importedOpencodeSessionIds(): Set<string> {
+    const rows = db.query<{ imported_opencode_session_id: string }, []>(
+      `SELECT imported_opencode_session_id FROM tasks WHERE imported_opencode_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.imported_opencode_session_id));
+  },
+  /**
+   * Record the branch agetor last observed checked out in a task's worktree
+   * (`checkout_branch`, migration 063; `null` = detached HEAD / unknown) in
+   * one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump and it bypasses the generic `update`'s SET clause so a
+   * concurrent unrelated PATCH can't race it. Compare-then-write
+   * (`checkout_branch IS NOT ?`): an unchanged value matches zero rows, so a
+   * repeated observation doesn't churn the row the webview's
+   * `reconcileById` identity preservation depends on. A pipeline STEP row
+   * (non-null `pipeline_parent_id`) also writes its parent in the same
+   * transaction — step tasks share the parent's worktree and run through the
+   * ordinary orchestrator start/settle paths, so mirroring here keeps the
+   * parent card current with no runner change. Silently no-ops on an unknown
+   * task id (zero rows match, same as every other targeted UPDATE here).
+   */
+  setCheckoutBranch(taskId: string, value: string | null): void {
+    db.transaction(() => {
+      db.run(
+        `UPDATE tasks SET checkout_branch = ? WHERE id = ? AND checkout_branch IS NOT ?`,
+        [value, taskId, value],
+      );
+      const row = db
+        .query<{ pipeline_parent_id: string | null }, [string]>(
+          `SELECT pipeline_parent_id FROM tasks WHERE id = ?`,
+        )
+        .get(taskId);
+      if (row?.pipeline_parent_id) {
+        db.run(
+          `UPDATE tasks SET checkout_branch = ? WHERE id = ? AND checkout_branch IS NOT ?`,
+          [value, row.pipeline_parent_id, value],
+        );
+      }
+    })();
+  },
+  /**
+   * Bind (or detach, when both arguments are `null`) a task's agent profile
+   * in one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump (server-managed state, not a task mutation) and it
+   * bypasses the generic `update`'s SET clause entirely so a concurrent
+   * unrelated PATCH can't race it. Callers: `createTask` (initial bind),
+   * `startTask` (freshening the snapshot from the live profile right before
+   * a task's first run — see `docs/plans/agent-profiles.md` D2), and the
+   * detach route (`profileId`/`snapshot` both `null`). Doesn't check whether
+   * the task exists first — an `UPDATE ... WHERE id = ?` against a missing
+   * id simply matches zero rows, same as every other targeted UPDATE here.
+   */
+  setAgentProfile(taskId: string, profileId: string | null, snapshot: AgentProfileSnapshot | null): Task | null {
+    db.run(
+      `UPDATE tasks SET agent_profile_id = ?, agent_profile = ? WHERE id = ?`,
+      [profileId, snapshot ? JSON.stringify(snapshot) : null, taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Overwrite a pipeline PARENT task's `pipeline_run` state (`PipelineRunState`
+   * JSON, migration 058) in one targeted `UPDATE` — same pattern as
+   * `setAgentProfile`/`setFxRecovery` above: no `updated_at` bump (this is
+   * server-managed run progress, not a task mutation — the runner calls this
+   * on every state transition, and bumping `updated_at` on each one would
+   * re-render every task on every 2s poll) and it bypasses the generic
+   * `update`'s SET clause entirely so a concurrent unrelated PATCH can't
+   * race a live run. `value: null` is the pre-first-run idle state written
+   * once more explicitly by `tasks.insert`; this method's own callers
+   * (`src/bun/pipeline-runner.ts`) never pass `null` in practice once a run
+   * has started. Doesn't check whether the task exists first — an
+   * `UPDATE ... WHERE id = ?` against a missing id simply matches zero rows,
+   * same as every other targeted UPDATE in this file.
+   */
+  setPipelineRun(taskId: string, run: PipelineRunState | null): Task | null {
+    db.run(
+      `UPDATE tasks SET pipeline_run = ? WHERE id = ?`,
+      [run ? JSON.stringify(run) : null, taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Every non-archived task currently carrying a persisted fx pause whose
+   * `autoResume` schedule is non-null — the boot-time re-arm input
+   * (`rearmFxAutoResumes` in the orchestrator re-schedules a timer for each
+   * one, since in-memory timers don't survive a process restart). A paused
+   * task with `autoResume: null` (auto-resume off, exhausted, or cancelled)
+   * is deliberately excluded — there is nothing to re-arm for it. Archived
+   * tasks are excluded too: archiving cancels any pending auto-resume (see
+   * the orchestrator's archive path), so a lingering row there would be
+   * stale by construction.
+   */
+  listFxAutoResumePending(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
+    return this.listFxRecovery().filter((row) => row.fxRecovery.autoResume);
+  },
+  /**
+   * Every non-archived task carrying a persisted fx pause, with or without a
+   * pending `autoResume` — the boot sweep's input (`rearmFxAutoResumes`
+   * clears every row once the installed fx can no longer resume a pause).
+   */
+  listFxRecovery(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
+    const rows = db.query<{ id: string; fx_recovery: string | null }, []>(
+      `SELECT id, fx_recovery FROM tasks WHERE fx_recovery IS NOT NULL AND archived_at IS NULL`,
+    ).all();
+    const out: Array<{ id: string; fxRecovery: TaskFxRecovery }> = [];
+    for (const row of rows) {
+      const fxRecovery = parseTaskFxRecovery(row.fx_recovery);
+      if (fxRecovery) out.push({ id: row.id, fxRecovery });
+    }
+    return out;
+  },
+  /**
+   * Tasks archived at or before `cutoffMs` (ms epoch, the unit of
+   * `archived_at`), oldest archive first — the archived-history retention
+   * pass's candidate list (docs/plans/non-blocking-session-restore.md, T8).
+   * Un-archived tasks (`archived_at IS NULL`) never match. Ids and archive
+   * times only: the pass walks each task's runs itself and must not
+   * materialize full `Task` rows (with their JSON columns) for a table that
+   * can hold thousands of archived tasks.
+   */
+  archivedBefore(cutoffMs: number): Array<{ id: string; archivedAt: number }> {
+    return db.query<{ id: string; archived_at: number }, [number]>(
+      `SELECT id, archived_at FROM tasks
+       WHERE archived_at IS NOT NULL AND archived_at <= ?
+       ORDER BY archived_at ASC`,
+    ).all(cutoffMs).map((r) => ({ id: r.id, archivedAt: r.archived_at }));
+  },
+};
+
+/**
+ * Per-task backlog of saved, not-yet-sent draft messages. Every op is a
+ * read-modify-write on the task's `backlog` JSON column (via `tasks.update`)
+ * and returns the freshly-updated Task, or null when the task is gone. Item
+ * ids are minted here so clients never supply their own. Array order is the
+ * display order the UI renders and the user reorders. All ops are pure list
+ * transforms — there is no process side effect, so the server can call them
+ * directly without going through the orchestrator.
+ */
+export const backlog = {
+  add(taskId: string, input: { text: string; references?: TaskReference[] }): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const item: BacklogMessage = {
+      id: randomUUID(),
+      text: input.text,
+      references: sanitizeRefs(input.references),
+      createdAt: Date.now(),
+    };
+    // Newest draft on top: the thing you just jotted is the one most likely
+    // to be sent or edited next.
+    return tasks.update(taskId, { backlog: [item, ...task.backlog] });
+  },
+  updateItem(
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    // Unknown id → return the task unchanged rather than writing a no-op row.
+    if (!task.backlog.some((m) => m.id === itemId)) return task;
+    const next = task.backlog.map((m) =>
+      m.id === itemId
+        ? {
+            ...m,
+            text: patch.text !== undefined ? patch.text : m.text,
+            references:
+              patch.references !== undefined ? sanitizeRefs(patch.references) : m.references,
+          }
+        : m,
+    );
+    return tasks.update(taskId, { backlog: next });
+  },
+  remove(taskId: string, itemId: string): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    return tasks.update(taskId, {
+      backlog: task.backlog.filter((m) => m.id !== itemId),
+    });
+  },
+  /** Reorder the backlog to match `order` (item ids in the desired sequence).
+   *  Ids not in the current backlog are ignored; items absent from `order` are
+   *  appended in their existing relative order — so a stale or partial `order`
+   *  can never silently drop a saved draft. */
+  reorder(taskId: string, order: string[]): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const byId = new Map(task.backlog.map((m) => [m.id, m]));
+    const seen = new Set<string>();
+    const next: BacklogMessage[] = [];
+    for (const id of order) {
+      const m = byId.get(id);
+      if (m && !seen.has(id)) {
+        next.push(m);
+        seen.add(id);
+      }
+    }
+    for (const m of task.backlog) if (!seen.has(m.id)) next.push(m);
+    return tasks.update(taskId, { backlog: next });
+  },
+};
+
+/**
+ * The task's single composer draft — a pure wrapper over `tasks.update`, no
+ * process side effect. `null` clears it (stored as SQL NULL by `update`).
+ * References run through the same `sanitizeRefs` the read path (`parseDraft`)
+ * applies, and an effectively-empty draft (blank text, no sanitized refs)
+ * normalizes to `null` here too — otherwise a caller with junk refs could
+ * write a non-null row that reads back as `null`, a zombie draft that never
+ * shows up but never gets treated as absent either.
+ */
+export const drafts = {
+  set(taskId: string, draft: TaskDraft | null): Task | null {
+    if (draft) {
+      const references = sanitizeRefs(draft.references);
+      draft = draft.text.trim() || references.length > 0 ? { text: draft.text, references } : null;
+    }
+    return tasks.update(taskId, { draft });
+  },
+};
+
+type ProjectRow = { path: string; name: string; added_at: number; branch_config: string | null };
+
+/** Parse the stored branch-config JSON, tolerating legacy NULLs and bad data. */
+function parseBranchConfig(raw: string | null): BranchNamingConfig | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    if (v && typeof v === "object" && "rules" in v) return v as BranchNamingConfig;
+  } catch {
+    /* corrupt row — treat as "no custom config" so consumers use defaults */
+  }
+  return null;
+}
+
+const toProject = (r: ProjectRow): Project => ({
+  path: r.path,
+  name: r.name,
+  addedAt: r.added_at,
+  branchConfig: parseBranchConfig(r.branch_config),
+});
+
+export const projects = {
+  list(): Project[] {
+    return db.query<ProjectRow, []>(
+      `SELECT * FROM projects ORDER BY added_at DESC`,
+    ).all().map(toProject);
+  },
+  get(path: string): Project | null {
+    const row = db.query<ProjectRow, [string]>(
+      `SELECT * FROM projects WHERE path = ?`,
+    ).get(path);
+    return row ? toProject(row) : null;
+  },
+  /**
+   * Insert if new, refresh `added_at` if already present. The refresh lets the
+   * picker surface "recently used" paths at the top — every task creation
+   * bumps its project to the front. `branch_config` is left untouched on
+   * conflict so re-picking a project doesn't wipe its nomenclature.
+   */
+  upsert(path: string, name: string): Project {
+    const now = Date.now();
+    db.run(
+      `INSERT INTO projects (path, name, added_at) VALUES (?, ?, ?)
+       ON CONFLICT(path) DO UPDATE SET added_at = excluded.added_at`,
+      [path, name, now],
+    );
+    return this.get(path)!;
+  },
+  /**
+   * Persist (or clear, with `null`) a project's branch nomenclature. Returns
+   * the refreshed row, or null if the project isn't registered.
+   */
+  setBranchConfig(path: string, config: BranchNamingConfig | null): Project | null {
+    db.run(
+      `UPDATE projects SET branch_config = ? WHERE path = ?`,
+      [config ? JSON.stringify(config) : null, path],
+    );
+    return this.get(path);
+  },
+  delete(path: string) {
+    db.run(`DELETE FROM projects WHERE path = ?`, [path]);
+  },
+};
+
+/**
+ * Tiny key-value store for cross-session UI preferences. First customer:
+ * NewTaskForm uses `lastModel:<agent>` / `lastEffort:<agent>` keys so the
+ * pickers default to whatever the user last submitted, per agent. Values
+ * are opaque strings; the meaning of a key lives in whichever caller
+ * writes it.
+ */
+export const preferences = {
+  get(key: string): string | null {
+    const row = db.query<{ value: string }, [string]>(
+      `SELECT value FROM preferences WHERE key = ?`,
+    ).get(key);
+    return row?.value ?? null;
+  },
+  list(): Record<string, string> {
+    const rows = db.query<{ key: string; value: string }, []>(
+      `SELECT key, value FROM preferences`,
+    ).all();
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.key] = r.value;
+    return out;
+  },
+  set(key: string, value: string): void {
+    db.run(
+      `INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      [key, value, Date.now()],
+    );
+  },
+};
+
+/**
+ * Archived-history retention's record of completed sweeps (migration 067):
+ * `taskId → sweepKey`, where an unchanged key means the task holds nothing new
+ * to trim. Written only by `retention.ts`. Kept out of `preferences` so it
+ * never rides along on `GET /preferences` / `agetor config ls`.
+ */
+export const retentionSweeps = {
+  /** Every recorded key — one row per swept archived task. */
+  all(): Map<string, string> {
+    const rows = db.query<{ task_id: string; sweep_key: string }, []>(
+      `SELECT task_id, sweep_key FROM retention_swept_tasks`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.sweep_key]));
+  },
+  /** Records `taskId`'s completed sweep. A task deleted meanwhile is skipped
+   *  (no row, and no foreign-key error). */
+  set(taskId: string, sweepKey: string): void {
+    db.run(
+      `INSERT INTO retention_swept_tasks (task_id, sweep_key)
+       SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?1)
+       ON CONFLICT(task_id) DO UPDATE SET sweep_key = excluded.sweep_key`,
+      [taskId, sweepKey],
+    );
+  },
+  /** Drops the record of every task that is no longer archived at or before
+   *  `cutoff` (unarchived, or the retention age grew), so the table stays
+   *  bounded by the candidate set. */
+  pruneNotArchivedBefore(cutoff: number): void {
+    db.run(
+      `DELETE FROM retention_swept_tasks WHERE task_id NOT IN
+         (SELECT id FROM tasks WHERE archived_at IS NOT NULL AND archived_at <= ?)`,
+      [cutoff],
+    );
+  },
+};
+
+/**
+ * Claude Code session ids the launch scan has already toasted (migration
+ * 071). Offered, not imported: an id here is still listed and importable.
+ */
+export const claudeSessionSeen = {
+  ids(): Set<string> {
+    const rows = db.query<{ session_id: string }, []>(
+      `SELECT session_id FROM claude_session_seen`,
+    ).all();
+    return new Set(rows.map((r) => r.session_id));
+  },
+  /** Record `ids` as seen, in order, then keep only the newest `cap` rows.
+   *  Re-adding a known id moves it to the newest end. */
+  add(ids: readonly string[], cap: number, now: number = Date.now()): void {
+    if (ids.length === 0) return;
+    db.transaction(() => {
+      ids.forEach((id, i) => {
+        db.run(
+          `INSERT INTO claude_session_seen (session_id, seen_at) VALUES (?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET seen_at = excluded.seen_at`,
+          [id, now + i],
+        );
+      });
+      db.run(
+        `DELETE FROM claude_session_seen WHERE session_id NOT IN (
+           SELECT session_id FROM claude_session_seen
+           ORDER BY seen_at DESC, session_id DESC LIMIT ?
+         )`,
+        [cap],
+      );
+    })();
+  },
+};
+
+/**
+ * Bookkeeping for the "turn a built-in harness on once its CLI is installed"
+ * hook (migration 080, `src/bun/harness-auto-enable.ts`,
+ * docs/plans/add-opencode-harness.md D-14). A harness id here has been acted
+ * on once and is never auto-enabled again — so a user who turns it back Off
+ * keeps it off. `notified = 0` rows are the ones whose
+ * `harnesses_auto_enabled` notice has not yet reached an `/app/events`
+ * client. No FK to `harnesses` (a harnesses rebuild would cascade it away).
+ */
+export const harnessAutoEnabled = {
+  has(harnessId: string): boolean {
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM harness_auto_enabled WHERE harness_id = ? LIMIT 1`,
+    ).get(harnessId);
+    return row != null;
+  },
+  /** Record a harness as acted on. A second record of the same id is a
+   *  no-op: it keeps the first `enabled_at` and never resets `notified`. */
+  record(harnessId: string, now: number = Date.now()): void {
+    db.run(
+      `INSERT OR IGNORE INTO harness_auto_enabled (harness_id, enabled_at, notified) VALUES (?, ?, 0)`,
+      [harnessId, now],
+    );
+  },
+  /** Recorded ids whose notice is still owed, oldest record first. */
+  pending(): string[] {
+    return db.query<{ harness_id: string }, []>(
+      `SELECT harness_id FROM harness_auto_enabled WHERE notified = 0
+         ORDER BY enabled_at ASC, harness_id ASC`,
+    ).all().map((r) => r.harness_id);
+  },
+  markNotified(harnessIds: readonly string[]): void {
+    if (harnessIds.length === 0) return;
+    db.transaction(() => {
+      for (const id of harnessIds) {
+        db.run(`UPDATE harness_auto_enabled SET notified = 1 WHERE harness_id = ?`, [id]);
+      }
+    })();
+  },
+  all(): { harnessId: string; enabledAt: number; notified: boolean }[] {
+    return db.query<{ harness_id: string; enabled_at: number; notified: number }, []>(
+      `SELECT harness_id, enabled_at, notified FROM harness_auto_enabled
+         ORDER BY enabled_at ASC, harness_id ASC`,
+    ).all().map((r) => ({ harnessId: r.harness_id, enabledAt: r.enabled_at, notified: r.notified === 1 }));
+  },
+};
+
+type HarnessRow = {
+  id: string;
+  kind: string;
+  label: string;
+  is_builtin: number;
+  home: string | null;
+  bin: string | null;
+  env_json: string;
+  enabled: number;
+  // fx-only per-harness toggle (migration 073, default 1) — see
+  // `Harness.profileMcpServers`.
+  profile_mcp_servers: number;
+  created_at: number;
+  updated_at: number;
+};
+
+const toHarness = (r: HarnessRow): Harness => {
+  let env: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(r.env_json);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string") env[k] = v;
+      }
+    }
+  } catch { /* malformed env_json → empty */ }
+  return {
+    id: r.id,
+    kind: r.kind as AgentKind,
+    label: r.label,
+    isBuiltin: r.is_builtin === 1,
+    home: r.home,
+    bin: r.bin,
+    env,
+    enabled: r.enabled === 1,
+    profileMcpServers: r.profile_mcp_servers !== 0,
+  };
+};
+
+export class HarnessInUseError extends Error {
+  taskIds: string[];
+  /** Ids of the {@link AgentProfile} rows referencing this harness — a
+   *  profile delete never populates this list (deleting a profile always
+   *  succeeds; only deleting the harness it points at can be refused). */
+  profileIds: string[];
+  constructor(taskIds: string[], profileIds: string[] = []) {
+    const parts: string[] = [];
+    if (taskIds.length > 0) parts.push(`${taskIds.length} task(s)`);
+    if (profileIds.length > 0) parts.push(`${profileIds.length} agent(s)`);
+    super(`harness in use by ${parts.length > 0 ? parts.join(" and ") : "0 task(s)"}`);
+    this.taskIds = taskIds;
+    this.profileIds = profileIds;
+    this.name = "HarnessInUseError";
+  }
+}
+
+export class HarnessBuiltinError extends Error {
+  constructor(action: string) {
+    super(`cannot ${action} a built-in harness`);
+    this.name = "HarnessBuiltinError";
+  }
+}
+
+const HARNESS_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+export interface HarnessInsertInput {
+  id: string;
+  kind: AgentKind;
+  label: string;
+  home?: string | null;
+  bin?: string | null;
+  env?: Record<string, string>;
+  /** Defaults to on (the column's default) when omitted. */
+  profileMcpServers?: boolean;
+}
+
+export interface HarnessPatch {
+  label?: string;
+  home?: string | null;
+  bin?: string | null;
+  env?: Record<string, string>;
+  /** The one field `update` accepts on a built-in harness too — see its doc. */
+  profileMcpServers?: boolean;
+}
+
+export const harnesses = {
+  list(): Harness[] {
+    return db
+      .query<HarnessRow, []>(
+        `SELECT * FROM harnesses ORDER BY is_builtin DESC, created_at ASC`,
+      )
+      .all()
+      .map(toHarness);
+  },
+  get(id: string): Harness | null {
+    const row = db
+      .query<HarnessRow, [string]>(`SELECT * FROM harnesses WHERE id = ?`)
+      .get(id);
+    return row ? toHarness(row) : null;
+  },
+  /**
+   * Resolve a harness id, falling back to a synthetic built-in when the id
+   * looks like a known kind (legacy rows or freshly-deleted aliases). Used
+   * at spawn time so an out-of-band missing row never silently picks the
+   * wrong kind.
+   */
+  getByIdOrKind(id: string): Harness | null {
+    const direct = this.get(id);
+    if (direct) return direct;
+    if (
+      id === "claude-code" || id === "codex" || id === "cursor" ||
+      id === "gemini" || id === "fx" || id === "antigravity" || id === "opencode" ||
+      id === "copilot"
+    ) {
+      const label =
+        id === "claude-code" ? "Claude Code"
+        : id === "codex" ? "Codex"
+        : id === "cursor" ? "Cursor"
+        : id === "gemini" ? "Gemini CLI"
+        : id === "fx" ? "fx.sh"
+        : id === "antigravity" ? "Antigravity"
+        : id === "copilot" ? "GitHub Copilot"
+        : "OpenCode";
+      return {
+        id,
+        kind: id,
+        label,
+        isBuiltin: true,
+        home: null,
+        bin: null,
+        env: {},
+        enabled: true,
+        profileMcpServers: true,
+      } satisfies Harness;
+    }
+    return null;
+  },
+  insert(input: HarnessInsertInput): Harness {
+    if (!HARNESS_ID_RE.test(input.id)) {
+      throw new Error(
+        `invalid harness id "${input.id}" — must match ${HARNESS_ID_RE}`,
+      );
+    }
+    if (
+      input.kind !== "claude-code" && input.kind !== "codex" &&
+      input.kind !== "cursor" && input.kind !== "gemini" &&
+      input.kind !== "antigravity" && input.kind !== "fx" &&
+      input.kind !== "opencode" && input.kind !== "copilot"
+    ) {
+      throw new Error(`unknown harness kind: ${input.kind}`);
+    }
+    const now = Date.now();
+    const envJson = JSON.stringify(input.env ?? {});
+    db.run(
+      `INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, profile_mcp_servers, created_at, updated_at)
+       VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+      [
+        input.id,
+        input.kind,
+        input.label,
+        input.home ?? null,
+        input.bin ?? null,
+        envJson,
+        input.profileMcpServers === false ? 0 : 1,
+        now,
+        now,
+      ],
+    );
+    return this.get(input.id) as Harness;
+  },
+  /**
+   * Edit a harness's config. Built-ins refuse every identity/config field
+   * (`HarnessBuiltinError`), but `profileMcpServers` is a behaviour toggle
+   * like `enabled` — the built-in fx row is the harness most users run — so
+   * a patch carrying only that field is accepted on a built-in too.
+   */
+  update(id: string, patch: HarnessPatch): Harness {
+    const current = this.get(id);
+    if (!current) throw new Error(`harness not found: ${id}`);
+    const touchesConfig =
+      patch.label !== undefined || patch.home !== undefined ||
+      patch.bin !== undefined || patch.env !== undefined;
+    if (current.isBuiltin && touchesConfig) throw new HarnessBuiltinError("edit");
+    const next = {
+      label: patch.label ?? current.label,
+      home: patch.home === undefined ? current.home : patch.home,
+      bin: patch.bin === undefined ? current.bin : patch.bin,
+      env: patch.env ?? current.env,
+      profileMcpServers: patch.profileMcpServers ?? current.profileMcpServers !== false,
+    };
+    db.run(
+      `UPDATE harnesses
+         SET label = ?, home = ?, bin = ?, env_json = ?, profile_mcp_servers = ?, updated_at = ?
+       WHERE id = ?`,
+      [
+        next.label,
+        next.home,
+        next.bin,
+        JSON.stringify(next.env),
+        next.profileMcpServers ? 1 : 0,
+        Date.now(),
+        id,
+      ],
+    );
+    return this.get(id) as Harness;
+  },
+  delete(id: string): void {
+    const current = this.get(id);
+    if (!current) return;
+    if (current.isBuiltin) throw new HarnessBuiltinError("delete");
+    const inUse = db
+      .query<{ id: string }, [string]>(
+        `SELECT id FROM tasks WHERE agent = ?`,
+      )
+      .all(id);
+    const inUseByProfiles = db
+      .query<{ id: string }, [string]>(
+        `SELECT id FROM agent_profiles WHERE harness_id = ?`,
+      )
+      .all(id);
+    if (inUse.length > 0 || inUseByProfiles.length > 0) {
+      throw new HarnessInUseError(inUse.map((r) => r.id), inUseByProfiles.map((r) => r.id));
+    }
+    db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
+    // Drop any cached usage snapshot so a deleted alias doesn't leave an
+    // orphaned harness_usage row (the table has no FK cascade by design).
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
+  },
+  /**
+   * Soft delete / re-enable. Carve-out from `HarnessBuiltinError` — toggling
+   * the enabled flag is allowed on built-ins too. Identity/config fields
+   * (label, home, bin, env) remain immutable for built-ins via `update`.
+   */
+  setEnabled(id: string, enabled: boolean): Harness {
+    const current = this.get(id);
+    if (!current) throw new Error(`harness not found: ${id}`);
+    db.run(
+      `UPDATE harnesses SET enabled = ?, updated_at = ? WHERE id = ?`,
+      [enabled ? 1 : 0, Date.now(), id],
+    );
+    return this.get(id) as Harness;
+  },
+  /**
+   * Reports how many tasks reference this harness and which ones are
+   * currently running. The UI uses this to warn before disabling.
+   */
+  usage(id: string): HarnessUsage {
+    const total = db
+      .query<{ n: number }, [string]>(
+        `SELECT COUNT(*) AS n FROM tasks WHERE agent = ?`,
+      )
+      .get(id);
+    const running = db
+      .query<{ id: string }, [string]>(
+        `SELECT id FROM tasks WHERE agent = ? AND "column" = 'running'`,
+      )
+      .all(id);
+    return {
+      harnessId: id,
+      runningTaskIds: running.map((r) => r.id),
+      totalTaskCount: total?.n ?? 0,
+    };
+  },
+};
+
+type HarnessUsageRow = {
+  harness_id: string;
+  snapshot_json: string;
+  updated_at: number;
+};
+
+/**
+ * Latest per-harness usage/quota snapshot for the topbar usage tracker
+ * (docs/plans/harness-usage-tracker.md). Standalone table, deliberately not
+ * a column on `harnesses` — see migration 042's comment. `get`/`getAll`
+ * parse defensively (a malformed or stale-shape snapshot is dropped rather
+ * than thrown), mirroring `toHarness`'s handling of `env_json`.
+ */
+export const harnessUsage = {
+  get(harnessId: string): HarnessQuota | null {
+    const row = db
+      .query<HarnessUsageRow, [string]>(
+        `SELECT * FROM harness_usage WHERE harness_id = ?`,
+      )
+      .get(harnessId);
+    if (!row) return null;
+    try {
+      return JSON.parse(row.snapshot_json) as HarnessQuota;
+    } catch {
+      return null;
+    }
+  },
+  getAll(): HarnessQuota[] {
+    const rows = db
+      .query<HarnessUsageRow, []>(`SELECT * FROM harness_usage`)
+      .all();
+    const out: HarnessQuota[] = [];
+    for (const row of rows) {
+      try {
+        out.push(JSON.parse(row.snapshot_json) as HarnessQuota);
+      } catch {
+        // malformed snapshot — skip rather than throw.
+      }
+    }
+    return out;
+  },
+  upsert(quota: HarnessQuota): void {
+    db.run(
+      `INSERT INTO harness_usage (harness_id, snapshot_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(harness_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at`,
+      [quota.harnessId, JSON.stringify(quota), Date.now()],
+    );
+  },
+  delete(harnessId: string): void {
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [harnessId]);
+  },
+};
+
+type SavedPromptRow = {
+  id: string; name: string; content: string;
+  created_at: number; updated_at: number;
+};
+
+const toSavedPrompt = (r: SavedPromptRow): SavedPrompt => ({
+  id: r.id,
+  name: r.name,
+  content: r.content,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+export interface SavedPromptInsertInput {
+  name: string;
+  content: string;
+}
+
+export interface SavedPromptPatch {
+  name?: string;
+  content?: string;
+}
+
+export const savedPrompts = {
+  list(): SavedPrompt[] {
+    return db
+      .query<SavedPromptRow, []>(
+        `SELECT * FROM saved_prompts ORDER BY created_at ASC, id ASC`,
+      )
+      .all()
+      .map(toSavedPrompt);
+  },
+  get(id: string): SavedPrompt | null {
+    const row = db
+      .query<SavedPromptRow, [string]>(`SELECT * FROM saved_prompts WHERE id = ?`)
+      .get(id);
+    return row ? toSavedPrompt(row) : null;
+  },
+  insert(input: SavedPromptInsertInput): SavedPrompt {
+    const id = randomUUID();
+    const now = Date.now();
+    db.run(
+      `INSERT INTO saved_prompts (id, name, content, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, input.name, input.content, now, now],
+    );
+    return this.get(id) as SavedPrompt;
+  },
+  update(id: string, patch: SavedPromptPatch): SavedPrompt | null {
+    const current = this.get(id);
+    if (!current) return null;
+    const next = {
+      name: patch.name ?? current.name,
+      content: patch.content ?? current.content,
+    };
+    db.run(
+      `UPDATE saved_prompts SET name = ?, content = ?, updated_at = ? WHERE id = ?`,
+      [next.name, next.content, Date.now(), id],
+    );
+    return this.get(id);
+  },
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM saved_prompts WHERE id = ?`, [id]);
+    return true;
+  },
+};
+
+/** Thrown by `agentProfiles.insert`/`update` when the (trimmed,
+ *  case-insensitive) name collides with an existing profile — the `409` the
+ *  server maps this to, and what makes `agetor add --profile <name>`
+ *  unambiguous (`matchAgentProfileRef` in `shared/agent-profile.ts`). */
+export class AgentProfileNameError extends Error {
+  constructor(name: string) {
+    super(`agent name "${name}" is already in use`);
+    this.name = "AgentProfileNameError";
+  }
+}
+
+/** True for a bun:sqlite `UNIQUE` constraint violation — the backstop that
+ *  catches a name-key clash from a concurrent write that slipped past the
+ *  `findByName` pre-check below (there is no cross-process locking here, so
+ *  the pre-check alone can't be relied on to be race-free). */
+const isUniqueConstraintError = (e: unknown): boolean =>
+  e instanceof Error && "code" in e && (e as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE";
+
+type AgentProfileRow = {
+  id: string;
+  name: string;
+  name_key: string;
+  harness_id: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  speed: string;
+  max_mode: number;
+  // opencode only (migration 079): `OpencodeServerMode`, CHECK-guarded.
+  opencode_server: string;
+  instructions: string;
+  skills_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parse the stored `skills_json` column through the same sanitizer
+ *  {@link parseAgentProfileSnapshot} uses, tolerating malformed JSON or a
+ *  non-array top level (both collapse to `[]` rather than throwing) — a
+ *  profile row is our own write, but defensive parsing here costs nothing
+ *  and matches every other JSON column in this file. */
+const parseSkillsJson = (raw: string): string[] => {
+  try {
+    return sanitizeSkillsList(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+};
+
+const toAgentProfile = (r: AgentProfileRow): AgentProfile => ({
+  id: r.id,
+  name: r.name,
+  harness: r.harness_id,
+  model: r.model,
+  effort: r.effort,
+  mode: r.mode,
+  ...speedFields(r.speed),
+  maxMode: r.max_mode === 1,
+  opencodeServer: readOpencodeServer(r.opencode_server),
+  instructions: r.instructions,
+  skills: parseSkillsJson(r.skills_json),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+export interface AgentProfileInsertInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort?: string | null;
+  mode?: string | null;
+  speed?: Speed;
+  maxMode?: boolean;
+  /** opencode only; omitted ⇒ `"shared"` on insert, unchanged on update. */
+  opencodeServer?: OpencodeServerMode;
+  instructions?: string;
+  skills?: string[];
+}
+
+export interface AgentProfilePatch {
+  name?: string;
+  harness?: string;
+  model?: string;
+  effort?: string | null;
+  mode?: string | null;
+  speed?: Speed;
+  maxMode?: boolean;
+  /** opencode only; omitted ⇒ `"shared"` on insert, unchanged on update. */
+  opencodeServer?: OpencodeServerMode;
+  instructions?: string;
+  skills?: string[];
+}
+
+/** Validate + normalize the name/instructions fields shared by `insert` and
+ *  `update`: trims the name, rejects empty or over `AGENT_PROFILE_LIMITS.name`
+ *  with a plain `Error` (mirrors `harnesses.insert`'s id-format check —
+ *  these are caller/validation errors, not name-clash errors, so they're
+ *  never `AgentProfileNameError`), and rejects instructions over
+ *  `AGENT_PROFILE_LIMITS.instructions`. Returns the trimmed name and its
+ *  lower-cased `name_key`. */
+const validateAgentProfileNameAndInstructions = (name: string, instructions: string): { name: string; nameKey: string } => {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("agent name is required");
+  if (trimmed.length > AGENT_PROFILE_LIMITS.name) {
+    throw new Error(`agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer`);
+  }
+  if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+    throw new Error(`agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`);
+  }
+  return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/** `opencodeServer` on an agent-profile insert/patch: `undefined` passes
+ *  through, a member of `OPENCODE_SERVER_MODES` passes as itself, anything
+ *  else throws (the routes 400 on it first via `parseOpencodeServerInput`;
+ *  this is the db-layer backstop ahead of the column's CHECK). */
+const validateOpencodeServer = (v: unknown): OpencodeServerMode | undefined => {
+  if (v === undefined) return undefined;
+  if ((OPENCODE_SERVER_MODES as readonly unknown[]).includes(v)) return v as OpencodeServerMode;
+  throw new Error(OPENCODE_SERVER_INPUT_ERROR);
+};
+
+/**
+ * Reusable, named launch presets (`AgentProfile`, `shared/types.ts`) —
+ * see `docs/plans/agent-profiles.md` for the full design. `harness_id` is a
+ * soft reference: this module never validates that the harness exists (the
+ * server does, via `harnesses.getByIdOrKind`, before calling `insert`) — a
+ * profile pointing at a since-deleted harness id is expected once
+ * `harnesses.delete`'s guard is bypassed by hand-editing the DB, and the
+ * webview/CLI render it gracefully via the task-side snapshot's own
+ * `harnessKind`/`harnessLabel` copy.
+ */
+export const agentProfiles = {
+  list(): AgentProfile[] {
+    return db
+      .query<AgentProfileRow, []>(
+        `SELECT * FROM agent_profiles ORDER BY name_key ASC, id ASC`,
+      )
+      .all()
+      .map(toAgentProfile);
+  },
+  get(id: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE id = ?`)
+      .get(id);
+    return row ? toAgentProfile(row) : null;
+  },
+  /** Case-insensitive, trimmed name lookup — the backing query for the
+   *  unique-name check in `insert`/`update` and for `matchAgentProfileRef`'s
+   *  CLI `<id|name>` resolution. */
+  findByName(name: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE name_key = ?`)
+      .get(name.trim().toLowerCase());
+    return row ? toAgentProfile(row) : null;
+  },
+  insert(input: AgentProfileInsertInput): AgentProfile {
+    const instructions = input.instructions ?? "";
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(input.name, instructions);
+    const opencodeServer = validateOpencodeServer(input.opencodeServer) ?? "shared";
+    if (this.findByName(name)) throw new AgentProfileNameError(name);
+
+    const skills = sanitizeSkillsList(input.skills ?? []);
+    const id = randomUUID();
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO agent_profiles
+           (id, name, name_key, harness_id, model, effort, mode, speed, max_mode, opencode_server, instructions, skills_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, name, nameKey, input.harness, input.model,
+          input.effort ?? null, input.mode ?? null,
+          input.speed ?? "off", input.maxMode ? 1 : 0, opencodeServer,
+          instructions, JSON.stringify(skills), now, now,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id) as AgentProfile;
+  },
+  update(id: string, patch: AgentProfilePatch): AgentProfile | null {
+    const current = this.get(id);
+    if (!current) return null;
+
+    const nextNameRaw = patch.name !== undefined ? patch.name : current.name;
+    const nextInstructions = patch.instructions !== undefined ? patch.instructions : current.instructions;
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(nextNameRaw, nextInstructions);
+    if (patch.name !== undefined) {
+      const clash = this.findByName(name);
+      if (clash && clash.id !== id) throw new AgentProfileNameError(name);
+    }
+
+    const next = {
+      harness: patch.harness ?? current.harness,
+      model: patch.model ?? current.model,
+      effort: patch.effort !== undefined ? patch.effort : current.effort,
+      mode: patch.mode !== undefined ? patch.mode : current.mode,
+      speed: patch.speed ?? current.speed,
+      maxMode: patch.maxMode ?? current.maxMode,
+      opencodeServer: validateOpencodeServer(patch.opencodeServer) ?? current.opencodeServer,
+      skills: patch.skills !== undefined ? sanitizeSkillsList(patch.skills) : current.skills,
+    };
+
+    try {
+      db.run(
+        `UPDATE agent_profiles SET
+           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, speed = ?, max_mode = ?, opencode_server = ?, instructions = ?, skills_json = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          name, nameKey, next.harness, next.model, next.effort, next.mode,
+          next.speed, next.maxMode ? 1 : 0, next.opencodeServer, nextInstructions, JSON.stringify(next.skills),
+          Date.now(), id,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id);
+  },
+  /** Deleting a profile always succeeds — a task that was launched from it
+   *  keeps its own frozen snapshot (D7 in the plan), so there is nothing to
+   *  guard against here the way `harnesses.delete` must guard against
+   *  in-use tasks/profiles. */
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM agent_profiles WHERE id = ?`, [id]);
+    return true;
+  },
+  /** profileId -> count of tasks currently bound to it (`agent_profile_id =
+   *  profileId`, every column including archived). One grouped query, the
+   *  batch form the `GET /agent-profiles` list route uses so listing N
+   *  profiles never issues N count queries. Detaching a task
+   *  (`tasks.setAgentProfile(id, null, null)`) or deleting it lowers the
+   *  count automatically since both clear/remove `agent_profile_id`. */
+  taskCounts(): Map<string, number> {
+    const rows = db.query<{ agent_profile_id: string; n: number }, []>(
+      `SELECT agent_profile_id, COUNT(*) AS n FROM tasks WHERE agent_profile_id IS NOT NULL GROUP BY agent_profile_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.agent_profile_id, r.n]));
+  },
+  /** Single-profile count of tasks currently bound to it — for a
+   *  single-resource response (GET/POST/PATCH `/agent-profiles/:id`) where a
+   *  full grouped scan would be wasteful. */
+  taskCount(id: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE agent_profile_id = ?`,
+    ).get(id);
+    return row?.n ?? 0;
+  },
+};
+
+/** Thrown by `pipelines.insert`/`update` when the (trimmed, case-insensitive)
+ *  name collides with an existing pipeline — the `409` the server maps this
+ *  to, and what makes `agetor pipeline show <name>` unambiguous
+ *  (`matchPipelineRef` in `shared/pipeline.ts`). Mirrors
+ *  {@link AgentProfileNameError}. */
+export class PipelineNameError extends Error {
+  constructor(name: string) {
+    super(`pipeline name "${name}" is already in use`);
+    this.name = "PipelineNameError";
+  }
+}
+
+type PipelineRow = {
+  id: string;
+  name: string;
+  name_key: string;
+  description: string;
+  graph: string;
+  max_steps: number;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parse a pipeline row's stored `graph` JSON. This is our own write
+ *  (produced by `validatePipelineGraph` at insert/update time), so this only
+ *  ever fires against on-disk corruption or a shape an older/newer validator
+ *  no longer accepts, but every other JSON column in this file is parsed
+ *  defensively and `pipelines` is no exception.
+ *
+ *  m21: unparseable JSON still collapses to the empty graph
+ *  `{steps:[],edges:[],startStepId:null}` (there's nothing else to return),
+ *  logged via `console.warn` so the corruption is visible. A value that
+ *  parses fine yet fails today's `validatePipelineGraph` is returned AS-IS
+ *  (also warned) ONLY when it's still shaped safely enough to hand to the
+ *  pipeline editor and the step-resolution helpers — a plain object with
+ *  array `steps`/`edges` and a `startStepId` that's a string, `null`, or
+ *  `undefined`. That's deliberately lenient (not full `validatePipelineGraph`
+ *  again): the pipeline editor reads this value straight through, and an
+ *  editor session that opens, makes an unrelated change, and saves would
+ *  otherwise silently overwrite the user's real graph with nothing.
+ *  Anything looser than that minimal shape (not an object, non-array
+ *  `steps`/`edges`, a `startStepId` of some other type) collapses to the
+ *  empty graph instead — there's nothing safe to index into otherwise.
+ *  Trusting the stored shape here is the same call `sanitizeRunSnapshot`
+ *  makes for a run's frozen snapshot, for a different reason — this one is
+ *  "don't destroy data", not "don't re-validate a graph that already
+ *  validated once". */
+
+const parsePipelineGraph = (raw: string): PipelineGraph => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(`[agetor] pipeline graph column is not valid JSON — falling back to an empty graph:`, err);
+    return { steps: [], edges: [], startStepId: null };
+  }
+  const validated = validatePipelineGraph(parsed);
+  if (validated.ok) return validated.graph;
+  console.warn(`[agetor] stored pipeline graph failed validation (${validated.error}) — returning it unmodified if shape-safe`);
+  if (isPlainObject(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    const startStepIdOk = rec.startStepId === undefined || rec.startStepId === null || typeof rec.startStepId === "string";
+    if (
+      Array.isArray(rec.steps) &&
+      Array.isArray(rec.edges) &&
+      startStepIdOk &&
+      rec.steps.every(isShapeSafePipelineStep) &&
+      rec.edges.every(isShapeSafePipelineEdge)
+    ) {
+      return parsed as unknown as PipelineGraph;
+    }
+  }
+  console.warn(`[agetor] stored pipeline graph shape is unsafe to return as-is — falling back to an empty graph`);
+  return { steps: [], edges: [], startStepId: null };
+};
+
+const toPipeline = (r: PipelineRow): Pipeline => ({
+  id: r.id,
+  name: r.name,
+  description: r.description,
+  graph: parsePipelineGraph(r.graph),
+  maxSteps: r.max_steps,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+/** Validate + normalize the name/description fields shared by `insert` and
+ *  `update`: trims the name, rejects empty or over `PIPELINE_LIMITS.name`
+ *  with a plain `Error` (a caller/validation error, not a name-clash error
+ *  — mirrors `validateAgentProfileNameAndInstructions`), and rejects a
+ *  description over `PIPELINE_LIMITS.description`. Returns the trimmed name
+ *  and its lower-cased `name_key`. */
+const validatePipelineNameAndDescription = (name: string, description: string): { name: string; nameKey: string } => {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("pipeline name is required");
+  if (trimmed.length > PIPELINE_LIMITS.name) {
+    throw new Error(`pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer`);
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(trimmed)) {
+    throw new Error("pipeline name must not contain control characters");
+  }
+  if (description.length > PIPELINE_LIMITS.description) {
+    throw new Error(`pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer`);
+  }
+  return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/** Resolve a requested `maxSteps`: absent (`undefined`) defaults to
+ *  `PIPELINE_LIMITS.maxStepsDefault`; anything else must be an integer in
+ *  `1..PIPELINE_LIMITS.maxStepsMax` or this throws a plain `Error` (a
+ *  caller/validation error, like `validatePipelineNameAndDescription`'s).
+ *  L-S5: this used to CLAMP out-of-range values silently, which let the db
+ *  layer be handed exactly what the `/pipelines` routes 400 on — the two
+ *  layers now agree, and the route's error text is reused verbatim. */
+const resolveMaxSteps = (raw: number | undefined): number => {
+  if (raw === undefined) return PIPELINE_LIMITS.maxStepsDefault;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > PIPELINE_LIMITS.maxStepsMax) {
+    throw new Error(`maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}`);
+  }
+  return raw;
+};
+
+/**
+ * Named, reusable pipeline graphs (`Pipeline`, `shared/types.ts`) — the
+ * templates a pipeline task is launched from. See `docs/plans/pipelines.md`
+ * for the full design. Structurally a near-clone of `agentProfiles` above:
+ * unique case-insensitive names via `name_key`, delete is never blocked
+ * (D8 — an already-started run is frozen onto its own
+ * `tasks.pipeline_run.snapshot` and doesn't need the live row), and
+ * `taskCounts`/`taskCount` mirror `agentProfiles`' the same way. The one
+ * addition is `graph` validation/normalization on every write, via
+ * `validatePipelineGraph` (`shared/pipeline.ts`) — `insert`/`update` never
+ * store an un-normalized graph, and a graph that fails validation throws a
+ * plain `Error` carrying `validatePipelineGraph`'s own message (the server
+ * maps that to a 400).
+ */
+export const pipelines = {
+  list(): Pipeline[] {
+    return db
+      .query<PipelineRow, []>(`SELECT * FROM pipelines ORDER BY name_key ASC, id ASC`)
+      .all()
+      .map(toPipeline);
+  },
+  get(id: string): Pipeline | null {
+    const row = db.query<PipelineRow, [string]>(`SELECT * FROM pipelines WHERE id = ?`).get(id);
+    return row ? toPipeline(row) : null;
+  },
+  /** Case-insensitive, trimmed name lookup — the backing query for the
+   *  unique-name check in `insert`/`update` and for `matchPipelineRef`'s CLI
+   *  `<id|name>` resolution. */
+  findByName(name: string): Pipeline | null {
+    const row = db
+      .query<PipelineRow, [string]>(`SELECT * FROM pipelines WHERE name_key = ?`)
+      .get(name.trim().toLowerCase());
+    return row ? toPipeline(row) : null;
+  },
+  insert(input: PipelineInput): Pipeline {
+    const description = input.description ?? "";
+    const { name, nameKey } = validatePipelineNameAndDescription(input.name, description);
+    if (this.findByName(name)) throw new PipelineNameError(name);
+
+    const validated = validatePipelineGraph(input.graph);
+    if (!validated.ok) throw new Error(validated.error);
+
+    const maxSteps = resolveMaxSteps(input.maxSteps);
+    const id = randomUUID();
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO pipelines
+           (id, name, name_key, description, graph, max_steps, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, name, nameKey, description, JSON.stringify(validated.graph), maxSteps, now, now],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new PipelineNameError(name);
+      throw e;
+    }
+    return this.get(id) as Pipeline;
+  },
+  update(id: string, patch: Partial<PipelineInput>): Pipeline | null {
+    const current = this.get(id);
+    if (!current) return null;
+
+    const nextNameRaw = patch.name !== undefined ? patch.name : current.name;
+    const nextDescription = patch.description !== undefined ? patch.description : current.description;
+    const { name, nameKey } = validatePipelineNameAndDescription(nextNameRaw, nextDescription);
+    if (patch.name !== undefined) {
+      const clash = this.findByName(name);
+      if (clash && clash.id !== id) throw new PipelineNameError(name);
+    }
+
+    const validated = patch.graph !== undefined ? validatePipelineGraph(patch.graph) : { ok: true as const, graph: current.graph };
+    if (!validated.ok) throw new Error(validated.error);
+
+    const maxSteps = patch.maxSteps !== undefined ? resolveMaxSteps(patch.maxSteps) : current.maxSteps;
+
+    try {
+      db.run(
+        `UPDATE pipelines SET
+           name = ?, name_key = ?, description = ?, graph = ?, max_steps = ?, updated_at = ?
+         WHERE id = ?`,
+        [name, nameKey, nextDescription, JSON.stringify(validated.graph), maxSteps, Date.now(), id],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new PipelineNameError(name);
+      throw e;
+    }
+    return this.get(id);
+  },
+  /** Deleting a pipeline always succeeds — a task that was launched from it
+   *  keeps its own frozen `pipeline_run.snapshot` (D8 in the plan), so there
+   *  is nothing to guard against here the way `harnesses.delete` must guard
+   *  against in-use tasks/profiles. Mirrors `agentProfiles.delete`. */
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM pipelines WHERE id = ?`, [id]);
+    return true;
+  },
+  /** pipelineId -> count of tasks currently bound to it (`pipeline_id =
+   *  pipelineId`, every column including archived). One grouped query — the
+   *  batch form the `GET /pipelines` list route uses so listing N pipelines
+   *  never issues N count queries. Mirrors `agentProfiles.taskCounts`. */
+  taskCounts(): Map<string, number> {
+    const rows = db.query<{ pipeline_id: string; n: number }, []>(
+      `SELECT pipeline_id, COUNT(*) AS n FROM tasks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.pipeline_id, r.n]));
+  },
+  /** Single-pipeline count of tasks currently bound to it — for a
+   *  single-resource response (GET/POST/PATCH `/pipelines/:id`) where a full
+   *  grouped scan would be wasteful. Mirrors `agentProfiles.taskCount`. */
+  taskCount(id: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE pipeline_id = ?`,
+    ).get(id);
+    return row?.n ?? 0;
+  },
+};
+
+type RunRow = {
+  id: string; task_id: string; agent: string; status: string;
+  started_at: number; ended_at: number | null; exit_code: number | null;
+  tmux_session: string | null;
+  claude_session_id: string | null;
+  codex_session_id: string | null;
+  cursor_session_id: string | null;
+  gemini_session_id: string | null;
+  fx_session_id: string | null;
+  antigravity_session_id: string | null;
+  // OpenCode's own session id (`ses_…`, migration 078), discovered from the
+  // first NDJSON line that carries a `sessionID` and replayed via `-s`.
+  opencode_session_id: string | null;
+  copilot_session_id: string | null;
+  origin: string | null;
+};
+
+/** Every per-kind session-id column on `runs` — the closed whitelist
+ *  `runs.sessionIdsForTask` interpolates into its SQL. */
+export const SESSION_ID_COLUMNS = [
+  "claude_session_id",
+  "codex_session_id",
+  "cursor_session_id",
+  "gemini_session_id",
+  "antigravity_session_id",
+  "fx_session_id",
+  "opencode_session_id",
+  "copilot_session_id",
+] as const;
+export type SessionIdColumn = (typeof SESSION_ID_COLUMNS)[number];
+
+/** One `run_events` row as the task-level event reads return it
+ *  (`runs.eventsForTask`, `runs.eventsForTaskAfter`). */
+export type TaskEventRow = {
+  id: number;
+  runId: string;
+  stream: string;
+  data: string;
+  ts: number;
+  subagentId: string | null;
+};
+
+/** What `runs.appendEvent` stored: the row id and the timestamp written to
+ *  it — callers broadcast this exact pair so a live frame and its replayed
+ *  twin agree on `id` and `ts`. */
+export interface AppendedEvent {
+  id: number;
+  ts: number;
+}
+
+/** Answer of `runs.eventsForTaskAfter`: the rows after the cursor, or a
+ *  refusal telling the client to take a fresh window. */
+export type ForwardResumeResult =
+  | { kind: "resume"; rows: TaskEventRow[] }
+  | { kind: "snapshot"; reason: ForwardResumeSnapshotReason };
+
+/**
+ * Given rows in DESC (newest-first) id order — each carrying its `data`
+ * column's `LENGTH()` as `len` — finds the id of the oldest row to keep
+ * under a byte budget, walking newest → oldest and accumulating `len`.
+ * Always keeps at least `minEvents` rows before the budget can cut anything
+ * off (the `MIN_REPLAY_EVENTS` floor — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §3.3), and
+ * always keeps at least ONE row regardless of `minEvents`, so a caller can
+ * never get back an empty window from a non-empty input. `len` is the
+ * UTF-8 byte length of each event's `data` — `eventsForTask` selects
+ * `LENGTH(CAST(data AS BLOB))` (bytes; plain `LENGTH()` on TEXT would count
+ * characters) and the rebuild route uses `Buffer.byteLength`, so the
+ * budgets count what actually goes over the wire. Returns `null` only when
+ * `rowsDesc` is empty. Pure and
+ * DB-free so it's unit-testable on its own.
+ */
+export function clampWindowByBytes(
+  rowsDesc: Array<{ id: number; len: number }>,
+  maxBytes: number,
+  minEvents: number,
+): number | null {
+  if (rowsDesc.length === 0) return null;
+  let accumulated = 0;
+  let count = 0;
+  for (const row of rowsDesc) {
+    if (count >= minEvents && accumulated + row.len > maxBytes) break;
+    accumulated += row.len;
+    count++;
+  }
+  if (count === 0) count = 1;
+  return rowsDesc[count - 1]!.id;
+}
+
+/**
+ * Decides whether a first-load window should be extended back to an anchor
+ * event (the newest main-stream `user` event) — see
+ * `docs/plans/first-load-reaches-last-user-message.md` §3. The extension is
+ * ALL-OR-NOTHING: either the whole span `[anchorId, beforeId)` fits under
+ * both ceilings and `anchorId` becomes the new floor, or the caller's
+ * existing `minId` (the default count/byte-budgeted window) stands unchanged
+ * — there is no partial extension.
+ *
+ * - `anchorId == null` (no user event at all, e.g. a task with only status
+ *   breadcrumbs) → `minId` unchanged.
+ * - `anchorId >= minId` — the anchor already sits inside (or exactly at the
+ *   edge of) the default window → `minId` unchanged; nothing to extend.
+ * - Otherwise `spanRowsDesc` — the DESC (newest-first) `{id, len}` rows of
+ *   the span `id >= anchorId` (and `id < beforeId` when the caller has one),
+ *   capped by the CALLER at `maxEvents + 1` rows — decides it:
+ *   - `spanRowsDesc.length > maxEvents` → the span holds MORE than
+ *     `maxEvents` events (the `+1` the caller fetched proves it, without
+ *     this function ever seeing an unbounded row set) → `minId` unchanged.
+ *   - else sum every row's `len`; `> maxBytes` → `minId` unchanged;
+ *     otherwise → `anchorId` (the window now starts at the anchor).
+ *
+ * Both callers (the SSE replay route via `eventsForTask`'s `opts.anchor`,
+ * and the `?limit=` rebuild-snapshot route directly, over its in-memory
+ * mapped events with `id` = array index) share this one rule and its unit
+ * tests, so "does the span fit" can't drift between the two surfaces. Pure
+ * and DB-free, like `clampWindowByBytes`.
+ */
+export function resolveAnchoredMinId(args: {
+  minId: number;
+  anchorId: number | null;
+  spanRowsDesc: Array<{ id: number; len: number }>;
+  maxEvents: number;
+  maxBytes: number;
+}): number {
+  const { minId, anchorId, spanRowsDesc, maxEvents, maxBytes } = args;
+  if (anchorId == null || anchorId >= minId) return minId;
+  if (spanRowsDesc.length > maxEvents) return minId;
+  let total = 0;
+  for (const row of spanRowsDesc) total += row.len;
+  if (total > maxBytes) return minId;
+  return anchorId;
+}
+
+const toRun = (r: RunRow): Run => ({
+  id: r.id,
+  taskId: r.task_id,
+  agent: r.agent as Run["agent"],
+  status: r.status as Run["status"],
+  startedAt: r.started_at,
+  endedAt: r.ended_at,
+  exitCode: r.exit_code,
+  tmuxSession: r.tmux_session,
+  claudeSessionId: r.claude_session_id,
+  codexSessionId: r.codex_session_id,
+  cursorSessionId: r.cursor_session_id,
+  geminiSessionId: r.gemini_session_id,
+  fxSessionId: r.fx_session_id,
+  antigravitySessionId: r.antigravity_session_id,
+  opencodeSessionId: r.opencode_session_id,
+  copilotSessionId: r.copilot_session_id,
+  origin: (r.origin as Run["origin"]) ?? null,
+});
+
+/**
+ * The retention trim's candidate query (see `runs.toolResultRowsForTrim`).
+ * Exported so the `EXPLAIN QUERY PLAN` guard test can assert it SEARCHes
+ * `idx_run_events_run` with no temp b-tree sort.
+ */
+export const TOOL_RESULT_TRIM_SQL = `SELECT id, data FROM run_events
+  WHERE run_id = ? AND stream = 'tool_result' AND LENGTH(CAST(data AS BLOB)) > ?
+    AND substr(data, 1, 13) != '{"retention":' AND id > ?
+  ORDER BY id LIMIT ?`;
+
+export const runs = {
+  listForTask(taskId: string): Run[] {
+    return db.query<RunRow, [string]>(
+      `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC`,
+    ).all(taskId).map(toRun);
+  },
+  /**
+   * Total run count for a task, across every status — the "has this task
+   * ever run" test `effectiveAgentProfile` (docs/plans/agent-profiles.md D2)
+   * uses to decide whether a bound agent profile is still "live" (follows
+   * edits) or frozen to its captured snapshot. A plain `COUNT(*)` rather
+   * than `listForTask(...).length` so the caller isn't paying to materialize
+   * every run row just to check the count.
+   */
+  countForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM runs WHERE task_id = ?`,
+    ).get(taskId);
+    return row?.n ?? 0;
+  },
+  get(id: string): Run | null {
+    const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
+    return row ? toRun(row) : null;
+  },
+  /** `r.origin` is optional on the `Run` type (most callers don't set it —
+   *  only the continuation-run factory does) so `?? null` keeps a
+   *  user-initiated run's row explicitly NULL rather than the JS `undefined`
+   *  bun:sqlite would otherwise bind. */
+  insert(r: Run): Run {
+    db.run(
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.opencodeSessionId ?? null, r.copilotSessionId ?? null, r.origin ?? null],
+    );
+    return { ...r, origin: r.origin ?? null };
+  },
+  update(id: string, patch: Partial<Run>): Run | null {
+    const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
+    if (!row) return null;
+    const current = toRun(row);
+    const next: Run = { ...current, ...patch, id };
+    db.run(
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=?, opencode_session_id=?, copilot_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, next.opencodeSessionId ?? null, next.copilotSessionId ?? null, id],
+    );
+    return next;
+  },
+  /** Events for a single run, in event-id order. `runId` is the same as
+   *  the argument — included on every row so the shape matches
+   *  `eventsForTask`, keeping the two helpers interchangeable to a
+   *  caller that just wants `{ runId, stream, data, ts }`. */
+  events(runId: string) {
+    return db.query<
+      { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
+      [string]
+    >(
+      `SELECT run_id as runId, stream, data, ts, subagent_id as subagentId
+       FROM run_events
+       WHERE run_id = ?
+       ORDER BY id ASC`,
+    ).all(runId);
+  },
+  /** The most recently persisted MAIN-stream event's raw `data` for a run
+   *  (`subagent_id IS NULL`, like `seenLineUuidsForTask`), or `null` if the
+   *  run has none yet.
+   *
+   *  Backs `reapIdleSessions`'s idempotence guard: a re-reap regression
+   *  would try to append the identical hibernate breadcrumb to the same run
+   *  again, and comparing against the last persisted event's exact text is
+   *  enough to catch that without a full row fetch. The breadcrumb itself is
+   *  a main-stream row, so a subagent row landing afterwards must not
+   *  re-arm the guard — hence the filter. */
+  lastEventData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events WHERE run_id = ? AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
+  /** The most recently persisted MAIN-stream `tool_use` event's raw `data`
+   *  for a run (`subagent_id IS NULL`, same rationale as `lastEventData`: a
+   *  subagent's tool call must not be mistaken for the main run's), or
+   *  `null` if the run has none.
+   *
+   *  Backs `detectCursorPlan`'s "is the run's last tool call a
+   *  `createPlanToolCall`?" check. That used to be a full `runs.events(runId)`
+   *  scan keeping only the last `tool_use` row — correct, but O(run length)
+   *  on every settlement of every cursor run, even long ones with no plan at
+   *  all. This is the same lookup expressed as a targeted, indexed query.
+   *
+   *  `INDEXED BY idx_run_events_run` is load-bearing: without it the planner
+   *  prefers the partial `idx_run_events_user_history (stream, id DESC)` (it
+   *  satisfies `stream = 'tool_use'`, `subagent_id IS NULL` AND the
+   *  `ORDER BY id DESC`) and walks EVERY run's `tool_use` rows newest-first
+   *  until one belongs to `run_id` — a near-full scan of the table's biggest
+   *  stream for an old run. Forcing the `(run_id, id)` index bounds the walk
+   *  to this run's rows. */
+  lastToolUseData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
+  /**
+   * Find a run's persisted `tool_use` event by its `id` (claude-tmux's
+   * `{ id, name, input, serverSide }` shape — see the `case "tool_use"`
+   * branch in `claude-tmux.ts`). Backs the sent-files map-miss fallback in
+   * the orchestrator (plan §3, decision 4): the in-memory
+   * `toolUseId → SentFilesRequest` map is per-run and non-persistent, so an
+   * agetor restart mid-flight or a reattach replay can miss it, and this is
+   * how the confirming `tool_result` re-derives the original request.
+   *
+   * There is no index on `(run_id, stream)` — only `idx_run_events_run
+   * (run_id, id)` and the partial `idx_run_events_user_history` exist — so
+   * this scans the run's rows via `idx_run_events_run` and evaluates
+   * `stream = 'tool_use'` plus the `LIKE '%"id":"<toolUseId>"%'` prefilter
+   * against each row's `data` column-by-column; that's fine because this
+   * fallback is rare (the in-memory map-hit path above almost always
+   * resolves it first). The LIKE prefilter still avoids a `JSON.parse` of
+   * every tool_use the run ever had, and the 5-row cap bounds the
+   * pathological case of many tool_use rows sharing a substring match; each
+   * candidate is then `JSON.parse`d and only the first whose parsed `id` field is an
+   * EXACT match to `toolUseId` is returned — the LIKE pattern is a filter,
+   * never the source of truth, so a substring collision (one id embedded in
+   * another) can't misattribute a delivery.
+   *
+   * `toolUseId` is rejected (returns `null` without querying) when it
+   * contains `"` or `\` — either would corrupt the crafted `"id":"…"` JSON
+   * substring this pattern searches for, and no real claude tool_use id
+   * (`toolu_<hex>`, e.g. `toolu_01AbC…`) ever contains either, so this only
+   * ever declines a hostile/malformed id. `%` and `_` are SQL LIKE's own
+   * wildcard characters and — unlike `"`/`\` — DO legitimately appear in
+   * real ids (every claude tool_use id contains the underscore in its
+   * `toolu_` prefix; a reject-on-any-of-four guard, the naive reading, would
+   * make this prefilter a permanent no-op against every real id in
+   * production) — so instead of rejecting on them, they're escaped with a
+   * literal backslash (`ESCAPE '\'`) so LIKE matches them as ordinary
+   * characters rather than wildcards. This only narrows the prefilter
+   * either way: the loop below still requires an EXACT parsed-JSON `id`
+   * match before returning anything, so an unescaped wildcard could only
+   * ever widen the candidate set, never cause a wrong match.
+   */
+  findToolUseEvent(runId: string, toolUseId: string): { id: number; data: string } | null {
+    if (/["\\]/.test(toolUseId)) return null;
+    const likeSafe = toolUseId.replace(/[%_]/g, "\\$&");
+
+    const rows = db.query<{ id: number; data: string }, [string, string]>(
+      `SELECT id, data FROM run_events
+       WHERE run_id = ? AND stream = 'tool_use' AND data LIKE ? ESCAPE '\\'
+       ORDER BY id DESC
+       LIMIT 5`,
+    ).all(runId, `%"id":"${likeSafe}"%`);
+
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.data) as { id?: unknown };
+        if (parsed && typeof parsed === "object" && parsed.id === toolUseId) {
+          return { id: row.id, data: row.data };
+        }
+      } catch {
+        // Malformed JSON on a LIKE-matched row — skip it, don't throw; the
+        // next candidate (or the eventual `null`) is the right outcome.
+      }
+    }
+    return null;
+  },
+  /** All events across every run of a task, in event-id order (which is
+   *  chronological — id is autoincrement, ts can collide when bursts of
+   *  events land in the same Date.now() ms). Used by the unified
+   *  task-level stream so the panel shows the whole conversation as one
+   *  scrollback instead of per-run silos.
+   *
+   *  With no `opts` (or no `opts.limit`), returns the full unbounded
+   *  ascending history — the original behavior, kept for existing callers
+   *  (tests, `rebuildEventsFromJsonl`-adjacent tooling) that want everything.
+   *
+   *  With `opts.limit` set, returns only the MOST RECENT `limit` events:
+   *  filters `id < opts.beforeId` when given, orders by id DESC, takes
+   *  `limit`, then re-sorts ascending. This is what powers the capped SSE
+   *  replay window and the `/events/page` paging route — both want "the
+   *  newest N (before some cursor)", not "the first N".
+   *
+   *  The limit path is a two-step query, not one. A single
+   *  `SELECT … ORDER BY run_events.id DESC LIMIT ?` still has to sort every
+   *  matching row before it can take the top N — `EXPLAIN QUERY PLAN` shows
+   *  SQLite picks the covering index for the join+filter but then falls back
+   *  to `USE TEMP B-TREE FOR ORDER BY`, and that b-tree materializes the full
+   *  `data` payload (often the largest column by far) for EVERY event the
+   *  task ever had, not just the `limit` returned. Measured 219.5ms on a
+   *  production task with 18.5k events. Splitting it in two fixes that:
+   *   1. Sort ids only (`SELECT run_events.id …`) — no `data` payload in the
+   *      row, so the temp b-tree rides the covering index
+   *      (`idx_run_events_run(run_id, id)`) instead of materializing text.
+   *   2. Fetch the actual rows for that exact id range, ascending (no
+   *      reverse needed) — a plain indexed range scan, not a sort.
+   *  Measured 14.8ms + 3.9ms ≈ 19ms for the identical 800-row result on the
+   *  same task — an ~11x improvement, no schema change.
+   *
+   *  Step 2 re-applies `beforeId` (not just the `id >= minId` floor coming
+   *  out of step 1): without it, events newer than the cursor — i.e. events
+   *  the caller has already seen, or that landed on a DIFFERENT run of the
+   *  same task with an id inside `[minId, taskMax]` but still `>= beforeId`
+   *  — would wrongly re-enter the page. `id >= minId` alone only bounds the
+   *  page from below; `beforeId` is what bounds it from above, exactly as it
+   *  did in the one-query version.
+   *
+   *  `opts.maxBytes` layers a BYTE budget on top of `opts.limit`'s event-count
+   *  cap (see `EVENTS_REPLAY_MAX_BYTES` / `EVENTS_PAGE_MAX_BYTES` in
+   *  `shared/types.ts`): step 1 additionally selects each row's
+   *  `LENGTH(data)`, then `clampWindowByBytes` walks the DESC id rows
+   *  newest → oldest accumulating that length and raises `minId` to stop
+   *  once the budget would be exceeded — never below `opts.minEvents`
+   *  (`MIN_REPLAY_EVENTS`) rows, so a task whose newest event alone exceeds
+   *  the budget still returns something. Step 2 is otherwise unchanged: it
+   *  just ends up scanning a narrower `[minId, taskMax]` range. When
+   *  `opts.maxBytes` is omitted the byte walk never runs — this path is
+   *  byte-identical to before it existed.
+   *
+   *  `opts.anchor` (additive, only meaningful together with `opts.limit`)
+   *  extends the window's floor back to the newest main-stream `user` event
+   *  when that fits under `anchor.maxEvents`/`anchor.maxBytes` — see
+   *  `docs/plans/first-load-reaches-last-user-message.md` §3 and
+   *  `resolveAnchoredMinId` above, which makes the actual fit/no-fit call.
+   *  After the byte walk settles `minId`: look up the anchor id via
+   *  `lastUserEventId(taskId, opts.beforeId)` (same cursor the rest of this
+   *  call already respects); if it exists and sits BEFORE `minId` (i.e. the
+   *  default window doesn't already reach it), assemble the DESC `{id, len}`
+   *  rows of the whole span `[anchorId, beforeId)` — anchor to newest, since
+   *  the ceilings must cover the entire resulting window, not just the part
+   *  below the old floor — from step 1's own rows (`[minId, beforeId)`, already
+   *  in memory) plus one bounded read of `[anchorId, minId)`, capped so the
+   *  total never exceeds `anchor.maxEvents + 1` rows, and hand them to
+   *  `resolveAnchoredMinId`. Its return either leaves `minId` alone (span
+   *  too large in count or bytes) or lowers it to `anchorId`.
+   *  Step 2's `LIMIT` becomes `max(opts.limit, opts.anchor.maxEvents)` in
+   *  that case: the `[minId, beforeId)` range fetched by step 2 is already
+   *  exact once `minId` is anchored, so `LIMIT` is only a defensive cap —
+   *  leaving it at the plain `opts.limit` would truncate the NEWEST rows of
+   *  a window that just grew past that count. Without `opts.anchor` this
+   *  function is byte-identical to before the option existed, including
+   *  step 2's `LIMIT opts.limit`. */
+  eventsForTask(
+    taskId: string,
+    opts?: {
+      beforeId?: number;
+      limit?: number;
+      maxBytes?: number;
+      minEvents?: number;
+      anchor?: { maxEvents: number; maxBytes: number };
+    },
+  ): TaskEventRow[] {
+    type Row = TaskEventRow;
+    if (opts?.limit) {
+      const idConditions = ["runs.task_id = ?"];
+      const idParams: Array<string | number> = [taskId];
+      if (opts.beforeId != null) {
+        idConditions.push("run_events.id < ?");
+        idParams.push(opts.beforeId);
+      }
+      idParams.push(opts.limit);
+      const idRows = db.query<{ id: number; len: number }, Array<string | number>>(
+        `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${idConditions.join(" AND ")}
+         ORDER BY run_events.id DESC
+         LIMIT ?`,
+      ).all(...idParams);
+      if (idRows.length === 0) return [];
+      // DESC order — the last row is the smallest id in the page.
+      let minId = idRows[idRows.length - 1]!.id;
+      if (opts.maxBytes != null) {
+        const clampedId = clampWindowByBytes(idRows, opts.maxBytes, opts.minEvents ?? 1);
+        if (clampedId != null) minId = clampedId;
+      }
+
+      if (opts.anchor) {
+        const anchorId = runs.lastUserEventId(taskId, opts.beforeId);
+        if (anchorId != null && anchorId < minId) {
+          // The span `resolveAnchoredMinId` judges is `[anchorId, beforeId)`
+          // — anchor to newest — but its upper part, `[minId, beforeId)`, is
+          // exactly the default window step 1 already fetched (with `len`),
+          // so only the part BELOW the current floor, `[anchorId, minId)`, is
+          // read from the DB. Its LIMIT is the remaining room under the count
+          // ceiling (+1, so a span that overflows it is detectable by length
+          // alone) — the returned row count is bounded by that, though the
+          // ORDER BY still sorts every task row in the range through a temp
+          // b-tree (same plan shape as step 1, over a strict subset of its
+          // rows). No room left means the window alone already exceeds the
+          // ceiling: skip the read, `resolveAnchoredMinId` rejects on count.
+          const windowRowsDesc = idRows.filter((r) => r.id >= minId);
+          const room = opts.anchor.maxEvents + 1 - windowRowsDesc.length;
+          let spanRowsDesc = windowRowsDesc;
+          if (room > 0) {
+            const belowRowsDesc = db.query<{ id: number; len: number }, Array<string | number>>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id >= ? AND run_events.id < ?
+               ORDER BY run_events.id DESC
+               LIMIT ?`,
+            ).all(taskId, anchorId, minId, room);
+            spanRowsDesc = windowRowsDesc.concat(belowRowsDesc);
+          }
+          minId = resolveAnchoredMinId({
+            minId,
+            anchorId,
+            spanRowsDesc,
+            maxEvents: opts.anchor.maxEvents,
+            maxBytes: opts.anchor.maxBytes,
+          });
+        }
+      }
+
+      const rowConditions = ["runs.task_id = ?", "run_events.id >= ?"];
+      const rowParams: Array<string | number> = [taskId, minId];
+      if (opts.beforeId != null) {
+        rowConditions.push("run_events.id < ?");
+        rowParams.push(opts.beforeId);
+      }
+      // Once `opts.anchor` may have lowered `minId` past `opts.limit` events
+      // back, the exact `[minId, beforeId)` range must not be truncated by a
+      // `LIMIT` still pinned at the pre-anchor count — see the doc comment
+      // above `eventsForTask`.
+      rowParams.push(opts.anchor ? Math.max(opts.limit, opts.anchor.maxEvents) : opts.limit);
+      return db.query<Row, Array<string | number>>(
+        `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${rowConditions.join(" AND ")}
+         ORDER BY run_events.id ASC
+         LIMIT ?`,
+      ).all(...rowParams);
+    }
+    return db.query<Row, [string]>(
+      `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ?
+       ORDER BY run_events.id ASC`,
+    ).all(taskId);
+  },
+  /**
+   * Forward resume for the per-task event stream (docs/plans/
+   * event-stream-forward-resume.md P3): the task's rows with `id > afterId`,
+   * ascending, subagent rows included — or a refusal when the gap is too big
+   * or the cursor is foreign.
+   *
+   * Same two-step shape as `eventsForTask`, so a big gap never loads bodies:
+   *  1. Read `sqlite_sequence.seq` for `run_events` (the AUTOINCREMENT
+   *     high-water mark; 0 when the row is absent) and probe the IDS of the
+   *     task's rows after the cursor, `LIMIT maxEvents + 1` — the +1 row
+   *     proves "too many" without an unbounded read. Ids only, so
+   *     `(run_id, id)` covers the probe and no row body is read. The
+   *     temp-B-tree sort is bounded too: each run's index range yields ids
+   *     in order, so SQLite stops a run's walk once the LIMIT sorter is full
+   *     and holds a smaller id — measured ~1 ms at any cursor on a 1M-row
+   *     task over 20 runs (a per-run LIMIT + JS merge was slower: 37 ms at
+   *     300 runs).
+   *  2. Only when the count fits, size the bounded range (`id > afterId AND
+   *     id <= lastProbedId`, at most `maxEvents` rows) with
+   *     `LENGTH(CAST(data AS BLOB))`. `decideForwardResume` (pure, shared
+   *     with the future remote router) makes the call.
+   *  3. On resume, fetch the full rows for that same range. Bounding by the
+   *     last probed id keeps the steps consistent if an event lands in
+   *     between (it reaches the client through the live stream instead).
+   *
+   *  Plans as `SEARCH runs USING INDEX idx_runs_task` + `SEARCH run_events
+   *  USING INDEX idx_run_events_run (run_id=? AND id>?)`; `INDEXED BY` pins
+   *  the index so SQLite can't pick the `stream`-first user-history one.
+   */
+  eventsForTaskAfter(
+    taskId: string,
+    afterId: number,
+    opts: { maxEvents: number; maxBytes: number },
+  ): ForwardResumeResult {
+    const seqRow = db
+      .query<{ seq: number }, []>(`SELECT seq FROM sqlite_sequence WHERE name = 'run_events'`)
+      .get();
+    const highWater = seqRow?.seq ?? 0;
+    const gapIdsAsc = db
+      .query<{ id: number }, [string, number, number]>(
+        `SELECT run_events.id as id
+         FROM run_events INDEXED BY idx_run_events_run
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE runs.task_id = ? AND run_events.id > ?
+         ORDER BY run_events.id ASC
+         LIMIT ?`,
+      )
+      .all(taskId, afterId, opts.maxEvents + 1);
+    // Over the count budget (or empty) the sizes can't change the answer —
+    // `decideForwardResume` checks the count before the bytes — so skip the
+    // body read and hand it zero lengths.
+    const gapRowsAsc =
+      gapIdsAsc.length === 0 || gapIdsAsc.length > opts.maxEvents
+        ? gapIdsAsc.map((r) => ({ id: r.id, len: 0 }))
+        : db
+            .query<{ id: number; len: number }, [string, number, number]>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events INDEXED BY idx_run_events_run
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id > ? AND run_events.id <= ?
+               ORDER BY run_events.id ASC`,
+            )
+            .all(taskId, afterId, gapIdsAsc[gapIdsAsc.length - 1]!.id);
+    const decision = decideForwardResume({
+      afterId,
+      highWater,
+      gapRowsAsc,
+      maxEvents: opts.maxEvents,
+      maxBytes: opts.maxBytes,
+    });
+    if (decision.kind === "snapshot") return decision;
+    if (gapRowsAsc.length === 0) return { kind: "resume", rows: [] };
+    const lastProbedId = gapRowsAsc[gapRowsAsc.length - 1]!.id;
+    const rows = db
+      .query<TaskEventRow, [string, number, number]>(
+        `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+         FROM run_events INDEXED BY idx_run_events_run
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE runs.task_id = ? AND run_events.id > ? AND run_events.id <= ?
+         ORDER BY run_events.id ASC`,
+      )
+      .all(taskId, afterId, lastProbedId);
+    return { kind: "resume", rows };
+  },
+  /** Past sent user messages (main-stream only, blank ones excluded) across
+   *  every task, regardless of harness — used to build a cross-task "message
+   *  history" picker shared by all tasks. Byte-identical texts are collapsed
+   *  to their most recent occurrence via `GROUP BY data` + `MAX(id)`:
+   *  SQLite's bare-column-with-single-MAX semantics
+   *  (https://www.sqlite.org/lang_select.html#bareagg) guarantees the other
+   *  selected columns come from that same max-id row. */
+  userMessageHistory(
+    limit: number,
+  ): Array<{ id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null; taskAgent: string }> {
+    type Row = { id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null; taskAgent: string };
+    return db.query<Row, [number]>(
+      `SELECT MAX(run_events.id) as id, run_events.data as data, ts, tasks.id as taskId, tasks.title as taskTitle,
+              tasks.workdir as taskWorkdir, projects.name as projectName, tasks.agent as taskAgent
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       JOIN tasks ON tasks.id = runs.task_id
+       LEFT JOIN projects ON projects.path = tasks.workdir
+       WHERE run_events.stream = 'user'
+         AND run_events.subagent_id IS NULL
+         AND trim(run_events.data, char(32,9,10,13)) != ''
+       GROUP BY run_events.data
+       ORDER BY id DESC
+       LIMIT ?`,
+    ).all(limit);
+  },
+  /** Todo-family tool events for a task, across every run, in event-id
+   *  (chronological) order — main-stream only (`subagent_id IS NULL`, same
+   *  rationale as `lastEventData`/`lastToolUseData`: a background agent's own
+   *  TodoWrite/TaskCreate/TaskUpdate calls track ITS todos, not the primary
+   *  task's, and must not be mixed into the board summary).
+   *
+   *  Two different LIKE shapes for the two streams, deliberately NOT a
+   *  single shared marker set (mirrors `isTodoFamilyChunk` in
+   *  orchestrator.ts, same split for the same reason):
+   *   - `tool_use` rows carry `"name":"<Tool>"` in their JSON envelope, so
+   *     the filter matches that literal envelope form rather than a bare
+   *     substring — a bare `LIKE '%TaskCreate%'` also matches an unrelated
+   *     tool_result whose text happens to quote "TaskCreate" (this repo
+   *     dogfoods itself, so that's a real false positive, not a theoretical
+   *     one).
+   *   - `tool_result` rows have NO tool name at all (`{toolUseId, content,
+   *     isError}`) — only `TaskCreate`'s result is ever consulted by
+   *     `deriveTodoProgress` (to resolve the "Task #N" number), and always
+   *     via the fixed `"Task #N created successfully"` text Claude emits, so
+   *     that's the cheapest-but-correct marker: cheaper than admitting every
+   *     tool_result row for the task (most of which `deriveTodoProgress`
+   *     would just discard by unmatched `toolUseId`), and correct because it
+   *     targets the exact literal all TaskCreate results share.
+   *  Backs the orchestrator chunk handler's board-summary update: rare
+   *  chunks, so a full re-derive per call is cheap, and because the chunk
+   *  handler always calls `runs.appendEvent` before running this query (see
+   *  `makeChunkHandler`), the just-arrived chunk is already included — no
+   *  separate "append the current chunk" step needed. */
+  todoRelevantEventsForTask(taskId: string): Array<{ stream: string; data: string }> {
+    return db.query<{ stream: string; data: string }, [string]>(
+      `SELECT stream, data
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ?
+         AND run_events.subagent_id IS NULL
+         AND (
+           (run_events.stream = 'tool_use' AND (
+             data LIKE '%"name":"TodoWrite"%'
+             OR data LIKE '%"name":"TaskCreate"%'
+             OR data LIKE '%"name":"TaskUpdate"%'
+           ))
+           OR (run_events.stream = 'tool_result' AND data LIKE '%created successfully%')
+         )
+       ORDER BY run_events.id ASC`,
+    ).all(taskId);
+  },
+  /** Cheap existence check — is there at least one persisted event for this
+   *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE
+   *  `replay_meta` frame and the `/events/page` paging route, so the client
+   *  knows whether to keep showing "Load earlier" without fetching (and
+   *  counting) the whole remaining history. */
+  hasEventsBefore(taskId: string, beforeId: number): boolean {
+    const row = db.query<{ 1: number }, [string, number]>(
+      `SELECT 1 FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ? AND run_events.id < ?
+       LIMIT 1`,
+    ).get(taskId, beforeId);
+    return row !== null;
+  },
+  /**
+   * The id of the newest MAIN-stream `user` event for a task — the "last
+   * user sent message" anchor for the first-load window extension (see
+   * `resolveAnchoredMinId` above and
+   * `docs/plans/first-load-reaches-last-user-message.md`), or `null` when
+   * the task has no such event (e.g. only status breadcrumbs so far).
+   * `subagent_id IS NULL` (main-stream only) matches `lastEventData`'s
+   * rationale — a background subagent's own `user` turns are its own
+   * conversation, not the primary task's. `beforeId`, when given, excludes
+   * events at or after that id, mirroring every other paging cursor in this
+   * file. SQLite serves this from migration 039's partial index
+   * `idx_run_events_user_history (stream, id DESC) WHERE subagent_id IS NULL`
+   * (verified with EXPLAIN QUERY PLAN): it walks main-stream `user` rows
+   * newest-first ACROSS EVERY TASK, probing `runs` by primary key on each
+   * until one belongs to this task — the index carries no run/task column,
+   * so the cost is bounded by how many user messages landed anywhere since
+   * this task's last one, NOT by this task's own history length. User rows
+   * are sparse (a few thousand across a multi-hundred-thousand-event DB) and
+   * every started task has at least its prompt echo, so this is a few ms in
+   * practice; a partial index on `(run_id, stream, id DESC)` would make it
+   * terminate inside the task's own runs if that ever changes.
+   */
+  lastUserEventId(taskId: string, beforeId?: number): number | null {
+    const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];
+    const params: Array<string | number> = [taskId];
+    if (beforeId != null) {
+      conditions.push("run_events.id < ?");
+      params.push(beforeId);
+    }
+    const row = db.query<{ id: number }, Array<string | number>>(
+      `SELECT run_events.id as id
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY run_events.id DESC
+       LIMIT 1`,
+    ).get(...params);
+    return row ? row.id : null;
+  },
+  /**
+   * Returns the stored `{ id, ts }`, or `null` when nothing was actually
+   * inserted — i.e. the `INSERT OR IGNORE` dedup path hit an existing
+   * `(run_id, line_uuid)` row. `null` means "already persisted earlier,
+   * don't re-derive from it" (the unread-watermark detector in
+   * `makeChunkHandler` relies on it) rather than misreading a stale
+   * `lastInsertRowid` left over from some unrelated prior statement on this
+   * connection. Callers send the returned pair live, so a streamed frame
+   * carries the same `id` and `ts` as its replayed row (forward resume,
+   * docs/plans/event-stream-forward-resume.md D11/P1). `ts` defaults to now;
+   * a caller that already stamped the event passes it so both agree.
+   */
+  appendEvent(
+    runId: string,
+    stream: RunEventStream,
+    data: string,
+    lineUuid?: string | null,
+    subagentId?: string | null,
+    ts?: number,
+  ): AppendedEvent | null {
+    const stamp = ts ?? Date.now();
+    // INSERT OR IGNORE only when a dedup key is provided. With NULL keys the
+    // partial unique index (`WHERE line_uuid IS NOT NULL`) doesn't apply, so
+    // non-JSONL events still insert unconditionally and we don't accidentally
+    // suppress two genuinely distinct status/stderr rows that happen to share
+    // (runId, NULL).
+    if (lineUuid) {
+      const result = db.run(
+        `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid, subagent_id) VALUES (?, ?, ?, ?, ?, ?)`,
+        [runId, stream, data, stamp, lineUuid, subagentId ?? null],
+      );
+      return result.changes > 0 ? { id: Number(result.lastInsertRowid), ts: stamp } : null;
+    }
+    const result = db.run(
+      `INSERT INTO run_events (run_id, stream, data, ts, subagent_id) VALUES (?, ?, ?, ?, ?)`,
+      [runId, stream, data, stamp, subagentId ?? null],
+    );
+    return { id: Number(result.lastInsertRowid), ts: stamp };
+  },
+  /** Line uuids persisted on one run. Seeds `currentRunLineUuids` on
+   *  reattach so a historical `end_turn` that lives on a different run
+   *  (an imported seed run) dedups without staging. Uses the partial unique
+   *  index `run_events_run_line_uuid (run_id, line_uuid) WHERE line_uuid IS
+   *  NOT NULL`. Includes subagent-tagged rows: the running run's own
+   *  `end_turn` uuids are what the gate cares about, and a subagent uuid
+   *  in the set is harmless. */
+  seenLineUuidsForRun(runId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string]>(
+      `SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL`,
+    ).all(runId);
+    return new Set(rows.map((r) => r.line_uuid));
+  },
+  /** Every non-null `runs.claude_session_id`. One query, served by
+   *  `runs_claude_session_id_idx`. The scanner hides the union of this set
+   *  and the import claim column — see {@link hiddenClaudeSessionIds}. */
+  claudeSessionIds(): Set<string> {
+    const rows = db.query<{ claude_session_id: string }, []>(
+      `SELECT claude_session_id FROM runs WHERE claude_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.claude_session_id));
+  },
+  /** Every non-null `runs.opencode_session_id` — the OpenCode ids Agetor
+   *  owns as runs. One query, served by `runs_opencode_session_id_idx`
+   *  (migration 079). The scanner hides the union of this set and the import
+   *  claim column — see {@link hiddenOpencodeSessionIds}. */
+  opencodeSessionIdsOwned(): Set<string> {
+    const rows = db.query<{ opencode_session_id: string }, []>(
+      `SELECT opencode_session_id FROM runs WHERE opencode_session_id IS NOT NULL`,
+    ).all();
+    return new Set(rows.map((r) => r.opencode_session_id));
+  },
+  /** True when any run already records this OpenCode session id. */
+  hasOpencodeSessionId(sessionId: string): boolean {
+    if (!sessionId) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM runs WHERE opencode_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row != null;
+  },
+  /**
+   * Every non-null session id recorded in `column` across a task's runs,
+   * newest run first, each with the run's `agent` (the harness id that ran
+   * it). The building block for harness-scoped resume
+   * (`findLastSessionIdForHarness`, docs/plans/add-opencode-harness.md
+   * D-15): a caller picks the newest row whose `agent` matches the task's
+   * current harness, so a same-kind harness switch never resumes the other
+   * account's session. `column` is a closed whitelist (it is interpolated
+   * into the SQL); anything outside {@link SESSION_ID_COLUMNS} throws.
+   * Reads `runs` only — never `run_events`.
+   */
+  sessionIdsForTask(taskId: string, column: SessionIdColumn): { sessionId: string; agent: string }[] {
+    if (!SESSION_ID_COLUMNS.includes(column)) throw new Error(`unknown session id column: ${String(column)}`);
+    return db.query<{ sessionId: string; agent: string }, [string]>(
+      `SELECT ${column} AS sessionId, agent FROM runs
+         WHERE task_id = ? AND ${column} IS NOT NULL
+         ORDER BY started_at DESC, rowid DESC`,
+    ).all(taskId);
+  },
+  /** True when any run already records this Claude session id. Not a
+   *  uniqueness check — several runs on one task share an id. */
+  hasClaudeSessionId(sessionId: string): boolean {
+    if (!sessionId) return false;
+    const row = db.query<{ one: number }, [string]>(
+      `SELECT 1 AS one FROM runs WHERE claude_session_id = ? LIMIT 1`,
+    ).get(sessionId);
+    return row != null;
+  },
+  /** Return every JSONL line uuid already persisted across *every* run of
+   *  this task. Used by `reattachSession` to seed the in-memory dedup set so
+   *  re-tailing the per-session JSONL from offset 0 (after an agetor
+   *  restart) skips events we already streamed in the previous process.
+   *
+   *  Scoped to the task (not just the reattached run) on purpose: one tmux
+   *  session = one JSONL file = all of a task's turns. The replay from
+   *  offset 0 will encounter end_turn lines from prior, already-`succeeded`
+   *  run rows; without those uuids in the dedup set the dispatcher would
+   *  re-emit them onto the reattached (still-`running`) run's chunk
+   *  handler — corrupting its event history and, worse, firing
+   *  `onEndOfTurn` on the wrong turn and prematurely resolving the
+   *  current run.
+   *
+   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
+   *  only — subagent transcripts live in separate sidechain files and are
+   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
+   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
+   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
+   *  scope conceptually, and matches the same filter applied elsewhere for
+   *  subagent-tagged rows. */
+  seenLineUuidsForTask(taskId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string]>(
+      `SELECT e.line_uuid
+       FROM run_events e
+       JOIN runs r ON r.id = e.run_id
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL AND e.subagent_id IS NULL`,
+    ).all(taskId);
+    return new Set(rows.map((r) => r.line_uuid));
+  },
+  /** Line uuids already persisted for a single subagent's stream. Seeds the
+   *  subagent tailer's in-memory dedup set on reattach so re-reading
+   *  `agent-<id>.jsonl` from offset 0 doesn't double-insert/emit events the
+   *  previous process already streamed.
+   *
+   *  TASK-SCOPED, and spelled to hit one specific index: the only index that
+   *  mentions `subagent_id` is the partial unique
+   *  `run_events_run_sub_line_uuid (run_id, IFNULL(subagent_id, ''), line_uuid)
+   *  WHERE line_uuid IS NOT NULL` (migrations/022_subagents.sql). A bare
+   *  `WHERE subagent_id = ?` cannot use it (the leading column is `run_id`),
+   *  so the old query was `SCAN run_events USING INDEX …` — a full pass over
+   *  a multi-GB table per subagent (~1.1 s each on a 4.5 GB DB, ~105 s for a
+   *  96-subagent task, all on the Bun main thread). Joining through `runs` by
+   *  `task_id` supplies the leading `run_id` equality, and
+   *  `IFNULL(e.subagent_id, '') = ?` matches the index EXPRESSION exactly (the
+   *  spelling is load-bearing: `e.subagent_id = ?` would not match the
+   *  expression and falls back to a scan). SQLite then does a covering SEARCH
+   *  per run of the task — `line_uuid` is in the index, so no table lookup.
+   *
+   *  Task scoping is a strict superset of run scoping: every subagent's events
+   *  are written under its own task's runs (and `subagents.id` is a global
+   *  primary key), so no event for `subagentId` can live under another task's
+   *  runs. Pinned by the `EXPLAIN QUERY PLAN` guard test over every
+   *  `run_events` query. */
+  seenLineUuidsForSubagent(taskId: string, subagentId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string, string]>(
+      `SELECT e.line_uuid
+       FROM runs r JOIN run_events e ON e.run_id = r.id
+       WHERE r.task_id = ? AND IFNULL(e.subagent_id, '') = ? AND e.line_uuid IS NOT NULL`,
+    ).all(taskId, subagentId);
+    return new Set(rows.map((r) => r.line_uuid));
+  },
+  /** Whether ANY persisted event for `subagentId` carries a `line_uuid`
+   *  starting with `prefix` — a targeted probe for a marker key such as
+   *  claude-subagents.ts's `monitor:<id>:terminal:` (an authoritative Monitor
+   *  receipt on record), cheaper than materialising every uuid via
+   *  `seenLineUuidsForSubagent` just to scan a chatty stream for one prefix.
+   *  Compared with `substr` rather than `LIKE` so a `%`/`_` in the prefix
+   *  can't widen the match.
+   *
+   *  Same task-scoped, `IFNULL(e.subagent_id, '')` shape as
+   *  `seenLineUuidsForSubagent` (see there for why both are load-bearing): a
+   *  covering SEARCH of `run_events_run_sub_line_uuid` per run of the task,
+   *  stopping at the first match. */
+  hasLineUuidPrefixForSubagent(taskId: string, subagentId: string, prefix: string): boolean {
+    const row = db.query<{ one: number }, [string, string, string, string]>(
+      `SELECT 1 as one
+       FROM runs r JOIN run_events e ON e.run_id = r.id
+       WHERE r.task_id = ? AND IFNULL(e.subagent_id, '') = ? AND e.line_uuid IS NOT NULL
+         AND substr(e.line_uuid, 1, length(?)) = ?
+       LIMIT 1`,
+    ).get(taskId, subagentId, prefix, prefix);
+    return row !== null;
+  },
+  /** Whether a run already has a persisted MAIN-stream api-error status line
+   *  (`status` event whose data starts with `prefix`, i.e.
+   *  `CLAUDE_API_ERROR_STATUS_PREFIX`). Lifted verbatim from the boot
+   *  reattach path in the orchestrator, which pre-seeds `handle.apiError` from
+   *  it: the reattach replay can't re-emit the status (its assistant-line uuid
+   *  is already in the seen set), so without the seed `attachDoneHandler`
+   *  would bounce a `blocked` column back to `review`.
+   *
+   *  `subagent_id IS NULL`: a subagent tailer's own transient api-error status
+   *  row (since #81) must not seed the main run's flag. Run-scoped, so it
+   *  walks `idx_run_events_run (run_id, id)`; `EXISTS` short-circuits on the
+   *  first match. `prefix` is matched with `LIKE prefix%` exactly as before
+   *  (the callers pass a fixed constant with no wildcard characters).
+   *
+   *  `INDEXED BY idx_run_events_run` for the same reason as `lastToolUseData`:
+   *  with no `sqlite_stat1` the planner otherwise picks the partial
+   *  `idx_run_events_user_history (stream=?)` and walks every `status` event
+   *  in the database (with a table lookup each, `run_id` not being in that
+   *  index) whenever the run has no api-error line — the common case. */
+  hasPriorApiErrorStatus(runId: string, prefix: string): boolean {
+    const row = db.query<{ found: 0 | 1 }, [string, string]>(
+      `SELECT EXISTS(
+         SELECT 1 FROM run_events INDEXED BY idx_run_events_run
+         WHERE run_id = ? AND stream = 'status' AND data LIKE ? AND subagent_id IS NULL
+       ) AS found`,
+    ).get(runId, `${prefix}%`);
+    return (row?.found ?? 0) === 1;
+  },
+  /** `data` of the newest main-or-subagent `status` event on `runId` whose
+   *  text starts with `prefix` (e.g. fx's `FX_RECOVERY_STATUS_PREFIX`
+   *  sentinel), or null. Lifted from `orchestrator.ts`'s
+   *  `latestResumableFxPause` so the run_events plan guard covers it; pinned
+   *  to `idx_run_events_run` for the same reason as `hasPriorApiErrorStatus`
+   *  — without `sqlite_stat1` the `stream = ?` term can steer SQLite onto
+   *  `idx_run_events_user_history` and a walk of every status row in the
+   *  database. `LIKE` is used only with a caller-supplied literal prefix. */
+  lastStatusDataWithPrefix(runId: string, prefix: string): string | null {
+    const row = db.query<{ data: string }, [string, string]>(
+      `SELECT data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND stream = 'status' AND data LIKE ?
+       ORDER BY id DESC LIMIT 1`,
+    ).get(runId, `${prefix}%`);
+    return row?.data ?? null;
+  },
+  /** One keyset page of a run's `tool_result` rows that archived-history
+   *  retention may trim: payload over `minBytes` (UTF-8 bytes — `LENGTH` of a
+   *  BLOB cast, since `LENGTH(text)` counts characters), not already carrying
+   *  the retention marker, `id > afterId`, ascending, at most `limit` rows.
+   *
+   *  The marker prefilter is a SQL `substr` on the first 13 bytes
+   *  (`{"retention":`) rather than a JSON parse: a trimmed row re-serializes
+   *  with the `retention` key FIRST (see `trimToolResultData`), so already
+   *  trimmed rows are skipped without being read, which makes the pass
+   *  idempotent and crash-resumable. The query walks `idx_run_events_run
+   *  (run_id, id)` in id order — `id > ?` is a range on the index's second
+   *  column and `ORDER BY id` is satisfied by it, so there is no temp b-tree
+   *  sort (pinned by `TOOL_RESULT_TRIM_SQL`'s plan-guard test). */
+  toolResultRowsForTrim(
+    runId: string,
+    minBytes: number,
+    afterId: number,
+    limit: number,
+  ): Array<{ id: number; data: string }> {
+    return db.query<{ id: number; data: string }, [string, number, number, number]>(
+      TOOL_RESULT_TRIM_SQL,
+    ).all(runId, minBytes, afterId, limit);
+  },
+  /** Replace ONE event's `data` payload in place — the retention trim's write.
+   *  A targeted UPDATE of `data` only: `id`, `stream`, `ts`, `line_uuid` and
+   *  `subagent_id` stay untouched, so the `(run_id, IFNULL(subagent_id,''),
+   *  line_uuid)` dedup index still recognises the row and an unarchive +
+   *  resume never re-imports what was trimmed. */
+  replaceEventData(id: number, data: string): void {
+    db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, id);
+  },
+  /**
+   * Replace the `data` of the main-stream event with this `line_uuid`.
+   * No-op when that row is absent. Cursor ACP uses it to fill in a tool
+   * call's `rawInput` as the partial call grows, without inserting a second
+   * `tool_use` — a new row would become `lastToolUseData` and hide a plan.
+   *
+   * The lookup matches `run_events_run_sub_line_uuid`
+   * `(run_id, IFNULL(subagent_id, ''), line_uuid)` exactly, main stream
+   * only (`''`). The write is the same primary-key UPDATE as
+   * `replaceEventData`.
+   */
+  replaceMainEventDataByLineUuid(runId: string, lineUuid: string, data: string): boolean {
+    const row = db.query<{ id: number }, [string, string]>(
+      `SELECT id FROM run_events INDEXED BY run_events_run_sub_line_uuid
+       WHERE run_id = ? AND IFNULL(subagent_id, '') = '' AND line_uuid = ?
+       LIMIT 1`,
+    ).get(runId, lineUuid);
+    if (!row) return false;
+    db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, row.id);
+    return true;
+  },
+  /** Newest `run_events.id` of one run, or 0 for a run with no events. The
+   *  retention pass folds it into a task's sweep key so a task that gained
+   *  events after it was swept (a JSONL rebuild of an archived task) is swept
+   *  again. `MAX(id)` over the `(run_id, id)` prefix is a single index seek;
+   *  pinned with `INDEXED BY` like the other run-scoped probes. */
+  maxEventIdForRun(runId: string): number {
+    const row = db.query<{ m: number | null }, [string]>(
+      `SELECT MAX(id) AS m FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ?`,
+    ).get(runId);
+    return row?.m ?? 0;
+  },
+  /** Ids of every run belonging to a task (any status), oldest first.
+   *  Retention walks a task's `run_events` per run (the `idx_run_events_run`
+   *  prefix) rather than by task so each keyset page stays index-ordered. */
+  runIdsForTask(taskId: string): string[] {
+    return db.query<{ id: string }, [string]>(
+      `SELECT id FROM runs WHERE task_id = ? ORDER BY started_at ASC, id ASC`,
+    ).all(taskId).map((r) => r.id);
+  },
+};
+
+/** Session ids the Claude import list must not offer. A run already records
+ *  the id, or a task's claim column holds it before the seed run exists. */
+export function hiddenClaudeSessionIds(): Set<string> {
+  const ids = runs.claudeSessionIds();
+  for (const id of tasks.importedClaudeSessionIds()) ids.add(id);
+  return ids;
+}
+
+/** OpenCode session ids the import list must not offer — the
+ *  {@link hiddenClaudeSessionIds} counterpart: a run records the id, or a
+ *  task's claim column holds it before the seed run exists. */
+export function hiddenOpencodeSessionIds(): Set<string> {
+  const ids = runs.opencodeSessionIdsOwned();
+  for (const id of tasks.importedOpencodeSessionIds()) ids.add(id);
+  return ids;
+}
+
+interface SubagentRow {
+  id: string;
+  task_id: string;
+  run_id: string | null;
+  parent_kind: string;
+  agent_type: string | null;
+  description: string | null;
+  spawn_depth: number;
+  source_path: string;
+  status: string;
+  started_at: number;
+  ended_at: number | null;
+  tool_use_id: string | null;
+}
+
+/** Every `parent_kind` the app understands. The column is plain TEXT with no
+ *  CHECK constraint (see `022_subagents.sql`) precisely so new kinds need no
+ *  migration — but an unknown value read back from a future/foreign build must
+ *  still land on a member of the union, so `toSubagent` falls back to
+ *  `"subagent"` for anything not listed here. Keep in sync with
+ *  `Subagent.parentKind` in shared/types.ts. */
+const PARENT_KINDS = new Set<string>([
+  "subagent",
+  "bg_session",
+  "workflow",
+  "workflow_agent",
+  "monitor",
+  "opencode_subagent",
+  "copilot_subagent",
+]);
+
+function toSubagent(r: SubagentRow): Subagent {
+  return {
+    id: r.id,
+    taskId: r.task_id,
+    runId: r.run_id,
+    parentKind: PARENT_KINDS.has(r.parent_kind)
+      ? (r.parent_kind as Subagent["parentKind"])
+      : "subagent",
+    agentType: r.agent_type,
+    description: r.description,
+    spawnDepth: r.spawn_depth,
+    sourcePath: r.source_path,
+    toolUseId: r.tool_use_id,
+    status: r.status as SubagentStatus,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+  };
+}
+
+export const subagents = {
+  /** Every tracked subagent for a task, oldest first (spawn order — that's how
+   *  the tab strip lays them out left-to-right after the pinned Main tab). */
+  listForTask(taskId: string): Subagent[] {
+    return db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? ORDER BY started_at ASC, id ASC`,
+    ).all(taskId).map(toSubagent);
+  },
+  get(id: string): Subagent | null {
+    const row = db.query<SubagentRow, [string]>(`SELECT * FROM subagents WHERE id = ?`).get(id);
+    return row ? toSubagent(row) : null;
+  },
+  /** Register a freshly-discovered subagent. Idempotent: re-discovering an
+   *  existing id (e.g. the watcher restarts) is a no-op rather than resetting
+   *  its status/timing. */
+  insertIfAbsent(s: Subagent): void {
+    db.run(
+      `INSERT OR IGNORE INTO subagents
+         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at, tool_use_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt, s.toolUseId ?? null],
+    );
+  },
+  setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Backfill the tool_result correlation key for a row created before this
+   *  column existed (or whose meta sidecar hadn't been read yet). Only fills
+   *  a NULL — never overwrites an id already recorded, so a stale re-read of
+   *  the sidecar can't clobber a value another path already set. */
+  setToolUseId(id: string, toolUseId: string): void {
+    db.run(`UPDATE subagents SET tool_use_id = ? WHERE id = ? AND tool_use_id IS NULL`, [toolUseId, id]);
+  },
+  /** Settle a single subagent by id — the DB half of an *externally*-detected
+   *  completion (a parent task-notification naming the finishing agent, or
+   *  boot reconciliation finding its session gone), as opposed to the
+   *  watcher's own `checkDone` idle-detection. Idempotent: only flips a row
+   *  whose status is currently `running`, so a duplicate/late signal (e.g.
+   *  the watcher's own idle-detection racing the same completion) is a
+   *  harmless no-op rather than double-firing `ended_at`. Returns whether a
+   *  row actually changed, plus its `taskId` (cheap — same SELECT) so the
+   *  caller can trigger the settle/release-hold bookkeeping without a second
+   *  query. */
+  markSettledById(id: string, status: "completed" | "orphaned"): { changed: boolean; taskId: string | null } {
+    const row = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE id = ? AND status = 'running'`,
+    ).get(id);
+    if (!row) return { changed: false, taskId: null };
+    const now = Date.now();
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, now, id]);
+    return { changed: true, taskId: row.task_id };
+  },
+  /** True when at least one subagent row for this task is still `running`. */
+  hasRunning(taskId: string): boolean {
+    const row = db.query<{ 1: number }, [string]>(
+      `SELECT 1 FROM subagents WHERE task_id = ? AND status = 'running' LIMIT 1`,
+    ).get(taskId);
+    return row !== null;
+  },
+  /** True when at least one subagent row for ANY task is still `running` —
+   *  the task-agnostic sibling of `hasRunning`, for whole-process idle checks
+   *  (the headless daemon's idle-shutdown). `startedAfter`, when given,
+   *  restricts the scan to rows started after that epoch-ms cutoff — the
+   *  caller's escape hatch against a row that can never settle (a workflow
+   *  container row, which has no staleness backstop, or a row left behind by
+   *  an `AGETOR_TRACK_SUBAGENTS=0` no-op watcher): past the cutoff nothing is
+   *  plausibly still going to finish it, so the idle check should stop
+   *  treating it as live work. */
+  hasAnyRunning(startedAfter?: number): boolean {
+    const row =
+      startedAfter != null
+        ? db
+            .query<{ 1: number }, [number]>(
+              `SELECT 1 FROM subagents WHERE status = 'running' AND started_at > ? LIMIT 1`,
+            )
+            .get(startedAfter)
+        : db.query<{ 1: number }, []>(
+            `SELECT 1 FROM subagents WHERE status = 'running' LIMIT 1`,
+          ).get();
+    return row !== null;
+  },
+  /** How many of this task's subagents are `running`. Distinct from
+   *  `runningCountsByTask` so a single-task caller doesn't scan every row. */
+  runningCountForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).get(taskId);
+    return row?.n ?? 0;
+  },
+  /** Flip every `running` row for this task to `orphaned` (ended_at = now).
+   *  Returns the affected rows (post-update shape) so the caller can emit a
+   *  `finished` lifecycle event per row. Returns [] when nothing was running. */
+  orphanRunning(taskId: string, now: number): Subagent[] {
+    const rows = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).all(taskId);
+    if (rows.length === 0) return [];
+    db.run(
+      `UPDATE subagents SET status = 'orphaned', ended_at = ? WHERE task_id = ? AND status = 'running'`,
+      [now, taskId],
+    );
+    return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** Settle every `running` subagent row of ONE run to `status` (ended_at =
+   *  `now`). Run-scoped (unlike `orphanRunning`, which is task-scoped), for
+   *  drivers that own their subagents' lifecycle and close them all when the
+   *  parent run settles. Only `running` rows change, so a row a driver already
+   *  settled keeps its own status and timestamp. Returns the number of rows
+   *  changed. */
+  settleRunningForRun(runId: string, status: SubagentStatus, now: number): number {
+    const result = db.run(
+      `UPDATE subagents SET status = ?, ended_at = ? WHERE run_id = ? AND status = 'running'`,
+      [status, now, runId],
+    );
+    return result.changes;
+  },
+  /** taskId -> count of `running` rows. One grouped query, for the board poll. */
+  runningCountsByTask(): Map<string, number> {
+    const rows = db.query<{ task_id: string; n: number }, []>(
+      `SELECT task_id, COUNT(*) AS n FROM subagents WHERE status = 'running' GROUP BY task_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.n]));
+  },
+  /** Distinct ids of every task with at least one `running` subagents row,
+   *  regardless of the task's own `column`. Boot reconciliation's held-task
+   *  pass used to source from `tasks WHERE column = 'running'`, which misses
+   *  a task whose terminal run already resolved and moved the card to
+   *  `review`/`done`/etc. before the crash — this is the wider source set
+   *  that also catches that case. */
+  taskIdsWithRunning(): string[] {
+    const rows = db.query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM subagents WHERE status = 'running'`,
+    ).all();
+    return rows.map((r) => r.task_id);
+  },
+};
+
+/** Outcome stored on `cursor_asks`. Null in the table means still open. */
+export type CursorAskOutcome = "answered" | "skipped" | "cancelled";
+
+export interface StoredCursorAsk {
+  taskId: string;
+  toolCallId: string;
+  runId: string;
+  payload: { title?: string; questions: unknown[] };
+  outcome: CursorAskOutcome | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
+interface CursorAskSqlRow {
+  task_id: string;
+  tool_call_id: string;
+  run_id: string;
+  payload_json: string;
+  outcome: string | null;
+  created_at: number;
+  resolved_at: number | null;
+}
+
+function toStoredCursorAsk(row: CursorAskSqlRow): StoredCursorAsk {
+  let payload: StoredCursorAsk["payload"] = { questions: [] };
+  try {
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const rec = parsed as Record<string, unknown>;
+      payload = {
+        ...(typeof rec.title === "string" ? { title: rec.title } : {}),
+        questions: Array.isArray(rec.questions) ? rec.questions : [],
+      };
+    }
+  } catch {
+    /* keep the empty payload — a corrupt row must not throw at boot */
+  }
+  const outcome = row.outcome === "answered" || row.outcome === "skipped" || row.outcome === "cancelled"
+    ? row.outcome
+    : null;
+  return {
+    taskId: row.task_id,
+    toolCallId: row.tool_call_id,
+    runId: row.run_id,
+    payload,
+    outcome,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+/** Insert a pending Cursor question. A second insert for the same task and
+ *  tool call does not clobber a row that already exists (resolved or not). */
+export function insertCursorAsk(row: {
+  taskId: string;
+  toolCallId: string;
+  runId: string;
+  payload: unknown;
+  createdAt?: number;
+}): void {
+  db.run(
+    `INSERT OR IGNORE INTO cursor_asks (task_id, tool_call_id, run_id, payload_json, outcome, created_at, resolved_at)
+     VALUES (?, ?, ?, ?, NULL, ?, NULL)`,
+    [row.taskId, row.toolCallId, row.runId, JSON.stringify(row.payload), row.createdAt ?? Date.now()],
+  );
+}
+
+/** Mark one question resolved. A row that already has an outcome is left
+ *  alone, so a late cancel cannot overwrite an answer. */
+export function resolveCursorAsk(taskId: string, toolCallId: string, outcome: CursorAskOutcome): void {
+  db.run(
+    `UPDATE cursor_asks SET outcome = ?, resolved_at = ? WHERE task_id = ? AND tool_call_id = ? AND outcome IS NULL`,
+    [outcome, Date.now(), taskId, toolCallId],
+  );
+}
+
+/** Unanswered questions, oldest first. Boot rebuild reads this instead of
+ *  scanning `run_events`. */
+export function listOpenCursorAsks(): StoredCursorAsk[] {
+  const rows = db.query<CursorAskSqlRow, []>(
+    `SELECT task_id, tool_call_id, run_id, payload_json, outcome, created_at, resolved_at
+     FROM cursor_asks WHERE outcome IS NULL ORDER BY created_at ASC, tool_call_id ASC`,
+  ).all();
+  return rows.map(toStoredCursorAsk);
+}

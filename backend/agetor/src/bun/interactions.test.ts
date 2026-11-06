@@ -1,0 +1,1006 @@
+import { test, expect, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+// Top-level: db.ts captures AGETOR_DATA_DIR at first import. `beforeAll`
+// would run AFTER any sibling test that already imported db.ts in this
+// process, falling back to ~/.agetor and polluting the user's real db.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-int-"));
+
+// The broadcasters are single process-wide callbacks that orchestrator.ts
+// installs once at load. Tests below override them to capture raw broadcasts,
+// so snapshot whatever is installed before each test and put it back after —
+// a leaked override would silently detach the global `interaction` events for
+// every later test file in the same process (it once hid exactly that bug).
+type Broadcasters = {
+  broadcast: Parameters<typeof import("./interactions.ts").setBroadcaster>[0];
+  resolved: Parameters<typeof import("./interactions.ts").setResolvedBroadcaster>[0];
+};
+let installedBroadcasters: Broadcasters | null = null;
+
+beforeEach(async () => {
+  const { __testing, setBroadcaster, setResolvedBroadcaster } = await import("./interactions.ts");
+  __testing.reset();
+  // A setter returns the fn it replaced; re-install it straight away.
+  const broadcast = setBroadcaster(() => {});
+  setBroadcaster(broadcast);
+  const resolved = setResolvedBroadcaster(() => {});
+  setResolvedBroadcaster(resolved);
+  installedBroadcasters = { broadcast, resolved };
+});
+
+afterEach(async () => {
+  if (!installedBroadcasters) return;
+  const { setBroadcaster, setResolvedBroadcaster } = await import("./interactions.ts");
+  setBroadcaster(installedBroadcasters.broadcast);
+  setResolvedBroadcaster(installedBroadcasters.resolved);
+  installedBroadcasters = null;
+});
+
+/** Insert a Task row pointing at a fresh temp directory so the
+ *  pendingInteractionCount surfacing path has a real row to read. Returns
+ *  the resolved cwd for assertions. */
+async function makeTaskWithCwd(id: string): Promise<string> {
+  const cwd = mkdtempSync(path.join(tmpdir(), `agetor-int-task-${id}-`));
+  const { tasks } = await import("./db.ts");
+  tasks.insert({
+    id,
+    title: id,
+    prompt: "",
+    column: "backlog",
+    agent: "claude-code",
+    workdir: cwd,
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: "opus-4.7",
+    effort: null,
+    speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [],    backlog: [], plans: [], draft: null,
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+  });
+  return cwd;
+}
+
+/** Convenience wrapper so the generic-machinery tests below read cleanly —
+ *  registers a tmux_prompt with a single Yes choice. */
+async function makePrompt(taskId: string, runId: string, fingerprint: string) {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  return registerTmuxPrompt({
+    taskId, runId,
+    paneText: "?", choices: [{ key: "1", label: "Yes" }], fingerprint,
+  });
+}
+
+test("cancelPendingForTask resolves every pending interaction with the sentinel", async () => {
+  const { cancelPendingForTask, __testing } = await import("./interactions.ts");
+  const p = await makePrompt("tCancel", "r1", "fp-cancel");
+  expect(__testing.tmuxPromptsSize()).toBe(1);
+
+  cancelPendingForTask("tCancel", "bye");
+  await expect(p.answer).resolves.toEqual({ key: "__cancelled__" });
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+});
+
+test("cancelPendingForTask leaves other tasks' interactions untouched", async () => {
+  const { cancelPendingForTask, answerTmuxPrompt } = await import("./interactions.ts");
+  const keep = await makePrompt("tA", "r1", "fp-keep");
+  const drop = await makePrompt("tB", "r1", "fp-drop");
+  cancelPendingForTask("tB", "stop");
+  await expect(drop.answer).resolves.toEqual({ key: "__cancelled__" });
+  // 'keep' still pending → answerable:
+  expect(answerTmuxPrompt(keep.id, { key: "1" })).toBe(true);
+  await expect(keep.answer).resolves.toEqual({ key: "1" });
+});
+
+test("listPendingForTask returns interactions in createdAt order", async () => {
+  const { listPendingForTask } = await import("./interactions.ts");
+  const q1 = await makePrompt("tList", "r1", "fp-1");
+  await new Promise((r) => setTimeout(r, 5));
+  const q2 = await makePrompt("tList", "r1", "fp-2");
+  const pending = listPendingForTask("tList");
+  expect(pending.map((p) => p.id)).toEqual([q1.id, q2.id]);
+});
+
+test("setBroadcaster receives newly registered interactions", async () => {
+  const { setBroadcaster, registerScrapedAskQuestions } = await import("./interactions.ts");
+  const seen: string[] = [];
+  setBroadcaster((req) => {
+    if (req.kind === "ask_questions") seen.push(`ask_questions:${req.questions.length}`);
+    else if (req.kind === "tmux_prompt") seen.push(`tmux_prompt`);
+  });
+  registerScrapedAskQuestions({
+    taskId: "tBroad", runId: "r1",
+    questions: [{ question: "Which?", options: [{ label: "A" }] }],
+    fingerprint: "fp-broad",
+  });
+  expect(seen.length).toBe(1);
+  expect(seen[0]).toBe("ask_questions:1");
+});
+
+/* ── AskUserQuestion scraper-sourced ────────────────────────────────── */
+
+test("registerScrapedAskQuestions broadcasts a scraper-sourced card and lists it as pending", async () => {
+  const { registerScrapedAskQuestions, listPendingForTask, countPendingForTask, setBroadcaster } =
+    await import("./interactions.ts");
+  const seen: string[] = [];
+  setBroadcaster((req) => seen.push(req.kind));
+  const req = registerScrapedAskQuestions({
+    taskId: "tS",
+    runId: "rS",
+    questions: [{ question: "Pick", options: [{ label: "A" }, { label: "B" }] }],
+    fingerprint: "fp-1",
+  });
+  expect(req.source).toBe("scraper");
+  expect(req.fingerprint).toBe("fp-1");
+  expect(seen).toEqual(["ask_questions"]);
+  expect(countPendingForTask("tS")).toBe(1);
+  expect(listPendingForTask("tS").map((r) => r.id)).toContain(req.id);
+});
+
+test("getAskQuestionsById returns the request with its questions + source", async () => {
+  const { registerScrapedAskQuestions, getAskQuestionsById } = await import("./interactions.ts");
+  const req = registerScrapedAskQuestions({
+    taskId: "tS2",
+    runId: "rS2",
+    questions: [{ question: "Pick", multiSelect: true, options: [{ label: "A" }] }],
+    fingerprint: "fp-2",
+  });
+  const got = getAskQuestionsById(req.id);
+  expect(got?.source).toBe("scraper");
+  expect(got?.questions[0]!.question).toBe("Pick");
+  expect(getAskQuestionsById("missing")).toBeNull();
+});
+
+test("findScrapedAskQuestionsByFingerprint locates the pending card (scraper dedup gate)", async () => {
+  const { registerScrapedAskQuestions, findScrapedAskQuestionsByFingerprint } =
+    await import("./interactions.ts");
+  const req = registerScrapedAskQuestions({
+    taskId: "tS3", runId: "rS3",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-3",
+  });
+  expect(findScrapedAskQuestionsByFingerprint("tS3", "fp-3")?.id).toBe(req.id);
+  expect(findScrapedAskQuestionsByFingerprint("tS3", "other")).toBeNull();
+  expect(findScrapedAskQuestionsByFingerprint("otherTask", "fp-3")).toBeNull();
+});
+
+test("activeAskQuestionsForTask powers the registration gate (don't double-register)", async () => {
+  const { registerScrapedAskQuestions, activeAskQuestionsForTask } = await import("./interactions.ts");
+  expect(activeAskQuestionsForTask("tS4")).toHaveLength(0);
+  registerScrapedAskQuestions({
+    taskId: "tS4", runId: "rS4",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-4",
+  });
+  expect(activeAskQuestionsForTask("tS4")).toHaveLength(1);
+  // A different task's cards never leak into the gate.
+  expect(activeAskQuestionsForTask("tS4-other")).toHaveLength(0);
+});
+
+test("resolveScrapedAskQuestions removes the card and broadcasts the resolution", async () => {
+  const { registerScrapedAskQuestions, resolveScrapedAskQuestions, countPendingForTask, setResolvedBroadcaster } =
+    await import("./interactions.ts");
+  const resolved: string[] = [];
+  setResolvedBroadcaster((r) => resolved.push(r.id));
+  const req = registerScrapedAskQuestions({
+    taskId: "tS5", runId: "rS5",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-5",
+  });
+  expect(resolveScrapedAskQuestions(req.id)).toBe(true);
+  expect(countPendingForTask("tS5")).toBe(0);
+  expect(resolved).toEqual([req.id]);
+  // Idempotent: a second resolve is a no-op.
+  expect(resolveScrapedAskQuestions(req.id)).toBe(false);
+});
+
+test("cancelPendingForTask also clears a scraper-sourced card (uniform teardown)", async () => {
+  const { registerScrapedAskQuestions, cancelPendingForTask, countPendingForTask } =
+    await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tS6", runId: "rS6",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-6",
+  });
+  expect(countPendingForTask("tS6")).toBe(1);
+  cancelPendingForTask("tS6", "cancelled");
+  expect(countPendingForTask("tS6")).toBe(0);
+});
+
+test("cancelPendingForTask resolves ask_questions entries", async () => {
+  const { registerScrapedAskQuestions, cancelPendingForTask, countPendingForTask } =
+    await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tC", runId: "rC",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-c",
+  });
+  expect(countPendingForTask("tC")).toBe(1);
+  cancelPendingForTask("tC", "cancelled by user");
+  expect(countPendingForTask("tC")).toBe(0);
+});
+
+test("tasks.get / tasks.list expose pendingInteractionCount reflecting open interactions", async () => {
+  await makeTaskWithCwd("tCount");
+  const { tasks } = await import("./db.ts");
+  const {
+    registerScrapedAskQuestions, registerTmuxPrompt, answerTmuxPrompt,
+  } = await import("./interactions.ts");
+
+  // No interactions yet → 0.
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(0);
+
+  // One of each remaining kind from the in-memory maps; counter reflects all.
+  registerScrapedAskQuestions({
+    taskId: "tCount", runId: "r1",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-tCount",
+  });
+  const t = registerTmuxPrompt({
+    taskId: "tCount", runId: "r1",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-count",
+  });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(2);
+  // And the same count surfaces via tasks.list (the kanban's polling path).
+  const fromList = tasks.list().find((t) => t.id === "tCount");
+  expect(fromList?.pendingInteractionCount).toBe(2);
+
+  // Answering removes the entry from its map and decrements the count.
+  answerTmuxPrompt(t.id, { key: "1" });
+  await t.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(1);
+
+  // Counter is scoped to the task: a sibling task with no interactions reads 0.
+  await makeTaskWithCwd("tCountSibling");
+  expect(tasks.get("tCountSibling")!.pendingInteractionCount).toBe(0);
+});
+
+test("registerTmuxPrompt + answerTmuxPrompt round-trips a key", async () => {
+  const { registerTmuxPrompt, answerTmuxPrompt, __testing } = await import("./interactions.ts");
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+  const { id, answer } = registerTmuxPrompt({
+    taskId: "tT", runId: "rT",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "abc123",
+  });
+  expect(__testing.tmuxPromptsSize()).toBe(1);
+  expect(answerTmuxPrompt(id, { key: "1" })).toBe(true);
+  await expect(answer).resolves.toEqual({ key: "1" });
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+});
+
+test("findTmuxPromptByFingerprint hits only the same task + fingerprint", async () => {
+  const { registerTmuxPrompt, findTmuxPromptByFingerprint } = await import("./interactions.ts");
+  registerTmuxPrompt({
+    taskId: "tA", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-A",
+  });
+  registerTmuxPrompt({
+    taskId: "tB", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-B",
+  });
+  expect(findTmuxPromptByFingerprint("tA", "fp-A")?.fingerprint).toBe("fp-A");
+  expect(findTmuxPromptByFingerprint("tA", "fp-B")).toBeNull();   // wrong task
+  expect(findTmuxPromptByFingerprint("tB", "fp-A")).toBeNull();   // wrong fp
+});
+
+test("listPendingForTask returns tmux_prompt entries alongside other kinds", async () => {
+  const { registerScrapedAskQuestions, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tM", runId: "rM",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-ask",
+  });
+  registerTmuxPrompt({
+    taskId: "tM", runId: "rM",
+    paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp",
+  });
+  const kinds = listPendingForTask("tM").map((r) => r.kind).sort();
+  expect(kinds).toEqual(["ask_questions", "tmux_prompt"]);
+});
+
+test("cancelPendingForTask resolves tmux_prompt entries with the sentinel", async () => {
+  const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
+  const { answer } = registerTmuxPrompt({
+    taskId: "tX", runId: "rX",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-X",
+  });
+  cancelPendingForTask("tX", "task deleted");
+  await expect(answer).resolves.toEqual({ key: "__cancelled__" });
+});
+
+test("registerTmuxPrompt rejects reserved sentinel keys", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-sentinel", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "__external__", label: "External" }],
+    fingerprint: "fp-sentinel",
+  })).toThrow(/reserved/);
+});
+
+/* ── Unparsable fallback tmux_prompt (unparsable:true, choices:[]) ────── */
+
+test("registerTmuxPrompt with unparsable:true + choices:[] creates a request carrying both, broadcast + listPendingForTask included, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, setBroadcaster } = await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { req } = registerTmuxPrompt({
+    taskId: "tUnparsable", runId: "rU",
+    paneText: "Set up auto mode for your environment?\n...\nEsc to cancel",
+    choices: [],
+    fingerprint: "fp-unparsable",
+    unparsable: true,
+  });
+
+  expect(req.unparsable).toBe(true);
+  expect(req.choices).toEqual([]);
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { unparsable?: boolean }).unparsable).toBe(true);
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tUnparsable");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { unparsable?: boolean }).unparsable).toBe(true);
+  expect((pending[0] as { choices: unknown[] }).choices).toEqual([]);
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.unparsable).toBe(true);
+  expect(roundTripped.choices).toEqual([]);
+});
+
+test("registerTmuxPrompt without the unparsable flag leaves it undefined (back-compat)", async () => {
+  const { registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  const { req } = registerTmuxPrompt({
+    taskId: "tNormal", runId: "rN",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-normal",
+  });
+
+  expect(req.unparsable).toBeUndefined();
+
+  const pending = listPendingForTask("tNormal");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { unparsable?: boolean }).unparsable).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key (JSON.stringify
+  // drops `undefined` properties, matching how the SSE payload would look).
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("unparsable" in roundTripped).toBe(false);
+});
+
+test("an unparsable prompt resolves via the __external__ sentinel (scrapeOnce sweep path), leaves the pending list, and fans out a resolved event", async () => {
+  const { registerTmuxPrompt, answerTmuxPrompt, listPendingForTask, setResolvedBroadcaster } =
+    await import("./interactions.ts");
+  const resolved: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, kind: r.kind }));
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tExternal", runId: "rE",
+    paneText: "Set up auto mode for your environment?",
+    choices: [],
+    fingerprint: "fp-external",
+    unparsable: true,
+  });
+  expect(listPendingForTask("tExternal")).toHaveLength(1);
+
+  // The scraper sweep resolves a fallback card the same way it resolves any
+  // other tmux_prompt whose fingerprint no longer matches the live pane.
+  expect(answerTmuxPrompt(id, { key: "__external__" })).toBe(true);
+  await expect(answer).resolves.toEqual({ key: "__external__" });
+
+  expect(listPendingForTask("tExternal")).toHaveLength(0);
+  expect(resolved).toEqual([{ id: req.id, kind: "tmux_prompt" }]);
+});
+
+test("empty choices array passes the reserved-key validation (no choices to reject)", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-empty-choices", runId: "r1",
+    paneText: "?",
+    choices: [],
+    fingerprint: "fp-empty-choices",
+    unparsable: true,
+  })).not.toThrow();
+});
+
+test("answer* paths emit on the resolved broadcaster", async () => {
+  const {
+    setResolvedBroadcaster,
+    registerScrapedAskQuestions, resolveScrapedAskQuestions,
+    registerTmuxPrompt, answerTmuxPrompt,
+    cancelPendingForTask,
+  } = await import("./interactions.ts");
+  const seen: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => { seen.push({ id: r.id, kind: r.kind }); });
+
+  const q = registerScrapedAskQuestions({
+    taskId: "tR", runId: "rR",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-rq",
+  });
+  resolveScrapedAskQuestions(q.id);
+
+  const t = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r",
+  });
+  answerTmuxPrompt(t.id, { key: "1" });
+  await t.answer;
+
+  // cancellation path should fan out too
+  const t2 = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r2",
+  });
+  cancelPendingForTask("tR", "test");
+  await t2.answer;
+
+  // Expect three resolution emissions in order.
+  expect(seen.map((s) => s.kind)).toEqual(["ask_questions", "tmux_prompt", "tmux_prompt"]);
+  expect(seen.map((s) => s.id)).toEqual([q.id, t.id, t2.id]);
+});
+/* ── fx ACP session/request_permission (real in-process awaiter) ─────── */
+
+/** Convenience wrapper mirroring `makePrompt` above — registers an
+ *  fx_permission with two options, the shape `respondPermissionRequest`
+ *  (fx-acp.ts) actually sends. */
+async function makeFxPermission(taskId: string, runId: string) {
+  const { registerFxPermission } = await import("./interactions.ts");
+  return registerFxPermission({
+    taskId, runId,
+    toolCall: { toolCallId: "tc-1", title: "Run something", kind: "execute" },
+    options: [
+      { optionId: "allow-once", name: "allow-once", kind: "allow_once" },
+      { optionId: "reject-once", name: "reject-once", kind: "reject_once" },
+    ],
+    mode: "ask",
+  });
+}
+
+test("registerFxPermission + answerFxPermission round-trips an optionId, and the card leaves the pending list", async () => {
+  const { listPendingForTask, answerFxPermission, __testing } = await import("./interactions.ts");
+  expect(__testing.fxPermissionsSize()).toBe(0);
+
+  const { id, req, answer } = await makeFxPermission("tFx", "rFx");
+  expect(__testing.fxPermissionsSize()).toBe(1);
+  expect(req.kind).toBe("fx_permission");
+  expect(req.taskId).toBe("tFx");
+  expect(listPendingForTask("tFx").map((r) => r.id)).toEqual([id]);
+
+  expect(answerFxPermission(id, { optionId: "allow-once" })).toBe(true);
+  await expect(answer).resolves.toEqual({ optionId: "allow-once" });
+
+  expect(__testing.fxPermissionsSize()).toBe(0);
+  expect(listPendingForTask("tFx")).toHaveLength(0);
+});
+
+test("answerFxPermission is idempotent: a second answer for the same id returns false", async () => {
+  const { answerFxPermission } = await import("./interactions.ts");
+  const { id, answer } = await makeFxPermission("tFxTwice", "rFx");
+
+  expect(answerFxPermission(id, { optionId: "allow-once" })).toBe(true);
+  await expect(answer).resolves.toEqual({ optionId: "allow-once" });
+
+  // A second (racing) resolution attempt for the same id — e.g. the
+  // driver's own cancel/teardown sweep landing after the user already
+  // answered — must be a safe no-op, not a double-resolve.
+  expect(answerFxPermission(id, { cancelled: true })).toBe(false);
+});
+
+test("findFxPermissionById returns the pending request, then null once answered", async () => {
+  const { findFxPermissionById, answerFxPermission } = await import("./interactions.ts");
+  const { id } = await makeFxPermission("tFxFind", "rFx");
+
+  expect(findFxPermissionById(id)?.taskId).toBe("tFxFind");
+  expect(findFxPermissionById("missing-id")).toBeNull();
+
+  answerFxPermission(id, { optionId: "reject-once" });
+  expect(findFxPermissionById(id)).toBeNull();
+});
+
+test("cancelPendingForTask resolves a pending fx_permission with {cancelled: true} and removes it", async () => {
+  const { cancelPendingForTask, __testing } = await import("./interactions.ts");
+  const { answer } = await makeFxPermission("tFxCancel", "rFx");
+  expect(__testing.fxPermissionsSize()).toBe(1);
+
+  cancelPendingForTask("tFxCancel", "stop");
+  await expect(answer).resolves.toEqual({ cancelled: true });
+  expect(__testing.fxPermissionsSize()).toBe(0);
+});
+
+test("cancelPendingForTask leaves other tasks' fx_permission cards untouched", async () => {
+  const { cancelPendingForTask, answerFxPermission } = await import("./interactions.ts");
+  const keep = await makeFxPermission("tFxA", "rFx");
+  const drop = await makeFxPermission("tFxB", "rFx");
+
+  cancelPendingForTask("tFxB", "stop");
+  await expect(drop.answer).resolves.toEqual({ cancelled: true });
+
+  // 'keep' still pending → answerable:
+  expect(answerFxPermission(keep.id, { optionId: "allow-once" })).toBe(true);
+  await expect(keep.answer).resolves.toEqual({ optionId: "allow-once" });
+});
+
+test("registerFxPermission broadcasts the card, and answering it fires the resolved broadcaster", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, answerFxPermission } = await import("./interactions.ts");
+  const broadcasted: string[] = [];
+  const resolved: Array<{ id: string; kind: string }> = [];
+  setBroadcaster((req) => broadcasted.push(req.kind));
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, kind: r.kind }));
+
+  const { id } = await makeFxPermission("tFxBroadcast", "rFx");
+  expect(broadcasted).toEqual(["fx_permission"]);
+  expect(resolved).toEqual([]);
+
+  answerFxPermission(id, { optionId: "allow-once" });
+  expect(resolved).toEqual([{ id, kind: "fx_permission" }]);
+});
+
+test("listPendingForTask returns fx_permission entries alongside the other kinds, in createdAt order", async () => {
+  const { registerScrapedAskQuestions, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tFxMixed", runId: "rM",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-fx-mixed-ask",
+  });
+  registerTmuxPrompt({
+    taskId: "tFxMixed", runId: "rM",
+    paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-fx-mixed-tmux",
+  });
+  await makeFxPermission("tFxMixed", "rM");
+
+  const kinds = listPendingForTask("tFxMixed").map((r) => r.kind).sort();
+  expect(kinds).toEqual(["ask_questions", "fx_permission", "tmux_prompt"]);
+});
+
+/* ── Broadcast-throw rollback ──────────────────────────────────────────
+ *
+ * Every register* function wraps its `broadcast(req)` call in try/catch:
+ * a throwing listener (the orchestrator's SSE fan-out has no per-listener
+ * try/catch of its own) must not strand a phantom pending entry the UI can
+ * never see or dismiss. The rollback removes the entry from its map AND
+ * fires the resolved-broadcast (so any UI that DID see the request before
+ * the listener threw learns it's gone too) before rethrowing the original
+ * error to the caller. Covered here for the real in-process awaiter
+ * (`fx_permission`) and one sibling kind (`tmux_prompt`) — `ask_questions`
+ * shares the identical rollback shape (see `registerScrapedAskQuestions` in
+ * interactions.ts) and is not re-covered per kind here.
+ * ────────────────────────────────────────────────────────────────────── */
+
+test("registerFxPermission rolls back when the broadcaster throws: the entry never lands in the registry, and the resolved-broadcast still fires", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, listPendingForTask, __testing } = await import("./interactions.ts");
+  const resolved: Array<{ id: string; taskId: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, taskId: r.taskId, kind: r.kind }));
+  setBroadcaster(() => {
+    throw new Error("boom");
+  });
+
+  let thrown: unknown;
+  try {
+    await makeFxPermission("tFxThrow", "rFx");
+  } catch (err) {
+    thrown = err;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("boom");
+
+  // Rolled back: never registered, so nothing is pending and nothing is
+  // answerable.
+  expect(__testing.fxPermissionsSize()).toBe(0);
+  expect(listPendingForTask("tFxThrow")).toHaveLength(0);
+
+  // The resolved-broadcast still fired for the doomed entry, so a UI that
+  // rendered the card from an earlier (successful) listener in the same
+  // fan-out learns to drop it.
+  expect(resolved).toHaveLength(1);
+  expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tFxThrow", kind: "fx_permission" });
+});
+
+test("registerTmuxPrompt rolls back the same way when the broadcaster throws (sibling kind)", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, registerTmuxPrompt, listPendingForTask, __testing } =
+    await import("./interactions.ts");
+  const resolved: Array<{ id: string; taskId: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, taskId: r.taskId, kind: r.kind }));
+  setBroadcaster(() => {
+    throw new Error("kaboom");
+  });
+
+  let thrown: unknown;
+  try {
+    registerTmuxPrompt({
+      taskId: "tTmuxThrow", runId: "r1",
+      paneText: "?", choices: [{ key: "1", label: "Yes" }], fingerprint: "fp-throw",
+    });
+  } catch (err) {
+    thrown = err;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("kaboom");
+
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+  expect(listPendingForTask("tTmuxThrow")).toHaveLength(0);
+
+  expect(resolved).toHaveLength(1);
+  expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tTmuxThrow", kind: "tmux_prompt" });
+});
+
+/* ── nav passthrough (claude 2.1.245 /effort slider) ──────────────────── */
+
+test("registerTmuxPrompt with nav:\"horizontal\" carries it through req, broadcast, and listPendingForTask, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt, setBroadcaster } =
+    await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavHorizontal", runId: "rNH",
+    paneText: "←/→ to adjust · Enter to confirm",
+    choices: [{ key: "1", label: "low" }, { key: "2", label: "high" }],
+    cursorIndex: 1,
+    nav: "horizontal",
+    fingerprint: "fp-nav-horizontal",
+  });
+
+  expect(req.nav).toBe("horizontal");
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { nav?: string }).nav).toBe("horizontal");
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tNavHorizontal");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBe("horizontal");
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.nav).toBe("horizontal");
+
+  answerTmuxPrompt(id, { key: "2" });
+  await answer;
+});
+
+test("registerTmuxPrompt without nav leaves it undefined (back-compat; dismissal path treats undefined as vertical)", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt } =
+    await import("./interactions.ts");
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavUndefined", runId: "rNU",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-nav-undefined",
+  });
+
+  expect(req.nav).toBeUndefined();
+
+  const pending = listPendingForTask("tNavUndefined");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key (JSON.stringify
+  // drops `undefined` properties, matching how the SSE payload would look).
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("nav" in roundTripped).toBe(false);
+
+  answerTmuxPrompt(id, { key: "1" });
+  await answer;
+});
+
+test("registerTmuxPrompt with nav:\"vertical\" explicitly is preserved as \"vertical\"", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt } =
+    await import("./interactions.ts");
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavVertical", runId: "rNV",
+    paneText: "Choose an option:",
+    choices: [{ key: "1", label: "A" }, { key: "2", label: "B" }],
+    cursorIndex: 0,
+    nav: "vertical",
+    fingerprint: "fp-nav-vertical",
+  });
+
+  expect(req.nav).toBe("vertical");
+
+  const pending = listPendingForTask("tNavVertical");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBe("vertical");
+
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.nav).toBe("vertical");
+
+  answerTmuxPrompt(id, { key: "1" });
+  await answer;
+});
+
+/* ── confirmKey passthrough (claude 2.1.245 bare /model picker's "s to use
+ * this session only") — same round-trip shape as the nav tests above:
+ * req → broadcast → listPendingForTask → JSON. ─────────────────────────── */
+
+test("registerTmuxPrompt with confirmKey:\"s\" carries it through req, broadcast, and listPendingForTask, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt, setBroadcaster } =
+    await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tConfirmKeyS", runId: "rCKS",
+    paneText: "Enter to set as default · s to use this session only · Esc to cancel",
+    choices: [{ key: "1", label: "Default" }, { key: "2", label: "Opus" }],
+    cursorIndex: 1,
+    confirmKey: "s",
+    fingerprint: "fp-confirmkey-s",
+  });
+
+  expect(req.confirmKey).toBe("s");
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { confirmKey?: string }).confirmKey).toBe("s");
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tConfirmKeyS");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { confirmKey?: string }).confirmKey).toBe("s");
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.confirmKey).toBe("s");
+
+  answerTmuxPrompt(id, { key: "2" });
+  await answer;
+});
+
+test("registerTmuxPrompt without confirmKey leaves it undefined (back-compat; dismissal path treats undefined as Enter)", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt } =
+    await import("./interactions.ts");
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tConfirmKeyUndefined", runId: "rCKU",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-confirmkey-undefined",
+  });
+
+  expect(req.confirmKey).toBeUndefined();
+
+  const pending = listPendingForTask("tConfirmKeyUndefined");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { confirmKey?: string }).confirmKey).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key (JSON.stringify
+  // drops `undefined` properties, matching how the SSE payload would look).
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("confirmKey" in roundTripped).toBe(false);
+
+  answerTmuxPrompt(id, { key: "1" });
+  await answer;
+});
+
+test("registerTmuxPrompt rejects a confirmKey that isn't a single printable ASCII letter — 'Enter' (a key NAME, not a keystroke)", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-confirmkey-enter", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "1", label: "Yes" }],
+    confirmKey: "Enter",
+    fingerprint: "fp-confirmkey-enter",
+  })).toThrow(/confirmKey/);
+});
+
+test("registerTmuxPrompt rejects a confirmKey that isn't a single printable ASCII letter — 'C-c' (a tmux control-key name)", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-confirmkey-cc", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "1", label: "Yes" }],
+    confirmKey: "C-c",
+    fingerprint: "fp-confirmkey-cc",
+  })).toThrow(/confirmKey/);
+});
+
+test("Cursor ask registers, answers, skips, and returns the same card for a duplicate tool call", async () => {
+  const { registerCursorAskQuestions, answerCursorAsk, listOpenCursorAsks } = await import("./db.ts").then(async (db) => {
+    const interactions = await import("./interactions.ts");
+    return { ...interactions, listOpenCursorAsks: db.listOpenCursorAsks };
+  });
+  const first = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    title: "Pick",
+    delivery: "live",
+    questions: [{
+      id: "q1",
+      prompt: "",
+      promptMarkdown: "Which?",
+      options: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }],
+    }],
+  });
+  expect(first.req.source).toBe("cursor");
+  expect(first.req.title).toBe("Pick");
+  expect(first.req.questions[0]?.question).toBe("Which?");
+  expect(first.req.questions[0]?.options[0]?.id).toBe("a");
+  const again = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "other", options: [{ id: "z", label: "Zed" }] }],
+  });
+  expect(again.id).toBe(first.id);
+  expect(again.req.questions[0]?.question).toBe("Which?");
+  const pending = answerCursorAsk(first.id, {
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(pending).toBe(true);
+  expect(await first.answer).toEqual({
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(listOpenCursorAsks().some((row) => row.toolCallId === "call\n1")).toBe(false);
+
+  const skip = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call-skip",
+    delivery: "live",
+    questions: [{ id: "q2", prompt: "Skip me?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  expect(answerCursorAsk(skip.id, { outcome: "skipped" })).toBe(true);
+  expect(await skip.answer).toEqual({ outcome: "skipped" });
+});
+
+test("cancelPendingForTask writes cancelled for a Cursor card and does not write skipped", async () => {
+  const { registerCursorAskQuestions, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  const card = registerCursorAskQuestions({
+    taskId: "tCursorCancel",
+    runId: "rCursorCancel",
+    toolCallId: "call-cancel",
+    delivery: "live",
+    questions: [{ id: "q", prompt: "Stop?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const settled = card.answer;
+  cancelPendingForTask("tCursorCancel", "stop");
+  expect(await settled).toEqual({ outcome: "cancelled" });
+  const row = db.query<{ outcome: string }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get("tCursorCancel", "call-cancel");
+  expect(row?.outcome).toBe("cancelled");
+});
+
+test("retargetLiveCursorAsksForRun releases only that run's live Cursor card and leaves the row open", async () => {
+  const {
+    registerCursorAskQuestions,
+    registerScrapedAskQuestions,
+    retargetLiveCursorAsksForRun,
+    listPendingForTask,
+    answerCursorAsk,
+    setBroadcaster,
+  } = await import("./interactions.ts");
+  const { db, listOpenCursorAsks } = await import("./db.ts");
+  const published: Array<{ id: string; delivery?: string; followupCause?: string; reason?: string }> = [];
+  setBroadcaster((req, reason) => {
+    if (req.kind === "ask_questions") {
+      published.push({ id: req.id, delivery: req.delivery, followupCause: req.followupCause, reason });
+    }
+  });
+  const live = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-live",
+    title: "Pick",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "Which?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const olderRun = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rOlder",
+    toolCallId: "call-older",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "Older?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const already = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-already",
+    delivery: "restart-followup",
+    questions: [{ id: "q2", prompt: "Later?", options: [{ id: "b", label: "Beta" }] }],
+  });
+  const scraper = registerScrapedAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    questions: [{ question: "Pane?", options: [{ label: "Yes" }] }],
+    fingerprint: "fp-retarget",
+  });
+  const driver = live.answer;
+  retargetLiveCursorAsksForRun("rRetarget");
+  expect(await driver).toEqual({ outcome: "cancelled" });
+  const pending = listPendingForTask("tRetarget");
+  const retargeted = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-live");
+  if (!retargeted || retargeted.kind !== "ask_questions") throw new Error("expected retargeted ask");
+  expect(retargeted.id).toBe(live.id);
+  expect(retargeted.delivery).toBe("restart-followup");
+  expect(retargeted.followupCause).toBe("child-exit");
+  const updates = published.filter((row) => row.reason === "update");
+  expect(updates).toEqual([{ id: live.id, delivery: "restart-followup", followupCause: "child-exit", reason: "update" }]);
+  const keptFollowup = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-already");
+  if (!keptFollowup || keptFollowup.kind !== "ask_questions") throw new Error("expected follow-up");
+  expect(keptFollowup.id).toBe(already.id);
+  expect(keptFollowup.delivery).toBe("restart-followup");
+  const older = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-older");
+  if (!older || older.kind !== "ask_questions") throw new Error("expected older ask");
+  expect(older.delivery).toBe("live");
+  expect(pending.some((p) => p.kind === "ask_questions" && p.id === scraper.id)).toBe(true);
+  const row = db.query<{ outcome: string | null }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get("tRetarget", "call-live");
+  expect(row).not.toBeNull();
+  expect(row?.outcome ?? null).toBeNull();
+  expect(listOpenCursorAsks().some((open) => open.taskId === "tRetarget" && open.toolCallId === "call-live")).toBe(true);
+  let resolvedAgain = false;
+  const again = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-live",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "nope", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  void again.answer.then(() => { resolvedAgain = true; });
+  retargetLiveCursorAsksForRun("rRetarget");
+  await new Promise((r) => setTimeout(r, 20));
+  expect(resolvedAgain).toBe(false);
+  expect(again.id).toBe(live.id);
+  expect(again.req.delivery).toBe("restart-followup");
+  expect(published.filter((row) => row.reason === "update")).toEqual([
+    { id: live.id, delivery: "restart-followup", followupCause: "child-exit", reason: "update" },
+  ]);
+  answerCursorAsk(again.id, { outcome: "cancelled" });
+  answerCursorAsk(olderRun.id, { outcome: "cancelled" });
+  answerCursorAsk(already.id, { outcome: "cancelled" });
+});
+
+test("a scraper ask card still has no awaiter", async () => {
+  const { registerScrapedAskQuestions, answerCursorAsk } = await import("./interactions.ts");
+  const req = registerScrapedAskQuestions({
+    taskId: "tScraperStill",
+    runId: "rScraperStill",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-scraper-still",
+  });
+  expect(req.source).toBe("scraper");
+  expect(answerCursorAsk(req.id, { outcome: "skipped" })).toBe(false);
+});
+
+test("registerTmuxPrompt accepts a single-letter confirmKey regardless of case", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-confirmkey-upper", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "1", label: "Yes" }],
+    confirmKey: "S",
+    fingerprint: "fp-confirmkey-upper",
+  })).not.toThrow();});

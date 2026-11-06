@@ -1,0 +1,1 @@
+{"approved":false,"reason":"clamp 未校验 low > high，反向边界不会抛出 ValueError；可信测试以退出码 1 失败。"}

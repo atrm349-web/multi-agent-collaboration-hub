@@ -1,0 +1,263 @@
+import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
+import { gotoApp as gotoAppUrl, openSettingsGeneral, putPreference } from "./helpers";
+
+/**
+ * E2E coverage for the Auto/Dark/Light theme feature
+ * (docs/plans/auto-dark-light-theme.md, T10). Runs Chromium against the real
+ * webview served by `bun run hmr` and the real Bun API/orchestrator served
+ * by `src/bun/headless.ts` (a per-worker instance provisioned by the
+ * `backend` fixture in e2e/fixtures.ts) — no mocked fetches, no internal API
+ * calls standing in for UI interaction.
+ *
+ * These assert **computed colors and DOM classes**, never pixel/screenshot
+ * diffs: Chromium's rendering differs from the WKWebView the app actually
+ * ships in, so a pixel baseline would be flaky and wouldn't reflect the real
+ * product. `screenshot: "only-on-failure"` in the config still captures
+ * human-reviewable artifacts on failure.
+ *
+ * All tests in this file share this worker's one headless backend + SQLite
+ * DB and run serially — the persistence spec depends on the DB state a
+ * prior test left behind, and each test still starts from a known
+ * preference via the direct `PUT /preferences/theme` call in
+ * `setThemePreference`, so ordering never has to be inferred from
+ * Settings-UI state.
+ */
+
+test.describe.configure({ mode: "serial" });
+
+/** Arrange-only helper: seeds the persisted preference directly through the
+ *  API so each test starts from a known state, without that setup step
+ *  itself being the thing under test (spec 2 below drives the actual change
+ *  through the Settings UI, which is what's meant to be under test). */
+async function setThemePreference(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  value: "auto" | "dark" | "light",
+): Promise<void> {
+  await putPreference(request, backend, "theme", value);
+}
+
+/** Navigates to the app boot URL and waits for real rendered content — the
+ *  Settings button in the app bar — rather than a fixed sleep. */
+async function gotoApp(page: Page, backend: E2EBackend): Promise<void> {
+  await gotoAppUrl(page, backend.bootBase);
+}
+
+function isDark(page: Page): Promise<boolean> {
+  return page.evaluate(() => document.documentElement.classList.contains("dark"));
+}
+
+function colorScheme(page: Page): Promise<string> {
+  return page.evaluate(() => document.documentElement.style.colorScheme);
+}
+
+function bodyBackground(page: Page): Promise<string> {
+  return page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+}
+
+test.describe("theme: boot resolution (no flash)", () => {
+  for (const system of ["dark", "light"] as const) {
+    test(`resolves "auto" to the system's ${system} scheme before first paint`, async ({
+      page,
+      request,
+      backend,
+    }) => {
+      await setThemePreference(request, backend, "auto");
+
+      // Record the `dark` class + color-scheme the instant the document
+      // finishes parsing (i.e. right after index.html's blocking <head>
+      // script has run, and well before React mounts) so we can prove the
+      // theme was already settled then — not merely correct by the time our
+      // assertions run after full load.
+      await page.addInitScript(() => {
+        (window as unknown as { __themeAtParse?: { cls: string; scheme: string } }).__themeAtParse =
+          undefined;
+        document.addEventListener(
+          "readystatechange",
+          () => {
+            if (document.readyState !== "loading" && !(window as any).__themeAtParse) {
+              (window as any).__themeAtParse = {
+                cls: document.documentElement.className,
+                scheme: document.documentElement.style.colorScheme,
+              };
+            }
+          },
+          { once: false },
+        );
+      });
+
+      await page.emulateMedia({ colorScheme: system });
+      await gotoApp(page, backend);
+
+      const atParse = await page.evaluate(
+        () => (window as unknown as { __themeAtParse?: { cls: string; scheme: string } }).__themeAtParse,
+      );
+      expect(atParse, "theme should already be settled right after HTML parsing").toBeTruthy();
+
+      const expectDark = system === "dark";
+      expect(atParse!.cls.includes("dark")).toBe(expectDark);
+      expect(atParse!.scheme).toBe(system);
+
+      // And it must still match after the app has fully mounted — i.e. no
+      // late correction/flip once React's ThemeProvider takes over.
+      expect(await isDark(page)).toBe(expectDark);
+      expect(await colorScheme(page)).toBe(system);
+    });
+  }
+});
+
+test.describe("theme: Settings → General picker", () => {
+  test("selecting Light flips <html> off dark and repaints body; selecting Dark restores it", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
+    expect(await isDark(page)).toBe(true);
+    const darkBg = await bodyBackground(page);
+
+    const dialog = await openSettingsGeneral(page);
+    await dialog.getByRole("button", { name: "Light", exact: true }).click();
+
+    await expect
+      .poll(() => isDark(page), { message: "expected <html> to lose the dark class" })
+      .toBe(false);
+    expect(await colorScheme(page)).toBe("light");
+    const lightBg = await bodyBackground(page);
+    expect(lightBg).not.toBe(darkBg);
+
+    await dialog.getByRole("button", { name: "Dark", exact: true }).click();
+    await expect
+      .poll(() => isDark(page), { message: "expected <html> to regain the dark class" })
+      .toBe(true);
+    expect(await colorScheme(page)).toBe("dark");
+    expect(await bodyBackground(page)).toBe(darkBg);
+  });
+
+  test("persists the choice across a reload", async ({ page, request, backend }) => {
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
+
+    const dialog = await openSettingsGeneral(page);
+    // The picker flips the class optimistically and saves in the background,
+    // so wait for the save itself before reloading — a reload that beats the
+    // PUT boots with the old preference.
+    const saved = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && new URL(r.url()).pathname === "/preferences/theme",
+    );
+    await dialog.getByRole("button", { name: "Light", exact: true }).click();
+    await expect.poll(() => isDark(page)).toBe(false);
+    expect((await saved).ok()).toBe(true);
+
+    await page.reload();
+    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+
+    // Persisted server-side (PUT /preferences/theme), not client localStorage
+    // — so a fresh load must come back Light without re-touching the UI.
+    expect(await isDark(page)).toBe(false);
+    expect(await colorScheme(page)).toBe("light");
+
+    const prefs = await request.get(`${backend.apiBase}/preferences`, {
+      headers: { authorization: `Bearer ${backend.apiToken}` },
+    });
+    expect((await prefs.json()).theme).toBe("light");
+  });
+});
+
+test.describe("theme: Auto follows the system", () => {
+  test("tracks the emulated OS preference, including a live flip while open", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await setThemePreference(request, backend, "auto");
+    await page.emulateMedia({ colorScheme: "light" });
+    await gotoApp(page, backend);
+    expect(await isDark(page)).toBe(false);
+
+    // Live flip — no reload, no re-navigation. This is the behavior
+    // ThemeProvider's matchMedia "change" listener exists for.
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expect
+      .poll(() => isDark(page), { message: "expected a live flip to dark on OS change" })
+      .toBe(true);
+    expect(await colorScheme(page)).toBe("dark");
+
+    await page.emulateMedia({ colorScheme: "light" });
+    await expect
+      .poll(() => isDark(page), { message: "expected a live flip back to light on OS change" })
+      .toBe(false);
+    expect(await colorScheme(page)).toBe("light");
+  });
+});
+
+test.describe("theme: boot request order", () => {
+  // L-A12: the `/pipelines` list is gated on `prefsLoaded` in App.tsx
+  // (`usePipelines({ enabled: prefsLoaded })`) precisely so it can never go
+  // out ahead of the boot `listPreferences` read — under the browser's
+  // per-host connection cap, with two SSE channels already open, an
+  // ungated `/pipelines` request once delayed the `dark` class past first
+  // paint. Pin the order from the page's own request stream: the FIRST
+  // `GET /pipelines` (if any) must come after the first `GET /preferences`.
+  test("GET /pipelines is never requested before GET /preferences", async ({ page, request, backend }) => {
+    await setThemePreference(request, backend, "dark");
+    const order: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() !== "GET") return;
+      const path = new URL(req.url()).pathname;
+      if (path === "/preferences" || path === "/pipelines") order.push(path);
+    });
+    await gotoApp(page, backend);
+    await expect
+      .poll(() => order.includes("/preferences"), { message: "expected the boot listPreferences fetch", timeout: 5000 })
+      .toBe(true);
+    // Give a wrongly-ungated `/pipelines` fetch every chance to show up
+    // (it would be issued in the very same mount pass as `/preferences`).
+    await expect
+      .poll(() => order.includes("/pipelines"), { message: "expected the (prefs-gated) pipelines fetch", timeout: 5000 })
+      .toBe(true);
+    expect(order.indexOf("/preferences")).toBeLessThan(order.indexOf("/pipelines"));
+  });
+});
+
+test.describe("theme: token layer is live", () => {
+  test("a converted status token (--danger) actually differs between themes", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const readDanger = () =>
+      page.evaluate(() =>
+        getComputedStyle(document.documentElement).getPropertyValue("--danger").trim(),
+      );
+
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
+    // The Vite/e2e boot path carries no `&theme=` on the URL hash (only the
+    // packaged app's index.ts adds it), so the page first paints from
+    // `matchMedia` and flips to the persisted Dark only once App's
+    // `listPreferences` fetch lands — under parallel-run load that fetch can
+    // take seconds, and reading the token before the flip compares Light
+    // against Light. Wait for the flip; the no-flash guarantee is the
+    // packaged app's, not this path's.
+    // Bounded tightly on purpose (L-A12): the flip is one `listPreferences`
+    // round-trip after mount, so a multi-second delay — the `/pipelines`
+    // fetch (or anything else) racing ahead of it under the per-host
+    // connection cap — must FAIL here rather than be absorbed by the
+    // default 5s poll budget.
+    await expect
+      .poll(() => isDark(page), { message: "expected the persisted Dark preference to apply", timeout: 1500 })
+      .toBe(true);
+    const dangerDark = await readDanger();
+
+    const dialog = await openSettingsGeneral(page);
+    await dialog.getByRole("button", { name: "Light", exact: true }).click();
+    await expect.poll(() => isDark(page)).toBe(false);
+    const dangerLight = await readDanger();
+
+    expect(dangerDark).toBeTruthy();
+    expect(dangerLight).toBeTruthy();
+    expect(dangerLight).not.toBe(dangerDark);
+  });
+});

@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "packages/agent-adapters/codex/**/*.ts",
+    "src/bun/hub-codex-runtime.test.ts",
+    "scripts/verify-hub-codex.ts",
+    "scripts/verify-hub-persistence.ts",
+    "src/types/**/*.d.ts",
+    "packages/core/**/*.ts",
+    "packages/shared/**/*.ts",
+    "src/bun/hub-state-store.test.ts",
+    "src/bun/hub-durable-codex.test.ts",
+    "src/bun/hub-http.test.ts",
+    "src/bun/hub-planner.test.ts",
+    "src/bun/hub-workspace.test.ts",
+    "src/bun/hub-frontend.test.ts",
+    "src/bun/hub-service.test.ts",
+    "scripts/start-hub.ts",
+    "scripts/verify-hub-platform.ts"
+  ]
+}

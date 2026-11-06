@@ -1,0 +1,2288 @@
+import type {
+  AgentKind,
+  AgentProfile,
+  AgentStatus,
+  AppEvent,
+  BackgroundStatus,
+  BranchInfo,
+  BranchNamingConfig,
+  ColumnId,
+  DbCompactResult,
+  DbStats,
+  DiscoveredAccount,
+  GlobalEvent,
+  RetentionPassResult,
+  GitHubIssueThreadResult,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubCheckRun,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubChecksResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
+  GitHubAssigneesResult,
+  GitProvider,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
+  GitHubListItem,
+  GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeability,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
+  GitHubRepoPermissions,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
+  Handoff,
+  Harness,
+  HarnessQuota,
+  HarnessStatus,
+  HarnessUsage,
+  Isolation,
+  OpencodeServerMode,
+  OpencodeSessionList,
+  Pipeline,
+  PipelineInput,
+  Project,
+  RemoteAccessStatus,
+  Run,
+  RunEvent,
+  SavedPrompt,
+  Subagent,
+  Speed,
+  Task,
+  TaskDiff,
+  TaskEventsReplayMeta,
+  TaskGitStatus,
+  TaskTeardownPreview,
+  TaskReference,
+  TaskType,
+  TerminalTab,
+  UpdateStatus,
+  WorktreeGitStatus,
+  WorktreeInfo,
+  WorktreeTeardownResult,
+} from "../../shared/types.ts";
+import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
+import type { NotificationKind } from "../../shared/os-notification.ts";
+import type {
+  BundleExportResponse,
+  BundlePickResponse,
+  BundleSaveResponse,
+  BundleSelection,
+} from "../../shared/bundle.ts";
+import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
+import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
+import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
+import { openEventStream } from "./sse-fetch.ts";
+
+export interface UpdateSnapshot {
+  status: UpdateStatus;
+  version: string | null;
+  error: string | null;
+  lastCheckedAt: number | null;
+}
+
+// Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
+// callers (BranchPicker) keep working while the single definition lives in
+// src/shared/types.ts (server + webview share one wire shape).
+export type { BranchInfo, BranchNamingConfig };
+export type {
+  GitHubCheckRun,
+  GitHubChecksResult,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
+  GitHubIssueThreadResult,
+  GitHubItemKind,
+  GitHubItemState,
+  GitProvider,
+  GitHubAssigneesResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
+  GitHubListItem,
+  GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeability,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
+  GitHubRepoPermissions,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
+};
+export { commitPushPrompt } from "../../shared/types.ts";
+
+/** Where a command/extension comes from. `plugin` entries are contributed by an
+ *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
+ *  entries are baked into the harness binary (e.g. /init, /review). */
+export type EntrySource = "user" | "project" | "plugin" | "builtin";
+
+export interface AvailableCommand {
+  name: string;
+  description: string;
+  source: EntrySource;
+  kind: "command" | "skill";
+}
+
+/** An MCP server / skill / plugin surfaced by the prompt-top picker.
+ *  `insert` is the token dropped into the textarea (`/name` for skills,
+ *  `@name` for MCP servers and plugins). */
+export interface AvailableExtension {
+  name: string;
+  insert: string;
+  description: string;
+  source: EntrySource;
+  kind: "mcp" | "skill" | "plugin" | "agent";
+}
+
+/** Per-kind model id list from the CLI's own catalog discovery — kept fresh
+ *  by the boot sweep, the periodic 15-minute re-probe, harness-status
+ *  transitions, and a manual refresh (`refreshAgentModels`), not just at
+ *  boot. For fx (account-scoped catalogs), this kind-level map reflects the
+ *  built-in harness only — see `HarnessModelMap` for the per-harness list a
+ *  multi-account setup needs. */
+export interface AgentModelMap {
+  "claude-code": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "codex": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "cursor": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "gemini": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "antigravity": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "fx": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "opencode": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "copilot": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+}
+
+/** Per-harness model id list from `GET /agent-models/harnesses` — one entry
+ *  per *enabled* harness (every kind, not just fx; non-fx harnesses carry
+ *  their kind's list so callers have a single lookup keyed by harness id,
+ *  which is what `task.agent` / the New Task form's `agent` state hold).
+ *  `ready` is false until the boot discovery sweep has resolved at least
+ *  once — before that, `byHarness` may be incomplete or empty. `efforts`
+ *  carries the CLI-discovered per-model reasoning-effort ids (codex only
+ *  today; see `discoveredEffortsFor` in `src/shared/model-options.ts`), and
+ *  `fast`/`ultrafast` the fx speed-tier flags (`supportedSpeeds`). */
+export interface HarnessModelMap {
+  ready: boolean;
+  byHarness: Record<string, { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[]>;
+}
+
+/** Pending multi-question card. Claude's scraper cards omit the Cursor
+ *  fields; a Cursor `cursor/ask_question` card sets `source: "cursor"`. */
+export interface PendingAskQuestions {
+  kind: "ask_questions";
+  id: string;
+  taskId: string;
+  runId: string;
+  questions: Array<{
+    id?: string;
+    question: string;
+    header?: string;
+    multiSelect?: boolean;
+    options: Array<{ id?: string; label: string; description?: string; preview?: string }>;
+  }>;
+  createdAt: number;
+  source?: "scraper" | "cursor";
+  title?: string;
+  toolCallId?: string;
+  delivery?: "live" | "restart-followup";
+  /** Why a follow-up card is no longer live. Absent means a restart. */
+  followupCause?: "restart" | "child-exit";
+}
+
+/** Modal the tmux pane scraper detected — typically a plan-mode safety
+ *  dialog or another REPL prompt the PreToolUse hook system never sees.
+ *  Each `choices[i].key` is the literal keystroke the server will
+ *  `tmux send-keys` on click. */
+export interface PendingTmuxPrompt {
+  kind: "tmux_prompt";
+  id: string;
+  taskId: string;
+  runId: string;
+  paneText: string;
+  choices: Array<{ key: string; label: string }>;
+  fingerprint: string;
+  createdAt: number;
+  /** True when the scraper couldn't parse this modal into choices (footer-
+   *  gated fallback or stuck-turn watchdog) — `choices` is always `[]` in
+   *  that case. The RunPanel renders an "Open in Terminal" fallback card
+   *  instead of choice buttons. */
+  unparsable?: boolean;
+}
+
+/** The ACP tool call an fx permission request is asking about — mirrors
+ *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
+ *  `toolCallId` is guaranteed; `title`/`kind`/`rawInput` are rendered
+ *  generically when absent. */
+export interface FxPermissionToolCall {
+  toolCallId: string;
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+}
+
+/** One selectable option fx offered. `kind` is a hint from ACP's
+ *  `PermissionOptionKind` (`allow_once` | `allow_always` | `reject_once` |
+ *  `reject_always`) but kept as a plain optional string since fx documents
+ *  additional session-scoped kinds beyond those four — the card renders
+ *  fx's own `name` verbatim rather than hardcoding a fixed set. */
+export interface FxPermissionOption {
+  optionId: string;
+  name: string;
+  kind?: string;
+}
+
+/** Pending fx ACP `session/request_permission` call (real in-process
+ *  awaiter — unlike the two scraper-sourced kinds above, resolving this
+ *  directly unblocks fx's turn; there is no pane and no keystroke leg).
+ *  Mirrors `FxPermissionRequest` on the server. */
+export interface PendingFxPermission {
+  kind: "fx_permission";
+  id: string;
+  taskId: string;
+  runId: string;
+  createdAt: number;
+  toolCall: FxPermissionToolCall;
+  options: FxPermissionOption[];
+  /** The agetor mode (`auto` | `ask`) that caused this request to surface
+   *  as a card — `yolo` auto-allows and never reaches here. */
+  mode: "auto" | "ask";
+}
+
+export type PendingInteraction =
+  | PendingAskQuestions
+  | PendingTmuxPrompt
+  | PendingFxPermission;
+
+/** One stored per-host git credential, as surfaced to the webview. The store
+ *  is shared across GitHub/GitLab/Bitbucket — `host` may be a plain provider
+ *  domain (github.com, gitlab.com, bitbucket.org) or a raw ssh alias host
+ *  (e.g. github-work.com, bitbucket-work.com). The raw credential is never
+ *  returned — `tokenPreview` is a redacted tail (e.g. "…abcd"). Routes keep
+ *  the `/github/tokens` path and the `GitHub` type-name prefix for
+ *  backwards compatibility with existing stored tokens; the type name is
+ *  legacy naming only, not a GitHub-only shape. */
+export interface GitHubTokenInfo {
+  host: string;
+  label: string | null;
+  tokenPreview: string;
+}
+
+/** Response shape for the (misleadingly-named, back-compat) `/github/tokens`
+ *  routes, which actually serve credentials for any supported git host —
+ *  GitHub, GitLab, and Bitbucket. `detectedHosts` are the distinct raw
+ *  remote hosts (including ssh aliases, across all three providers) seen
+ *  across registered project dirs — used to suggest hosts that don't have a
+ *  token yet. */
+export interface GitHubTokensResult {
+  tokens: GitHubTokenInfo[];
+  detectedHosts: string[];
+}
+
+// Read api port + token, preferring globals injected by the Bun side via
+// BrowserWindow's `preload` option — that path works under the native
+// views:// scheme, which rejects URLs carrying a fragment or query.
+// Fall back to URL hash for the Vite HMR path, which loads from a plain
+// http:// URL where the hash payload still works.
+declare global {
+  interface Window { __AGETOR?: { port: string; token: string; theme?: string; fontSize?: number | string } }
+}
+// Guard `window` access for the test runtime (`bun test` runs this module
+// outside a browser). Production paths always have a real window, so the
+// `?? undefined` fallback never trips at runtime in the app.
+const _win = typeof window !== "undefined" ? window : undefined;
+const injected = _win?.__AGETOR;
+const params = new URLSearchParams(
+  ((_win?.location.hash || _win?.location.search) ?? "").replace(/^[#?]/, ""),
+);
+const API_PORT = injected?.port ?? params.get("api") ?? "4317";
+const API_TOKEN = injected?.token ?? params.get("token") ?? "";
+const BASE = `http://127.0.0.1:${API_PORT}`;
+
+// Point the busy-banner watchdog at this core before the first request. It
+// only ever probes the unauthenticated `/health` route and never aborts or
+// retries a tracked request (docs/plans/non-blocking-session-restore.md).
+configureCoreBusy({ base: BASE });
+
+/** The `Authorization` header every webview request to the core carries. The
+ *  master token never rides in a URL (master-token plan, D13): SSE goes through
+ *  `openEventStream` and images through `useAuthedObjectUrl`, both of which
+ *  send this header. */
+function authHeaders(): Record<string, string> {
+  return { authorization: `Bearer ${API_TOKEN}` };
+}
+
+/** `fetch` with the auth header merged in — the one helper the `blob:` image
+ *  hook (`authed-blob.ts`) uses to read a core byte-serving route. Caller
+ *  headers win on a clash. */
+export function authedFetch(url: string, init?: RequestInit): Promise<Response> {
+  return fetch(url, { ...init, headers: { ...authHeaders(), ...(init?.headers as Record<string, string> | undefined) } });
+}
+
+/** Error thrown for any non-2xx API response. Carries the parsed JSON body
+ *  so callers can read structured fields (e.g. the `taskIds` list returned
+ *  by `DELETE /harnesses/:id` when the harness is still in use) instead of
+ *  re-parsing the message string. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function j<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // The whole request — fetch AND body parse — is registered with the
+  // core-busy watchdog, so a response that was accepted but never finishes
+  // (a blocked Bun main thread) counts as pending and can raise the banner.
+  return trackRequest(jRequest<T>(path, init, opts));
+}
+
+async function jRequest<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // fetchWithRecovery absorbs transient socket-layer rejections (WebKit's
+  // bare "Load failed" — see net-retry.ts) via a health-gated single retry
+  // before giving up; it throws a truthful error when the server really is
+  // unreachable. HTTP error statuses still fall through to the !res.ok
+  // handling below unchanged. `opts.retry: false` (set by a handful of
+  // non-idempotent callers below) still probes health for the error
+  // message but never re-issues the request.
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(init?.headers ?? {}),
+    },
+  }, opts);
+  if (res.status === 204) return undefined as T;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = (body && typeof body === "object" && "error" in body && body.error)
+      ? String(body.error)
+      : `${res.status} ${res.statusText}`;
+    throw new ApiError(msg, res.status, body);
+  }
+  return body as T;
+}
+
+/** `j` for the bundle routes, whose callers read fields off the answer:
+ *  a 2xx whose body didn't parse as a JSON object (`j` resolves `null` for
+ *  an unparsable one) is an answer the request lost on the way back, so it
+ *  throws `ApiTransitError` — which the dialogs already word as "the
+ *  connection dropped" and treat as "it may have run" — instead of letting
+ *  a caller dereference `null` after an import that did commit. */
+async function bundleJ<T extends object>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  const body = await j<unknown>(path, init, opts);
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new ApiTransitError(`request to ${path} returned an unreadable answer`);
+  }
+  return body as T;
+}
+
+/**
+ * Run a request that is EXPECTED to block the core's main thread with the busy
+ * banner suspended for its lifetime, so "Agetor is busy" never shows as a false
+ * alarm: `compactDb` (VACUUM) and every request that opens a native Open panel
+ * — Electrobun's `openFileDialog` is a synchronous FFI call, so the core is
+ * blocked for as long as the user keeps the panel up (the server brackets
+ * those calls with a `native file dialog` lag label for the same reason).
+ */
+export async function withCoreBusySuspended<T>(request: () => Promise<T>): Promise<T> {
+  const release = suspendCoreBusy();
+  try {
+    return await request();
+  } finally {
+    release();
+  }
+}
+
+export interface AppDefaults { home: string; cwd: string; dataDir: string }
+
+/** One page of older task events, as returned by `GET /tasks/:id/events/page`
+ *  (the "Load earlier" backward-paging cursor). Ascending order (oldest
+ *  first), same shape as the SSE stream's events plus `id` — the real
+ *  `run_events` row id, which the SSE stream never carries (see
+ *  `TaskEventsReplayMeta`) but this paging route does, since it's exactly
+ *  what the next `beforeId` needs. */
+export interface TaskEventsPage {
+  events: (RunEvent & { id: number })[];
+  earliestId: number | null;
+  hasMore: boolean;
+}
+
+/** One previously-sent message, as returned by
+ *  `GET /tasks/:id/messages/history` — drives `MessageHistoryPicker`. Newest
+ *  first, already coarsely deduped server-side (client still re-dedups after
+ *  its own slash-command-XML/refs-block cleaning — see that component). */
+export interface SentMessageItem {
+  id: number;
+  text: string;
+  ts: number;
+  taskId: string;
+  taskTitle: string;
+  project: string;
+  agent: string;
+}
+
+export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+/** One day × model row of an account's local token rollup. */
+export interface AccountUsageDay {
+  day: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+export interface AccountUsagePayload { configDir: string; days: AccountUsageDay[] }
+export interface HarnessInput {
+  id: string;
+  kind: AgentKind;
+  label: string;
+  home: string | null;
+  bin: string | null;
+  env: Record<string, string>;
+  /** Forward the profile's MCP servers to the harness (absent ⇒ on). */
+  profileMcpServers?: boolean;
+}
+
+/** Body shape for `POST /agent-profiles` / `PATCH /agent-profiles/:id` — see
+ *  `docs/plans/agent-profiles.md` §3 for the full contract. `harness` is a
+ *  harness id (same semantics as `Task.agent` / `createTask`'s `agent`).
+ *  `effort`/`mode` follow the task PATCH guard's null-clear-only philosophy;
+ *  `skills` are bare names (no leading `/`), normalized server-side. */
+export interface AgentProfileInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  speed: Speed;
+  maxMode: boolean;
+  /** OpenCode's server option (D-4). Omitted ⇒ `"shared"` on create,
+   *  unchanged on PATCH, copied from the source on duplicate; any value but
+   *  `shared`/`standalone` is a 400. */
+  opencodeServer?: OpencodeServerMode;
+  instructions: string;
+  skills: string[];
+}
+
+/** Body for `POST /agent-profiles/:id/duplicate` — omitted fields are copied
+ *  from the source; `copyTasks` also re-creates its live tasks on the copy. */
+export interface DuplicateAgentProfileInput extends Partial<AgentProfileInput> {
+  copyTasks?: boolean;
+}
+
+export interface DuplicateAgentProfileResult {
+  profile: AgentProfile;
+  copiedTasks: Task[];
+  taskCopyErrors: { sourceTaskId: string; error: string }[];
+}
+
+export interface ClaudeSessionListItem {
+  sessionId: string;
+  configDir: string;
+  cwd: string;
+  title: string;
+  gitBranch: string | null;
+  liveBranch: string | null;
+  branchMismatch: boolean;
+  model: string | null;
+  lastActivity: number;
+  messageCount: number;
+  liveness: "live" | "idle" | "unknown";
+  liveHint: string | null;
+  importable: boolean;
+  blockedReason: "long-path" | "missing-folder" | "live" | "no-harness" | null;
+  harnessId: string | null;
+}
+
+export interface ClaudeSessionList {
+  sessions: ClaudeSessionListItem[];
+  /** Oldest cached liveness probe behind the list; null when a config dir
+   *  has none. See `CLAUDE_SESSIONS_LIVENESS_STALE_MS`. */
+  livenessCheckedAt: number | null;
+}
+
+export const api = {
+  defaults: () => j<AppDefaults>("/defaults"),
+  info: () => j<{ version: string }>("/info"),
+  /** Toggle the window's macOS "zoom" state. Wired up to double-click on
+   *  the app bar in App.tsx because Electrobun's drag region doesn't
+   *  implement the native title-bar double-click gesture. */
+  toggleWindowZoom: () =>
+    j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
+  /** Ask the main process to raise + focus the app window. A WKWebView's own
+   *  `window.focus()` can't activate the host NSApplication, so every "bring
+   *  agetor to front" affordance (toast clicks, etc.) has to round-trip
+   *  through here instead. Best-effort UI polish: swallows failures behind a
+   *  console.warn rather than throwing into a React event handler. */
+  focusWindow: (): Promise<void> =>
+    j<{ ok: true }>("/window/focus", { method: "POST" })
+      .then(() => undefined)
+      .catch((e) => { console.warn("[agetor] focusWindow failed", e); }),
+  getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
+  checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
+  applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
+  listAgents: () => j<AgentStatus[]>("/agents"),
+  listHarnesses: () => j<HarnessesPayload>("/harnesses"),
+  createHarness: (input: HarnessInput) =>
+    j<Harness>("/harnesses", { method: "POST", body: JSON.stringify(input) }),
+  updateHarness: (id: string, patch: Partial<Omit<HarnessInput, "id" | "kind">>) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteHarness: (id: string) =>
+    j<void>(`/harnesses/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  setHarnessEnabled: (id: string, enabled: boolean) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+  getHarnessUsage: (id: string) =>
+    j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  /** Persisted quota/usage snapshots for every harness — seeds the topbar
+   *  usage tracker on boot (`GET /usage`, distinct from `getHarnessUsage`
+   *  above, which is unrelated task-count blast radius). Live updates
+   *  arrive afterwards via the `harness_usage` `AppEvent` on
+   *  `subscribeAppEvents`. */
+  getAllUsage: () => j<HarnessQuota[]>("/usage"),
+  /** Force a fresh quota fetch for one harness, bypassing the poller's
+   *  cadence floor — the popover's manual Refresh button. */
+  refreshHarnessUsage: (id: string) =>
+    j<HarnessQuota>(`/harnesses/${encodeURIComponent(id)}/usage/refresh`, { method: "POST" }),
+  /** Claude config dirs with a logged-in account that no harness points at
+   *  yet — the Add-harness picker's "use an existing account" entries. */
+  discoverAccounts: () => j<{ accounts: DiscoveredAccount[] }>("/harness-discovery"),
+  /** Daily per-model token rollup for a claude-code harness's account. */
+  getAccountUsage: (id: string) =>
+    j<AccountUsagePayload>(`/harnesses/${encodeURIComponent(id)}/account-usage`),
+  openHarnessTerminal: (id: string) =>
+    j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
+      method: "POST",
+    }),
+  listSavedPrompts: () => j<SavedPrompt[]>("/saved-prompts"),
+  createSavedPrompt: (input: { name: string; content: string }) =>
+    j<SavedPrompt>("/saved-prompts", { method: "POST", body: JSON.stringify(input) }),
+  updateSavedPrompt: (id: string, patch: { name?: string; content?: string }) =>
+    j<SavedPrompt>(`/saved-prompts/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteSavedPrompt: (id: string) =>
+    j<{ ok: true }>(`/saved-prompts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  listAgentProfiles: () => j<AgentProfile[]>("/agent-profiles"),
+  getAgentProfile: (id: string) => j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`),
+  createAgentProfile: (input: AgentProfileInput) =>
+    j<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(input) }),
+  duplicateAgentProfile: (id: string, input: DuplicateAgentProfileInput) =>
+    // retry: false — a replay would create another copy.
+    j<DuplicateAgentProfileResult>(
+      `/agent-profiles/${encodeURIComponent(id)}/duplicate`,
+      { method: "POST", body: JSON.stringify(input) },
+      { retry: false },
+    ),
+  updateAgentProfile: (id: string, patch: Partial<AgentProfileInput>) =>
+    j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteAgentProfile: (id: string) =>
+    j<void>(`/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Detach a task from its bound agent profile — the values it copied stay
+   *  on the task row, but the four dropdowns (+ speed, cursor max) unlock.
+   *  404 unknown task, 409 archived. */
+  detachTaskAgentProfile: (taskId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
+  listPipelines: () => j<Pipeline[]>("/pipelines"),
+  getPipeline: (id: string) => j<Pipeline>(`/pipelines/${encodeURIComponent(id)}`),
+  createPipeline: (input: PipelineInput) =>
+    // retry: false — a replay would create a duplicate pipeline (409 on
+    // the name clash it collides with, but no reason to risk it).
+    j<Pipeline>("/pipelines", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  updatePipeline: (id: string, patch: Partial<PipelineInput>) =>
+    j<Pipeline>(`/pipelines/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deletePipeline: (id: string) =>
+    j<void>(`/pipelines/${encodeURIComponent(id)}`, { method: "DELETE" }, { retry: false }),
+  // ── Agents + Pipelines bundle (docs/plans/agents-pipelines-import-export.md K4) ──
+  /** The canonical bundle text for a selection, plus its counts and
+   *  export-time warnings. Read-only, so a replay is harmless. */
+  exportBundle: (selection: BundleSelection) =>
+    bundleJ<BundleExportResponse>("/bundle/export", { method: "POST", body: JSON.stringify(selection) }),
+  /** Save the export to ~/Downloads (revealed in Finder) or a folder picked
+   *  in the native panel. `retry: false` — a replay would write a second,
+   *  numbered copy (or open a second panel). Only the folder target opens a
+   *  panel, so only it suspends the busy banner. */
+  saveBundle: (selection: BundleSelection, target: "downloads" | "folder") => {
+    const request = () =>
+      bundleJ<BundleSaveResponse>(
+        "/bundle/export/save",
+        { method: "POST", body: JSON.stringify({ ...selection, target }) },
+        { retry: false },
+      );
+    return target === "folder" ? withCoreBusySuspended(request) : request();
+  },
+  /** Choose file: the native Open panel, filtered to .json. `retry: false` —
+   *  a replay would open the panel twice. */
+  pickBundleFile: () =>
+    withCoreBusySuspended(() =>
+      bundleJ<BundlePickResponse>("/bundle/pick-file", { method: "POST", body: "{}" }, { retry: false }),
+    ),
+  /** Dry run: what importing `text` would create, rename and bind. `signal`
+   *  lets the import dialog drop a preview it no longer wants (the dialog
+   *  closed or got new text) instead of waiting for it to land. */
+  previewBundleImport: (text: string, options: BundleImportOptions, signal?: AbortSignal) =>
+    bundleJ<BundleImportPlan>("/bundle/import/preview", { method: "POST", body: JSON.stringify({ text, options }), signal }),
+  /** Commit an import — all or nothing. 409 `{ error, plan }` when blocked,
+   *  or when the re-plan no longer matches the previewed `planFingerprint`.
+   *  `retry: false` — a replay after a lost response would import twice. */
+  importBundle: (text: string, options: BundleImportOptions, planFingerprint: string) =>
+    bundleJ<BundleImportResponse>(
+      "/bundle/import",
+      { method: "POST", body: JSON.stringify({ text, options, planFingerprint }) },
+      { retry: false },
+    ),
+  /** A pipeline TASK's live run: the parent task plus every hidden step
+   *  task belonging to it (`GET /tasks/:id/pipeline`) — what
+   *  `PipelineRunView` needs in one round-trip. 404 unknown task, 400 the
+   *  task isn't a pipeline task. */
+  getPipelineRun: (taskId: string) =>
+    j<{ task: Task; steps: Task[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline`),
+  /** Manually advance a blocked (or just-settled) pipeline execution: start
+   *  `nextStepIds`, or `null` to finish the run here. `handoff` seeds the
+   *  synthetic handoff recorded for this manual transition (e.g. a
+   *  free-text purpose/summary typed in the Advance form); `fromTaskId`
+   *  disambiguates which blocked execution is being advanced when more than
+   *  one is blocked at once. `retry: false` — a replay would double-start
+   *  the next step(s). */
+  advancePipeline: (
+    taskId: string,
+    body: { nextStepIds: string[] | null; handoff?: Partial<Handoff>; fromTaskId?: string },
+  ) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/advance`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { retry: false }),
+  /** Retry the pipeline's current blocked/cancelled execution. `taskId`
+   *  disambiguates which blocked step task to retry when several are
+   *  blocked at once; omit to retry the run's only/most-recent block.
+   *  `retry: false` — a replay would double-spawn the retry. */
+  retryPipeline: (taskId: string, body?: { taskId?: string }) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/retry`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }, { retry: false }),
+  /** Stop every active execution of a pipeline run and return the parent
+   *  task to `ready` (state `cancelled`) — mirrors Stop on an ordinary
+   *  task. `retry: false` to match every other cancel-shaped mutation. */
+  cancelPipeline: (taskId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/cancel`, { method: "POST" }, { retry: false }),
+  /** Restart a finished pipeline run (`done`/`cancelled`/`blocked`) from its
+   *  start step, discarding the prior run's history — a fresh execution of
+   *  the same parent task. Mirrors `startPipelineRun`'s own return shape
+   *  (same as `/tasks/:id/start`'s bounded-spawn-await shape, item 16) —
+   *  NOT a `Task`: the route hands back the server result verbatim.
+   *  `retry: false` to match every other run-mutating pipeline route. */
+  restartPipeline: (taskId: string) =>
+    j<{ runId: string; pending?: true }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, { method: "POST" }, { retry: false }),
+  listAgentModels: () => j<AgentModelMap>("/agent-models"),
+  /** Per-harness model catalog (fx account-scoped, one entry per enabled
+   *  harness) — see `HarnessModelMap`. */
+  listHarnessModels: () => j<HarnessModelMap>("/agent-models/harnesses"),
+  /** Force a fresh discovery probe. Omit `harnessId` to refresh every
+   *  enabled harness; pass one to refresh just that harness (the picker's
+   *  manual ↻ button). Always returns the unchanged kind-level map — refetch
+   *  `listHarnessModels()` separately for the per-harness view. */
+  refreshAgentModels: (harnessId?: string) =>
+    j<AgentModelMap>(
+      harnessId ? `/agent-models?harness=${encodeURIComponent(harnessId)}` : "/agent-models",
+      { method: "POST" },
+    ),
+  listProjects: () => j<Project[]>("/projects"),
+  /** The native folder panel; registers the pick as a project. */
+  pickProject: (startingFolder?: string) =>
+    withCoreBusySuspended(() =>
+      j<{ project: Project | null }>("/projects/pick", {
+        method: "POST",
+        body: JSON.stringify({ startingFolder }),
+      }),
+    ),
+  deleteProject: (p: string) =>
+    j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  cloneProject: (input: {
+    url: string;
+    provider?: GitProvider;
+    dest?: string;
+    eli5?: boolean;
+    agent?: string;
+    mode?: string;
+    model?: string;
+    effort?: string | null;
+    speed?: Speed;
+    maxMode?: boolean;
+    opencodeServer?: OpencodeServerMode;
+    agentProfileId?: string;
+    /** Client-minted uuid so the caller can subscribe to this clone's
+     *  `clone_progress` AppEvents (via `subscribeCloneProgress`) BEFORE
+     *  awaiting this call, and so `cancelClone` can name the right one.
+     *  The server mints its own when omitted and echoes it back either way. */
+    cloneId?: string;
+  }) =>
+    // retry: false — a replay after a lost response would re-enter the route
+    // against a destination the first attempt already filled (502 "already
+    // exists") while that clone and its explainer task are live, or race a
+    // second `git clone` into the same directory.
+    j<{ project: Project; provider: GitProvider; eli5TaskId: string | null; eli5Error: string | null; cloneId: string }>(
+      "/projects/clone",
+      { method: "POST", body: JSON.stringify(input) },
+      { retry: false },
+    ),
+  /** Kill the in-flight `git clone` behind `cloneId` (the id passed to, or
+   *  echoed back by, `cloneProject`). Resolves `{ ok: true }` on success; the
+   *  held `cloneProject` call then rejects with an `ApiError` whose
+   *  `.status === 409` and whose `.body` carries `{ cancelled: true }` —
+   *  `CloneProjectDialog` checks that shape to tell a user-initiated cancel
+   *  apart from a real clone failure. Throws (`ApiError`, `.status === 404`)
+   *  when nothing was in flight for that id — the clone may have just
+   *  finished on its own, which callers should treat as a benign race, not
+   *  a failure to report. */
+  cancelClone: (cloneId: string) =>
+    j<{ ok: true }>(`/projects/clone/${encodeURIComponent(cloneId)}`, { method: "DELETE" }),
+  /** Per-project branch nomenclature. GET resolves to built-in defaults when the
+   *  project has no stored config, so the form always gets a usable shape. */
+  getProjectBranchConfig: (p: string) =>
+    j<BranchNamingConfig>(`/projects/settings?path=${encodeURIComponent(p)}`),
+  setProjectBranchConfig: (p: string, config: BranchNamingConfig) =>
+    j<Project>("/projects/settings", {
+      method: "PUT",
+      body: JSON.stringify({ path: p, config }),
+    }),
+  /** Open a native file/folder picker and return the chosen references.
+   *  WKWebView never exposes `File.path`, so this native panel is the only
+   *  reliable way to turn a user pick into an absolute path. Returns `[]` on
+   *  cancel. `isDirectory` follows `mode`. */
+  pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
+    withCoreBusySuspended(() =>
+      j<{ refs: TaskReference[] }>("/refs/pick", {
+        method: "POST",
+        body: JSON.stringify({ mode, startingFolder }),
+      }),
+    ).then((r) => r.refs),
+  /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
+   *  references — the server stats each for directory-ness and drops any
+   *  that no longer exist. */
+  resolveRefs: (paths: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths }),
+    }).then((r) => r.refs),
+  /** Recover the real paths of the drag/drop that just ended, off the macOS
+   *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
+   *  is the fallback for non-image files/folders dragged from Finder. The
+   *  server stats each (directory-ness correct, nonexistent dropped). */
+  dragRefs: () =>
+    j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
+  listBranches: (dir: string) =>
+    j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  /** `git fetch --all --prune` on the project so newly pushed remote branches
+   *  show up in the branch picker. Resolves once the fetch completes; the
+   *  caller re-lists branches afterwards. */
+  gitFetch: (dir: string) =>
+    j<{ ok: true }>("/projects/fetch", {
+      method: "POST",
+      body: JSON.stringify({ path: dir }),
+    }),
+  /** Fast-forward a single local `branch` to its upstream (the picker's Git Pull
+   *  button). The caller re-lists branches afterwards so the behind indicator
+   *  refreshes. Rejects (ApiError) on divergence, missing upstream, or network
+   *  failure — the git stderr rides along as the error message. */
+  gitPull: (dir: string, branch: string) =>
+    j<{ ok: true }>("/projects/pull", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
+    }),
+  /** Push a local `branch` to its remote and set upstream (the New PR composer's
+   *  Push button) so a local-only branch can be opened as a pull request.
+   *  Rejects (ApiError) on a rejected push, missing remote, or network failure —
+   *  the git stderr rides along as the error message. */
+  gitPush: (dir: string, branch: string) =>
+    j<{ ok: true; remote?: string }>("/projects/push", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
+    }),
+  listGitHubItems: (input: {
+    path: string;
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+    assignee?: string;
+    createdByMe?: boolean;
+    assignedToMe?: boolean;
+    reviewRequested?: boolean;
+    searchQuery?: string;
+    page?: number;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+  }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      kind: input.kind,
+      state: input.state,
+    });
+    if (input.query) q.set("q", input.query);
+    if (input.labels && input.labels.length > 0) q.set("labels", input.labels.join(","));
+    if (input.assignee) q.set("assignee", input.assignee);
+    if (input.createdByMe) q.set("createdByMe", "1");
+    if (input.assignedToMe) q.set("assignedToMe", "1");
+    if (input.reviewRequested) q.set("reviewRequested", "1");
+    if (input.searchQuery) q.set("searchQuery", input.searchQuery);
+    if (input.page) q.set("page", String(input.page));
+    if (input.sort) q.set("sort", input.sort);
+    if (input.direction) q.set("direction", input.direction);
+    return j<GitHubListResult>(`/github/items?${q.toString()}`);
+  },
+  /** Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+   *  dialog. Same filters as `listGitHubItems`, fanned out server-side across
+   *  every path with a GitHub remote and merged into one list; each item
+   *  carries its own repo's path as `sourcePath`. `page`/"Load more" aren't
+   *  supported — the aggregate result always covers the first page per repo. */
+  listGitHubItemsAcrossRepos: (input: {
+    paths: string[];
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+    assignee?: string;
+    createdByMe?: boolean;
+    assignedToMe?: boolean;
+    reviewRequested?: boolean;
+    searchQuery?: string;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+  }) =>
+    j<GitHubListResult>("/github/items-aggregate", {
+      method: "POST",
+      body: JSON.stringify({
+        paths: input.paths,
+        kind: input.kind,
+        state: input.state,
+        q: input.query,
+        labels: input.labels,
+        assignee: input.assignee,
+        createdByMe: input.createdByMe,
+        assignedToMe: input.assignedToMe,
+        reviewRequested: input.reviewRequested,
+        searchQuery: input.searchQuery,
+        sort: input.sort,
+        direction: input.direction,
+      }),
+    }),
+  getGitHubRepoPermissions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true } & GitHubRepoPermissions>(`/github/repo-permissions?${q.toString()}`);
+  },
+  getGitHubPullDiff: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<TaskDiff>(`/github/pull-diff?${q.toString()}`);
+  },
+  getGitHubPullDetail: (path: string, number: number) => {
+    const q = new URLSearchParams({ path, number: String(number) });
+    return j<{ ok: true; item: GitHubListItem }>(`/github/pull-detail?${q.toString()}`);
+  },
+  /** A single issue plus its full comment thread — powers every "create a
+   *  task from this issue" entry point (dialog, New Task form paste-URL).
+   *  `opts.includeComments: false` (the "View issue" prefill's use case, which
+   *  only needs the item) appends `includeComments=false` to skip the
+   *  server's comments fetch; omitted (the default `true`) sends no query
+   *  param at all, matching every other optional-flag param in this file. */
+  getGitHubIssueThread: (path: string, number: number, opts?: { includeComments?: boolean }) => {
+    const q = new URLSearchParams({ path, number: String(number) });
+    if (opts?.includeComments === false) q.set("includeComments", "false");
+    return j<{ ok: true } & GitHubIssueThreadResult>(`/github/issue-thread?${q.toString()}`);
+  },
+  getGitHubPullChecks: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubChecksResult>(`/github/pull-checks?${q.toString()}`);
+  },
+  getGitHubPullMergeability: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullMergeability>(`/github/pull-mergeability?${q.toString()}`);
+  },
+  updateGitHubPullBranch: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/pull-update-branch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  reopenGitHubPull: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-reopen", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubPullDraft: (input: { path: string; number: number; draft: boolean }) =>
+    j<{ ok: true; draft: boolean; message?: string }>("/github/pull-draft", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubPullAutoMerge: (input: { path: string; number: number; enable: boolean; mergeMethod?: GitHubPullMergeMethod }) =>
+    j<{ ok: true; autoMergeEnabled: boolean; message?: string }>("/github/pull-auto-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullCommits: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullCommitsResult>(`/github/pull-commits?${q.toString()}`);
+  },
+  getGitHubPullLinkedIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubLinkedIssuesResult>(`/github/pull-linked-issues?${q.toString()}`);
+  },
+  getGitHubPullDefaults: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);
+  },
+  // `kind` ("pulls"|"issues") lets GitLab/Bitbucket route to the right
+  // notes/comments endpoint (their APIs split MR/PR comments from issue
+  // comments, unlike GitHub's single endpoint) — see git-host.ts's
+  // `ListCommentsInput` doc comment. Optional/additive: omitted, the server
+  // defaults to "pulls" (GitHub ignores it entirely).
+  listGitHubComments: (input: { path: string; number: number; kind?: GitHubItemKind }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    if (input.kind) q.set("kind", input.kind);
+    return j<GitHubCommentsResult>(`/github/comments?${q.toString()}`);
+  },
+  createGitHubComment: (input: { path: string; number: number; body: string; kind?: GitHubItemKind }) =>
+    // retry: false — a replay would post a duplicate PR/issue comment.
+    j<{ comment: GitHubComment }>("/github/comments", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, { retry: false }),
+  getGitHubViewer: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
+  },
+  // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — call
+  // before the other GitHub* helpers to learn which provider (GitHub/GitLab/
+  // Bitbucket) a project's git remote resolves to.
+  getProviderInfo: (path: string) => {
+    const q = new URLSearchParams({ path });
+    return j<{ ok: true; provider: GitProvider; owner: string; name: string; host: string; remoteHost: string }>(
+      `/github/provider-info?${q.toString()}`,
+    );
+  },
+  listGitHubLabels: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubLabelsResult>(`/github/labels?${q.toString()}`);
+  },
+  createGitHubLabel: (input: { path: string; name: string; color: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/labels", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubLabel: (input: { path: string; name: string; newName?: string; color?: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/label-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubLabel: (input: { path: string; name: string }) =>
+    j<{ ok: true; message?: string }>("/github/label-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubAssignees: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubAssigneesResult>(`/github/assignees?${q.toString()}`);
+  },
+  listGitHubMilestones: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubMilestonesResult>(`/github/milestones?${q.toString()}`);
+  },
+  createGitHubMilestone: (input: { path: string; title: string; description?: string; dueOn?: string }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestones", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubMilestone: (input: {
+    path: string;
+    number: number;
+    title?: string;
+    description?: string;
+    dueOn?: string | null;
+    state?: "open" | "closed";
+  }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestone-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubMilestone: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/milestone-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubReleases: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubReleasesResult>(`/github/releases?${q.toString()}`);
+  },
+  createGitHubRelease: (input: {
+    path: string;
+    tagName: string;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    targetCommitish?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/releases", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubRelease: (input: {
+    path: string;
+    id: number;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    tagName?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/release-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubRelease: (input: { path: string; id: number }) =>
+    j<{ ok: true; message?: string }>("/github/release-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubTags: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubTagsResult>(`/github/tags?${q.toString()}`);
+  },
+  listGitHubWorkflowRuns: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowRunsResult>(`/github/workflow-runs?${q.toString()}`);
+  },
+  listGitHubWorkflows: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowsResult>(`/github/workflows?${q.toString()}`);
+  },
+  rerunGitHubWorkflowRun: (input: { path: string; runId: number; failedOnly?: boolean }) =>
+    j<{ ok: true; message: string }>("/github/workflow-rerun", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  cancelGitHubWorkflowRun: (input: { path: string; runId: number }) =>
+    j<{ ok: true; message: string }>("/github/workflow-cancel", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  dispatchGitHubWorkflow: (input: { path: string; workflowId: number; ref: string; inputs?: Record<string, string> }) =>
+    j<{ ok: true; message: string }>("/github/workflow-dispatch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubCommitStatus: (input: { path: string; ref: string }) => {
+    const q = new URLSearchParams({ path: input.path, ref: input.ref });
+    return j<GitHubCommitStatusResult>(`/github/commit-status?${q.toString()}`);
+  },
+  updateGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review"; body: string }) =>
+    j<{ ok: true; comment: GitHubComment }>("/github/comment-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review" }) =>
+    j<{ ok: true; message?: string }>("/github/comment-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPullLineComment: (input: {
+    path: string;
+    number: number;
+    body: string;
+    filePath: string;
+    line: number;
+    side: "LEFT" | "RIGHT";
+  }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullReviewComments: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewCommentsResult>(`/github/pull-review-comments?${q.toString()}`);
+  },
+  getGitHubPullReviewThreads: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewThreadsResult>(`/github/pull-review-threads?${q.toString()}`);
+  },
+  setGitHubReviewThreadResolved: (input: { path: string; threadId: string; resolved: boolean }) =>
+    j<{ ok: true; resolved: boolean; message?: string }>("/github/review-thread-resolve", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  replyGitHubPullLineComment: (input: { path: string; number: number; commentId: number; body: string }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment-reply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  reviewGitHubPull: (input: {
+    path: string;
+    number: number;
+    event: GitHubPullReviewEvent;
+    body?: string;
+    comments?: { path: string; line: number; side: "LEFT" | "RIGHT"; body: string }[];
+  }) =>
+    j<{ ok: true; message?: string }>("/github/pull-review", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mergeGitHubPull: (input: {
+    path: string;
+    number: number;
+    method: GitHubPullMergeMethod;
+    title?: string;
+    message?: string;
+  }) =>
+    j<GitHubPullMergeResult>("/github/pull-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  closeGitHubPull: (input: { path: string; number: number; comment?: string }) =>
+    j<{ ok: true; message?: string; item?: GitHubListResult["items"][number]; commentPosted?: boolean }>("/github/pull-close", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPull: (input: {
+    path: string;
+    title: string;
+    head: string;
+    base: string;
+    body?: string;
+    draft?: boolean;
+    reviewers?: string[];
+    /** When set, the server persists the created PR's URL onto this task
+     *  (`tasks.pr_url`) atomically with creation — see `Task.prUrl`. */
+    taskId?: string;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubIssue: (input: {
+    path: string;
+    title: string;
+    body?: string;
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubIssue: (input: {
+    path: string;
+    number: number;
+    kind?: GitHubItemKind;
+    title?: string;
+    body?: string;
+    state?: "open" | "closed";
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssueLock: (input: { path: string; number: number; locked: boolean; lockReason?: string }) =>
+    j<{ ok: true; locked: boolean; message?: string }>("/github/issue-lock", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssuePinned: (input: { path: string; number: number; pinned: boolean }) =>
+    j<{ ok: true; pinned: boolean; message?: string }>("/github/issue-pin", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubIssuePinned: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; pinned: boolean }>(`/github/issue-pinned?${q.toString()}`);
+  },
+  listGitHubSubIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<GitHubSubIssuesResult>(`/github/sub-issues?${q.toString()}`);
+  },
+  addGitHubSubIssue: (input: { path: string; number: number; childNumber: number }) =>
+    j<{ ok: true; subIssue: GitHubSubIssue; message?: string }>("/github/sub-issue-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubSubIssue: (input: { path: string; number: number; childId: number }) =>
+    j<{ ok: true; message?: string }>("/github/sub-issue-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  transferGitHubIssue: (input: { path: string; number: number; targetRepo: string }) =>
+    j<{ ok: true; url: string; message?: string }>("/github/issue-transfer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubProjectsV2: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubProjectsV2Result>(`/github/projects?${q.toString()}`);
+  },
+  getGitHubProjectItems: (input: { path: string; projectId: string }) => {
+    const q = new URLSearchParams({ path: input.path, projectId: input.projectId });
+    return j<GitHubProjectItemsResult>(`/github/project-items?${q.toString()}`);
+  },
+  addGitHubProjectItem: (input: { path: string; projectId: string; contentNumber: number; contentKind: "issue" | "pr" }) =>
+    j<{ ok: true; itemId: string }>("/github/project-item-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubProjectItem: (input: { path: string; projectId: string; itemId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubProjectItemStatus: (input: { path: string; projectId: string; itemId: string; fieldId: string; optionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-status", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubDiscussions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubDiscussionsResult>(`/github/discussions?${q.toString()}`);
+  },
+  getGitHubDiscussion: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; detail: GitHubDiscussionDetail }>(`/github/discussion?${q.toString()}`);
+  },
+  createGitHubDiscussion: (input: { path: string; categoryId: string; title: string; body: string }) =>
+    j<{ ok: true; number: number; url: string }>("/github/discussion-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  addGitHubDiscussionComment: (input: { path: string; discussionId: string; body: string }) =>
+    j<{ ok: true; commentId: string }>("/github/discussion-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubDiscussionAnswer: (input: { path: string; commentId: string; answer: boolean }) =>
+    j<{ ok: true; isAnswer: boolean }>("/github/discussion-answer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussion: (input: { path: string; discussionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussionComment: (input: { path: string; commentId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-comment-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  requestGitHubPullReviewers: (input: { path: string; number: number; reviewers: string[]; teamReviewers?: string[] }) =>
+    j<{ ok: true; message?: string }>("/github/pull-reviewers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyGitHubSuggestion: (input: { path: string; number: number; commentId: number }) =>
+    j<{ ok: true; message: string }>("/github/pull-apply-suggestion", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubReactions: (input: { path: string; subject: GitHubReactionSubject; viewer?: string }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      subjectType: input.subject.type,
+      subjectId: String(input.subject.id),
+    });
+    if (input.viewer) q.set("viewer", input.viewer);
+    return j<GitHubReactionsResult>(`/github/reactions?${q.toString()}`);
+  },
+  addGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; content: GitHubReactionContent }) =>
+    j<{ ok: true; reactionId: number; content: GitHubReactionContent }>("/github/reaction-add", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        content: input.content,
+      }),
+    }),
+  removeGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; reactionId: number }) =>
+    j<{ ok: true }>("/github/reaction-remove", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        reactionId: input.reactionId,
+      }),
+    }),
+  listGitHubNotifications: (input: { path: string; all?: boolean }) => {
+    const q = new URLSearchParams({ path: input.path, all: input.all ? "true" : "false" });
+    return j<GitHubNotificationsResult>(`/github/notifications?${q.toString()}`);
+  },
+  markGitHubNotificationRead: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/notification-read", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  markAllGitHubNotificationsRead: (input: { path: string }) =>
+    j<{ ok: true; message: string }>("/github/notifications-read-all", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubThreadSubscription: (input: { path: string; threadId: string }) => {
+    const q = new URLSearchParams({ path: input.path, threadId: input.threadId });
+    return j<{ ok: true; subscribed: boolean; ignored: boolean }>(`/github/thread-subscription?${q.toString()}`);
+  },
+  setGitHubThreadSubscription: (input: { path: string; threadId: string; ignored: boolean }) =>
+    j<{ ok: true; subscribed: boolean; ignored: boolean }>("/github/thread-subscription", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  unsubscribeGitHubThread: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/thread-unsubscribe", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  /** Stored per-host git credentials (GitHub, GitLab, and Bitbucket all
+   *  share this store) + hosts detected across registered projects — drives
+   *  the "Git host tokens" Settings section. Route path kept as
+   *  `/github/tokens` for back-compat with existing stored credentials. */
+  listGitHubTokens: () => j<GitHubTokensResult>("/github/tokens"),
+  /** Upsert the credential for `input.host`. Returns the refreshed list —
+   *  never the raw token. */
+  setGitHubToken: (input: { host: string; token: string; label?: string | null }) =>
+    j<GitHubTokensResult>("/github/tokens", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubToken: (host: string) =>
+    j<{ ok: true }>(`/github/tokens/${encodeURIComponent(host)}`, { method: "DELETE" }),
+  getTmuxSource: () =>
+    j<{
+      source: "system" | "bundled";
+      bundledAvailable: boolean;
+      bundledPath: string;
+      resolvedBin: string;
+    }>("/tmux-source"),
+  setTmuxSource: (source: "system" | "bundled") =>
+    j<{ ok: true; source: "system" | "bundled" }>("/tmux-source", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+  listPreferences: () => j<Record<string, string>>("/preferences"),
+  setPreference: (key: string, value: string) =>
+    j<void>(`/preferences/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value }),
+    }),
+  listClaudeSessions: () => j<ClaudeSessionList>("/claude-sessions"),
+  recheckClaudeSessions: () =>
+    j<ClaudeSessionList>("/claude-sessions/recheck", { method: "POST" }),
+  /** `retry: false` — a replay after a lost response would import the same
+   *  sessions again. */
+  importClaudeSessions: (ids: string[]) =>
+    j<{ results: { id: string; taskId?: string; error?: string }[] }>("/claude-sessions/import", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }, { retry: false }),
+  /** `branch` is the one the caller showed; omitted, the server uses the
+   *  transcript's latest branch. */
+  checkoutClaudeSession: (sessionId: string, branch?: string) =>
+    j<{ ok: true; branch: string } | { error: string }>("/claude-sessions/checkout", {
+      method: "POST",
+      body: JSON.stringify(branch ? { sessionId, branch } : { sessionId }),
+    }),
+  /** Re-run a failed history backfill. `retry: false` — a replay after the
+   *  server already flipped the row to `importing` comes back as "import is
+   *  not failed" and would show that as the failure. */
+  retryClaudeSessionImport: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/claude-session/retry`, { method: "POST" }, { retry: false }),
+  /** OpenCode sessions started outside Agetor (D-13), per enabled OpenCode
+   *  harness × registered project. */
+  listOpencodeSessions: () => j<OpencodeSessionList>("/opencode-sessions"),
+  /** Same list, bypassing the scanner's 10 s cache. */
+  recheckOpencodeSessions: () =>
+    j<OpencodeSessionList>("/opencode-sessions/recheck", { method: "POST" }),
+  /** `harnessId` names the OpenCode harness to import under (default: the
+   *  one that listed each session). `retry: false` — a replay after a lost
+   *  response would import the same sessions again. */
+  importOpencodeSessions: (ids: string[], harnessId?: string) =>
+    j<{ results: { id: string; taskId?: string; error?: string }[] }>("/opencode-sessions/import", {
+      method: "POST",
+      body: JSON.stringify(harnessId ? { ids, harnessId } : { ids }),
+    }, { retry: false }),
+  /** Re-run a failed OpenCode history backfill. `retry: false` for the same
+   *  reason as `retryClaudeSessionImport`. */
+  retryOpencodeSessionImport: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, { method: "POST" }, { retry: false }),
+  /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
+   *  and the archived-history retention bookkeeping (Settings → General). */
+  getDbStats: () => j<DbStats>("/db/stats"),
+  /** `POST /db/compact` — `VACUUM` + WAL truncate. Blocks the core for the
+   *  whole duration (the request itself is the freeze), so it suspends the
+   *  busy banner for its lifetime; the Settings modal owns the user-facing
+   *  "Agetor won't respond" copy. Refused with a 409 `ApiError` (message =
+   *  the server's "N task(s) running — …" text, body carries
+   *  `activeRunCount`) while any run is active. `retry: false` — never
+   *  replayed. */
+  compactDb: (): Promise<DbCompactResult> =>
+    withCoreBusySuspended(() => j<DbCompactResult>("/db/compact", { method: "POST" }, { retry: false })),
+  /** `POST /db/retention/run` — runs one archived-history retention pass now.
+   *  400 when the preference is `off`, 409 while a pass is already running
+   *  (both thrown as `ApiError`). `retry: false`. */
+  runRetentionPass: () =>
+    j<RetentionPassResult>("/db/retention/run", { method: "POST" }, { retry: false }),
+  listAgentCapabilities: (opts: { agent: string; workdir?: string | null; branch?: string }) => {
+    // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
+    // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"
+    // still works). The server resolves to the harness via getByIdOrKind and
+    // reads from the harness's own home when set. `workdir` is optional — the
+    // server always includes user-level entries + plugins even without one
+    // (project-level commands/skills only exist once a workdir is known);
+    // omitted/empty means "no workdir" rather than an empty-string one, same
+    // convention as `listProjectFiles`'s `ref`.
+    const q = new URLSearchParams({ agent: opts.agent });
+    if (opts.workdir) q.set("workdir", opts.workdir);
+    if (opts.branch) q.set("branch", opts.branch);
+    return j<{ commands: AvailableCommand[]; extensions: AvailableExtension[] }>(
+      `/agent-discovery?${q.toString()}`,
+    );
+  },
+  /** File/directory listing for the `@` file-reference popover and
+   *  highlighter — `GET /files/index`. Two modes, chosen by whether `ref` is
+   *  given: with a `ref`, the server resolves tracked files at that ref via
+   *  `git ls-tree` (the shape a not-yet-created worktree will have once it's
+   *  materialized); without one, it resolves the live working tree via
+   *  `git ls-files` (tracked + untracked, minus ignored/deleted). `ref` is
+   *  omitted from the request entirely when blank/null so the server always
+   *  sees "no ref" rather than an empty-string one. `truncated` is true when
+   *  the listing hit the server's file-count cap.
+   *
+   *  `q` switches to server-side search mode (monorepo fallback past the 20k
+   *  display cap): when set — the empty string counts, `null`/`undefined`
+   *  omit the param entirely — the server ranks files + derived directories
+   *  over the ENTIRE listing with the shared `filterFileEntries` scorer and
+   *  returns up to `limit` (server default 50) matches; `truncated` then
+   *  reports the internal 250k scan cap instead of the 20k display cap. See
+   *  `searchProjectFiles` (`use-project-files.ts`), the `@` popover's
+   *  consumer of this mode. */
+  listProjectFiles: (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+    const params = new URLSearchParams({ dir: scope.dir });
+    if (scope.ref) params.set("ref", scope.ref);
+    if (scope.q != null) params.set("q", scope.q);
+    if (scope.limit != null) params.set("limit", String(scope.limit));
+    return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`);
+  },
+  listTasks: () => j<Task[]>("/tasks"),
+  /** Single task by id, fresh from the server (bypasses the 2s board poll's
+   *  staleness). Used to re-check a task's persisted draft right after the
+   *  panel seeds from a possibly-stale polled object — see RunPanel's
+   *  pristine-adopt seeding. 404s (task deleted) surface as ApiError. */
+  getTask: (id: string) => j<Task>(`/tasks/${id}`),
+  createTask: (input: {
+    title: string;
+    prompt: string;
+    /** Harness id — see `listHarnesses()`. Built-in ids are `claude-code` / `codex`. */
+    agent: string;
+    workdir: string;
+    isolation: Isolation;
+    baseRef?: string;
+    /** Explicit branch name for worktree isolation. Overrides the project's
+     *  nomenclature; the server validates it and makes it unique. */
+    branch?: string;
+    /** Check the worktree out on this pre-existing branch (e.g. a PR's head
+     *  branch) instead of minting a fresh one. Requires worktree isolation. */
+    existingBranch?: string;
+    mode?: string | null;
+    model?: string | null;
+    effort?: string | null;
+    speed?: Speed;
+    maxMode?: boolean;
+    /** OpenCode's server option (D-4); `"shared"` when omitted. A selected
+     *  profile's own value wins. */
+    opencodeServer?: OpencodeServerMode;
+    /** Initial column. Defaults to "backlog" if omitted. */
+    column?: ColumnId;
+    references?: TaskReference[];
+    taskType?: TaskType;
+    /** URL of the issue this task is created from — validated and same-repo
+     *  checked server-side (`createTask`); powers "View issue" and the
+     *  PR-body `Closes #N` prefill. */
+    issueUrl?: string;
+    /** Full markdown snapshot of the issue + its comment thread, written to
+     *  a per-task file and attached as a reference. Only meaningful
+     *  alongside `issueUrl`. */
+    issueSnapshot?: string;
+    /** Id of an {@link AgentProfile} to launch from — the server resolves it
+     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode`/`opencodeServer` from the
+     *  profile (body-provided values for those fields are ignored); 400 on an
+     *  unknown id. */
+    agentProfileId?: string | null;
+    /** Id of a {@link Pipeline} to launch this task as the parent run of —
+     *  mutually exclusive with `agentProfileId` (400 when both are sent).
+     *  See `docs/plans/pipelines.md` D1. */
+    pipelineId?: string;
+  }) =>
+    // retry: false — a replay would create a duplicate task + branch.
+    j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  updateTask: (id: string, patch: Partial<Task>) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  moveTask: (id: string, column: ColumnId) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
+  deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
+  // `pending: true` (optional): the server returned before the agent spawn
+  // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+  startTask: (id: string) => j<{ runId: string; pending?: true }>(`/tasks/${id}/start`, { method: "POST" }),
+  /** `force: true` bypasses the done-column gate (still rejects an active
+   *  run) — used by the Worktrees page's "Archive & delete" flow to archive
+   *  a stale worktree's task regardless of its current column. `stopRun:
+   *  true` additionally stops any in-flight run/background agents before
+   *  archiving — required (server-enforced) to archive a running/blocked
+   *  task at all; the caller is expected to confirm with the user first.
+   *  `forceWorktree: true` discards uncommitted changes in the worktree's
+   *  checkout during teardown (never the branch, commits, or run/AI
+   *  history) — also part of the Worktrees page's "Archive & delete", after
+   *  the caller has warned the user. `awaitTeardown: true` makes the
+   *  request block until the worktree removal has actually finished (no
+   *  timeout is set server-side), and the response then carries a
+   *  `teardown` outcome describing whether the directory is really gone —
+   *  omit it and the archive returns immediately with teardown deferred to
+   *  a background queue, as before. Omitting all four flags sends no body,
+   *  matching the original archive-from-`done` callers unchanged.
+   *
+   *  `retry: false` only when `awaitTeardown` is set — matching
+   *  `createTask`/`sendRunInput`'s idiom above. The route sets an unbounded
+   *  server timeout and blocks on the *entire* per-workdir teardown FIFO
+   *  (every same-repo teardown queued ahead of this one), which can run well
+   *  past WKWebView's own request timeout even though the operation is
+   *  succeeding server-side. A default retry on that timeout would silently
+   *  re-issue a second, non-idempotent archive against a task the user may
+   *  have already resumed (re-running `dropSession`/`killTerminalsForTask`,
+   *  re-queuing a second worktree teardown behind the first). The
+   *  fire-and-forget archive (no `awaitTeardown`, e.g. the kanban button)
+   *  returns fast and keeps the default retry — it isn't the non-idempotent
+   *  hazard this guards against. */
+  archiveTask: (
+    id: string,
+    opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+  ) =>
+    j<Task & { teardown?: WorktreeTeardownResult }>(`/tasks/${id}/archive`, {
+      method: "POST",
+      ...(opts?.force || opts?.stopRun || opts?.forceWorktree || opts?.awaitTeardown
+        ? {
+            body: JSON.stringify({
+              force: !!opts.force,
+              stopRun: !!opts.stopRun,
+              forceWorktree: !!opts.forceWorktree,
+              awaitTeardown: !!opts.awaitTeardown,
+            }),
+          }
+        : {}),
+    }, opts?.awaitTeardown ? { retry: false } : undefined),
+  unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
+
+  /** Every git worktree materialized on disk under `dataDir/worktrees/`,
+   *  cross-referenced against the tasks table. Drives the Worktrees page. */
+  listWorktrees: () => j<WorktreeInfo[]>("/worktrees"),
+  /** Removes an orphaned worktree directory (no owning task row) — a
+   *  task-backed worktree is torn down via `archiveTask(id, { force: true })`
+   *  instead, since deleting it destroys the ticket. */
+  deleteWorktree: (id: string) => j<void>(`/worktrees/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** On-demand live dirty/ahead/merged status for a single worktree — not part
+   *  of the bulk listing above (that stays fs+DB-only to avoid a subprocess
+   *  fan-out per poll). Fetched per row by the Worktrees page. */
+  getWorktreeGitStatus: (id: string) =>
+    j<WorktreeGitStatus>(`/worktrees/${encodeURIComponent(id)}/git-status`),
+
+  // Terminal tabs. State is in-memory on the bun side; the live byte stream
+  // runs over the WebSocket whose URL `terminalSocketUrl` builds.
+  listTerminals: (taskId: string) => j<TerminalTab[]>(`/tasks/${taskId}/terminals`),
+  createTerminal: (taskId: string) =>
+    j<TerminalTab>(`/tasks/${taskId}/terminals`, { method: "POST" }),
+  closeTerminal: (id: string) => j<void>(`/terminals/${id}`, { method: "DELETE" }),
+  /** Mint a single-use, 30 s ticket for a terminal's duplex stream and return
+   *  the ws:// URL that redeems it (P7/D13). WebSockets can't set the
+   *  Authorization header, and the master token must never ride a URL, so the
+   *  upgrade carries `?ticket=` instead — bound to this terminal id, consumed
+   *  by the first upgrade. Callers mint a fresh one per connect AND per
+   *  reconnect. `retry: false`: a replayed POST would burn a second ticket,
+   *  and the caller's own reconnect loop is the retry policy. */
+  terminalSocketUrl: async (id: string): Promise<string> => {
+    const { ticket } = await j<{ ticket: string; expiresAt: number }>(
+      `/terminals/${encodeURIComponent(id)}/ws-ticket`,
+      { method: "POST" },
+      { retry: false },
+    );
+    return `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?ticket=${encodeURIComponent(ticket)}`;
+  },
+  listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Backward page of a task's persisted events, older than `beforeId`
+   *  (exclusive) — drives the run panel's "Load earlier" affordance once the
+   *  bounded SSE replay window (`EVENTS_REPLAY_LIMIT`) has been exhausted.
+   *  `beforeId` is required by the route; `limit` defaults server-side to
+   *  `EVENTS_REPLAY_LIMIT` when omitted. */
+  fetchTaskEventsPage: (taskId: string, beforeId: number, limit?: number) => {
+    const q = new URLSearchParams({ beforeId: String(beforeId) });
+    if (limit) q.set("limit", String(limit));
+    return j<TaskEventsPage>(`/tasks/${taskId}/events/page?${q.toString()}`);
+  },
+  /** Past sent messages across every task and harness, newest first — backs
+   *  `MessageHistoryPicker`'s "insert a past message" dropdown. `taskId` only
+   *  selects which task's endpoint is called (and gates 404-on-unknown-task);
+   *  it does not scope the returned payload. */
+  fetchMessageHistory: (taskId: string, limit?: number) => {
+    const q = limit ? `?${new URLSearchParams({ limit: String(limit) }).toString()}` : "";
+    return j<{ messages: SentMessageItem[] }>(`/tasks/${taskId}/messages/history${q}`);
+  },
+  /** Background/sub agents tracked for a task — drives the run panel's
+   *  read-only per-subagent tab strip. Polled like `listRuns`; live deltas
+   *  also arrive on the task SSE as `stream: "subagent"` events. */
+  listSubagents: (taskId: string) => j<Subagent[]>(`/tasks/${taskId}/subagents`),
+  /** Everything the task's worktree changed vs its pinned base. Empty `files`
+   *  + a `note` when there's no worktree or no diff. */
+  getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
+  getTaskGitStatus: (taskId: string) =>
+    j<TaskGitStatus>(`/tasks/${taskId}/git-status`),
+  /** Which branches deleting the task would remove (`task.branch`, plus the
+   *  branch a drifted worktree is actually on), after the default-branch /
+   *  PR-head / held-by-another-task exclusions — read before the delete
+   *  confirm so the dialog can name them. Read-only. */
+  getTaskTeardownPreview: (taskId: string) =>
+    j<TaskTeardownPreview>(`/tasks/${encodeURIComponent(taskId)}/teardown-preview`),
+  cancelRun: (runId: string) =>
+    j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
+  // Mirrors the orchestrator's `SendInputResult` (src/bun/orchestrator.ts) —
+  // keep the two in sync. `withheld`/`savedToBacklog` are only ever present
+  // alongside `delivered: false`: they distinguish "claude is showing a
+  // modal, so the message was withheld and re-stashed into the backlog tray"
+  // from an ordinary delivery failure (run/task not found, worktree restore
+  // failure, …), which carries neither flag.
+  sendRunInput: (runId: string, line: string) =>
+    // retry: false — a replay would paste a duplicate message into a live
+    // agent tmux session.
+    j<
+      // `unresolvedRefs` = raw `@` tokens the server-side expansion left
+      // verbatim. The webview deliberately doesn't render it post-send —
+      // PromptComposer's inline warning covers it pre-send.
+      // `pending: true` (optional): the server returned before the agent spawn
+      // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+      | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
+      | { delivered: false; reason: string; withheld?: boolean; savedToBacklog?: boolean }
+    >(
+      `/runs/${runId}/input`,
+      { method: "POST", body: JSON.stringify({ line }) },
+      { retry: false },
+    ),
+  /** Bumps the task's read watermark to its latest assistant event, clearing
+   *  `task.unread`. Called on opening/switching/closing the run panel — see
+   *  App.tsx's `selected`-tracking effect. Returns the full updated Task so
+   *  the caller can reconcile it into board state immediately (optimistic —
+   *  don't wait for the next poll). Idempotent; safe to fire-and-forget. */
+  markTaskSeen: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "POST" }),
+  /** Re-flags a task's read watermark as unread — the board's task context
+   *  menu's "Mark as unread" entry, restoring `task.unread`'s "New messages"
+   *  dot. No-op (server-side) when the task has no assistant messages yet
+   *  (`task.hasAssistantMessages` is the client-side gate for showing the
+   *  menu entry at all). Returns the full updated Task so the caller can
+   *  merge only the `unread` field back into board state, same as
+   *  `markTaskSeen`. */
+  markTaskUnread: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "DELETE" }),
+
+  // Messages backlog — saved, not-yet-sent draft messages parked on a task.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  addBacklogItem: (taskId: string, input: { text: string; references?: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateBacklogItem: (
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteBacklogItem: (taskId: string, itemId: string) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, { method: "DELETE" }),
+  /** Replace the backlog order with `order` (item ids, desired sequence). */
+  reorderBacklog: (taskId: string, order: string[]) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "PUT",
+      body: JSON.stringify({ order }),
+    }),
+
+  // Cursor plans — detected `createPlanToolCall` records on `task.plans`.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  /** Persist (or clear, with `null`) unapproved edits to a pending plan.
+   *  Rejected (400) once the plan is no longer `pending`. */
+  savePlanEdit: (taskId: string, planId: string, editedContent: string | null) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ editedContent }),
+    }),
+  /** Approve a pending plan: the server writes the effective content
+   *  (edited ?? original) to a `.plan.md` file in the task's worktree and
+   *  auto-sends an approval message that resumes the agent.
+   *  `retry: false` — like `sendRunInput`, a replay would re-send a
+   *  duplicate approval message to a live agent session. */
+  /** Resolves to the updated Task. A profile-bound cursor task in Plan mode
+   *  (which the route can't switch to Auto) additionally carries `warning`,
+   *  the same line the route writes to the transcript. */
+  approvePlan: (taskId: string, planId: string) =>
+    j<Task & { warning?: string }>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
+      method: "POST",
+    }, { retry: false }),
+
+  /** Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+   *  recovery — see `resumeFxRecovery` in orchestrator.ts). Sends no new
+   *  prompt; fx continues from its own checkpoint. `retry: false` — like
+   *  `approvePlan`, a replay would spawn a second continue-recovery run
+   *  against a checkpoint the first request already consumed. Rejected
+   *  (400/404/409) via the thrown `ApiError` when the task isn't fx, is
+   *  archived, has no resumable paused response, or already has a turn
+   *  in flight. */
+  resumeFxRecovery: (taskId: string) =>
+    j<{ ok: true; runId: string }>(`/tasks/${encodeURIComponent(taskId)}/fx-resume`, {
+      method: "POST",
+    }, { retry: false }),
+
+  /** Cancel a pending fx auto-resume timer (`task.fxRecovery.autoResume`)
+   *  without touching the pause itself — the paused response stays paused,
+   *  resumable only via a manual `resumeFxRecovery` from here on. `retry:
+   *  false` — like `resumeFxRecovery`, a replay against an already-cancelled
+   *  (or already-fired) timer should surface as a real 400/404, not be
+   *  silently retried. */
+  cancelFxAutoResume: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`, {
+      method: "DELETE",
+    }, { retry: false }),
+
+  // Composer draft — the single unsent text+refs autosaved from the task
+  // details modal. Every mutation returns the full updated Task.
+  setTaskDraft: (taskId: string, draft: { text: string; references: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/draft`, {
+      method: "PUT",
+      body: JSON.stringify(draft),
+    }),
+  clearTaskDraft: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/draft`, { method: "DELETE" }),
+  /**
+   * Open a file or directory with the OS default app. `path` may be absolute
+   * or, when `taskId` is supplied, relative to the task's cwd
+   * (worktreePath ?? workdir).
+   */
+  openPath: (input: { path: string; taskId?: string }) =>
+    j<{ opened: boolean; path: string }>(`/open-path`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /**
+   * Reveal a file or directory in the Finder (`open -R`), same abs-or-
+   * task-relative + existsSync contract as `openPath`. macOS-only — the
+   * `POST /reveal-path` route (landing alongside this in the same branch)
+   * answers 501 under the headless backend, same as `/open-path`.
+   */
+  revealPath: (input: { path: string; taskId?: string }) =>
+    j<{ revealed: boolean; path: string }>(`/reveal-path`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /**
+   * Open an http(s) or mailto URL in the OS default browser. The webview is
+   * sandboxed; `target="_blank"` does nothing, so anchor clicks need to
+   * round-trip through the Bun main process to reach `Utils.openExternal`.
+   */
+  openExternal: (url: string) =>
+    j<{ opened: boolean; url: string }>(`/open-external`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+
+  /**
+   * Open the claude-code task's tmux session in a new Terminal.app window.
+   * Returns the session name on success. Server-side checks the session is
+   * actually live and that the task uses a claude-code harness.
+   */
+  openTmux: (taskId: string) =>
+    j<{ ok: true; sessionName: string }>(`/tasks/${taskId}/open-tmux`, {
+      method: "POST",
+    }),
+
+  /** Absolute, TOKEN-LESS URL for an inline thumbnail of a referenced image
+   *  path. The route needs the `Authorization` header, which an `<img src>`
+   *  can't send, so image consumers pass this to `useAuthedObjectUrl` /
+   *  `<AuthedImg>` (fetch with the header, show a `blob:` URL). `GET
+   *  /files/preview` answers 401 without the header, 400 for a non-absolute
+   *  or non-image path, 404 when the path doesn't exist (or isn't a regular
+   *  file), and 200 with the raw image bytes otherwise. */
+  filePreviewUrl: (path: string): string =>
+    `${BASE}/files/preview?path=${encodeURIComponent(path)}`,
+
+  /** Absolute, token-less URL for a task's worktree-diff binary blob (old or
+   *  new side of a binary file), for `BinaryFilePreview`. Backed by `GET
+   *  /tasks/:id/diff/blob`, which resolves `side: "old"` via `git show
+   *  <baseRef>:<path>` and `side: "new"` from the on-disk file in the task's
+   *  cwd (worktree or workdir), mirroring what `getTaskDiff`'s underlying
+   *  `git diff` compared. Fetched with the header, never used as a bare
+   *  `<img src>`. */
+  taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
+    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}`,
+
+  /** Absolute, token-less URL for a GitHub PR's binary blob (old or new
+   *  side), for `BinaryFilePreview`. Identifying params mirror
+   *  `getGitHubPullDiff` (`path`, `number`) exactly, plus the blob-specific
+   *  `filePath` (repo-relative file path — carried as a distinct param name
+   *  from `path`, which is the local repo dir used to resolve the GitHub
+   *  remote) and `side`. Backed by `GET /github/pull-blob`: the old side
+   *  anchors at the PR's merge base (the `.diff` shown is a three-dot
+   *  diff), the new side at the PR head sha. */
+  pullBlobUrl: (opts: { path: string; number: number; filePath: string; side: "old" | "new" }): string => {
+    const q = new URLSearchParams({
+      path: opts.path,
+      number: String(opts.number),
+      filePath: opts.filePath,
+      side: opts.side,
+    });
+    return `${BASE}/github/pull-blob?${q.toString()}`;
+  },
+
+  /** Fetch binary blob bytes via an `Authorization: Bearer` header — used
+   *  for PDF panes, which go through `fetch`/pdf.js rather than an `<img>`
+   *  tag. `url` is typically one of `taskDiffBlobUrl`'s / `pullBlobUrl`'s
+   *  token-less outputs; the header is the only credential. Throws an `Error` whose
+   *  message distinguishes a missing blob ("missing", 404) from one over
+   *  the server's size cap ("too-large", 413) from any other failure, so
+   *  callers can render a matching empty state. */
+  fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
+    const res = await fetch(url, {
+      headers: { "authorization": `Bearer ${API_TOKEN}` },
+    });
+    if (!res.ok) {
+      if (res.status === 404) throw new Error("missing");
+      if (res.status === 413) throw new Error("too-large");
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+    return res.arrayBuffer();
+  },
+  /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
+   *  drag) to disk and get back its absolute path. Bypasses `j()` because the
+   *  body is raw bytes, not JSON. */
+  uploadScreenshot: async (blob: Blob): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/screenshots`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
+
+  /** Byte-copy fallback for a path-less non-image file (dropped or pasted)
+   *  that has no recoverable original path — the server writes the raw bytes
+   *  to `dataDir/attachments/` and returns the on-disk path. Bypasses `j()`
+   *  because the body is raw bytes, not JSON; same shape as
+   *  `uploadScreenshot`. */
+  uploadAttachment: async (blob: Blob, name: string): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/attachments?name=${encodeURIComponent(name)}`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
+
+  /** Answer claude's AskUserQuestion (scraper-sourced). One entry per
+   *  question in the original tool input, in the same order.
+   *
+   *  Mirrors `sendRunInput`'s shape for the custom/free-text answer path —
+   *  that's the only branch capable of a withhold (dismissing the modal then
+   *  delivering the answer as a follow-up turn via `sendInput`; the
+   *  drive-a-numbered-modal path types keys straight into the open modal, no
+   *  paste to withhold). `withheld`/`savedToBacklog`/`reason` are only ever
+   *  present alongside `ok: false`, and only for that free-text path — see
+   *  `/ask-questions/:id/answer` in server.ts. A request for a card that
+   *  another request is still answering is refused 409 (thrown as `ApiError`). */
+  skipAskQuestions: (id: string) =>
+    j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, { method: "POST", body: JSON.stringify({ skip: true }) }),
+  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> }) =>
+    j<{
+      ok: boolean;
+      withheld?: boolean;
+      savedToBacklog?: boolean;
+      reason?: string;
+      /** Which path delivered (or attempted) the answer: `"drive"` typed it into
+       *  the live modal, `"message"` dismissed the modal and sent a follow-up. */
+      delivery?: "drive" | "message";
+    }>(
+      `/ask-questions/${id}/answer`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
+  /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
+   *  keys advertised on the request — the server validates against the
+   *  recorded set before injecting keystrokes via `tmux send-keys`. */
+  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
+    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer an fx ACP permission request. `{ optionId }` must be one of the
+   *  option ids the request advertised — the server validates against the
+   *  recorded set before echoing it back into the ACP RPC reply.
+   *  `{ cancel: true }` is the Stop/delete path. */
+  answerFxPermission: (id: string, body: { optionId: string } | { cancel: true }) =>
+    j<{ ok: boolean }>(`/fx-permissions/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listPendingInteractions: (taskId: string) =>
+    j<PendingInteraction[]>(`/tasks/${taskId}/interactions/pending`),
+  /** Re-parse a run's events from claude's on-disk JSONL session
+   *  transcript. Use when the persisted `run_events` rows pre-date the
+   *  structured-event refactor (the legacy mapper truncated tool inputs
+   *  at 500 chars, so the in-DB copy is missing the tail bytes). Returns
+   *  an empty list + `reason` when the JSONL is gone or the run had no
+   *  claude session id (e.g. codex runs).
+   *
+   *  `limit`, when passed, bounds the rebuild to the most recent `limit`
+   *  mapped events (ascending) and the response carries `hasMore` — so an
+   *  automatic/background rebuild doesn't silently replace the panel's
+   *  bounded live window with an unbounded full-history dump. Omitted
+   *  (the manual "Rebuild from session JSONL" button's case), the server
+   *  returns the legacy full array with no `hasMore` field. */
+  rebuildRunEvents: (runId: string, limit?: number) =>
+    j<{ events: RunEvent[]; hasMore?: boolean; source?: string; reason?: string }>(
+      `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
+    ),
+
+  /** Fire a native macOS notification via the Bun process. Fire-and-forget
+   *  — the OS handles display. When `taskId` is provided, the Bun side
+   *  encodes it into an `agetor://task/<id>` deep-link so clicking the
+   *  notification opens straight to that task, not just app focus. */
+  notifyOS: (input: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+    /** The event kind; the core uses it for the entry's urgency (sound) and
+     *  for the reason-scoped removals. */
+    kind?: NotificationKind;
+  }) =>
+    j<{ ok: boolean }>("/notifications", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /** Remove a task's Notification Center entry (the focused-window update
+   *  path: the in-app toast carries the news, so the older entry goes).
+   *  Fire-and-forget like `notifyOS`; callers `.catch(() => {})`. */
+  clearTaskNotification: (taskId: string) =>
+    j<{ ok: boolean }>(`/notifications/${encodeURIComponent(taskId)}`, {
+      method: "DELETE",
+    }),
+
+  /** App-wide lifecycle event stream. Live-only (no replay) — subscribers
+   *  see events from the moment they connect. Used by the toast hook in
+   *  App.tsx to surface success / error / pending-input across every task
+   *  without subscribing per-task. */
+  subscribeGlobalEvents(onEvent: (e: GlobalEvent) => void): () => void {
+    return openEventStream(
+      `${BASE}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as GlobalEvent);
+          } catch { /* ignore */ }
+        },
+        // Logged so a future debug session has a breadcrumb when toasts stop
+        // arriving (typically: stale token, backend restart). The reader
+        // reconnects on its own except after a 401/403/404, so this is
+        // informational — no UI surfacing.
+        onError: (e) => { console.warn("[agetor] global events stream error", e); },
+      },
+      { headers: authHeaders() },
+    );
+  },
+
+  /** App-level event stream — carries `quit_request` (the main process
+   *  sends it when the user hits Cmd+Q while runs are active), `open_task`
+   *  (a native-notification deep-link click), `harness_usage` (a fresh
+   *  usage/quota snapshot from the background poller or a force-refresh —
+   *  see `getAllUsage`/`refreshHarnessUsage`), and `agent_models_changed`
+   *  (the model-discovery scheduler re-probed one or more harnesses and at
+   *  least one catalog changed — refetch `listAgentModels`/
+   *  `listHarnessModels`). No type whitelist here: every `AppEvent` variant
+   *  is forwarded to `onEvent` as-is, so a new variant needs no change in
+   *  this function. Live-only (no replay). */
+  subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
+    return openEventStream(
+      `${BASE}/app/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as AppEvent);
+          } catch { /* ignore */ }
+        },
+        onError: (e) => { console.warn("[agetor] app events stream error", e); },
+      },
+      { headers: authHeaders() },
+    );
+  },
+
+  /** Tell the main process to quit despite running tasks. Used by the
+   *  QuitConfirmDialog after the user picks "Quit anyway". Fire-and-forget
+   *  — the response races process exit. `completely` also stops the
+   *  background core ("Quit Agetor Completely", plan §3.6). `retry: false`:
+   *  the process is going away, a replay would only chase a dead socket. */
+  forceQuit: (opts?: { completely?: boolean }) =>
+    j<{ ok: boolean }>(
+      "/app/force-quit",
+      {
+        method: "POST",
+        ...(opts?.completely ? { body: JSON.stringify({ completely: true }) } : {}),
+      },
+      { retry: false },
+    ),
+
+  /** "Keep Agetor running in the background" state (docs/plans/always-on-host.md
+   *  §3.3). `fresh` bypasses the core's short status cache. */
+  getBackground: (opts?: { fresh?: boolean }) =>
+    j<BackgroundStatus>(`/background${opts?.fresh ? "?fresh=1" : ""}`),
+  /** Registers the login item. `retry: false` on the mutations below: a replay
+   *  after a lost answer could flip the switch back. */
+  turnOnBackground: () =>
+    j<BackgroundStatus>("/background", { method: "POST" }, { retry: false }),
+  turnOffBackground: () =>
+    j<BackgroundStatus>("/background", { method: "DELETE" }, { retry: false }),
+  /** Boots the stopped supervisor now; 409 `{code}` when it can't. */
+  startBackground: () =>
+    j<BackgroundStatus>("/background/start", { method: "POST" }, { retry: false }),
+  /** Opens System Settings › Login Items. */
+  openLoginItems: () =>
+    j<{ ok: true }>("/background/open-settings", { method: "POST" }, { retry: false }),
+  getRemoteAccess: () => j<RemoteAccessStatus>("/remote-access"),
+  /** Turning remote access ON is native-only (the Remote Access… box); the
+   *  webview can only turn it off. */
+  turnOffRemoteAccess: () =>
+    j<RemoteAccessStatus>("/remote-access", { method: "DELETE" }, { retry: false }),
+
+  subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
+    return openEventStream(
+      `${BASE}/runs/${runId}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as RunEvent);
+          } catch { /* ignore */ }
+        },
+        onError: (e) => { console.warn("[agetor] run events stream error", runId, e); },
+      },
+      { headers: authHeaders() },
+    );
+  },
+  /** Unified task-level event stream: every run's events, merged in id
+   *  order. Replaces per-run subscriptions for the run panel so the user
+   *  sees the whole conversation as one scrollback.
+   *
+   *  `onReplayMeta`, when supplied, receives the named `replay_meta` frame the
+   *  server sends as the FIRST frame of every (re)connect — the bounded
+   *  replay window's earliest event id and whether older history exists
+   *  (drives the run panel's "Load earlier" button). It's a *named* SSE
+   *  event (`event: replay_meta`), invisible to `onmessage`, so registering
+   *  the listener only when a caller asks for it costs nothing for callers
+   *  that don't care.
+   *
+   *  The meta also tells how the server answered a reconnect: `resumedAfter`
+   *  is the event id the replay continued after (only newer rows follow), and
+   *  `snapshotRequired` means the server could not resume (a gap, or too much
+   *  to send) and sent a fresh bounded window the caller must reset to.
+   *  `openEventStream` remembers the last SSE id and sends it as
+   *  `Last-Event-ID` on every reconnect, so resumption needs no caller code. */
+  subscribeTask(
+    taskId: string,
+    onEvent: (e: RunEvent) => void,
+    onReplayMeta?: (meta: TaskEventsReplayMeta) => void,
+  ): () => void {
+    return openEventStream(
+      `${BASE}/tasks/${taskId}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as RunEvent);
+          } catch { /* ignore */ }
+        },
+        // Named frame: invisible to `onMessage`, so registering it only when
+        // a caller asks costs nothing for callers that don't care.
+        events: onReplayMeta
+          ? {
+              [TASK_EVENTS_REPLAY_META_EVENT]: (data) => {
+                // Tolerant shape check: a malformed meta is dropped, never cast.
+                const meta = parseReplayMeta(data);
+                if (meta) onReplayMeta(meta);
+              },
+            }
+          : undefined,
+        onError: (e) => { console.warn("[agetor] task events stream error", taskId, e); },
+      },
+      { headers: authHeaders() },
+    );
+  },
+};

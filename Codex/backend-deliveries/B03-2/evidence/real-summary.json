@@ -1,0 +1,19 @@
+{
+  "passed": true,
+  "execution": "real",
+  "modelCalls": 1,
+  "runId": "0c14193f-630c-4c14-8821-2d24facdc359",
+  "providerSessionId": "01a19c07-7345-74b1-ae33-c69c26a4a5a9",
+  "persistedRunStatus": "succeeded",
+  "subtaskStatus": "validating",
+  "taskNotPrematurelySucceeded": true,
+  "logsAfterReopen": 9,
+  "snapshotSeq": 28,
+  "startupWorkerCrashInjected": true,
+  "modelProcessCrashTested": false,
+  "crashedRunId": "2e13378d-b097-42ea-8be0-c032e536641c",
+  "crashedRunStatus": "interrupted",
+  "quarantinedSlotRetained": true,
+  "noAutomaticModelReplay": true,
+  "controlStorageWriteDenied": true
+}

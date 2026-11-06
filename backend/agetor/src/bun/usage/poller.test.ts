@@ -1,0 +1,411 @@
+import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { AppEvent, Harness, HarnessQuota } from "../../shared/types.ts";
+import { USAGE_MIN_REFRESH_MS } from "../../shared/types.ts";
+import type { UsageProviderOpts } from "./poller.ts";
+
+// Set AGETOR_DATA_DIR before any import that pulls in db.ts. ES imports
+// hoist before top-level code, so we use dynamic `await import()` below
+// instead of a top-level `import { db } from "../db.ts"` — mirrors
+// src/bun/harnesses.test.ts's precedent.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-poller-"));
+const { db, harnesses, harnessUsage } = await import("../db.ts");
+const { subscribeAppEvents } = await import("../quit-guard.ts");
+const { pollAllUsage, refreshOne, __setUsageProviderForTest, __resetIdeReadConsentForTest } =
+  await import("./poller.ts");
+
+function fakeQuota(overrides: Partial<HarnessQuota> = {}): HarnessQuota {
+  return {
+    harnessId: "claude-code",
+    kind: "claude-code",
+    planType: null,
+    status: "ok",
+    source: "api",
+    fetchedAtMs: Date.now(),
+    meters: [{ id: "five_hour", label: "5 hour", usedPercent: 50, resetsAtMs: null }],
+    reason: null,
+    ...overrides,
+  };
+}
+
+// Track every unsubscribe fn registered by a test so a forgotten one can't
+// leak a listener into a sibling test in this same file (quit-guard's
+// `listeners` set is module-level and process-global under `bun test`).
+let activeUnsubs: Array<() => void> = [];
+function trackSubscribe(fn: (e: AppEvent) => void): () => void {
+  const unsub = subscribeAppEvents(fn);
+  activeUnsubs.push(unsub);
+  return unsub;
+}
+
+beforeEach(() => {
+  // Baseline: only claude-code enabled, so `pollAllUsage` never has a
+  // reason to touch a REAL provider for codex (enabled by default) —
+  // per-test fake providers only ever cover claude-code/gemini here.
+  db.run(`UPDATE harnesses SET enabled = 1 WHERE id = 'claude-code'`);
+  db.run(`UPDATE harnesses SET enabled = 0 WHERE id IN ('codex', 'cursor', 'gemini')`);
+  db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
+  db.run(`DELETE FROM harness_usage`);
+  __resetIdeReadConsentForTest();
+  // claude-code is enabled for every test, so a `pollAllUsage` sweep would
+  // otherwise run the REAL provider (keychain read + a network call with the
+  // developer's own token). Tests that care install their own fake over this.
+  __setUsageProviderForTest("claude-code", async () => fakeQuota());
+});
+
+afterEach(() => {
+  __setUsageProviderForTest("claude-code", null);
+  __setUsageProviderForTest("codex", null);
+  __setUsageProviderForTest("cursor", null);
+  __setUsageProviderForTest("gemini", null);
+  for (const unsub of activeUnsubs) unsub();
+  activeUnsubs = [];
+});
+
+afterAll(() => {
+  // Belt-and-braces: restore the default-enabled baseline in case a later
+  // file in the same `bun test` process reads this module's db instance
+  // (shouldn't happen given the mkdtemp isolation, but costs nothing).
+  db.run(`UPDATE harnesses SET enabled = 1 WHERE id IN ('claude-code', 'codex')`);
+  db.run(`UPDATE harnesses SET enabled = 0 WHERE id IN ('cursor', 'gemini')`);
+});
+
+test("pollAllUsage fans out to the fake provider, upserts, and broadcasts", async () => {
+  let calls = 0;
+  const quota = fakeQuota({ fetchedAtMs: Date.now() });
+  __setUsageProviderForTest("claude-code", async (_h: Harness) => {
+    calls++;
+    return quota;
+  });
+
+  const events: AppEvent[] = [];
+  trackSubscribe((e) => events.push(e));
+
+  await pollAllUsage();
+
+  expect(calls).toBe(1);
+  expect(harnessUsage.get("claude-code")).toEqual(quota);
+
+  const usageEvents = events.filter(
+    (e): e is Extract<AppEvent, { type: "harness_usage" }> => e.type === "harness_usage",
+  );
+  expect(usageEvents.length).toBeGreaterThanOrEqual(1);
+  expect(usageEvents.some((e) => e.quota.harnessId === "claude-code")).toBe(true);
+});
+
+test("refreshOne respects the freshness floor and bypasses it on force", async () => {
+  const cached = fakeQuota({ fetchedAtMs: Date.now(), meters: [{ id: "five_hour", label: "5 hour", usedPercent: 10, resetsAtMs: null }] });
+  harnessUsage.upsert(cached);
+
+  let calls = 0;
+  const fresh = fakeQuota({ fetchedAtMs: Date.now(), meters: [{ id: "five_hour", label: "5 hour", usedPercent: 90, resetsAtMs: null }] });
+  __setUsageProviderForTest("claude-code", async (_h: Harness) => {
+    calls++;
+    return fresh;
+  });
+
+  // Non-force: cached snapshot is still fresh (< USAGE_MIN_REFRESH_MS old) →
+  // provider must not be called, and the cached snapshot comes back as-is.
+  const result1 = await refreshOne("claude-code");
+  expect(calls).toBe(0);
+  expect(result1).toEqual(cached);
+
+  // Force: bypasses the freshness floor, hits the provider, replaces the
+  // stored snapshot.
+  const result2 = await refreshOne("claude-code", { force: true });
+  expect(calls).toBe(1);
+  expect(result2).toEqual(fresh);
+  expect(harnessUsage.get("claude-code")).toEqual(fresh);
+});
+
+test("refreshOne returns null and stores nothing for a kind with no registered provider", async () => {
+  // gemini has no entry in USAGE_PROVIDERS and no override installed here —
+  // enable the harness so the null comes specifically from "no provider",
+  // not from "harness disabled".
+  harnesses.setEnabled("gemini", true);
+
+  const result = await refreshOne("gemini");
+
+  expect(result).toBeNull();
+  expect(harnessUsage.get("gemini")).toBeNull();
+});
+
+test("pollAllUsage no-ops on an overlapping call while a sweep is in flight", async () => {
+  let calls = 0;
+  let resolveDeferred!: (q: HarnessQuota) => void;
+  const deferred = new Promise<HarnessQuota>((resolve) => {
+    resolveDeferred = resolve;
+  });
+  __setUsageProviderForTest("claude-code", async (_h: Harness) => {
+    calls++;
+    return deferred;
+  });
+
+  // Fire both sweeps without awaiting the first. `pollAllUsage` flips its
+  // module-level `pollInFlight` guard synchronously (before its first
+  // `await`), so the second call's guard check observes it already set and
+  // returns immediately without touching the provider.
+  const p1 = pollAllUsage();
+  const p2 = pollAllUsage();
+
+  resolveDeferred(fakeQuota({ fetchedAtMs: Date.now() }));
+  await Promise.all([p1, p2]);
+
+  expect(calls).toBe(1);
+});
+
+// `allowIdeRead` gating (macOS Sequoia TCC cross-app-data-read spam fix —
+// see refreshOne's doc in poller.ts and cursor-usage.ts's discoverCursorCookie).
+// Cursor is the only provider consuming this today, so these tests exercise
+// `refreshOne` against the "cursor" harness with a recording fake provider.
+test("refreshOne passes allowIdeRead:false when there's no prior snapshot and no force", async () => {
+  harnesses.setEnabled("cursor", true);
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+// D26(i): consent is in memory only. A stored `ok` or `error` row — which
+// an agent can write straight into agetor.sqlite — must not open the
+// cross-app read; only a forced refresh in this process does.
+test("refreshOne keeps allowIdeRead:false for a stored ok snapshot (agent-seeded or from a previous launch)", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "ok",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+
+  // The same holds through the background sweep.
+  harnessUsage.upsert({ ...harnessUsage.get("cursor")!, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  let sweptOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    sweptOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+  await pollAllUsage();
+  expect(sweptOpts).toBeDefined();
+  expect(sweptOpts?.allowIdeRead).toBe(false);
+});
+
+// Cold-start guarantee: the `unavailable` snapshot that the SKIP path itself
+// upserts (allowIdeRead:false → provider returns unavailable → refreshOne
+// stores it) must NOT re-open the cross-app read on the next sweep. Gating on
+// mere snapshot existence (`!= null`) would re-trip the TCC prompt one interval
+// after boot; gating on `status === "ok"` does not.
+test("refreshOne keeps allowIdeRead:false when the only prior snapshot is unavailable (skip-path)", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "unavailable",
+      meters: [],
+      reason: "skipped in background",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor", status: "unavailable", meters: [] });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("refreshOne passes allowIdeRead:true when force:true, even with no prior snapshot", async () => {
+  harnesses.setEnabled("cursor", true);
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor", { force: true });
+
+  expect(capturedOpts?.allowIdeRead).toBe(true);
+});
+
+test("refreshOne keeps allowIdeRead:false for a stored error snapshot", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnessUsage.upsert(
+    fakeQuota({
+      harnessId: "cursor",
+      kind: "cursor",
+      status: "error",
+      meters: [],
+      reason: "login expired",
+      fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000,
+    }),
+  );
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a forced refresh grants the IDE read to later background sweeps of that harness only, in this process", async () => {
+  harnesses.setEnabled("cursor", true);
+  const seen: Array<{ id: string; allow: boolean | undefined }> = [];
+  __setUsageProviderForTest("cursor", async (h: Harness, opts?: UsageProviderOpts) => {
+    seen.push({ id: h.id, allow: opts?.allowIdeRead });
+    return fakeQuota({ harnessId: h.id, kind: "cursor", fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  });
+
+  await refreshOne("cursor", { force: true });
+  await refreshOne("cursor");
+  expect(seen.map((s) => s.allow)).toEqual([true, true]);
+
+  // A relaunch forgets it, whatever the database says.
+  __resetIdeReadConsentForTest();
+  await refreshOne("cursor");
+  expect(seen.at(-1)?.allow).toBe(false);
+});
+
+// D26(i): the consent is keyed on the harness id the user refreshed. A
+// second cursor harness (another account, another HOME) has its own Cursor
+// database, and the user's click on the first one says nothing about it.
+test("a forced refresh grants the IDE read to that harness id only, not a second harness of the same kind", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnesses.insert({ id: "secondary-cursor", kind: "cursor", label: "Cursor (secondary)" });
+  harnesses.setEnabled("secondary-cursor", true);
+  const seen: Array<{ id: string; allow: boolean | undefined }> = [];
+  __setUsageProviderForTest("cursor", async (h: Harness, opts?: UsageProviderOpts) => {
+    seen.push({ id: h.id, allow: opts?.allowIdeRead });
+    // Already stale, so the next call refetches instead of serving the cache.
+    return fakeQuota({ harnessId: h.id, kind: "cursor", fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  });
+
+  await refreshOne("cursor", { force: true });
+  await refreshOne("secondary-cursor");
+  expect(seen).toEqual([
+    { id: "cursor", allow: true },
+    { id: "secondary-cursor", allow: false },
+  ]);
+
+  // The background sweep: the refreshed harness reads, the other doesn't.
+  seen.length = 0;
+  await pollAllUsage();
+  expect(seen.sort((a, b) => a.id.localeCompare(b.id))).toEqual([
+    { id: "cursor", allow: true },
+    { id: "secondary-cursor", allow: false },
+  ]);
+
+  // Refreshing the second one grants it too, independently.
+  seen.length = 0;
+  await refreshOne("secondary-cursor", { force: true });
+  await refreshOne("secondary-cursor");
+  expect(seen.map((s) => s.allow)).toEqual([true, true]);
+});
+
+test("a forced refresh of a disabled harness grants nothing (it never reaches the provider)", async () => {
+  // cursor stays disabled from beforeEach.
+  let calls = 0;
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    calls++;
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  expect(await refreshOne("cursor", { force: true })).toBeNull();
+  expect(calls).toBe(0);
+
+  // Enabling it later doesn't inherit a consent from the refused click.
+  harnesses.setEnabled("cursor", true);
+  await refreshOne("cursor");
+  expect(calls).toBe(1);
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a forced refresh of an unknown harness id grants nothing to a harness created later with that id", async () => {
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "late-cursor", kind: "cursor" });
+  });
+
+  expect(await refreshOne("late-cursor", { force: true })).toBeNull();
+  harnesses.insert({ id: "late-cursor", kind: "cursor", label: "Cursor (late)" });
+  harnesses.setEnabled("late-cursor", true);
+  await refreshOne("late-cursor");
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a provider throw on a forced refresh is stored as error (the read was allowed), and consent still holds", async () => {
+  harnesses.setEnabled("cursor", true);
+  __setUsageProviderForTest("cursor", async () => {
+    throw new Error("provider regressed");
+  });
+
+  const quota = await refreshOne("cursor", { force: true });
+  expect(quota?.status).toBe("error");
+  expect(quota?.reason).toBe("provider regressed");
+  expect(harnessUsage.get("cursor")?.status).toBe("error");
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+  harnessUsage.upsert({ ...harnessUsage.get("cursor")!, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  await refreshOne("cursor");
+  expect(capturedOpts?.allowIdeRead).toBe(true);
+});
+
+test("a provider throw on a non-allowed sweep is stored unavailable, and does not open the read next sweep", async () => {
+  harnesses.setEnabled("cursor", true);
+  __setUsageProviderForTest("cursor", async () => {
+    throw new Error("provider regressed");
+  });
+
+  await refreshOne("cursor");
+
+  expect(harnessUsage.get("cursor")?.status).toBe("unavailable");
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor", status: "unavailable", meters: [] });
+  });
+  // Backdate the stored row past the freshness floor so the provider runs.
+  const stored = harnessUsage.get("cursor")!;
+  harnessUsage.upsert({ ...stored, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+
+  await refreshOne("cursor");
+
+  expect(capturedOpts).toBeDefined();
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a19ad1-36b6-7ab1-9d83-e3ae84bd1909"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"approved\":false,\"reason\":\"clamp 未校验 low > high，反向边界不会抛出 ValueError；可信测试以退出码 1 失败。\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":17902,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":42,"reasoning_output_tokens":0}}

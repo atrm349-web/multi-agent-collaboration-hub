@@ -1,0 +1,1 @@
+{"code":"def clamp(value, low, high):\n    if low > high:\n        raise ValueError\n    return min(max(value, low), high)"}

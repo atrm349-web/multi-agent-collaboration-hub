@@ -1,0 +1,119 @@
+- banner:
+  - generic: MA
+  - generic: Multi-Agent Collaboration Hub
+  - generic: Local-First Cross-Vendor Autonomous Agent Orchestrator · Contract v0.2
+  - generic "多 Agent 协同神经核心处于活跃呼吸态": "NEURAL PULSE: ALIVE"
+  - generic: "Repo: Clamp Fixture Repo (Real Git + Controlled Test Runner) (main @ 920a6e45dc28b182d6cc9e4f2ac11aff6ddaa1b3)"
+  - generic "服务模式从后端 meta 读取；历史实测证据保持只读": "SERVICE: LIVE · contractVersion=0.2 · liveExecutionAvailable=true"
+  - generic: "SSE v0.2: Connected (snapshotSeq=82, seq=82)"
+  - button "+ 发布新协同任务"
+- complementary:
+  - generic: 核心控制视图 (Modules)
+  - navigation:
+    - button "1 Dashboard 总览" [active]:
+      - generic: "1"
+      - generic: Dashboard 总览
+    - button "2 Task Center 任务看板 1":
+      - generic: "2"
+      - generic: Task Center 任务看板
+      - generic: "1"
+    - button "3 Workflow View (DAG)":
+      - generic: "3"
+      - generic: Workflow View (DAG)
+    - button "4 Agent Workspace 终端":
+      - generic: "4"
+      - generic: Agent Workspace 终端
+    - button "5 Communication 消息总线 1":
+      - generic: "5"
+      - generic: Communication 消息总线
+      - generic: "1"
+    - button "6 Review Center 审核门禁 0":
+      - generic: "6"
+      - generic: Review Center 审核门禁
+      - generic: "0"
+    - button "7 Artifact Center 成果库 12":
+      - generic: "7"
+      - generic: Artifact Center 成果库
+      - generic: "12"
+    - button "8 Settings 适配器与策略":
+      - generic: "8"
+      - generic: Settings 适配器与策略
+  - generic: 当前聚焦任务 (Active Task)
+  - generic: R3 受控验证
+  - generic: succeeded
+  - generic: v7 · 100% · LIVE CURRENT
+  - text: ⌨️ 快捷键
+  - code: "1"
+  - text: –
+  - code: "8"
+  - text: 切换控制模块
+  - text: "🛡️ B-03 控制区隔离:"
+  - code: state/ ⊥ workspaces/
+- main:
+  - generic: LIVE CURRENT (executionMode=live · provenance=current)
+  - generic: succeeded
+  - generic: R3 受控验证
+  - generic: v7 | 进度 100% | 待批 0 | 产物 12
+  - button "⏸ 暂停任务 (Pause → pausing)" [disabled]
+  - button "▶ 恢复派发 (Resume → queued)" [disabled]
+  - button "⏹ 取消任务 (Cancel → cancelling)" [disabled]
+  - generic: 分页任务列表 (Page<Task>)
+  - generic: "1"
+  - generic: 1 项当前 LIVE / 0 项当前 MOCK / 0 项历史证据
+  - generic: 当前任务 DAG 节点 (Succeeded)
+  - generic: 3 / 3
+  - generic: 状态枚举严格对齐 v0.2 succeeded
+  - generic: Agent 适配器注册表
+  - generic: 2 / 2
+  - generic: 含 B-01 沙箱策略与 unsupportedReasons
+  - generic: 待决审批 (waiting_approval)
+  - generic: "0"
+  - generic: 审批与 Subtask Rework 职责严格分离
+  - generic: 当前任务不可变产物
+  - generic: "12"
+  - generic: relativePath + SHA-256 · 严禁绝对路径
+  - generic: Agent 适配器能力矩阵与 B-01 安全运行时边界 (GET /api/v1/agents)
+  - generic: Developer
+  - generic: Developer
+  - generic: available
+  - text: "Adapter:"
+  - code: codex-cli @ official-cli
+  - text: "PermissionProfile:"
+  - code: workspace-write
+  - generic: "Stages: analysis, implementation, documentation | MaxConcurrency: 1"
+  - generic: ✓ stream
+  - generic: ✓ resume
+  - generic: ✓ cancel
+  - generic: ✓ structured-output
+  - generic "Context is queued for the next turn": "✗ live-context: Context is queued for the next turn"
+  - generic: Independent reviewer
+  - generic: Independent reviewer
+  - generic: available
+  - text: "Adapter:"
+  - code: codex-cli @ official-cli
+  - text: "PermissionProfile:"
+  - code: read-only
+  - generic: "Stages: review, testing | MaxConcurrency: 1"
+  - generic: ✓ stream
+  - generic: ✓ resume
+  - generic: ✓ cancel
+  - generic: ✓ structured-output
+  - generic "Context is queued for the next turn": "✗ live-context: Context is queued for the next turn"
+  - generic: 当前聚焦任务一致性详情 (GET /api/v1/tasks/435b1a2d-69a5-444f-8811-919b3f10dd5a)
+  - button "查看完整 Subtask DAG →"
+  - button "前往审核门禁 (0) →"
+  - paragraph:
+    - strong: 任务目标 (goal)：
+    - text: R3-CHAIN
+  - strong: A · IMPLEMENTATION
+  - generic: succeeded
+  - generic: A
+  - generic: "attempt: 1/2 | timeoutMs: 120000 | deps: root"
+  - strong: FINAL-REVIEW · REVIEW
+  - generic: succeeded
+  - generic: Independent final review
+  - generic: "attempt: 1/2 | timeoutMs: 120000 | deps: e705e2b2-970c-4f57-90e2-0418ce09a696"
+  - strong: C · IMPLEMENTATION
+  - generic: succeeded
+  - generic: C
+  - generic: "attempt: 1/2 | timeoutMs: 120000 | deps: f22a8ab8-04ee-493e-8afa-878e7e96cd7d"

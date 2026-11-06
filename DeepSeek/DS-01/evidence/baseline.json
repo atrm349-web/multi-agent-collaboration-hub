@@ -1,0 +1,632 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "DeepSeek DS-01",
+  "generatedAt": "2026-11-06T04:51:00Z",
+  "sharedRoot": "./",
+  "backendGit": {
+    "branch": "codex/b04-b06-local-platform",
+    "head": "9f56aa45219df6544a7d2a62177a16ce78aa9a20",
+    "status": "M docs/hub/frontend-source-lock.json"
+  },
+  "sourceLock": {
+    "path": "backend/agetor/docs/hub/frontend-source-lock.json",
+    "delivery": "Codex F02-r3",
+    "checkedAt": "2026-11-03T07:44:18.947Z",
+    "reviewStatus": "accepted-macos-mvp-scoped",
+    "runtimeEnforced": false
+  },
+  "summary": {
+    "backend-lock": {
+      "match": 6,
+      "mismatch": 0,
+      "missing": 0,
+      "unrecorded": 0
+    },
+    "frontend-vs-codex-lock": {
+      "match": 1,
+      "mismatch": 2,
+      "missing": 0,
+      "unrecorded": 0
+    },
+    "codex-native-bundle": {
+      "match": 2,
+      "mismatch": 0,
+      "missing": 0,
+      "unrecorded": 0
+    },
+    "antigravity-manifest": {
+      "match": 20,
+      "mismatch": 6,
+      "missing": 0,
+      "unrecorded": 0
+    },
+    "codex-f02-r3-package": {
+      "match": 27,
+      "mismatch": 0,
+      "missing": 0,
+      "unrecorded": 0
+    }
+  },
+  "checks": [
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/packages/core/frontend.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+      "actual": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/packages/core/http.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
+      "actual": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/packages/core/hub.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "c78178d24cf188f902f843519e569154aa1e039edad097ce5c68a9f4cc61b097",
+      "actual": "c78178d24cf188f902f843519e569154aa1e039edad097ce5c68a9f4cc61b097",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/packages/core/quality.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "469f5e9bb9b27e10b199b282436e55969cb1bec03d449618cf1f21ff040e6e87",
+      "actual": "469f5e9bb9b27e10b199b282436e55969cb1bec03d449618cf1f21ff040e6e87",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/packages/core/workspace.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "11f34351be19f10fb28660eac7526b4f84fe998c01f79a0a0f2e47c9b87b9836",
+      "actual": "11f34351be19f10fb28660eac7526b4f84fe998c01f79a0a0f2e47c9b87b9836",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "backend-lock",
+      "path": "backend/agetor/scripts/start-hub.ts",
+      "recordedIn": "frontend-source-lock.json/backendHashes",
+      "recorded": "875fed6861b13fbd73c74e2700cbdbe1d5c14b6d92be629482005835ebef8211",
+      "actual": "875fed6861b13fbd73c74e2700cbdbe1d5c14b6d92be629482005835ebef8211",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:12:25Z"
+    },
+    {
+      "group": "frontend-vs-codex-lock",
+      "path": "apps/web/public/index.html",
+      "recordedIn": "frontend-source-lock.json/sourceHashes",
+      "recorded": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T12:01:44Z"
+    },
+    {
+      "group": "frontend-vs-codex-lock",
+      "path": "apps/web/public/app.js",
+      "recordedIn": "frontend-source-lock.json/sourceHashes",
+      "recorded": "d2d92a8bc1b3aff0df40c4d192864401a77493a78cd45171d89217e0e96b9081",
+      "actual": "a0c69a3ce7d46612241faad718927a82e1ae9dc32079a731681308103e26e29b",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:28:02Z"
+    },
+    {
+      "group": "frontend-vs-codex-lock",
+      "path": "apps/web/public/styles.css",
+      "recordedIn": "frontend-source-lock.json/sourceHashes",
+      "recorded": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+      "actual": "430ef474f31f0b35b9944020ebc4fd364778538200e4e426bfc546e02393c454",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:28:31Z"
+    },
+    {
+      "group": "codex-native-bundle",
+      "path": "Codex/backend-deliveries/F02-r3/app.live-native.js",
+      "recordedIn": "frontend-source-lock.json/nativeBundleHashes",
+      "recorded": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
+      "actual": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-native-bundle",
+      "path": "Codex/backend-deliveries/F02-r3/index.live-native.html",
+      "recordedIn": "frontend-source-lock.json/nativeBundleHashes",
+      "recorded": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523",
+      "actual": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    }
+  ],
+  "antigravityManifest": [
+    {
+      "group": "antigravity-manifest",
+      "path": "package.json",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "0c8282b7968e580e7d7c90b41db4fd4826ed5a5d4b6380fd8b249ec57f6482e4",
+      "actual": "0c8282b7968e580e7d7c90b41db4fd4826ed5a5d4b6380fd8b249ec57f6482e4",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T11:20:34Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "packages/shared/src/types.ts",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "bbff12d05c1f88b6ddf3f6e249e36ba3e1bdbe625da0d88705e9cfd6f70bce65",
+      "actual": "bbff12d05c1f88b6ddf3f6e249e36ba3e1bdbe625da0d88705e9cfd6f70bce65",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T10:55:55Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "packages/shared/src/types.v0.2.ts",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "a6b0fc147ff22e7508abc79631b3d3f6c4d29bcbe7c49d1378b3a7ce21a6fd42",
+      "actual": "a6b0fc147ff22e7508abc79631b3d3f6c4d29bcbe7c49d1378b3a7ce21a6fd42",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T06:18:34Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "apps/web/server.mjs",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "c76a264e1c258ceeb8eeb4a96163351ec1e21b72e50529d4cbe391be055877c8",
+      "actual": "ffe2b5fcdc34f27ec53653ada2865d1b656b02b69e3ca02c6cfab5a047be1cc8",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:19:13Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "apps/web/public/index.html",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T12:01:44Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "apps/web/public/styles.css",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "430ef474f31f0b35b9944020ebc4fd364778538200e4e426bfc546e02393c454",
+      "actual": "430ef474f31f0b35b9944020ebc4fd364778538200e4e426bfc546e02393c454",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T08:28:31Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "apps/web/public/app.js",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "a0c69a3ce7d46612241faad718927a82e1ae9dc32079a731681308103e26e29b",
+      "actual": "a0c69a3ce7d46612241faad718927a82e1ae9dc32079a731681308103e26e29b",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T08:28:02Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "tests/verify-contract-v0.2.mjs",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "1aa144e688607a6de9387fdb856dd093243ed3ad7ee5afe615e4d76e097c41ab",
+      "actual": "1aa144e688607a6de9387fdb856dd093243ed3ad7ee5afe615e4d76e097c41ab",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T11:18:08Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "tests/verify-browser-v0.2.mjs",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "3ae872e211df483e358c78fa99c9b0e34565959ec65bf6442f209cd0abc61a60",
+      "actual": "3ae872e211df483e358c78fa99c9b0e34565959ec65bf6442f209cd0abc61a60",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T11:20:01Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "tests/test-f02-r3-plan.ts",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "f90dfd7f6cb2f20c4314cbb0da4674d9e03d406085ae147fc2fe305ca7067098",
+      "actual": "82a4b211b2ad9ccc299fa409843437ed85596ff0691161e4d161491739c94050",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:02:05Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "docs/task-board.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "1e147977e2db152ce8d16ccca03088df27a441f2930d1bdd578634c445241849",
+      "actual": "09363589e3240d8d986e79953227d4a86d343b801b9142e637dbbf1ef0be748d",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T07:46:08Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "docs/frontend-plan.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "0f8027eaa948cb0f9796dd8737be79c7e132f5c636ee4df8f810ef7f7a315801",
+      "actual": "0f8027eaa948cb0f9796dd8737be79c7e132f5c636ee4df8f810ef7f7a315801",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T05:49:43Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "docs/ui-pages.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "032dd9bafe2e8cce58476e3599a7ea5a7e9ead824b59aa5ff52a7640b1629c9a",
+      "actual": "032dd9bafe2e8cce58476e3599a7ea5a7e9ead824b59aa5ff52a7640b1629c9a",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T05:49:44Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "docs/open-source-evaluation.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "6986edf75adc23022c756cec52f7c0d339001a336e0081598a6128f63592d487",
+      "actual": "6986edf75adc23022c756cec52f7c0d339001a336e0081598a6128f63592d487",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T05:49:42Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/alignment-ack-v0.2.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "a07eb3f9bd65f777ead5ea59cc5f080d7c495ee8734df0c5a810d5ae8e0c5e72",
+      "actual": "a07eb3f9bd65f777ead5ea59cc5f080d7c495ee8734df0c5a810d5ae8e0c5e72",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T11:23:53Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/交接进度.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "bfda8a82163b2f8eefef6ff2ef9d4e5f76f16fbc8ccbd6603a11681bead70fa0",
+      "actual": "f89bb22b90e336057a0f9e4c0bcca125eccb36d0280728792675de866647f8b1",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:04:01Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F03/README.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "6a4dd63339318b077d9424918a082102bf57f25a48cbb05d0dc0965a019483af",
+      "actual": "6a4dd63339318b077d9424918a082102bf57f25a48cbb05d0dc0965a019483af",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T11:23:23Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F03/manifest.json",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "f8976200b1107ed2accbc0f546f2ca0cd70286d5bc8c20fa01fffa391e258709",
+      "actual": "f8976200b1107ed2accbc0f546f2ca0cd70286d5bc8c20fa01fffa391e258709",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T12:03:06Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02/README.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "9df416423cfe7e3ba2a041f1bf686f18187a633e46501e288b38da8e49639862",
+      "actual": "9df416423cfe7e3ba2a041f1bf686f18187a633e46501e288b38da8e49639862",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:35:52Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02/manifest.json",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "cc866e669d8a27c4c9ce4732d673c7f706a5e75d1b5154f3e7bdd413cd01a044",
+      "actual": "cc866e669d8a27c4c9ce4732d673c7f706a5e75d1b5154f3e7bdd413cd01a044",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T00:35:54Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r2/README.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "1a53a655df543f94dcd0e48b4de516fbbe1c3c230788de8851953d77bf52fd6f",
+      "actual": "1a53a655df543f94dcd0e48b4de516fbbe1c3c230788de8851953d77bf52fd6f",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T01:24:08Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r2/manifest.json",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "b83c0023ef65d073849b6a04d4d87d0b980950aa05a2e4390549ec81a4188a60",
+      "actual": "8932364fbc3de30dbceeabcea8b261a5998757c05dcf5cb78f571b5bb9480320",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T02:22:57Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r3/README.md",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "cf99b4942e04f9d18d0028b08a5d2a1569ee4b58ee23b20c1e15f28fa6a70544",
+      "actual": "cf99b4942e04f9d18d0028b08a5d2a1569ee4b58ee23b20c1e15f28fa6a70544",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T08:03:34Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r3/manifest.json",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "85ef0db3625f3c151479ebffb53ef3cf5227ea777b752df85e5077bf13e51dcf",
+      "actual": "2da49279bd39e07aeb5609a8598059551db442fd60f43862d753ae41e166a4a0",
+      "verdict": "mismatch",
+      "mtimeUtc": "2026-11-03T08:31:13Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r3/app.live-native.js",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "252ba8265313ea9e07174b5d117efbb8674b2fea0a85b458baba8ac2dd5163d9",
+      "actual": "252ba8265313ea9e07174b5d117efbb8674b2fea0a85b458baba8ac2dd5163d9",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T08:30:57Z"
+    },
+    {
+      "group": "antigravity-manifest",
+      "path": "Antigravity/frontend-deliveries/F02-r3/index.live-native.html",
+      "recordedIn": "Antigravity/handoff-manifest.json",
+      "recorded": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317",
+      "actual": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T08:30:57Z"
+    }
+  ],
+  "codexPackage": [
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/README.md",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "eed1a6b52624809136c69c1d424a1f0104c9da2d8d7cf5a6fc61b6fdc417bdfd",
+      "actual": "eed1a6b52624809136c69c1d424a1f0104c9da2d8d7cf5a6fc61b6fdc417bdfd",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:45:25Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/app.live-native.js",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
+      "actual": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/app.patch",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "f966de84b924b449867e0e0a474cbe6e66f13bdabb158efc6c61e28716a0f371",
+      "actual": "f966de84b924b449867e0e0a474cbe6e66f13bdabb158efc6c61e28716a0f371",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/before-hashes.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "94a7fc41f381a5790b5bf5240c6299576f07d751e65fb4545fa710b5afb9c29a",
+      "actual": "94a7fc41f381a5790b5bf5240c6299576f07d751e65fb4545fa710b5afb9c29a",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:29:20Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/bridge-tests.log",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "1bb75347d083d498baccd06c5c86adbeba94bb47214587a3127d97ec465a6191",
+      "actual": "1bb75347d083d498baccd06c5c86adbeba94bb47214587a3127d97ec465a6191",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:43:44Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/browser/database-evidence.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "695cf0163ea32350929ec2651d2cb93ab1e2d976a0c1afc3566efe382ba2555f",
+      "actual": "695cf0163ea32350929ec2651d2cb93ab1e2d976a0c1afc3566efe382ba2555f",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:01Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/browser/final-dom.txt",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "cb20bfb67c32c3ab729b89f55ab3dd2c5706f7e4da760b325ae4c32701836bed",
+      "actual": "cb20bfb67c32c3ab729b89f55ab3dd2c5706f7e4da760b325ae4c32701836bed",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:43:35Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/browser/succeeded.jpg",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "37d582f869c0bd2db4d93193f79c20368ac3e7f7b8e12da6090363ad8ded047c",
+      "actual": "37d582f869c0bd2db4d93193f79c20368ac3e7f7b8e12da6090363ad8ded047c",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:43:35Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/browser/ui-checks.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "94309feed8f165b4d467804684a118d3753446362a4c6c6da2f30d88b3ffd3b7",
+      "actual": "94309feed8f165b4d467804684a118d3753446362a4c6c6da2f30d88b3ffd3b7",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/browser-server.log",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "6b5f0ffb62897925ae06c3ee8ae57ec49e75d310bf983a107eaa4450e6c5bd62",
+      "actual": "6b5f0ffb62897925ae06c3ee8ae57ec49e75d310bf983a107eaa4450e6c5bd62",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:39:43Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/build-delivery.ts",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "1986338d567c9aabea434c8238d188f5610c08f05c6372151d462afe0e939597",
+      "actual": "1986338d567c9aabea434c8238d188f5610c08f05c6372151d462afe0e939597",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/frontend-source-lock.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "d6b7a1ac96c748016e375fe0c9a2d46585f32e20a1c7ef279336619737d090c7",
+      "actual": "d6b7a1ac96c748016e375fe0c9a2d46585f32e20a1c7ef279336619737d090c7",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:46:08Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/index.live-native.html",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523",
+      "actual": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/inputs/premerge/app.js",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "6f8c0af20053bc5f27fac9f87cafb27c603e58dfdf48f324b6cbbd738efa5c40",
+      "actual": "6f8c0af20053bc5f27fac9f87cafb27c603e58dfdf48f324b6cbbd738efa5c40",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:40:34Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/inputs/premerge/index.html",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T12:01:44Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/inputs/premerge/styles.css",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+      "actual": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:22:33Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/inputs/premerge-server-evidence.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "da7db2e72c24228c0573e57b0cbc1d7bc53fea78ecab2aca5c878e202290248c",
+      "actual": "da7db2e72c24228c0573e57b0cbc1d7bc53fea78ecab2aca5c878e202290248c",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:52:57Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/manifest.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "e06fce34ba66b41e0009b64428135ac00dc0902ce660618ebc7cb28297b7793b",
+      "actual": "e06fce34ba66b41e0009b64428135ac00dc0902ce660618ebc7cb28297b7793b",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:44:18Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/plan-compression.test.ts",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "6bfe2500b2938b094128c55cd2201fb2adcf2e971fe10d31db3c6f7679f920c7",
+      "actual": "6bfe2500b2938b094128c55cd2201fb2adcf2e971fe10d31db3c6f7679f920c7",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:30:07Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/plan-tests.log",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "77a5eaa08725b91e06b4f2c2d176419fd66328a09c5539022599c7b08098d7ea",
+      "actual": "77a5eaa08725b91e06b4f2c2d176419fd66328a09c5539022599c7b08098d7ea",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:41:41Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/premerge-hashes.json",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "e02c95b54cdcf9b75be5ace255dba4cebfecce69bc48fc89afe6ad7f0500e27e",
+      "actual": "e02c95b54cdcf9b75be5ace255dba4cebfecce69bc48fc89afe6ad7f0500e27e",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:53:51Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/publish.py",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "599e1ed5250b2b0dddac68a0fb3c0fec040be5499cb423e80ac3faa279ee29c7",
+      "actual": "599e1ed5250b2b0dddac68a0fb3c0fec040be5499cb423e80ac3faa279ee29c7",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:45:25Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/published-plan-tests.log",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "8c64d5e8ab33ea2f6e7b95348e7b14cc64bcf1ef70a82646ac90d8fce1f3fa54",
+      "actual": "8c64d5e8ab33ea2f6e7b95348e7b14cc64bcf1ef70a82646ac90d8fce1f3fa54",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:45:57Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/serve-browser-fixture.ts",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "8a3f772e0f9f62dc53c7b47852cc4ec88cfcdfd7de8710565990dc8518e9091f",
+      "actual": "8a3f772e0f9f62dc53c7b47852cc4ec88cfcdfd7de8710565990dc8518e9091f",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T07:41:40Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/source/app.js",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "d2d92a8bc1b3aff0df40c4d192864401a77493a78cd45171d89217e0e96b9081",
+      "actual": "d2d92a8bc1b3aff0df40c4d192864401a77493a78cd45171d89217e0e96b9081",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:53:51Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/source/index.html",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "actual": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-02T12:01:44Z"
+    },
+    {
+      "group": "codex-f02-r3-package",
+      "path": "Codex/backend-deliveries/F02-r3/source/styles.css",
+      "recordedIn": "Codex/backend-deliveries/F02-r3/SHA256.json",
+      "recorded": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+      "actual": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e",
+      "verdict": "match",
+      "mtimeUtc": "2026-11-03T02:22:33Z"
+    }
+  ]
+}

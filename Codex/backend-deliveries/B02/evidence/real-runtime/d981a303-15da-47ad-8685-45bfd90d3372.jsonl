@@ -1,0 +1,4 @@
+{"seq":1,"stream":"event","event":{"type":"thread.started","thread_id":"01a19b5c-27a6-76e1-837d-16d2f0f0eb42"}}
+{"seq":2,"stream":"event","event":{"type":"turn.started"}}
+{"seq":3,"stream":"event","event":{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"我将执行这条命令，等待其结束。"}}}
+{"seq":4,"stream":"event","event":{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"python3 -c \\\"import time; print('HUB_TIMEOUT_WAIT', flush=True); time.sleep(60)\\\"\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}}

@@ -1,0 +1,91 @@
+{
+  "checkedAt": "2026-11-03T02:16:02.236Z",
+  "bridge": {
+    "sourceHashes": {
+      "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "app.js": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+      "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+    },
+    "nativeAppMatches": true,
+    "nativeHtmlMatches": true
+  },
+  "originalReproductions": {
+    "rawJsonDataPreserved": true,
+    "rawBytesPreserved": true,
+    "hashMismatchRejected": true,
+    "httpErrorRejected": true,
+    "chainDependenciesPreserved": true,
+    "chainCriteriaPreserved": true,
+    "emptyExecutableRejected": true,
+    "directInvalidPlanRejected": true
+  },
+  "additionalPlanChecks": {
+    "branchingBackendValidationError": "Error: INVALID_INPUT: acceptance criterion IDs must be unique in a plan",
+    "branching": [
+      {
+        "id": "dd227e77-092e-4b72-85ad-85247689d560",
+        "stage": "implementation",
+        "code": "A",
+        "title": "A",
+        "description": "A",
+        "dependsOn": [],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-A",
+            "description": "A"
+          }
+        ]
+      },
+      {
+        "id": "69d01808-2fee-4815-9a4e-331e96140a5f",
+        "stage": "implementation",
+        "code": "C",
+        "title": "C",
+        "description": "C",
+        "dependsOn": [
+          "dd227e77-092e-4b72-85ad-85247689d560"
+        ],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-C",
+            "description": "C"
+          },
+          {
+            "id": "ac-B",
+            "description": "B"
+          }
+        ]
+      },
+      {
+        "id": "1f21e683-b6d2-45ce-8937-2a4e5fded516",
+        "stage": "documentation",
+        "code": "D",
+        "title": "D",
+        "description": "D",
+        "dependsOn": [
+          "dd227e77-092e-4b72-85ad-85247689d560"
+        ],
+        "requiredCapabilities": [
+          "stream"
+        ],
+        "acceptanceCriteria": [
+          {
+            "id": "ac-D",
+            "description": "D"
+          },
+          {
+            "id": "ac-B",
+            "description": "B"
+          }
+        ]
+      }
+    ],
+    "terminalRemovedCriterionPreserved": false
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "root": "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/runtime",
+  "port": 4322,
+  "frontendDir": ".//apps/web/public",
+  "repositories": [
+    {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "label": "DS-02 amount formatter",
+      "path": "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/repo",
+      "defaultTestProfileId": "acceptance",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "testProfiles": [
+        {
+          "id": "acceptance",
+          "command": [
+            "/usr/local/bin/node",
+            "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/owner-tests/check.mjs"
+          ],
+          "timeoutMs": 20000,
+          "readPaths": [
+            "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/owner-tests"
+          ]
+        }
+      ]
+    }
+  ]
+}

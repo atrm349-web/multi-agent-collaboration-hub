@@ -1,0 +1,162 @@
+{
+  "verificationMode": "real-controller-http-chrome-with-injected-provider",
+  "providerExecution": "deterministic-subprocess-fixture",
+  "plannerExecution": "injected-draft-plan",
+  "independentTestSandbox": "bypassed-by-testRunner-injection",
+  "verifiedAt": "2026-11-03T01:01:05.219Z",
+  "origin": "http://127.0.0.1:55533",
+  "frontendDir": ".//apps/web/public",
+  "checks": {
+    "bootstrapAndLiveMode": {
+      "hasBootToken": true,
+      "modeText": "SERVICE: LIVE · contractVersion=0.2 · liveExecutionAvailable=true",
+      "sseText": "SSE v0.2: Connected (snapshotSeq=2, seq=2)",
+      "mockControlButtons": 0,
+      "repoCount": 1,
+      "selectedRepoId": "a22f952b-f2c9-4d44-8d00-c7498ed892af"
+    },
+    "decomposeAndCreate": {
+      "draftPreview": {
+        "hasPlan": true,
+        "subtaskCodes": [
+          "SUB-01:implementation"
+        ]
+      },
+      "createdTaskState": {
+        "taskId": "f18bd866-a92a-432e-be2e-b94ba8996112",
+        "status": "running",
+        "subtaskCodes": [
+          "SUB-01",
+          "FINAL-REVIEW"
+        ],
+        "runCount": 1
+      }
+    },
+    "pauseResumeMessageAndValidation": {
+      "pauseInitiated": "pausing",
+      "pausedConverged": "paused",
+      "msgCountAfterSend": 1,
+      "waitingApprovalState": {
+        "taskStatus": "waiting_approval",
+        "pendingApprovals": [
+          {
+            "id": "e6b8c011-e138-43b7-8b34-58967f1807b4",
+            "version": 1,
+            "createdAt": "2026-11-03T01:01:12.251Z",
+            "updatedAt": "2026-11-03T01:01:12.251Z",
+            "executionMode": "live",
+            "taskId": "f18bd866-a92a-432e-be2e-b94ba8996112",
+            "subtaskId": "c57701d7-e8b4-445d-9720-eaee72bafd56",
+            "runId": "e97938b1-fa90-492d-9c12-ad261373d6b9",
+            "actionType": "final_delivery",
+            "actionDigest": "878b1418d138d2a7d290b217535c3304257f98032b9382b500b51ab512eebcc8",
+            "summary": "Final delivery: Python 智能车视觉识别系统（赛道识别 + 障碍物检测 + 测试与文档）",
+            "status": "pending",
+            "expiresAt": "2026-11-03T01:31:12.250Z",
+            "artifactRefs": [
+              "004fe074-1b79-402d-a9fc-5016e337275c",
+              "0526c610-89e1-409e-b4a3-95478eb8e08a",
+              "12338e60-07be-4f27-b563-81981377fd16",
+              "72543645-ecd9-4489-85cd-243a0820db7c",
+              "d0c1ca80-675a-459c-9d50-037b5d4753e0"
+            ],
+            "diffArtifactId": "004fe074-1b79-402d-a9fc-5016e337275c",
+            "decidedAt": null,
+            "decidedBy": null
+          }
+        ],
+        "validations": [
+          {
+            "criterionId": "ac-clamp-01",
+            "status": "passed",
+            "exitCode": 0
+          },
+          {
+            "criterionId": "ac-1",
+            "status": "passed",
+            "exitCode": 0
+          }
+        ],
+        "artifacts": [
+          {
+            "id": "0526c610-89e1-409e-b4a3-95478eb8e08a",
+            "category": "diff",
+            "relativePath": "SUB-01-attempt-1.diff"
+          },
+          {
+            "id": "12338e60-07be-4f27-b563-81981377fd16",
+            "category": "code",
+            "relativePath": "src/clamp.ts"
+          },
+          {
+            "id": "d0c1ca80-675a-459c-9d50-037b5d4753e0",
+            "category": "test_report",
+            "relativePath": "SUB-01-clamp.json"
+          },
+          {
+            "id": "004fe074-1b79-402d-a9fc-5016e337275c",
+            "category": "diff",
+            "relativePath": "FINAL-REVIEW-attempt-1.diff"
+          },
+          {
+            "id": "72543645-ecd9-4489-85cd-243a0820db7c",
+            "category": "test_report",
+            "relativePath": "FINAL-REVIEW-clamp.json"
+          }
+        ]
+      }
+    },
+    "sseCursorRecovery": {
+      "sseConnected": true,
+      "badge": "SSE v0.2: Connected (snapshotSeq=45, seq=53)",
+      "snapshotSeq": 53
+    },
+    "artifactCenter": {
+      "artifactCount": 5,
+      "hasReportJson": true,
+      "hasDiffText": true,
+      "downloadButtons": 5
+    },
+    "approvalAndReworkLifecycle": {
+      "conflictStatus": 409,
+      "afterReject": {
+        "rejectedStatus": "rejected",
+        "taskStatus": "waiting_approval",
+        "hasExplicitReworkBtn": true
+      },
+      "afterExplicitRework": {
+        "totalApprovals": 2,
+        "pendingId": "d1f02c39-1498-4e47-962b-f0d33e1a063f",
+        "pendingDigest": "7c74ac5dcc94875a27ba609d8fc3cfde78b79a6031ea07e09dfe18918d053f17"
+      },
+      "finalApprovedState": {
+        "taskStatus": "succeeded",
+        "progressPct": 100,
+        "approvalStatuses": [
+          "rejected",
+          "approved"
+        ]
+      },
+      "pendingInvalidatedByRework": {
+        "taskStatus": "running",
+        "invalidatedStatus": "invalidated",
+        "hasRunningAttempt2": true
+      }
+    },
+    "cancelAndDrainedLogs": {
+      "task2ReworkRunning": {
+        "taskStatus": "running",
+        "invalidatedStatus": "invalidated",
+        "hasRunningAttempt2": true
+      },
+      "task2Cancelled": {
+        "taskStatus": "cancelled",
+        "runStatus": "cancelled",
+        "logCount": 2,
+        "hasDrainedLog": false
+      }
+    }
+  },
+  "consoleErrors": [],
+  "pageExceptions": []
+}

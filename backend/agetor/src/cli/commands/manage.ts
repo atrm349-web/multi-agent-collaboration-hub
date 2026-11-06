@@ -1,0 +1,124 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { getClient, type Flags } from "../context.ts";
+import { resolveTask } from "../resolve.ts";
+import { c, out, printJson } from "../output.ts";
+import { ApiError, type PatchTaskInput } from "../api-client.ts";
+import { COLUMNS } from "../../shared/types.ts";
+import { flagValue } from "../args.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag, usageError } from "../usage.ts";
+
+const COLUMN_IDS = COLUMNS.map((col) => col.id);
+
+export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  if (!ref) throw usageError("edit");
+  const patch: PatchTaskInput = {};
+  let detachProfile = false;
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i]!;
+    const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
+    switch (a) {
+      case "--title": patch.title = val(); break;
+      case "--prompt": patch.prompt = val(); break;
+      case "--prompt-file": {
+        const f = val(true);
+        patch.prompt = f === "-" ? (await Bun.stdin.text()).trim() : readFileSync(f, "utf8");
+        break;
+      }
+      case "--agent": patch.agent = val(); break;
+      // Resolve relative to the CLI's cwd, matching `add`/`projects add` —
+      // the daemon that ultimately runs git ops may have a different cwd.
+      case "--workdir": patch.workdir = path.resolve(val()); break;
+      case "--model": patch.model = val(); break;
+      case "--mode": patch.mode = val(); break;
+      case "--effort": patch.effort = val(); break;
+      // --fast / --no-fast are aliases of --speed fast / off; the later of
+      // several speed flags wins. Only `speed` goes on the wire.
+      case "--speed": patch.speed = parseSpeedFlag(val()); break;
+      case "--fast": patch.speed = "fast"; break;
+      case "--no-fast": patch.speed = "off"; break;
+      case "--max-mode": patch.maxMode = true; break;
+      case "--no-max-mode": patch.maxMode = false; break;
+      // OpenCode 2's server option; validated here with the routes' own
+      // parser, applied by the core on the task's next turn.
+      case "--opencode-server": patch.opencodeServer = parseOpencodeServerFlag(val()); break;
+      case "--type": patch.taskType = val(); break;
+      case "--column": patch.column = val(); break;
+      case "--detach-profile": detachProfile = true; break;
+      default: break;
+    }
+  }
+  if (Object.keys(patch).length === 0 && !detachProfile) {
+    throw new Error(
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--opencode-server/--type/--column/--detach-profile",
+    );
+  }
+  if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
+    throw new Error(`unknown column "${patch.column}" — one of: ${COLUMN_IDS.join(", ")}`);
+  }
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  // Detach first so a combined `--detach-profile --model …` unlocks the
+  // bound fields before the patch that wants to change them — the server
+  // 409s a PATCH that touches agent/mode/model/effort/speed/maxMode while
+  // still bound (opencodeServer included). That 409's message says "agent" (the server's own
+  // vocabulary — "agent" = harness there), which would read as nonsense at
+  // the CLI boundary where "agent" = harness and "profile" = agent profile
+  // (docs/plans/task-details-agent-row.md D4); rewrite it in place rather
+  // than change the server string, which the webview also reads verbatim.
+  // Every other error this command can raise still propagates unmodified.
+  let updated = detachProfile ? await client.detachTaskAgentProfile(task.id) : task;
+  if (Object.keys(patch).length > 0) {
+    try {
+      updated = await client.patchTask(updated.id, patch);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409 && err.message.startsWith("task is bound to agent")) {
+        const rewritten = err.message.replace(/^task is bound to agent/, "task is bound to profile");
+        throw new Error(`${rewritten} (agetor edit ${task.id.slice(0, 8)} --detach-profile)`);
+      }
+      throw err;
+    }
+  }
+  if (flags.json) return printJson(updated);
+  // model/mode/effort changes are forwarded to a live claude session by the
+  // server (reconcileTaskSession sends /model, /effort, cycles mode).
+  const changed = [...(detachProfile ? ["detach-profile"] : []), ...Object.keys(patch)];
+  out(`${c.green("✓")} updated ${c.dim(updated.id.slice(0, 8))} — ${changed.join(", ")}`);
+}
+
+export async function cmdMove(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  const column = args[1];
+  if (!ref || !column) {
+    throw usageError("move");
+  }
+  if (!COLUMN_IDS.includes(column as (typeof COLUMN_IDS)[number])) {
+    throw new Error(`unknown column "${column}" — one of: ${COLUMN_IDS.join(", ")}`);
+  }
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  const updated = await client.patchTask(task.id, { column });
+  if (flags.json) return printJson(updated);
+  out(`${c.cyan("→")} moved ${c.dim(updated.id.slice(0, 8))} → ${column}`);
+}
+
+export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  if (!ref) throw usageError("archive");
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  const updated = await client.archiveTask(task.id);
+  if (flags.json) return printJson(updated);
+  out(`${c.gray("archived")} ${c.dim(updated.id.slice(0, 8))}`);
+}
+
+export async function cmdUnarchive(args: string[], flags: Flags): Promise<void> {
+  const ref = args[0];
+  if (!ref) throw usageError("unarchive");
+  const client = await getClient(flags);
+  const task = await resolveTask(client, ref);
+  const updated = await client.unarchiveTask(task.id);
+  if (flags.json) return printJson(updated);
+  out(`${c.green("unarchived")} ${c.dim(updated.id.slice(0, 8))}`);
+}

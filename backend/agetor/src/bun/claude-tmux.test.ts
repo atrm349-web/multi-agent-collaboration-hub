@@ -1,0 +1,3135 @@
+import { test, expect } from "bun:test";
+import { homedir, tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+// cycleToMode's tmux send-keys call runs `Bun.spawnSync` on the tmux
+// binary; point it at /bin/echo so the per-press spawn is fast and the
+// (irrelevant) exit code stays 0 instead of depending on whether real
+// tmux is installed on the test host.
+process.env.AGETOR_TMUX_BIN = "/bin/echo";
+
+// claude-tmux.ts imports `tasks` from db.ts, which opens its sqlite
+// connection at module-load time. A plain top-level `import` is hoisted
+// ahead of any code in this file (including the AGETOR_TMUX_BIN line
+// above), so setting AGETOR_DATA_DIR first only works via a dynamic
+// import, which runs in place instead of being hoisted — same pattern as
+// harnesses.test.ts. Without this, this file (or whichever file `bun test`
+// happens to load first) can silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-claude-tmux-"));
+
+const {
+  buildClaudeSessionEnv,
+  CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_MODE_ACCEPT_EDITS,
+  CLAUDE_MODE_AUTO,
+  CLAUDE_MODE_BYPASS,
+  CLAUDE_MODE_DEFAULT,
+  CLAUDE_MODE_PLAN,
+  cycleDistance,
+  cycleOrderFor,
+  cycleToMode,
+  encodeProjectPath,
+  healWindowSize,
+  jsonlPathFor,
+  mapJsonlEventToChunks,
+  parseSessionActivityLine,
+  pinClaudeConfigDir,
+  rebuildEventsFromJsonl,
+  replayJsonlLines,
+  sessionNameFor,
+  toClaudeModeString,
+} = await import("./claude-tmux.ts");
+
+test("jsonlPathFor with home=null falls back to the system homedir", () => {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const p = jsonlPathFor("/a/b", "session-uuid", null);
+    expect(p.startsWith(homedir())).toBe(true);
+    expect(p).toBe(`${homedir()}/.claude/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test("jsonlPathFor with home=null honors CLAUDE_CONFIG_DIR", () => {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  const dir = mkdtempSync(path.join(tmpdir(), "claude-config-"));
+  process.env.CLAUDE_CONFIG_DIR = dir;
+  try {
+    const p = jsonlPathFor("/a/b", "session-uuid", null);
+    expect(p).toBe(`${dir}/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test("pinClaudeConfigDir gives a home-less session this process's config dir, or unsets the tmux server's", () => {
+  const argv = ["claude", "--model", "claude-opus-5-5"];
+  // This process has one: pass it explicitly so the tmux server's copy can't win.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, { CLAUDE_CONFIG_DIR: "/cfg/work" })).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/cfg/work" },
+  });
+  // It has none: drop whatever the server captured, so claude uses ~/.claude
+  // like jsonlPathFor(null) does. Never set it to ~/.claude explicitly.
+  expect(pinClaudeConfigDir(argv, { A: "1" }, null, {})).toEqual({
+    argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv],
+    env: { A: "1" },
+  });
+  // A harness home (already in env via harnessEnv) and a harness env map are left alone.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/h" }, "/h", {})).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  // A home always wins over a harness env map naming another dir, and is
+  // passed even when the env omits it — the tailer reads `<home>/projects`.
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/other" }, "/h", { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { A: "1" }, "/h", {})).toEqual({
+    argv,
+    env: { A: "1", CLAUDE_CONFIG_DIR: "/h" },
+  });
+  expect(pinClaudeConfigDir(argv, { CLAUDE_CONFIG_DIR: "/custom" }, null, { CLAUDE_CONFIG_DIR: "/cfg" })).toEqual({
+    argv,
+    env: { CLAUDE_CONFIG_DIR: "/custom" },
+  });
+});
+
+test("jsonlPathFor honors a per-harness CLAUDE_CONFIG_DIR override", () => {
+  // claude treats CLAUDE_CONFIG_DIR as the `.claude/` equivalent, so the
+  // override path itself is the root — no `.claude/` segment in between.
+  const p = jsonlPathFor("/a/b", "session-uuid", "/tmp/alt-home");
+  expect(p).toBe(`/tmp/alt-home/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+});
+
+test("encodeProjectPath turns every slash and dot into a dash", () => {
+  expect(encodeProjectPath("/Users/foo/bar")).toBe("-Users-foo-bar");
+  expect(encodeProjectPath("/")).toBe("-");
+  expect(encodeProjectPath("/a/b/c/d")).toBe("-a-b-c-d");
+  // Dot segments (e.g. `.agetor`) collapse to double-dash where they meet
+  // a separator — matches claude code's own directory naming under
+  // ~/.claude/projects/. Without this, JSONL discovery looks at the wrong dir.
+  expect(encodeProjectPath("/Users/foo/.agetor/worktrees/bar"))
+    .toBe("-Users-foo--agetor-worktrees-bar");
+  expect(encodeProjectPath("/x/y.z/q")).toBe("-x-y-z-q");
+});
+
+test("encodeProjectPath also replaces underscores and other non-alphanumerics", () => {
+  // Claude Code names the dir with every non-alphanumeric char turned into `-`;
+  // keeping `_` made JSONL discovery time out for repos like `my_repo`.
+  expect(encodeProjectPath("/Users/foo/git/my_repo"))
+    .toBe("-Users-foo-git-my-repo");
+  expect(encodeProjectPath("/Users/foo/my repo")).toBe("-Users-foo-my-repo");
+});
+
+test("sessionNameFor uses the first 12 chars of the task id", () => {
+  expect(sessionNameFor("abcdef0123456789-rest")).toBe("agetor-abcdef012345");
+});
+
+test("parseSessionActivityLine parses a detached live session", () => {
+  expect(parseSessionActivityLine("0:1785511908")).toEqual({
+    attached: false,
+    // seconds -> ms
+    activityAt: 1785511908 * 1000,
+  });
+});
+
+test("parseSessionActivityLine parses an attached session", () => {
+  expect(parseSessionActivityLine("1:123")).toEqual({ attached: true, activityAt: 123000 });
+});
+
+test("parseSessionActivityLine rejects an empty string", () => {
+  expect(parseSessionActivityLine("")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects the tmux 3.6a empty-target shape", () => {
+  // `display-message -p -t '=<name>'` on tmux 3.6a expands an unresolvable
+  // exact-match target's variables to empty and still exits 0 — this is the
+  // literal stdout that caused the reap-spam bug. list-sessions -f no longer
+  // produces this shape, but the parser must reject it defensively too.
+  expect(parseSessionActivityLine(":")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects non-digit fields", () => {
+  expect(parseSessionActivityLine("abc:123")).toBeNull();
+  expect(parseSessionActivityLine("0:abc")).toBeNull();
+  expect(parseSessionActivityLine("garbage")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects negative and whitespace variants", () => {
+  expect(parseSessionActivityLine("-1:123")).toBeNull();
+  expect(parseSessionActivityLine("0:-123")).toBeNull();
+  expect(parseSessionActivityLine("0: 123")).toBeNull();
+  expect(parseSessionActivityLine(" 0:123 ")).toEqual({ attached: false, activityAt: 123000 });
+  expect(parseSessionActivityLine("0 :123")).toBeNull();
+});
+
+test("buildClaudeSessionEnv pins the classic renderer and re-injects PATH", () => {
+  const env = buildClaudeSessionEnv({ CLAUDE_CODE_EFFORT_LEVEL: "low" });
+  // Caller env is preserved…
+  expect(env.CLAUDE_CODE_EFFORT_LEVEL).toBe("low");
+  // …and the classic-renderer pin is forced so a user's global `tui`
+  // fullscreen setting can't flip agetor's session into the alternate
+  // screen buffer (which would break the pane scraper's scrollback reads).
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
+  // PATH is re-injected from the current process.
+  expect(env.PATH).toBe(process.env.PATH ?? "");
+});
+
+test("buildClaudeSessionEnv's classic-renderer pin is not overridable by caller env", () => {
+  // A harness-level env that tried to enable fullscreen must lose: agetor's
+  // pin is layered last. CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN takes precedence
+  // over CLAUDE_CODE_NO_FLICKER per the docs, so the scraper stays safe even
+  // when both are present.
+  const env = buildClaudeSessionEnv({
+    CLAUDE_CODE_NO_FLICKER: "1",
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "0",
+  });
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
+});
+
+interface Record { stream: string; data: string }
+function recorder(): {
+  out: Record[];
+  onChunk: (s: Record["stream"], d: string) => void;
+} {
+  const out: Record[] = [];
+  return {
+    out,
+    onChunk: (stream, data) => out.push({ stream, data }),
+  };
+}
+
+test("mapJsonlEventToChunks: assistant text block → `assistant` stream, no end-of-turn", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [{ type: "text", text: "hello world" }],
+      stop_reason: "tool_use", // still going
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(false);
+  expect(out).toEqual([{ stream: "assistant", data: "hello world" }]);
+});
+
+test("mapJsonlEventToChunks: thinking block emits on `thinking` stream verbatim (no prefix)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "thinking", thinking: "let me consider…" }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "thinking", data: "let me consider…" });
+});
+
+test("mapJsonlEventToChunks: redacted_thinking emits a placeholder so the user knows reasoning happened", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "redacted_thinking", data: "..." }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "thinking", data: "[redacted thinking]" });
+});
+
+test("mapJsonlEventToChunks: tool_use block emits `tool_use` stream with JSON {id,name,input}", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [{
+        type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls -la" },
+      }],
+    },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]!.stream).toBe("tool_use");
+  const parsed = JSON.parse(out[0]!.data);
+  expect(parsed).toMatchObject({ id: "toolu_1", name: "Bash", input: { command: "ls -la" } });
+});
+
+test("mapJsonlEventToChunks: server_tool_use rides the same stream with serverSide=true", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "server_tool_use", id: "srv_1", name: "web_search", input: { q: "x" } }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]!.stream).toBe("tool_use");
+  expect(JSON.parse(out[0]!.data).serverSide).toBe(true);
+});
+
+test("mapJsonlEventToChunks: image content block surfaces as a placeholder so the UI shows something", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "..." } }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "assistant", data: "[image]" });
+});
+
+test("mapJsonlEventToChunks: assistant with stop_reason=end_turn signals endOfTurn (no banner — banner is emitted by dispatchLine on confirmation)", () => {
+  // mapJsonlEventToChunks now returns endOfTurn:true as a STAGING signal, not
+  // a fire signal. The "turn complete" banner is emitted by firePendingEndTurn
+  // in dispatchLine once the next line confirms the turn is really over. This
+  // prevents spurious banners when claude stamps end_turn on every split line
+  // of a response (thinking, text, tool_use) including mid-flight ones.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  // Text chunk emitted normally.
+  expect(out.some((r) => r.stream === "assistant" && r.data === "done")).toBe(true);
+  // Banner NOT emitted here — dispatchLine emits it when confirmed.
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: stop_reason=end_turn with a tool_use block returns endOfTurn:true (staging signal) but no banner", () => {
+  // All end_turn lines — regardless of content type — return endOfTurn:true as
+  // a staging signal for dispatchLine. The "turn complete" banner is NOT emitted
+  // here; dispatchLine suppresses it until the next line confirms the turn is
+  // over (i.e., is not a same-message continuation or a tool_result). The
+  // tool_use chunk itself is still streamed normally.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
+      stop_reason: "end_turn",
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  // tool_use chunk still emitted — it carries real work.
+  expect(out.some((r) => r.stream === "tool_use")).toBe(true);
+  // Banner NOT emitted; dispatchLine emits it when confirmed.
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: stop_reason=end_turn with text+tool_use still returns endOfTurn:true (staging) with no banner", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "let me check that" },
+        { type: "tool_use", id: "t2", name: "Read", input: {} },
+      ],
+      stop_reason: "end_turn",
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  expect(out.some((r) => r.stream === "assistant" && r.data === "let me check that")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: synthetic isApiErrorMessage line emits an api-error status and signals endOfTurn so the run resolves", () => {
+  // Without this branch the run would sit in `running` forever — claude
+  // stamps stop_reason: "stop_sequence" (not end_turn) on API-error
+  // messages, so the regular end_turn detection misses them. The
+  // orchestrator's chunk handler pattern-matches on the api-error status
+  // prefix to flip the task to the `blocked` column.
+  //
+  // Uses a uuid-aware recorder (the shared `recorder()` drops the third
+  // arg) because this test specifically asserts that the status chunk is
+  // emitted with `uuid: undefined` so the partial unique index on
+  // `(run_id, line_uuid)` doesn't drop the row.
+  const out: { stream: string; data: string; uuid: string | undefined }[] = [];
+  const onChunk = (stream: Record["stream"], data: string, uuid?: string) => out.push({ stream, data, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "err-1",
+    isApiErrorMessage: true,
+    apiErrorStatus: 529,
+    message: {
+      stop_reason: "stop_sequence",
+      content: [{ type: "text", text: "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment." }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  // The user-facing error text still rides the regular assistant stream
+  // with the JSONL line uuid (so it dedups on reattach).
+  const assistantRow = out.find((r) => r.stream === "assistant" && r.data.startsWith("API Error: 529"));
+  expect(assistantRow).toBeDefined();
+  expect(assistantRow!.uuid).toBe("err-1");
+  // Sentinel status chunk the orchestrator pattern-matches on. Must start
+  // with the full prefix (trailing space/colon rules out a hypothetical
+  // future status that begins with the word "api").
+  const status = out.find((r) => r.stream === "status" && r.data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX));
+  expect(status).toBeDefined();
+  expect(status!.data).toContain("HTTP 529");
+  // Critically: emitted with uuid:undefined. If we reused the assistant
+  // line's uuid the partial unique index would silently drop this row via
+  // INSERT OR IGNORE and the breadcrumb would vanish on panel reload.
+  expect(status!.uuid).toBeUndefined();
+});
+
+test("mapJsonlEventToChunks: isApiErrorMessage without apiErrorStatus still emits a sentinel status (HTTP suffix omitted)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "err-2",
+    isApiErrorMessage: true,
+    message: {
+      stop_reason: "stop_sequence",
+      content: [{ type: "text", text: "API Error: connection reset" }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  const status = out.find((r) => r.stream === "status" && r.data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX));
+  expect(status).toBeDefined();
+  expect(status!.data).not.toContain("HTTP");
+});
+
+test("mapJsonlEventToChunks: system{subtype:turn_duration} emits the duration as a status breadcrumb", () => {
+  // Claude 2.1.x writes a `system{subtype:"turn_duration"}` line right
+  // after the assistant end_turn. The end_turn itself already produced
+  // "turn complete"; this just adds the duration so the user sees at a
+  // glance whether the turn was quick or long.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "system",
+    subtype: "turn_duration",
+    durationMs: 52647,
+    uuid: "9e139a67-4473-4578-bae0-9ce18c651c76",
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(false);
+  expect(out).toEqual([{ stream: "status", data: "turn duration: 53s" }]);
+});
+
+test("mapJsonlEventToChunks: system{subtype:away_summary} stays silent (resumption context, not user-relevant)", () => {
+  // away_summary is claude's own recap of what just happened, written for
+  // its future-self on resume. Surfacing it as a breadcrumb would just
+  // duplicate the assistant text the user already read.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "system",
+    subtype: "away_summary",
+    content: "Goal was building the X feature; finished applying review fixes.",
+    uuid: "f85ee077-f89c-494e-9c50-951d29c76ddd",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue with a task-notification payload becomes a background-task breadcrumb", () => {
+  // Claude 2.1.x delivers background-task completion notifications via
+  // `queue-operation` events; older versions delivered the same content
+  // as synthetic `user` entries with `origin.kind: "task-notification"`.
+  // The user-facing breadcrumb is the same — extract the `<summary>` and
+  // prefix with `background task:`.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<task-notification>\n<task-id>bt7k1k0qf</task-id>\n<summary>Background command \"Wait for dev server ready\" completed (exit code 0)</summary>\n</task-notification>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{
+    stream: "status",
+    data: `background task: Background command "Wait for dev server ready" completed (exit code 0)`,
+  }]);
+});
+
+test("mapJsonlEventToChunks: queue-operation remove stays silent (just the dequeue half of an enqueue/remove pair)", () => {
+  // The `remove` half is claude popping the notification off its input
+  // queue once it's been processed — it carries no content the user
+  // hasn't already seen from the matching `enqueue`.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "queue-operation", operation: "remove" });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue with a task-notification but no <summary> emits a generic 'completed' breadcrumb", () => {
+  // Mirrors the existing user/origin.kind handler's fallback so both
+  // delivery paths (synthetic user entry vs. queue-operation) produce
+  // the same UX for the same logical event. Without this, a 2.1.x
+  // task-notification payload missing its `<summary>` would go dark in
+  // the run panel even though something measurable completed.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue of an unrecognised payload type stays silent (no raw XML in the panel)", () => {
+  // Non-task-notification enqueues (future event kinds claude might
+  // queue) shouldn't dump arbitrary content into the user's run panel.
+  // The task-notification prefix check is the only allow-listed
+  // generic fallback.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<some-future-payload>opaque content</some-future-payload>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("formatTurnDuration: rolls 59999ms over to '1m' rather than printing '60s'", async () => {
+  // Round-then-branch boundary check. With a naive `(ms/1000).toFixed(0)`
+  // inside the `< 60_000` branch, 59999ms would render as "60s" — visually
+  // jarring next to a turn that's clearly already a minute. The roll-over
+  // matters for any duration that lands within 500ms of a minute boundary.
+  const { mapJsonlEventToChunks } = await import("./claude-tmux.ts");
+  const cases: Array<{ ms: number; expected: string }> = [
+    { ms: 250, expected: "250ms" },
+    { ms: 1500, expected: "1.5s" },
+    { ms: 9999, expected: "10.0s" },
+    { ms: 52647, expected: "53s" },
+    { ms: 59_499, expected: "59s" },
+    { ms: 59_999, expected: "1m" },
+    { ms: 60_000, expected: "1m" },
+    { ms: 90_500, expected: "1m 31s" },
+    { ms: 3_600_000, expected: "60m" },
+  ];
+  for (const { ms, expected } of cases) {
+    const out: { stream: string; data: string }[] = [];
+    mapJsonlEventToChunks(
+      JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: ms, uuid: `dur-${ms}` }),
+      (stream, data) => out.push({ stream, data }),
+    );
+    expect(out[0]?.data).toBe(`turn duration: ${expected}`);
+  }
+});
+
+test("mapJsonlEventToChunks: user.content[].tool_result → `tool_result` stream with JSON payload", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok", is_error: false }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]!.stream).toBe("tool_result");
+  const parsed = JSON.parse(out[0]!.data);
+  expect(parsed).toMatchObject({ toolUseId: "toolu_1", content: "ok", isError: false });
+});
+
+test("mapJsonlEventToChunks: real tool error (non-intercept content) preserves is_error → true", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{
+      type: "tool_result",
+      tool_use_id: "toolu_4",
+      content: "Error: command not found",
+      is_error: true,
+    }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  const parsed = JSON.parse(out[0]!.data);
+  expect(parsed.isError).toBe(true);
+});
+
+test("mapJsonlEventToChunks: user with string content emits a `user` stream event", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", message: { content: "hi" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "user", data: "hi" }]);
+});
+
+test("mapJsonlEventToChunks: user.content[].text → `user` stream (array-form prompt)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "text", text: "hello there" }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "user", data: "hello there" }]);
+});
+
+test("mapJsonlEventToChunks: CR/LF in user content is normalized to \\n (tmux paste-buffer delivers \\n as \\r, dedup keys on bytes)", () => {
+  // String-form: claude transcribes the pasted prompt verbatim, including
+  // the `\r` characters tmux substituted for our `\n`s. Without normalization
+  // the JSONL emit's data differs byte-for-byte from the live `sendInput`
+  // emit (which has the original `\n`s), breaking the run panel's dedup.
+  const s = recorder();
+  mapJsonlEventToChunks(
+    JSON.stringify({ type: "user", message: { content: "line one\r\rline two\r\nline three" } }),
+    s.onChunk,
+  );
+  expect(s.out).toEqual([{ stream: "user", data: "line one\n\nline two\nline three" }]);
+
+  // Array-form: same normalization applies to every text block.
+  const a = recorder();
+  mapJsonlEventToChunks(
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "text", text: "para one\r\rpara two" }] },
+    }),
+    a.onChunk,
+  );
+  expect(a.out).toEqual([{ stream: "user", data: "para one\n\npara two" }]);
+});
+
+test("mapJsonlEventToChunks: task-notification user message → `status` breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: {
+      content:
+        "<task-notification>\n<task-id>b21qu207r</task-id>\n<status>completed</status>\n<summary>Background command \"Find bun executable\" completed (exit code 0)</summary>\n</task-notification>",
+    },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: 'background task: Background command "Find bun executable" completed (exit code 0)' },
+  ]);
+});
+
+test("mapJsonlEventToChunks: task-notification without a summary still emits a generic status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: { content: "<task-notification><status>completed</status></task-notification>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
+test("mapJsonlEventToChunks: malformed-tool-call retry (isMeta) → status breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "Your tool call was malformed and could not be parsed. Please retry." },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Your tool call was malformed and could not be parsed. Please retry." },
+  ]);
+});
+
+test("mapJsonlEventToChunks: large multi-line isMeta blob is truncated to one capped line", () => {
+  const { out, onChunk } = recorder();
+  const longFirstLine = "x".repeat(200);
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "text", text: `${longFirstLine}\nsecond line\nthird line` }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("status");
+  expect(out[0]!.data).toBe("x".repeat(137) + "…");
+});
+
+test("mapJsonlEventToChunks: isMeta breadcrumb strips a leading wrapper tag", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "<system-reminder>Reminder: something claude injected.</system-reminder>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Reminder: something claude injected.</system-reminder>" },
+  ]);
+});
+
+test("mapJsonlEventToChunks: isMeta <local-command-caveat> is silenced (claude's note-to-self, not user-relevant)", () => {
+  // claude 2.1.245 precedes every local slash command's transcript twin
+  // (`<command-name>…` + `<local-command-stdout>…`) with this isMeta caveat.
+  // Surfacing it as a breadcrumb put a "DO NOT respond to these messages…"
+  // line above every `/model` / `/effort` result — same silent treatment as
+  // the image-marker meta line.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: isMeta entry with only non-text blocks falls back to a generic label", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "image", source: {} }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "synthetic message" }]);
+});
+
+test("mapJsonlEventToChunks: empty isMeta content stays silent", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", isMeta: true, message: { content: "" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: isMeta image-source-meta marker is suppressed entirely (no chunks at all), uuid still preserved on the return value", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "img-meta-1",
+    isMeta: true,
+    message: {
+      content: [{ type: "text", text: "[Image: source: /Users/x/.agetor/screenshots/shot.png]" }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+  expect(res).toEqual({ endOfTurn: false, lineUuid: "img-meta-1" });
+});
+
+test("mapJsonlEventToChunks: isMeta image-source-meta marker with \\r noise and leading/trailing whitespace is still suppressed (imageSourceMetaPath trims)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "img-meta-2",
+    isMeta: true,
+    message: {
+      content: [{
+        type: "text",
+        text: "\r\n   [Image: source: /Users/x/.agetor/screenshots/shot.png]\r\n  ",
+      }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+  expect(res).toEqual({ endOfTurn: false, lineUuid: "img-meta-2" });
+});
+
+test("mapJsonlEventToChunks: isMeta entry with ordinary caveat text still emits exactly one status chunk (image suppression doesn't leak into the normal breadcrumb path)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "Caveat: the messages below were generated by the user while running local commands." },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Caveat: the messages below were generated by the user while running local commands." },
+  ]);
+});
+
+test("mapJsonlEventToChunks: genuine human turn (no isMeta) still emits a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", message: { content: "ship the fix please" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "user", data: "ship the fix please" }]);
+});
+
+test("mapJsonlEventToChunks: non-isMeta human user text that merely contains an image-source substring is NOT suppressed (still a user bubble)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: "here's the screenshot [Image: source: /tmp/shot.png] — does this look right?" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "user", data: "here's the screenshot [Image: source: /tmp/shot.png] — does this look right?" },
+  ]);
+});
+
+test("mapJsonlEventToChunks: tool_result user entry (no isMeta) still emits tool_result, not a breadcrumb", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok", is_error: false }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("tool_result");
+});
+
+test("mapJsonlEventToChunks: empty user string content stays silent", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", message: { content: "" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: invalid JSON surfaces a stderr chunk", () => {
+  const { out, onChunk } = recorder();
+  const res = mapJsonlEventToChunks("not json {", onChunk);
+  expect(res.endOfTurn).toBe(false);
+  expect(out[0]!.stream).toBe("stderr");
+  expect(out[0]!.data).toContain("jsonl parse error");
+});
+
+test("mapJsonlEventToChunks: system permission-mode event surfaces as status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "system", permissionMode: "auto" });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
+});
+
+test("mapJsonlEventToChunks: top-level permission-mode (claude variant) surfaces as status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "permission-mode", permissionMode: "plan" });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: plan" });
+});
+
+test("mapJsonlEventToChunks: lastPermissionMode matching the event's mode suppresses the status chunk", () => {
+  // Emit-on-change: claude journals a mode-bearing event at the start of
+  // every turn, not just on an actual change. When the caller's 4th arg
+  // already equals the event's mode, no status chunk should be emitted at
+  // all (and nothing else fires for a bare system/permission-mode event).
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "system", permissionMode: "auto" });
+  const res = mapJsonlEventToChunks(line, onChunk, false, "auto");
+  expect(out).toEqual([]);
+  expect(res.endOfTurn).toBe(false);
+});
+
+test("mapJsonlEventToChunks: lastPermissionMode differing from the event's mode still emits", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "permission-mode", permissionMode: "auto" });
+  mapJsonlEventToChunks(line, onChunk, false, "plan");
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
+});
+
+test("mapJsonlEventToChunks: omitting lastPermissionMode preserves always-emit default", () => {
+  // Cheap explicit check of the `undefined` default (the two tests above at
+  // :649-661 already cover this implicitly by calling with no 4th arg at
+  // all) — passing `undefined` explicitly must behave identically to
+  // omitting it, since real call sites without tracking (e.g. a caller that
+  // predates this param) pass nothing.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "system", permissionMode: "auto" });
+  mapJsonlEventToChunks(line, onChunk, false, undefined);
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
+});
+
+test("mapJsonlEventToChunks: user line's top-level permissionMode is a fallback mode-change signal (derived uuid avoids collision)", () => {
+  // Claude stamps `permissionMode` on every `user` line too, not just the
+  // dedicated `system`/`permission-mode` marker lines — this is the fallback
+  // path. The status chunk must use a DERIVED uuid, not the raw line uuid:
+  // this same line also emits a genuine `user` chunk below with the raw
+  // uuid, and reusing it would collide on the run_events dedup index
+  // `(run_id, IFNULL(subagent_id,''), line_uuid)` — the second insert gets
+  // silently dropped via INSERT OR IGNORE.
+  const seen: { stream: string; data: string; uuid?: string }[] = [];
+  const onChunk = (s: string, d: string, uuid?: string) => seen.push({ stream: s, data: d, uuid });
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "user-line-1",
+    permissionMode: "plan",
+    message: { content: "hello" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(seen).toEqual([
+    { stream: "status", data: "permission-mode: plan", uuid: "user-line-1:permission-mode" },
+    { stream: "user", data: "hello", uuid: "user-line-1" },
+  ]);
+  expect(seen[0]!.uuid).not.toBe(seen[1]!.uuid);
+});
+
+test("mapJsonlEventToChunks: user-line permissionMode fallback is suppressed when it matches lastPermissionMode", () => {
+  const seen: { stream: string; data: string }[] = [];
+  const onChunk = (s: string, d: string) => seen.push({ stream: s, data: d });
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "user-line-2",
+    permissionMode: "auto",
+    message: { content: "go" },
+  });
+  mapJsonlEventToChunks(line, onChunk, false, "auto");
+  // No status chunk — only the human-turn content chunk.
+  expect(seen).toEqual([{ stream: "user", data: "go" }]);
+});
+
+test("dispatchLine: a `user` line's permissionMode fallback shares the same emit-on-change dedup tracker as the `system`/`permission-mode` marker lines", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-user-fallback";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+
+  // A `user` line reports "auto" first — nothing has announced it yet, so
+  // this is a genuine change and must emit. It advances
+  // `lastAnnouncedPermissionMode` (the dedup tracker), but NOT
+  // `state.permissionMode` itself — only the dedicated `system`/
+  // `permission-mode` marker lines may write that (it's load-bearing for
+  // Shift+Tab cycle counting, and a lagging `user` line must never clobber a
+  // pane-verified value with a stale one).
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u1", permissionMode: "auto", message: { content: "hi" },
+  }));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+  expect(state.permissionMode).toBe(null);
+
+  // The dedicated marker line reporting the SAME mode right after is
+  // suppressed — the `user` line already announced it — but it DOES write
+  // `state.permissionMode`, since it's the only line type allowed to.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "u2", permissionMode: "auto",
+  }));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+  expect(state.permissionMode).toBe("auto");
+
+  // A genuine change — the marker line reporting "plan" — still emits.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode", uuid: "u3", permissionMode: "plan",
+  }));
+  expect(statusChunks()).toEqual([
+    { stream: "status", data: "permission-mode: auto" },
+    { stream: "status", data: "permission-mode: plan" },
+  ]);
+  expect(state.permissionMode).toBe("plan");
+
+  // A `user` line reporting the OLD mode ("auto") right after must NOT
+  // clobber `state.permissionMode` back to "auto" — this is the exact
+  // clobber this split guards against (a lagging user line racing a fresher
+  // pane-verified/marker-line mode).
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u4", permissionMode: "auto", message: { content: "stale" },
+  }));
+  expect(state.permissionMode).toBe("plan");
+  __forTest.uninstallSession(taskId);
+});
+
+test("mapJsonlEventToChunks: summary checkpoints surface as a status breadcrumb", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "summary", summary: "Earlier turns compacted" });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out[0]).toEqual({ stream: "status", data: "summary: Earlier turns compacted" });
+});
+
+test("mapJsonlEventToChunks: unknown event types are no-ops", () => {
+  const { out, onChunk } = recorder();
+  mapJsonlEventToChunks(JSON.stringify({ type: "attachment", whatever: 1 }), onChunk);
+  mapJsonlEventToChunks(JSON.stringify({ type: "ai-title", title: "x" }), onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: forwards the JSONL line uuid as the third onChunk arg", () => {
+  // Reattach dedup depends on this — each chunk has to know which JSONL line
+  // it came from so `run_events.line_uuid` can serve as the idempotency key.
+  const seen: { stream: string; data: string; uuid?: string }[] = [];
+  const onChunk = (s: string, d: string, uuid?: string) => seen.push({ stream: s, data: d, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "line-uuid-123",
+    message: { content: [{ type: "text", text: "hi" }] },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.lineUuid).toBe("line-uuid-123");
+  expect(seen[0]?.uuid).toBe("line-uuid-123");
+});
+
+test("mapJsonlEventToChunks: end-of-turn marker carries the line uuid on the return value", () => {
+  // The banner no longer comes from mapJsonlEventToChunks (it's emitted by
+  // dispatchLine's firePendingEndTurn when the turn is confirmed). The uuid is
+  // still accessible via res.lineUuid for the caller to stage correctly.
+  const seen: { stream: string; uuid?: string }[] = [];
+  const onChunk = (s: string, _d: string, uuid?: string) => seen.push({ stream: s, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "end-line",
+    message: { stop_reason: "end_turn", content: [] },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  expect(res.lineUuid).toBe("end-line");
+  // No "status" chunk from this function — the banner is emitted later by dispatchLine.
+  expect(seen.find((s) => s.stream === "status")).toBeUndefined();
+});
+
+test("toClaudeModeString translates agetor shorthand to canonical claude strings", () => {
+  expect(toClaudeModeString("bypass")).toBe(CLAUDE_MODE_BYPASS);
+  expect(toClaudeModeString("ask")).toBe(CLAUDE_MODE_DEFAULT);
+  // Already canonical / unknown — pass through verbatim.
+  expect(toClaudeModeString("auto")).toBe(CLAUDE_MODE_AUTO);
+  expect(toClaudeModeString("acceptEdits")).toBe(CLAUDE_MODE_ACCEPT_EDITS);
+  expect(toClaudeModeString("plan")).toBe(CLAUDE_MODE_PLAN);
+  expect(toClaudeModeString("dontAsk")).toBe("dontAsk");
+});
+
+test("cycleOrderFor: base 3 modes always present; bypass only when enabled; auto always at the end", () => {
+  expect(cycleOrderFor(false)).toEqual([
+    CLAUDE_MODE_DEFAULT,
+    CLAUDE_MODE_ACCEPT_EDITS,
+    CLAUDE_MODE_PLAN,
+    CLAUDE_MODE_AUTO,
+  ]);
+  expect(cycleOrderFor(true)).toEqual([
+    CLAUDE_MODE_DEFAULT,
+    CLAUDE_MODE_ACCEPT_EDITS,
+    CLAUDE_MODE_PLAN,
+    CLAUDE_MODE_BYPASS,
+    CLAUDE_MODE_AUTO,
+  ]);
+});
+
+test("cycleDistance returns press count via forward cycle", () => {
+  const cycle = cycleOrderFor(false); // default, acceptEdits, plan, auto
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_ACCEPT_EDITS)).toBe(1);
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_PLAN)).toBe(2);
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_AUTO)).toBe(3);
+  // wrap-around: from auto to default is one press, not three back.
+  expect(cycleDistance(cycle, CLAUDE_MODE_AUTO, CLAUDE_MODE_DEFAULT)).toBe(1);
+  // same mode → 0 presses (caller can skip).
+  expect(cycleDistance(cycle, CLAUDE_MODE_PLAN, CLAUDE_MODE_PLAN)).toBe(0);
+});
+
+test("cycleDistance returns null when target isn't in the cycle (e.g. bypass without launch flag)", () => {
+  const cycle = cycleOrderFor(false); // bypass NOT included
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_BYPASS)).toBeNull();
+  // Same for an unrecognized mode.
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, "dontAsk")).toBeNull();
+});
+
+test("cycleDistance with bypass enabled: order goes plan → bypass → auto", () => {
+  const cycle = cycleOrderFor(true);
+  // From bypass: one press lands on auto, two presses on default.
+  expect(cycleDistance(cycle, CLAUDE_MODE_BYPASS, CLAUDE_MODE_AUTO)).toBe(1);
+  expect(cycleDistance(cycle, CLAUDE_MODE_BYPASS, CLAUDE_MODE_DEFAULT)).toBe(2);
+  // plan → bypass is exactly one press (the new neighbour).
+  expect(cycleDistance(cycle, CLAUDE_MODE_PLAN, CLAUDE_MODE_BYPASS)).toBe(1);
+});
+
+test("system event updates state.permissionMode (dispatchLine path)", async () => {
+  // Use the test harness for SessionState since the watcher path needs a
+  // real fs but we only care that dispatchLine routes the permissionMode
+  // off `system` events into SessionState.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-track";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  expect(state.permissionMode).toBeNull();
+  __forTest.dispatchLine(
+    state,
+    JSON.stringify({ type: "system", permissionMode: "acceptEdits" }),
+  );
+  expect(state.permissionMode).toBe("acceptEdits");
+  // Subsequent permission-mode events overwrite.
+  __forTest.dispatchLine(
+    state,
+    JSON.stringify({ type: "permission-mode", permissionMode: "auto" }),
+  );
+  expect(state.permissionMode).toBe("auto");
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: repeated same-mode events emit one status chunk; a mode change emits a second", async () => {
+  // End-to-end emit-on-change through the real dispatch path (mirrors the
+  // spam scenario: claude journals a mode-bearing event at the start of
+  // every turn). Three mode-bearing lines with distinct uuids so dedup
+  // can't suppress them on its own — only the emit-on-change comparison
+  // against SessionState.permissionMode should.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-emit-on-change";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-1", permissionMode: "auto",
+  }));
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-2", permissionMode: "auto",
+  }));
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-3", permissionMode: "plan",
+  }));
+  expect(statusChunks()).toEqual([
+    { stream: "status", data: "permission-mode: auto" },
+    { stream: "status", data: "permission-mode: plan" },
+  ]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: replayed mode-bearing line rehydrates state without emitting, so the next genuinely-new same-mode line stays suppressed", async () => {
+  // Guards the mirror-above-dedup invariant: on reattach, `seenLineUuids` is
+  // pre-seeded from `run_events`, so the replayed line takes the dedup
+  // early-return (no chunk emission) — but the permissionMode mirror runs
+  // BEFORE that early-return, so state.permissionMode is still rehydrated.
+  // A later, genuinely-new line carrying the SAME mode must therefore also
+  // stay suppressed, not spuriously re-emit because the tracker looked empty.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-reattach-replay";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  // Pre-seed the dedup set as boot reconciliation does for an already-persisted line.
+  state.seenLineUuids.add("mode-uuid-replayed");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-replayed", permissionMode: "auto",
+  }));
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+  expect(statusChunks()).toEqual([]);
+  expect(state.permissionMode).toBe("auto");
+
+  // A brand-new line (not deduped) with the SAME mode must still be suppressed.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-fresh", permissionMode: "auto",
+  }));
+  expect(statusChunks()).toEqual([]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn still fires onEndOfTurn (reattach + crashed-before-status-update path)", async () => {
+  // Reattach scenario where agetor died in the narrow window between persisting
+  // the end_turn to `run_events` and updating the run row to `succeeded`. On
+  // restart seenLineUuids is pre-seeded, so the replayed end_turn hits the
+  // dedup path. It must STILL drive popEndOfTurn (via staging + firing on the
+  // next non-continuation line) so the run row transitions. Without this the
+  // run stays `running` (badge stuck "in progress") forever.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-dedup-reattach";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("end-turn-uuid-1");
+
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "end-turn-uuid-1",
+    message: { id: "msg-R", role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }));
+
+  // Staged, not yet fired — needs a confirming next line.
+  expect(endOfTurnFired).toBe(false);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-R");
+
+  // Non-continuation line fires it.  emitBanner:false so no "turn complete" emitted.
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }));
+  expect(endOfTurnFired).toBe(true);
+  // Prior process already emitted "turn complete" — no duplicate.
+  expect(emitted.some((e) => e.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: historical end_turn outside currentRunLineUuids does not fire onEndOfTurn", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-other-run";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("hist-end");
+  state.currentRunLineUuids = new Set(["live-uuid"]);
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "hist-end",
+    message: { id: "msg-H", role: "assistant", content: [{ type: "text", text: "old" }], stop_reason: "end_turn" },
+  }));
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 10 }));
+  expect(endOfTurnFired).toBe(false);
+  expect(state.pendingEndTurn).toBeNull();
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: end_turn uuid in currentRunLineUuids still fires onEndOfTurn", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-this-run";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("live-end");
+  state.currentRunLineUuids = new Set(["live-end"]);
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "live-end",
+    message: { id: "msg-L", role: "assistant", content: [{ type: "text", text: "now" }], stop_reason: "end_turn" },
+  }));
+  expect(endOfTurnFired).toBe(false);
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 10 }));
+  expect(endOfTurnFired).toBe(true);
+  __forTest.uninstallSession(taskId);
+});
+
+test("replayJsonlLines yields and matches the sync rebuild", async () => {
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }),
+  ].join("\n");
+  const sync: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => sync.push({ stream, data }));
+  const coop: { stream: string; data: string }[] = [];
+  const queue = lines.split("\n").map((line) => ({ line, bytes: Buffer.byteLength(line) + 1 }));
+  const pending = replayJsonlLines(() => queue.shift() ?? null, (stream, data) => coop.push({ stream, data }), { sliceMs: 0 });
+  // sliceMs 0 awaits setImmediate after the first line. A microtask runs
+  // before that macrotask, so the replay is still in progress here.
+  let midCount = 0;
+  await new Promise<void>((r) => queueMicrotask(() => { midCount = coop.length; r(); }));
+  await pending;
+  expect(midCount).toBeGreaterThan(0);
+  expect(midCount).toBeLessThan(sync.length);
+  expect(coop).toEqual(sync);
+  expect(coop.filter((r) => r.data === "turn complete")).toHaveLength(1);
+});
+
+test("dispatchLine: end_turn staging — tool_use line stages but tool_result cancels, slot never popped", async () => {
+  // The core of the fix: claude stamps end_turn on a tool_use split line.
+  // dispatchLine STAGES the pending end_turn (doesn't pop the slot yet).
+  // When the tool_result arrives on the next dispatchLine call, isEndTurnContinuation
+  // returns true → the pending is cancelled. The slot stays alive — the turn isn't over.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-tooluse-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // The buggy end_turn+tool_use line — should stage, not fire.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "et-tu",
+    message: { id: "msg-abc", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-abc");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // tool_result arrives → continuation → cancel the pending
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "tr-1",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(1); // still alive
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: a user-INTERRUPT tool_result FIRES the staged turn-end (run resolves — the ExitPlanMode reject fix)", async () => {
+  // Esc'ing a modal (or Ctrl+C) makes claude write a cancel tool_result. Unlike
+  // a normal tool_result (which continues the turn), this ENDS it. The staged
+  // end_turn must FIRE — otherwise the run hangs "Agent is working" forever
+  // (the bug behind rejecting an ExitPlanMode plan).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-interrupt-fires";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // ExitPlanMode tool_use with end_turn → staged.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "ep-1",
+    message: { id: "msg-plan", role: "assistant",
+      content: [{ type: "tool_use", id: "plan1", name: "ExitPlanMode", input: { plan: "x" } }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-plan");
+  expect(state.turnQueue.length).toBe(1);
+
+  // Interrupt tool_result (Esc) → must FIRE the end_turn, not cancel it.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "int-1",
+    message: { content: [{ type: "tool_result", tool_use_id: "plan1",
+      content: "The user doesn't want to proceed with this tool use. The tool use was rejected." }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();   // fired, not lingering
+  expect(state.turnQueue.length).toBe(0);    // slot popped → the run resolves
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: SendUserFile success tool_result forwards sanitized attachments from the top-level toolUseResult", async () => {
+  // Claude stamps a top-level `toolUseResult` object (sibling of `message`)
+  // on the `user` JSONL line alongside the `tool_result` content block.
+  // For SendUserFile it's `{ caption, display, attachments: [...] }` — the
+  // `attachments[]` array is what gets forwarded (sanitized), never the raw
+  // object wholesale. `pathValidated`/`file_uuid` are dropped by the
+  // sanitizer; `line_uuid` (the third onChunk arg) still threads through.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-success";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string; lineUuid?: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data, lineUuid) => recorded.push({ stream, data, lineUuid }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-success-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_sendfile_1",
+        content: "1 file delivered to user.\n  /private/tmp/claude-501/chart.png → file_uuid: file-abc-123\n",
+        is_error: false,
+      }],
+    },
+    toolUseResult: {
+      caption: "Here's the chart",
+      display: "render",
+      attachments: [{
+        path: "/private/tmp/claude-501/chart.png",
+        size: 2048,
+        isImage: true,
+        media_type: "image/png",
+        pathValidated: true,
+        file_uuid: "file-abc-123",
+      }],
+    },
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  expect(evt!.lineUuid).toBe("sf-success-1");
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed).toEqual({
+    toolUseId: "toolu_sendfile_1",
+    content: "1 file delivered to user.\n  /private/tmp/claude-501/chart.png → file_uuid: file-abc-123\n",
+    isError: false,
+    attachments: [{
+      path: "/private/tmp/claude-501/chart.png",
+      size: 2048,
+      isImage: true,
+      mediaType: "image/png",
+    }],
+  });
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: SendUserFile error tool_result (string toolUseResult) never adds an attachments key", async () => {
+  // On error claude stamps a bare STRING at the top-level `toolUseResult`
+  // (not an object), e.g. because a directory path was rejected — there is
+  // nothing to sanitize, and the emitted JSON must omit the key entirely
+  // rather than carry `attachments: null` or similar.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-error";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-error-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_sendfile_2",
+        content: "<tool_use_error>Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.</tool_use_error>",
+        is_error: true,
+      }],
+    },
+    toolUseResult: "Error: Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.",
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed.isError).toBe(true);
+  expect(parsed.content).toBe(
+    "<tool_use_error>Attachment \"/private/tmp/claude-501/agetor-sent\" is not a regular file.</tool_use_error>",
+  );
+  expect("attachments" in parsed).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: a tool_result whose object toolUseResult has no attachments array stays unchanged", async () => {
+  // Other tools' `toolUseResult` shapes are plain objects too (e.g. Read's
+  // file-content envelope) but carry no `attachments` field at all — the
+  // sanitizer returns null for a missing/non-array value, so the emitted
+  // event must be byte-identical to before this feature landed (no key).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-sent-files-no-attachments";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "sf-read-1",
+    message: {
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_read_1",
+        content: "line 1\nline 2\n",
+        is_error: false,
+      }],
+    },
+    toolUseResult: {
+      type: "text",
+      file: { filePath: "/private/tmp/claude-501/notes.txt", content: "line 1\nline 2\n", numLines: 2 },
+    },
+  }));
+
+  const evt = recorded.find((r) => r.stream === "tool_result");
+  expect(evt).toBeDefined();
+  const parsed = JSON.parse(evt!.data);
+  expect(parsed).toEqual({ toolUseId: "toolu_read_1", content: "line 1\nline 2\n", isError: false });
+  expect("attachments" in parsed).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: end_turn staging — thinking/text split lines stage+cancel, real end fires on confirmation", async () => {
+  // Reproduces the EXACT Guest Mode failure sequence:
+  // line 120: end_turn [thinking]  → stage (was previously STILL_FIRES with hasPendingToolUse fix)
+  // line 121: end_turn [text]      → same message.id → cancel staged, re-stage
+  // line 122: end_turn [tool_use]  → same message.id → cancel, re-stage
+  // line 123: user [tool_result]   → continuation    → cancel
+  // No slot pop at any point — the turn is still in progress.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-thinking-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  const mkLine = (blk: object, uuid: string) => JSON.stringify({
+    type: "assistant", uuid,
+    message: { id: "msg-XYZ", role: "assistant", content: [blk], stop_reason: "end_turn" },
+  });
+
+  __forTest.dispatchLine(state, mkLine({ type: "thinking", thinking: "hmm" }, "u1"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ");
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, mkLine({ type: "text", text: "I'll check" }, "u2"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ"); // re-staged
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, mkLine({ type: "tool_use", id: "t1", name: "Bash", input: {} }, "u3"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ"); // re-staged
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u4",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull(); // cancelled
+  expect(state.turnQueue.length).toBe(1); // still alive
+
+  // Now a new different message arrives (a real turn end) → pending is null already,
+  // so no spurious fire. Verify no banner was emitted throughout.
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+
+  // Cleanup: the donePromise never resolves (turn didn't end); that's correct.
+  // Reject it to avoid test hanging.
+  state.turnQueue[0]?.reject?.(new Error("cleanup"));
+  await donePromise.catch(() => {});
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: pending end_turn fires when next line is a non-continuation (real turn end confirmed)", async () => {
+  // When a real end_turn is followed by a non-tool_result, non-same-message
+  // line (e.g. a new user text prompt, or a last-prompt event), the pending
+  // fires: emits "turn complete" banner and pops the slot.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-fires-on-confirm";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "et-real",
+    message: { id: "msg-REAL", role: "assistant",
+      content: [{ type: "text", text: "all done!" }], stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-REAL");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // Non-continuation line (a system event — different type, no same message.id)
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "sys-1", subtype: "turn_duration", durationMs: 5000,
+  }));
+
+  // Pending fired: banner emitted, slot popped
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(0);
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(await donePromise).toBe(0);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn (reattach/dedup) is staged and fires on next non-continuation line", async () => {
+  // The crash-between-persist-and-status-update case: an already-seen end_turn
+  // is staged (not fired immediately). On the next call with a non-continuation
+  // line, it fires — no banner (emitBanner:false), but popEndOfTurn runs so
+  // the run-row transitions correctly.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-dedup-et-staged";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("seen-et-uuid");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "seen-et-uuid",
+    message: { id: "msg-SEEN", role: "assistant",
+      content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }));
+  // Staged, not fired yet.
+  expect(state.pendingEndTurn?.messageId).toBe("msg-SEEN");
+  expect(endOfTurnFired).toBe(false);
+
+  // Next non-continuation line fires it (emitBanner:false since it was dedup).
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(endOfTurnFired).toBe(true);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn tool_use (dedup) cancelled by next tool_result — onEndOfTurn never fires", async () => {
+  // Dedup + tool_use: the pending is staged with emitBanner:false. If the
+  // next line is a tool_result (continuation), the pending is cancelled and
+  // onEndOfTurn never fires. The run SHOULD NOT be marked done here.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-dedup-tooluse-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("seen-tu-uuid");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "seen-tu-uuid",
+    message: { id: "msg-TU", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-TU");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(endOfTurnFired).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen NON-end_turn line does NOT touch the turn queue or fire onEndOfTurn", async () => {
+  // Inverse of the end_turn carve-out: only end_turn lines should drive
+  // queue bookkeeping on the dedup path. A replayed tool_use or text
+  // assistant line must skip cleanly, leaving turnQueue + onEndOfTurn
+  // untouched. Guards against accidental over-trigger if isEndOfTurnEvent
+  // ever gets widened (e.g. to other stop_reason values).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-non-end-turn-dedup";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  // Push a slot and install an onEndOfTurn — both should survive the dispatch.
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => {
+    recorded.push({ stream, data });
+  });
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+
+  state.seenLineUuids.add("tool-use-uuid");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "tool-use-uuid",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }], stop_reason: "tool_use" },
+  }));
+
+  // Slot still queued, listener still armed, no chunk re-emitted.
+  expect(state.turnQueue.length).toBe(1);
+  expect(state.onEndOfTurn).not.toBeNull();
+  expect(endOfTurnFired).toBe(false);
+  expect(recorded).toEqual([]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn pops the head turn slot after next confirming line (mid-pipeline dedup edge case)", async () => {
+  // Duplicate end_turn (watcher + sync-flush reaching same offset): the slot
+  // must be popped exactly once after the confirming next line. With staging,
+  // the dedup'd end_turn stages the pending (emitBanner:false), and the next
+  // non-continuation line fires it — resolving done and popping the slot.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-dedup-live";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => {
+    recorded.push({ stream, data });
+  });
+
+  state.seenLineUuids.add("end-turn-uuid-2");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "end-turn-uuid-2",
+    message: { id: "msg-D2", role: "assistant", content: [], stop_reason: "end_turn" },
+  }));
+
+  // Staged — not popped yet.
+  expect(state.turnQueue.length).toBe(1);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-D2");
+
+  // Confirming next line (a system event — not a continuation).
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 100 }));
+
+  // Slot now popped; no duplicate chunks; done resolves.
+  expect(state.turnQueue.length).toBe(0);
+  expect(state.pendingEndTurn).toBeNull();
+  // No "turn complete" re-emitted (emitBanner:false on the dedup path).
+  expect(recorded.some((r) => r.data === "turn complete")).toBe(false);
+  expect(await donePromise).toBe(0);
+  __forTest.uninstallSession(taskId);
+});
+
+test("flush: fires a staged end_turn after END_TURN_IDLE_FIRE_MS with no new data (idle path)", async () => {
+  // Edge case: end_turn is the very last write to the JSONL — no following
+  // last-prompt, mode event, or tool_result arrives to trigger the fire
+  // via normal continuation logic. flush() detects idle (no new bytes +
+  // stagedAt age ≥ END_TURN_IDLE_FIRE_MS) and fires the pending directly.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync("/tmp/agetor-flush-idle-test-");
+  const jsonlPath = join(dir, "session.jsonl");
+  // Write a single end_turn line — this is the whole file.
+  writeFileSync(jsonlPath, JSON.stringify({
+    type: "assistant", uuid: "et-idle",
+    message: { id: "msg-IDLE", role: "assistant",
+      content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }) + "\n");
+
+  const taskId = "task-flush-idle";
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // First flush: reads the end_turn line, stages the pending.
+  await __forTest.flush(state);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-IDLE");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // Second flush with no new data but NOT yet past the idle threshold — still pending.
+  await __forTest.flush(state);
+  expect(state.pendingEndTurn).not.toBeNull(); // still waiting
+
+  // Backdate stagedAt past the idle threshold, then flush again with no data.
+  const pending = state.pendingEndTurn;
+  if (!pending) throw new Error("expected pending end_turn before idle backdate");
+  pending.stagedAt -= 1000; // older than END_TURN_IDLE_FIRE_MS (800ms)
+  await __forTest.flush(state);
+
+  // Idle path fires: pending cleared, slot popped, banner emitted, done resolves.
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(0);
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(await donePromise).toBe(0);
+  __forTest.uninstallSession(taskId);
+});
+
+test("staging: a cancelled run drops its pending end_turn so a late JSONL line cannot fire a stale banner", async () => {
+  // Race condition the prior review flagged: after the staging refactor,
+  // there's a window between staging an end_turn and the next line confirming
+  // it. If the user cancels in that window, the kill paths must drop
+  // state.pendingEndTurn — otherwise the late line fires firePendingEndTurn,
+  // emitting a "turn complete" banner via state.lastChunk on a run the
+  // orchestrator has already marked `cancelled`.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cancel-clears-pending";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const recorded: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => recorded.push({ stream, data });
+
+  // Stage a pending end_turn manually (mirrors what dispatchLine does after
+  // an end_turn line arrives but before the next line confirms it).
+  state.pendingEndTurn = {
+    messageId: "msg-CANCEL",
+    uuid: "uuid-cancelled",
+    emitBanner: true,
+    stagedAt: Date.now(),
+  };
+
+  // Simulate the cancel cleanup the kill paths do.
+  state.pendingEndTurn = null;
+  for (const slot of state.turnQueue.splice(0)) slot.reject?.(new Error("cancelled"));
+
+  // Now a late JSONL line arrives (e.g., claude's response to Ctrl+C, or the
+  // idle-fire path in flush). Without the cleanup the staged pending would
+  // fire here; with it, firePendingEndTurn becomes a no-op.
+  __forTest.firePendingEndTurn(state);
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 100 }));
+
+  // No "turn complete" banner emitted on the cancelled run.
+  expect(recorded.some((r) => r.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("rebuildEventsFromJsonl: emits 'turn complete' for a real turn end (rebuild endpoint parity)", () => {
+  // The /runs/:id/rebuild-events endpoint must produce the SAME event shape
+  // as the live SSE path — including "turn complete" banners. Looping
+  // mapJsonlEventToChunks per-line would emit zero banners after the staging
+  // refactor (banner moved to firePendingEndTurn). rebuildEventsFromJsonl
+  // drives a synthetic SessionState through the same dispatch pipeline so the
+  // banner survives.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  // Text emitted, banner emitted (in correct order: text then turn complete then duration).
+  expect(out.some((r) => r.stream === "assistant" && r.data === "hello")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn duration: 1.0s")).toBe(true);
+});
+
+test("rebuildEventsFromJsonl: suppresses spurious 'turn complete' for split-line end_turn (Guest Mode quirk)", () => {
+  // Same staging guarantee on the rebuild path: an end_turn line followed by
+  // a tool_result (continuation) must NOT produce a "turn complete" banner.
+  // Without this the rebuild would emit the same spurious dividers the live
+  // tailer used to emit before the staging fix.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant",
+        content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+        stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "user", uuid: "u2",
+      message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  expect(out.some((r) => r.stream === "tool_use")).toBe(true);
+  expect(out.some((r) => r.stream === "tool_result")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("rebuildEventsFromJsonl: fires staged end_turn at EOF (last line is the turn end)", () => {
+  // Edge case mirrors flush()'s idle-fire path: if the JSONL's last line is
+  // an end_turn (no following line to confirm via continuation check), the
+  // EOF fire in rebuildEventsFromJsonl must still emit the banner so the
+  // rebuilt stream isn't missing the closing divider.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant",
+        content: [{ type: "text", text: "all done" }], stop_reason: "end_turn" } }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  expect(out.some((r) => r.stream === "assistant" && r.data === "all done")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+});
+
+test("rebuildEventsFromJsonl: emits exactly one permission-mode status entry per mode CHANGE, not per event", () => {
+  // rebuildEventsFromJsonl drives dispatchLine against a synthetic state, so
+  // it inherits the same emit-on-change suppression — this is the "already
+  // persisted spam renders collapsed" acceptance criterion from the plan,
+  // exercised directly against a spammy JSONL: repeated same-mode events
+  // interleaved with unrelated (non-mode) events must collapse to one chip
+  // per actual change (auto -> plan -> auto = 3 chips, not 6).
+  const lines = [
+    JSON.stringify({ type: "system", uuid: "r1", permissionMode: "auto" }),
+    JSON.stringify({ type: "assistant", uuid: "r2",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hi" }], stop_reason: "tool_use" } }),
+    JSON.stringify({ type: "system", uuid: "r3", permissionMode: "auto" }),
+    JSON.stringify({ type: "permission-mode", uuid: "r4", permissionMode: "plan" }),
+    JSON.stringify({ type: "system", uuid: "r5", permissionMode: "plan" }),
+    JSON.stringify({ type: "system", uuid: "r6", permissionMode: "auto" }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  const modeChips = out.filter((r) => r.stream === "status" && r.data.startsWith("permission-mode: "));
+  expect(modeChips.map((r) => r.data)).toEqual([
+    "permission-mode: auto",
+    "permission-mode: plan",
+    "permission-mode: auto",
+  ]);
+});
+
+test("dispatchLine: permissionMode still updates when the event's uuid is already in seenLineUuids (reattach path)", async () => {
+  // On reattach, seenLineUuids is pre-seeded from run_events.line_uuid so
+  // the user-facing chunk replay stays idempotent. The permissionMode
+  // tracking has to run BEFORE that dedup check — otherwise the field
+  // would stay null until claude emitted a fresh mode event, and the
+  // first cycleToMode call after every restart would skip with
+  // "current mode unknown".
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-track-dedup";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.seenLineUuids.add("system-event-uuid-1");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system",
+    uuid: "system-event-uuid-1",
+    permissionMode: "bypassPermissions",
+  }));
+  expect(state.permissionMode).toBe("bypassPermissions");
+  __forTest.uninstallSession(taskId);
+});
+
+test("resumeJsonlOffset: returns EOF for an existing JSONL so the tailer skips historical content", async () => {
+  // Pins the resume fix: when claude --resume reopens an existing JSONL,
+  // the tailer must NOT re-dispatch historical end_turn markers, or the
+  // freshly-pushed turn slot for the new prompt would pop on a stale
+  // event and flip the new run to `succeeded` before claude has even
+  // processed the prompt. The fix is to anchor state.offset at the file
+  // size at spawn time; this test verifies the helper that produces it.
+  const { mkdtempSync, writeFileSync, statSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-resume-offset-"));
+  const jsonlPath = path.join(dir, "session.jsonl");
+  const historical = [
+    JSON.stringify({ type: "system", uuid: "u1", permissionMode: "default" }),
+    JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "hi" } }),
+    JSON.stringify({ type: "assistant", uuid: "u3", message: { role: "assistant", content: [], stop_reason: "end_turn" } }),
+  ].join("\n") + "\n";
+  writeFileSync(jsonlPath, historical);
+  const fileSize = statSync(jsonlPath).size;
+
+  // Offset must point at EOF so the tailer skips the historical end_turn
+  // marker on u3 — that was the source of the spurious `succeeded` flip.
+  expect(__forTest.resumeJsonlOffset(jsonlPath)).toBe(fileSize);
+});
+
+test("resumeJsonlOffset: returns 0 for a missing JSONL so a fresh spawn behaves like a cold start", async () => {
+  // Fresh-spawn path: the JSONL doesn't exist yet (claude creates it on
+  // boot), so the helper must return 0 — the tailer then reads from the
+  // very beginning when claude writes its first events.
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-resume-missing-"));
+  expect(__forTest.resumeJsonlOffset(path.join(dir, "session.jsonl"))).toBe(0);
+});
+
+test("cycleToMode: noop when already at target", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-noop";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_ACCEPT_EDITS;
+  const result = await cycleToMode(taskId, "acceptEdits");
+  expect(result).toEqual({ ok: true, presses: 0, via: "noop" });
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: returns 'current mode unknown' before claude's first event", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-unknown";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  expect(state.permissionMode).toBeNull();
+  const result = await cycleToMode(taskId, "auto");
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toBe("current mode unknown");
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: success on first attempt when the status bar shows the target", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // The status bar already reports auto once the presses land.
+  const prevPane = __forTest.setCaptureModePane(async () => "⏵⏵ auto mode on (shift+tab to cycle)");
+  try {
+    const taskId = "task-cycle-success";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    // Cycle: [default, acceptEdits, plan, auto] — 3 presses.
+    expect(result).toEqual({ ok: true, presses: 3, via: "shift-tab" });
+    // The verifier mirrors the observed mode back onto the session.
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
+});
+
+test("cycleToMode: retries from the newly-observed mode when the first press lands short", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Attempt 1 (from default) settles on acceptEdits; once cycleToMode records
+  // that landing on the session, attempt 2's bar reports auto.
+  const prevPane = __forTest.setCaptureModePane(async (s) =>
+    s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS
+      ? "⏵⏵ auto mode on (shift+tab to cycle)"
+      : "⏵⏵ accept edits on (shift+tab to cycle)",
+  );
+  try {
+    const taskId = "task-cycle-retry";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    // Attempt 1: default → auto = 3 presses (lands on acceptEdits instead).
+    // Attempt 2: acceptEdits → auto = 2 presses. Total: 5.
+    expect(result).toEqual({ ok: true, presses: 5, via: "shift-tab" });
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
+});
+
+test("cycleToMode: returns 'verification timed out' when the status bar never confirms", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevTimeout = __forTest.setModeVerifyTimeoutMs(20);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Bar shows no recognisable mode banner (e.g. the auto opt-in modal is
+  // painted over it) — readPaneMode returns null on every poll.
+  const prevPane = __forTest.setCaptureModePane(async () => "Some unrelated output\n❯ ");
+  try {
+    const taskId = "task-cycle-timeout";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verification timed out");
+      expect(result.attempts).toBe(1);
+      // lastObserved stays at the pre-press mode — the bar never moved.
+      expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+    }
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+    __forTest.setModeVerifyTimeoutMs(prevTimeout);
+  }
+});
+
+test("cycleToMode: gives up with 'verification mismatch' after MAX_VERIFY_ATTEMPTS wrong modes", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Each attempt lands on a wrong mode, keyed off where the previous attempt
+  // left the session: default → acceptEdits → plan → default.
+  const prevPane = __forTest.setCaptureModePane(async (s) => {
+    if (s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS) return "⏸ plan mode on (shift+tab to cycle)";
+    if (s.permissionMode === CLAUDE_MODE_PLAN) return "? for shortcuts";
+    return "⏵⏵ accept edits on (shift+tab to cycle)";
+  });
+  try {
+    const taskId = "task-cycle-mismatch";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verification mismatch");
+      expect(result.attempts).toBe(__forTest.MAX_VERIFY_ATTEMPTS);
+      expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+    }
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
+});
+
+test("cycleToMode: /plan target bypasses the verify loop entirely", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-plan";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_DEFAULT;
+  // No pane scrape — /plan returns immediately without verifying.
+  const result = await cycleToMode(taskId, "plan");
+  expect(result).toEqual({ ok: true, presses: 0, via: "slash-plan" });
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: overlapping calls on the same task both resolve", async () => {
+  // With pane-scrape verification there are no shared listeners to clobber;
+  // two overlapping calls just both poll the bar. This is a smoke test that
+  // concurrent cycleToMode calls (e.g. a user double-PATCH) each settle.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  const prevPane = __forTest.setCaptureModePane(async () => "⏵⏵ auto mode on (shift+tab to cycle)");
+  try {
+    const taskId = "task-cycle-race";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const [ra, rb] = await Promise.all([
+      cycleToMode(taskId, "auto"),
+      cycleToMode(taskId, "auto"),
+    ]);
+    expect(ra.ok).toBe(true);
+    expect(rb.ok).toBe(true);
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
+});
+
+test("readPaneMode: reads the trailing status-bar banner, ignoring mode phrases in output above it", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-anchor";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // A decoy "auto mode on" in assistant output must NOT win over the real
+  // banner on the trailing line.
+  const prevPane = __forTest.setCaptureModePane(async () =>
+    [
+      "Assistant: I'll switch to auto mode on your behalf.",
+      "❯ ",
+      "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+    ].join("\n"),
+  );
+  try {
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_PLAN);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: default mode recognised via the '? for shortcuts' trailing hint", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-default";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const prevPane = __forTest.setCaptureModePane(async () => "❯ \n  ? for shortcuts · ← for agents");
+  try {
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_DEFAULT);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: null when a mode phrase lacks the cycle-hint banner (e.g. modal covering the bar)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-null";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // "auto mode on" appears, but not as the trailing `(shift+tab to cycle)` banner.
+  const prevPane = __forTest.setCaptureModePane(async () => "talking about auto mode on\n❯ ");
+  try {
+    expect(await __forTest.readPaneMode(state)).toBeNull();
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("resolveAskCard resolves the card AND clears the session askCardId (so a failed drive can re-collect)", async () => {
+  const { __forTest, resolveAskCard } = await import("./claude-tmux.ts");
+  const { __testing, registerScrapedAskQuestions, activeAskQuestionsForTask } =
+    await import("./interactions.ts");
+  __testing.reset();
+  const taskId = "task-resolve-ask-card";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const card = registerScrapedAskQuestions({
+    taskId, runId: "r1",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp",
+  });
+  state.askCardId = card.id;
+  expect(activeAskQuestionsForTask(taskId)).toHaveLength(1);
+
+  resolveAskCard(card.id, taskId);
+  expect(activeAskQuestionsForTask(taskId)).toHaveLength(0); // interaction dropped
+  expect(state.askCardId).toBeNull();                        // tracker cleared → scraper can re-collect
+  __forTest.uninstallSession(taskId);
+});
+
+test("resolveAskCard still drops the card with no live session (the route's no-tmux path)", async () => {
+  const { resolveAskCard } = await import("./claude-tmux.ts");
+  const { __testing, registerScrapedAskQuestions, activeAskQuestionsForTask } =
+    await import("./interactions.ts");
+  __testing.reset();
+  const card = registerScrapedAskQuestions({
+    taskId: "task-resolve-ask-nosession", runId: "r1",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp",
+  });
+  expect(activeAskQuestionsForTask("task-resolve-ask-nosession")).toHaveLength(1);
+  resolveAskCard(card.id, "task-resolve-ask-nosession"); // no installSession → no state
+  expect(activeAskQuestionsForTask("task-resolve-ask-nosession")).toHaveLength(0);
+});
+
+test("readPendingAskQuestionsFromJsonl: returns the unanswered AskUserQuestion tool_use, with previews", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const jsonl = path.join(mkdtempSync(path.join(tmpdir(), "agetor-askjsonl-")), "s.jsonl");
+  const toolUse = {
+    type: "assistant",
+    message: { content: [{
+      type: "tool_use", id: "tu1", name: "AskUserQuestion",
+      input: { questions: [{
+        question: "How far should this go?", header: "Scope", multiSelect: false,
+        options: [
+          { label: "Plugins + curated built-ins", description: "Enumerate plugins AND a curated built-in list.", preview: "/ autocomplete shows:\n  /deploy ... [plugin]\n  /init ... [builtin]" },
+          { label: "Plugins only", description: "Enumerate enabled-plugin items only.", preview: "/ autocomplete shows:\n  /deploy ... [plugin]" },
+        ],
+      }] },
+    }] },
+  };
+  // A prior unrelated line + the pending tool_use, no matching tool_result.
+  writeFileSync(jsonl,
+    JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "go" }] } }) + "\n"
+    + JSON.stringify(toolUse) + "\n");
+
+  const qs = __forTest.readPendingAskQuestionsFromJsonl(jsonl);
+  expect(qs).not.toBeNull();
+  expect(qs!.length).toBe(1);
+  expect(qs![0]!.question).toBe("How far should this go?");
+  expect(qs![0]!.header).toBe("Scope");
+  expect(qs![0]!.options.map((o) => o.label)).toEqual(["Plugins + curated built-ins", "Plugins only"]);
+  expect(qs![0]!.options[0]!.description).toBe("Enumerate plugins AND a curated built-in list.");
+  expect(qs![0]!.options[0]!.preview).toContain("[builtin]"); // the multi-line preview survives
+});
+
+test("readPendingAskQuestionsFromJsonl: null once the tool_use has a matching tool_result (answered)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const jsonl = path.join(mkdtempSync(path.join(tmpdir(), "agetor-askjsonl2-")), "s.jsonl");
+  writeFileSync(jsonl,
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "AskUserQuestion", input: { questions: [{ question: "Q?", options: [{ label: "A" }] }] } }] } }) + "\n"
+    + JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "answered" }] } }) + "\n");
+  expect(__forTest.readPendingAskQuestionsFromJsonl(jsonl)).toBeNull();
+});
+
+test("readPendingAskQuestionsFromJsonl: null when there's no AskUserQuestion / the file is missing", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  expect(__forTest.readPendingAskQuestionsFromJsonl("/no/such/agetor/file.jsonl")).toBeNull();
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * collectAskQuestionsFromPane — per-option preview capture orchestration
+ *
+ * Drives the real collector against an in-memory fake pane (no tmux) that
+ * renders claude's side-by-side preview layout for the current (tab, cursor)
+ * and tracks navigation, so we can assert: every option's preview is scraped,
+ * the cursor (and tab) is restored to the start, and the pane was grown.
+ * ────────────────────────────────────────────────────────────────────────── */
+import type { NavKey } from "./claude-questions.ts";
+
+type FakeOption = { label: string; preview?: string[]; description?: string };
+type FakeTab = {
+  header: string; question: string; multiSelect: boolean; options: FakeOption[];
+  /** `false` renders the preview layout's bare, unnumbered `Chat about this` row
+   *  with NO `Type something` row. Default: the normal layout (a numbered Type
+   *  row directly above a numbered Chat row). */
+  typeRow?: boolean;
+};
+
+/** Render one frame of the modal as tmux would capture it: option list on the
+ *  left, the FOCUSED option's preview in a box to the right (col 30). `cursor`
+ *  indexes the real options; `options.length` is the Type row (when present) and
+ *  the next index the Chat row. */
+function renderFakeModal(tabs: FakeTab[], tab: number, cursor: number): string {
+  const COL = 30, W = 28;
+  const cur = tabs[tab]!;
+  const out: string[] = ["─".repeat(80)];
+  out.push(tabs.length > 1
+    ? "←  " + tabs.map((t) => "☐ " + t.header).join("  ") + "  ✔ Submit  →"
+    : " ☐ " + cur.header);
+  out.push("", cur.question, "");
+
+  // A description (when set) renders as its own 5-col-indented row under its
+  // option, like the real 2.1.284 modal. Only used on preview-less tabs, so the
+  // row shift never misaligns a preview box.
+  const leftParts = cur.options.flatMap((o, i) => [
+    (i === cursor ? "❯ " : "  ") + (i + 1) + ". " + (cur.multiSelect ? "[ ] " : "") + o.label,
+    ...(o.description ? ["     " + o.description] : []),
+  ]);
+  const prev = cur.options[cursor]?.preview;
+  const boxRows: string[] = [];
+  if (prev && prev.length) {
+    boxRows.push("┌" + "─".repeat(W) + "┐");
+    for (const pl of prev) boxRows.push("│ " + pl.padEnd(W - 1) + "│");
+    boxRows.push("└" + "─".repeat(W) + "┘");
+  }
+  const numRows = Math.max(leftParts.length, boxRows.length);
+  for (let r = 0; r < numRows; r++) {
+    const left = leftParts[r] ?? "";
+    const box = boxRows[r] ?? "";
+    out.push(box ? left.padEnd(COL) + box : left);
+  }
+  const hasType = cur.typeRow !== false;
+  const typeIdx = cur.options.length;
+  const chatIdx = typeIdx + (hasType ? 1 : 0);
+  if (hasType) {
+    out.push(`${cursor === typeIdx ? "❯ " : "  "}${typeIdx + 1}. ${cur.multiSelect ? "[ ] " : ""}Type something.`);
+  }
+  if (cur.multiSelect) out.push("  Next");
+  // The normal layout numbers the Chat row directly under the Type row; the
+  // preview layout renders it bare and unnumbered.
+  out.push(
+    hasType ? `${cursor === chatIdx ? "❯ " : "  "}${chatIdx + 1}. Chat about this` : "  Chat about this",
+    "─".repeat(80),
+    tabs.length > 1
+      ? "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+      : "Enter to select · ↑/↓ to navigate · Esc to cancel");
+  return out.join("\n");
+}
+
+/** The review tab (`✔ Submit`) as tmux captures it — no `Chat about this`, no
+ *  `Esc to cancel` footer; `detectAskModal` reads it as `"review"`. */
+const FAKE_REVIEW_FRAME = [
+  "─".repeat(80),
+  "Review your answers",
+  "",
+  " ● Question for Alpha?",
+  "   → Alpha one",
+  "",
+  "Ready to submit your answers?",
+  "",
+  "❯ 1. Submit answers",
+  "  2. Cancel",
+].join("\n");
+
+/** In-memory PaneIo: clamps Up at option 0 and Down at the last option (no
+ *  wrap — matching the real TUI), resets the cursor to 0 on a tab switch, and
+ *  logs every key + resize so the test can assert cursor/tab restoration. */
+function makeFakePane(
+  tabs: FakeTab[],
+  opts: {
+    /** 1-based indices of `Right` presses the fake TUI ignores (a swallowed key). */
+    swallowRightAt?: number[];
+    /** Ignore every `Right` press. */
+    swallowAllRights?: boolean;
+    /** Initial pane size (default 120x30). */
+    size?: { w: number; h: number };
+    /** 1-based indices of `Left` / `Up` / `Down` presses the fake TUI ignores. */
+    swallowLeftAt?: number[];
+    /** Initial cursor index (default 0; `options.length` = the Type row). */
+    startCursor?: number;
+    swallowUpAt?: number[];
+    swallowDownAt?: number[];
+    /** Ignore every `Left` press. */
+    swallowAllLefts?: boolean;
+    /** 1-based indices of `Left` presses that are swallowed while a LATE `Right`
+     *  (an earlier resend the TUI processed after the fact) lands, leaving the
+     *  modal stranded on the "Ready to submit your answers?" review tab. */
+    driftToReviewOnLeftAt?: number[];
+    /** Up from option 0 WRAPS to the Type row (the real TUI's behaviour), and
+     *  Down/Up move over the Type/Chat rows too. Default: clamp at the options. */
+    wrap?: boolean;
+  } = {},
+) {
+  let tab = 0, cursor = opts.startCursor ?? 0, w = opts.size?.w ?? 120, h = opts.size?.h ?? 30;
+  let rightPresses = 0, leftPresses = 0, upPresses = 0, downPresses = 0;
+  const log: string[] = [];
+  const io = {
+    capture: async () => (tab >= tabs.length ? FAKE_REVIEW_FRAME : renderFakeModal(tabs, tab, cursor)),
+    send: async (key: NavKey) => {
+      log.push(key);
+      if (key === "Left" && opts.driftToReviewOnLeftAt?.includes(leftPresses + 1)) {
+        leftPresses++;
+        tab = tabs.length;
+        cursor = 0;
+        return true;
+      }
+      if (key === "Right") {
+        rightPresses++;
+        if (opts.swallowAllRights || opts.swallowRightAt?.includes(rightPresses)) return true;
+      }
+      if (key === "Left") {
+        leftPresses++;
+        if (opts.swallowAllLefts || opts.swallowLeftAt?.includes(leftPresses)) return true;
+      }
+      if (key === "Up") { upPresses++; if (opts.swallowUpAt?.includes(upPresses)) return true; }
+      if (key === "Down") { downPresses++; if (opts.swallowDownAt?.includes(downPresses)) return true; }
+      if (tab >= tabs.length) {
+        // On the review tab only Left/Right move (Right clamps, Left steps back).
+        if (key === "Left") { tab = tabs.length - 1; cursor = 0; }
+        return true;
+      }
+      const cur = tabs[tab]!;
+      const rowCount = cur.options.length + (cur.typeRow === false ? 1 : 2);
+      if (key === "Down") cursor = opts.wrap ? (cursor + 1) % rowCount : Math.min(cursor + 1, cur.options.length - 1);
+      else if (key === "Up") cursor = opts.wrap ? (cursor - 1 + rowCount) % rowCount : Math.max(cursor - 1, 0);
+      else if (key === "Right") { tab = Math.min(tab + 1, tabs.length - 1); cursor = 0; }
+      else if (key === "Left") { tab = Math.max(tab - 1, 0); cursor = 0; }
+      return true;
+    },
+    size: async () => ({ w, h }),
+    resize: async (nw: number, nh: number) => { w = nw; h = nh; log.push(`resize:${nw}x${nh}`); },
+    restore: async (nw: number, nh: number) => { w = nw; h = nh; log.push(`restore:${nw}x${nh}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  return { io, log, at: () => ({ tab, cursor, w, h }) };
+}
+
+test("collectAskQuestionsFromPane: flat question scrapes every option's preview and restores the cursor", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [
+      { label: "Alpha", preview: ["a-one", "a-two", "a-three"] },
+      { label: "Beta", preview: ["b-one", "b-two"] },
+      { label: "Gamma", preview: ["g-only"] },
+    ],
+  }];
+  const { io, log, at } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flat", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(1);
+    expect(res![0]!.multiSelect).toBe(false);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(res![0]!.options[0]!.preview).toBe("a-one\na-two\na-three");
+    expect(res![0]!.options[1]!.preview).toBe("b-one\nb-two");
+    expect(res![0]!.options[2]!.preview).toBe("g-only");
+    // The pane was grown (and restored), and the cursor walked back to option 0.
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(at().cursor).toBe(0);
+    // Net option navigation is balanced (equal Downs and Ups).
+    expect(log.filter((l) => l === "Down").length).toBe(log.filter((l) => l === "Up").length);
+  } finally {
+    __forTest.uninstallSession("ask-flat");
+  }
+});
+
+test("collectAskQuestionsFromPane: tabbed multi-question scrapes previews per tab and restores tab+cursor", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [
+    {
+      header: "Size", question: "Pick sizes", multiSelect: true,
+      options: [
+        { label: "Small", preview: ["s-1", "s-2"] },
+        { label: "Large", preview: ["l-1"] },
+      ],
+    },
+    {
+      header: "Crust", question: "Pick a crust", multiSelect: false,
+      options: [
+        { label: "Thin", preview: ["t-1", "t-2", "t-3"] },
+        { label: "Deep", preview: ["d-1"] },
+      ],
+    },
+  ];
+  const { io, log, at } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-tabbed", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(2);
+    expect(res![0]!.header).toBe("Size");
+    expect(res![0]!.multiSelect).toBe(true);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Small", "Large"]);
+    expect(res![0]!.options[0]!.preview).toBe("s-1\ns-2");
+    expect(res![0]!.options[1]!.preview).toBe("l-1");
+    expect(res![1]!.header).toBe("Crust");
+    expect(res![1]!.multiSelect).toBe(false);
+    expect(res![1]!.options[0]!.preview).toBe("t-1\nt-2\nt-3");
+    expect(res![1]!.options[1]!.preview).toBe("d-1");
+    // Returned to the first tab, cursor at option 0; tab navigation balanced.
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+    expect(log.filter((l) => l === "Right").length).toBe(log.filter((l) => l === "Left").length);
+  } finally {
+    __forTest.uninstallSession("ask-tabbed");
+  }
+});
+
+test("collectAskQuestionsFromPane: flat no-preview question takes the fast path (no resize, no navigation)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Yes" }, { label: "No" }],
+  }];
+  const { io, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-nopreview", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(res![0]!.options.every((o) => o.preview === undefined)).toBe(true);
+    // Fast path: no grow, no keystrokes.
+    expect(log.length).toBe(0);
+  } finally {
+    __forTest.uninstallSession("ask-nopreview");
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Truncation fix: a flat question whose header/question/option-1 scrolled
+ * off the top of a short pane must NOT take the fast path, and must NOT
+ * register at all unless growing the pane recovers a complete parse.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** A truncated-top capture (mirrors the `truncated_top` fixture): option 1's
+ *  leftover wrapped description survives, but its own numbered row — and the
+ *  header + question above it — are off-screen. No preview panel, so this
+ *  would have hit the old (unconditional) fast path. */
+const TRUNCATED_TOP_TAIL = [
+  "One main model with others as failover/cost backups.",
+  "  2. Task-specialized",
+  "  3. Experimental",
+  "  4. Type something.",
+  "─".repeat(40),
+  "  5. Chat about this",
+  "",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+
+/** What growing the pane (more rows) would reveal: the same modal with
+ *  header/question/option 1 back on screen. */
+const GROWN_COMPLETE_TAIL = [
+  " ☐ Providers",
+  "",
+  "There are 5+ AI providers wired up. How are they used?",
+  "",
+  "❯ 1. Primary + fallbacks",
+  "  One main model with others as failover/cost backups.",
+  "  2. Task-specialized",
+  "  3. Experimental",
+  "  4. Type something.",
+  "─".repeat(40),
+  "  5. Chat about this",
+  "",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+
+/** Minimal fake PaneIo whose `capture()` result depends on whether `resize`
+ *  has been called yet — models a real tmux pane where growing the window
+ *  lets the TUI redraw with the previously-scrolled-off top back on screen. */
+function makeGrowablePane(opts: { grownTail: string | null }) {
+  let grown = false;
+  const log: string[] = [];
+  const io = {
+    capture: async () => (grown && opts.grownTail !== null ? opts.grownTail : TRUNCATED_TOP_TAIL),
+    send: async (key: NavKey) => { log.push(key); return true; },
+    size: async () => ({ w: 80, h: 24 }),
+    resize: async (w: number, h: number) => { grown = true; log.push(`resize:${w}x${h}`); },
+    restore: async (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  return { io, log };
+}
+
+test("collectAskQuestionsFromPane: incomplete flat capture skips the fast path, grows, and registers once the grown capture is complete", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeGrowablePane({ grownTail: GROWN_COMPLETE_TAIL });
+  const state = __forTest.installSession("ask-truncated-recovers", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(1);
+    expect(res![0]!.question).toBe("There are 5+ AI providers wired up. How are they used?");
+    expect(res![0]!.options.map((o) => o.label)).toEqual([
+      "Primary + fallbacks", "Task-specialized", "Experimental",
+    ]);
+    // The fast path was skipped — a resize (grow) actually happened.
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-recovers");
+  }
+});
+
+test("collectAskQuestionsFromPane: still incomplete after growing the pane → refuses to register (never drives a wrong answer)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // grownTail: null → capture() keeps returning the truncated pane even after
+  // resize (simulating a modal so tall even PREVIEW_PANE_ROWS can't show it).
+  const { io, log } = makeGrowablePane({ grownTail: null });
+  const state = __forTest.installSession("ask-truncated-stuck", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    // Absolute rule: never register a card whose first option isn't #1.
+    expect(res).toBeNull();
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    // Pane size is always restored even when we give up.
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    // First grow-but-still-incomplete failure counted against the latch.
+    expect(state.askGrowAttempts).toBe(1);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-stuck");
+  }
+});
+
+test("collectAskQuestionsFromPane: unavailable pane size (io.size() → null) still burns latch budget — a no-grow retry can never improve the capture", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const log: string[] = [];
+  const io = {
+    capture: async () => TRUNCATED_TOP_TAIL,
+    send: async () => true,
+    size: async () => null,
+    resize: async (w: number, h: number) => { log.push(`resize:${w}x${h}`); },
+    restore: async (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  const state = __forTest.installSession("ask-size-unavailable", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).toBeNull();
+    // No size → no resize attempted…
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(false);
+    // …but the failure still counts, so the give-up (and the generic-card
+    // fallback it unlocks) stays reachable for this stuck shape.
+    expect(state.askGrowAttempts).toBe(1);
+  } finally {
+    __forTest.uninstallSession("ask-size-unavailable");
+  }
+});
+
+test("collectAskQuestionsFromPane: give-up latch — after MAX_ASK_GROW_ATTEMPTS incomplete-after-grow failures, stops resizing the pane and refuses collection outright", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { MAX_ASK_GROW_ATTEMPTS } = __forTest;
+  // Same "never recovers" pane as the test above — every grow leaves the
+  // capture truncated — but this drives it repeatedly, the way `scrapeOnce`
+  // re-entering on every ~1s tick would, to prove the collector eventually
+  // stops resizing the user's live tmux window instead of looping forever.
+  const { io, log } = makeGrowablePane({ grownTail: null });
+  const state = __forTest.installSession("ask-truncated-gives-up", "/tmp/never-read.jsonl");
+  try {
+    for (let i = 1; i <= MAX_ASK_GROW_ATTEMPTS; i++) {
+      const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+      expect(res).toBeNull();
+      expect(state.askGrowAttempts).toBe(i);
+    }
+    // Latch has now given up. One more call must NOT resize/restore again —
+    // it should bail immediately without touching the pane at all.
+    const resizeCallsBeforeGiveUp = log.filter((l) => l.startsWith("resize:")).length;
+    expect(resizeCallsBeforeGiveUp).toBe(MAX_ASK_GROW_ATTEMPTS);
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).toBeNull();
+    // Counter doesn't keep climbing once given up — no new grow was attempted.
+    expect(state.askGrowAttempts).toBe(MAX_ASK_GROW_ATTEMPTS);
+    expect(log.filter((l) => l.startsWith("resize:")).length).toBe(resizeCallsBeforeGiveUp);
+
+    // A fresh modal (fingerprint change / the modal leaving the pane) resets
+    // the budget in production via `scrapeOnce`'s else-branch — simulate that
+    // reset directly here, since this test drives the collector in isolation.
+    state.askGrowAttempts = 0;
+    const resAfterReset = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(resAfterReset).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    expect(log.filter((l) => l.startsWith("resize:")).length).toBe(resizeCallsBeforeGiveUp + 1);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-gives-up");
+  }
+});
+
+test("askFallbackAllowed — generic modal matcher stays suppressed until the grow latch gives up, and never competes with a registered ask card", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { askFallbackAllowed, MAX_ASK_GROW_ATTEMPTS } = __forTest;
+  // Below the cap: still suppressed, no fallback.
+  expect(askFallbackAllowed(0, false)).toBe(false);
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS - 1, false)).toBe(false);
+  // At/above the cap with no registered card: fallback allowed.
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS, false)).toBe(true);
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS + 1, false)).toBe(true);
+  // Even after giving up, a live registered ask card still wins — the
+  // generic matcher must never compete with a real structured card.
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS, true)).toBe(false);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * askuserquestion-2-1-284-parsing T5: lossy-pane routing (D1), per-tab body
+ * verification with a bounded `Right` resend (D3), 200-col grow, tabBodyKey,
+ * JSONL grace removed (D4).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Four single-select tabs with descriptions and NO previews (so the walk
+ *  never navigates options — only tabs). */
+const FOUR_TABS: FakeTab[] = ["Alpha", "Bravo", "Charlie", "Delta"].map((h) => ({
+  header: h,
+  question: `Question for ${h}?`,
+  multiSelect: false,
+  options: [
+    { label: `${h} one`, description: `First ${h} option` },
+    { label: `${h} two`, description: `Second ${h} option` },
+  ],
+}));
+
+/** Tab-1 frame as an 80x24 pane would show it after the top scrolled off: the
+ *  top rule and the tab-bar row are gone (mirrors `v284_tabbar_scrolled_off`). */
+function scrolledOffTabBar(tabs: FakeTab[]): string {
+  return renderFakeModal(tabs, 0, 0).split("\n").slice(2).join("\n");
+}
+
+test("collectAskQuestionsFromPane: lossy first tail (tab bar scrolled off) skips the fast path and walks all 4 tabs", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { parseModalPane, isLossyAskPane } = await import("./claude-questions.ts");
+  const firstTail = scrolledOffTabBar(FOUR_TABS);
+  // Sanity: this is the exact shape that used to register as ONE question.
+  expect(parseModalPane(firstTail)!.tabbed).toBe(false);
+  expect(isLossyAskPane(firstTail)).toBe(true);
+  const { io, log, at } = makeFakePane(FOUR_TABS);
+  const state = __forTest.installSession("ask-lossy-tabbar", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, firstTail, io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(res!.map((q) => q.header)).toEqual(FOUR_TABS.map((t) => t.header));
+    expect(new Set(res!.map((q) => q.question)).size).toBe(4);
+    expect(res![0]!.options.map((o) => o.description)).toEqual(["First Alpha option", "Second Alpha option"]);
+    // Grown to GROW_PANE_COLS x 100 (orig was 120 wide), then restored.
+    expect(log).toContain("resize:200x100");
+    expect(log).toContain("restore:120x30");
+    expect(at().tab).toBe(0);
+    expect(log.filter((l) => l === "Right").length).toBe(3);
+    expect(log.filter((l) => l === "Right").length).toBe(log.filter((l) => l === "Left").length);
+  } finally {
+    __forTest.uninstallSession("ask-lossy-tabbar");
+  }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Right is resent once and the walk still yields 4 distinct questions", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const happy = makeFakePane(FOUR_TABS);
+  const stateA = __forTest.installSession("ask-swallow-happy", "/tmp/never-read.jsonl");
+  let happyRights = 0;
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(stateA, renderFakeModal(FOUR_TABS, 0, 0), happy.io);
+    expect(res!.length).toBe(4);
+    happyRights = happy.log.filter((l) => l === "Right").length;
+    expect(happyRights).toBe(3);
+  } finally {
+    __forTest.uninstallSession("ask-swallow-happy");
+  }
+
+  const { io, log, at } = makeFakePane(FOUR_TABS, { swallowRightAt: [1] });
+  const state = __forTest.installSession("ask-swallow-once", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(new Set(res!.map((q) => q.question)).size).toBe(4);
+    const rights = log.filter((l) => l === "Right").length;
+    const lefts = log.filter((l) => l === "Left").length;
+    expect(rights).toBe(happyRights + 1); // exactly one resend
+    // The return trip walks back every press sent (swallowed or not); Left clamps
+    // at tab 0, so the extra press is harmless and the tab ends at 0.
+    expect(lefts).toBe(rights);
+    expect(at().tab).toBe(0);
+    expect(log).toContain("restore:120x30");
+  } finally {
+    __forTest.uninstallSession("ask-swallow-once");
+  }
+});
+
+test("collectAskQuestionsFromPane: a Left swallowed while a late Right lands on the review tab still returns to tab 0 and registers", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { detectAskModal } = await import("./claude-questions.ts");
+  expect(detectAskModal(FAKE_REVIEW_FRAME)).toBe("review");
+  const twoTabs = FOUR_TABS.slice(0, 2);
+  const { io, log, at } = makeFakePane(twoTabs, { driftToReviewOnLeftAt: [1] });
+  const state = __forTest.installSession("ask-left-review-overshoot", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(twoTabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(twoTabs.map((t) => t.question));
+    expect(state.askGrowAttempts).toBe(0);
+    // Walk: 1 Right. Return trip: 1 Left (stranded on review). Verification: a
+    // Left off the review tab, then one more off the last question tab.
+    expect(log.filter((l) => l === "Right").length).toBe(1);
+    expect(log.filter((l) => l === "Left").length).toBe(3);
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+  } finally {
+    __forTest.uninstallSession("ask-left-review-overshoot");
+  }
+});
+
+test("collectAskQuestionsFromPane: every Right swallowed → null, one latch tick, bounded resend, back on tab 0", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log, at } = makeFakePane(FOUR_TABS, { swallowAllRights: true });
+  const state = __forTest.installSession("ask-swallow-all", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    expect(at().tab).toBe(0);
+    // One tab attempt = the press + at most ONE resend.
+    expect(log.filter((l) => l === "Right").length).toBeLessThanOrEqual(2);
+    expect(log.filter((l) => l === "Left").length).toBe(log.filter((l) => l === "Right").length);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(state.paneGrowInFlight).toBe(false);
+  } finally {
+    __forTest.uninstallSession("ask-swallow-all");
+  }
+});
+
+test("collectAskQuestionsFromPane: the small complete flat modal's fast path stays tied to isLossyAskPane === false", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { isLossyAskPane } = await import("./claude-questions.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Yes", description: "Do it" }, { label: "No", description: "Skip it" }],
+  }];
+  const frame = renderFakeModal(tabs, 0, 0);
+  expect(isLossyAskPane(frame)).toBe(false);
+  const { io, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-fast-tied", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, frame, io);
+    expect(res!.length).toBe(1);
+    expect(log.length).toBe(0);
+    // ...and the complementary frame (tab bar scrolled off) is lossy.
+    expect(isLossyAskPane(scrolledOffTabBar(FOUR_TABS))).toBe(true);
+  } finally {
+    __forTest.uninstallSession("ask-fast-tied");
+  }
+});
+
+test("GROW_PANE_COLS is 200 and the resize keeps a wider pane: max(orig.w, 200)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  expect(__forTest.GROW_PANE_COLS).toBe(200);
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Alpha", preview: ["a-1"] }],
+  }];
+  const wide = makeFakePane(tabs, { size: { w: 250, h: 40 } });
+  const state = __forTest.installSession("ask-grow-wide", "/tmp/never-read.jsonl");
+  try {
+    await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), wide.io);
+    expect(wide.log).toContain("resize:250x100");
+    expect(wide.log).toContain("restore:250x40");
+    expect(wide.log).not.toContain("resize:200x100");
+  } finally {
+    __forTest.uninstallSession("ask-grow-wide");
+  }
+  const narrow = makeFakePane(tabs, { size: { w: 80, h: 24 } });
+  const state2 = __forTest.installSession("ask-grow-narrow", "/tmp/never-read.jsonl");
+  try {
+    await __forTest.collectAskQuestionsFromPane(state2, renderFakeModal(tabs, 0, 0), narrow.io);
+    expect(narrow.log).toContain("resize:200x100");
+  } finally {
+    __forTest.uninstallSession("ask-grow-narrow");
+  }
+});
+
+test("tabBodyKey: pure identity of question + option labels; descriptions never matter", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { parseModalPane } = await import("./claude-questions.ts");
+  const parse = (t: FakeTab) => parseModalPane(renderFakeModal([t], 0, 0))!;
+  const base: FakeTab = {
+    header: "H", question: "Which one?", multiSelect: false,
+    options: [{ label: "A", description: "first" }, { label: "B", description: "second" }],
+  };
+  const key = __forTest.tabBodyKey(parse(base));
+  expect(parse(base).options[0]!.description).toBe("first"); // descriptions are parsed...
+  expect(__forTest.tabBodyKey(parse(base))).toBe(key);
+  expect(__forTest.tabBodyKey(parse({ ...base, options: [{ label: "A", description: "changed" }, { label: "B" }] }))).toBe(key); // ...but ignored
+  expect(__forTest.tabBodyKey(parse({ ...base, options: [{ label: "A" }, { label: "B changed" }] }))).not.toBe(key);
+  expect(__forTest.tabBodyKey(parse({ ...base, options: [{ label: "A" }, { label: "B" }, { label: "C" }] }))).not.toBe(key);
+  expect(__forTest.tabBodyKey(parse({ ...base, question: "Which other one?" }))).not.toBe(key);
+});
+
+// The post-collect recheck (D8, widened to 3 × 150 ms) lives in
+// `collectAndRegisterAskCard`, which reads the pane through the module-private
+// `captureTail(state)` (a real `tmux` subprocess). Its poll loop is factored into
+// `pollAskModalStillUp` and unit-tested below ("pollAskModalStillUp: rechecks
+// up to 3 × 150 ms …"); the wiring itself is covered by e2e/manual smoke.
+
+test("JSONL grace removed: shouldWaitForAskJsonl is gone and a lossy collection grows without sleeping first", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // Guard against reintroduction of the 2 s wait for a tool_use that never lands.
+  expect((__forTest as unknown as { shouldWaitForAskJsonl?: unknown }).shouldWaitForAskJsonl).toBeUndefined();
+  const { io: baseIo, log } = makeFakePane(FOUR_TABS);
+  const io = { ...baseIo, sleep: async (ms: number) => { log.push(`sleep:${ms}`); } };
+  const state = __forTest.installSession("ask-no-grace", "/tmp/never-read.jsonl");
+  try {
+    await __forTest.collectAskQuestionsFromPane(state, scrolledOffTabBar(FOUR_TABS), io);
+    // The very first pane action is the grow — no grace sleep ahead of it.
+    expect(log[0]).toBe("resize:200x100");
+  } finally {
+    __forTest.uninstallSession("ask-no-grace");
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * F-B (review round 1 #2-#5, #8, #10): registering only from a known state,
+ * verified Left / Up returns, a null first parse growing, region-parsed fast
+ * path, `hasTypeRow` carried onto the question.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const ALL_SWALLOWED = Array.from({ length: 40 }, (_, i) => i + 1);
+
+/** Flat question whose every option carries a preview (so the walk navigates). */
+const PREVIEW_FLAT: FakeTab[] = [{
+  header: "Pick", question: "Which option?", multiSelect: false,
+  options: [
+    { label: "Alpha", preview: ["a-1"] },
+    { label: "Beta", preview: ["b-1"] },
+    { label: "Gamma", preview: ["g-1"] },
+  ],
+}];
+
+test("collectAskQuestionsFromPane: hasTypeRow rides on the question — true for the normal layout (fast path and walk), false for the preview layout", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // Fast path (flat, no preview, normal layout: numbered Type row above Chat).
+  const flat: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const s1 = __forTest.installSession("ask-htr-fast", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s1, renderFakeModal(flat, 0, 0), makeFakePane(flat).io);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(res![0]!.hasTypeRow).toBe(true);
+  } finally { __forTest.uninstallSession("ask-htr-fast"); }
+
+  // Walk (tabbed) — normal layout.
+  const s2 = __forTest.installSession("ask-htr-walk", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s2, renderFakeModal(FOUR_TABS, 0, 0), makeFakePane(FOUR_TABS).io);
+    expect(res!.every((q) => q.hasTypeRow === true)).toBe(true);
+  } finally { __forTest.uninstallSession("ask-htr-walk"); }
+
+  // Preview layout: a bare, unnumbered `Chat about this` and NO Type row.
+  const preview: FakeTab[] = PREVIEW_FLAT.map((t) => ({ ...t, typeRow: false }));
+  const s3 = __forTest.installSession("ask-htr-preview", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(s3, renderFakeModal(preview, 0, 0), makeFakePane(preview).io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(res![0]!.hasTypeRow).toBe(false);
+  } finally { __forTest.uninstallSession("ask-htr-preview"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Left is detected on the return trip and an extra Left puts the modal back on tab 0", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // 3 Rights are needed; swallowing the FIRST Left strands the modal on tab 1.
+  const { io, log, at } = makeFakePane(FOUR_TABS, { swallowLeftAt: [1] });
+  const state = __forTest.installSession("ask-swallow-left", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+    // Exactly one extra Left beyond the 3 walked-back ones.
+    expect(log.filter((l) => l === "Left").length).toBe(4);
+    expect(state.askGrowAttempts).toBe(0);
+  } finally { __forTest.uninstallSession("ask-swallow-left"); }
+});
+
+test("collectAskQuestionsFromPane: the return trip never reaches tab 0 → null, latch counted, extra Lefts bounded", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeFakePane(FOUR_TABS, { swallowAllLefts: true });
+  const state = __forTest.installSession("ask-swallow-all-lefts", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(FOUR_TABS, 0, 0), io);
+    expect(res).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    // 3 walk-back Lefts + at most n (=4) extra ones.
+    expect(log.filter((l) => l === "Left").length).toBeLessThanOrEqual(3 + 4);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(state.paneGrowInFlight).toBe(false);
+  } finally { __forTest.uninstallSession("ask-swallow-all-lefts"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Up in the preview restore is corrected with an extra Up until the cursor is back on option 1", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log, at } = makeFakePane(PREVIEW_FLAT, { swallowUpAt: [1] });
+  const state = __forTest.installSession("ask-swallow-up", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.preview)).toEqual(["a-1", "b-1", "g-1"]);
+    expect(at().cursor).toBe(0);
+    expect(log.filter((l) => l === "Down").length).toBe(2);
+    expect(log.filter((l) => l === "Up").length).toBe(3); // 2 restoring + 1 correcting
+  } finally { __forTest.uninstallSession("ask-swallow-up"); }
+});
+
+test("collectAskQuestionsFromPane: a swallowed Down over-presses the Ups, which WRAP to the Type row — extra Ups walk back to option 1", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, at } = makeFakePane(PREVIEW_FLAT, { swallowDownAt: [1], wrap: true });
+  const state = __forTest.installSession("ask-wrap-up", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(at().cursor).toBe(0);
+  } finally { __forTest.uninstallSession("ask-wrap-up"); }
+});
+
+test("collectAskQuestionsFromPane: the cursor can never be restored → null and the failure is counted", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeFakePane(PREVIEW_FLAT, { swallowUpAt: ALL_SWALLOWED });
+  const state = __forTest.installSession("ask-up-stuck", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(PREVIEW_FLAT, 0, 0), io);
+    expect(res).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    // 2 restoring Ups + at most 2 × options extra ones.
+    expect(log.filter((l) => l === "Up").length).toBeLessThanOrEqual(2 + 2 * 3);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+  } finally { __forTest.uninstallSession("ask-up-stuck"); }
+});
+
+test("collectAskQuestionsFromPane: refuses to register when the cursor is not on option 1 (on the Type row) — fast path and walk both count the latch", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const flat: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const typeRowFrame = renderFakeModal(flat, 0, 2); // cursor on the Type row
+  expect(typeRowFrame).toContain("❯ 3. Type something.");
+  // Fast path.
+  const fast = makeFakePane(flat, { startCursor: 2 });
+  const s1 = __forTest.installSession("ask-cursor-fast", "/tmp/never-read.jsonl");
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s1, typeRowFrame, fast.io)).toBeNull();
+    expect(s1.askGrowAttempts).toBe(1);
+    expect(fast.log.length).toBe(0); // never resized or navigated
+  } finally { __forTest.uninstallSession("ask-cursor-fast"); }
+
+  // Walk (lossy tail forces the grow path); the grown frame has the cursor on the Type row.
+  const s2 = __forTest.installSession("ask-cursor-walk", "/tmp/never-read.jsonl");
+  const walk = makeFakePane(FOUR_TABS, { startCursor: 2 });
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s2, scrolledOffTabBar(FOUR_TABS), walk.io)).toBeNull();
+    expect(s2.askGrowAttempts).toBe(1);
+    expect(walk.log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(walk.log.filter((l) => l === "Right").length).toBe(0); // bailed before walking
+  } finally { __forTest.uninstallSession("ask-cursor-walk"); }
+});
+
+test("collectAskQuestionsFromPane: a first tail with NO option rows is lossy, not fatal — it grows and registers from the grown capture", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { parseModalPane } = await import("./claude-questions.ts");
+  const firstTail = "  ...mid-repaint garbage...\nEnter to select · Esc to cancel";
+  expect(parseModalPane(firstTail)).toBeNull();
+  const { io, log } = makeFakePane(FOUR_TABS);
+  const state = __forTest.installSession("ask-null-first", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, firstTail, io);
+    expect(res).not.toBeNull();
+    expect(res!.map((q) => q.question)).toEqual(FOUR_TABS.map((t) => t.question));
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+  } finally { __forTest.uninstallSession("ask-null-first"); }
+
+  // ...and when the grown capture is unparsable too, the failure is COUNTED.
+  const stuck = { ...makeFakePane(FOUR_TABS).io, capture: async () => firstTail };
+  const s2 = __forTest.installSession("ask-null-first-stuck", "/tmp/never-read.jsonl");
+  try {
+    expect(await __forTest.collectAskQuestionsFromPane(s2, firstTail, stuck)).toBeNull();
+    expect(s2.askGrowAttempts).toBe(1);
+  } finally { __forTest.uninstallSession("ask-null-first-stuck"); }
+});
+
+test("collectAskQuestionsFromPane: the fast path parses the modal REGION — a numbered list in scrollback can't defeat it", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{ header: "Pick", question: "Which option?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+  const scrollback = ["", "  Earlier the agent listed:", "  1. install deps", "  2. run the build", "  3. deploy", ""].join("\n");
+  const tail = scrollback + "\n" + renderFakeModal(tabs, 0, 0);
+  const { io, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-fast-region", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, tail, io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(log.length).toBe(0); // still the no-navigation fast path
+  } finally { __forTest.uninstallSession("ask-fast-region"); }
+});
+
+test("pollAskModalStillUp: rechecks up to 3 × 150 ms before concluding the modal left", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { pollAskModalStillUp, ASK_RECHECK_POLLS, ASK_RECHECK_GAP_MS } = __forTest;
+  expect(ASK_RECHECK_POLLS).toBe(3);
+  expect(ASK_RECHECK_GAP_MS).toBe(150);
+  // Never up: 1 immediate check + 3 rechecks, 3 sleeps of 150 ms.
+  let checks = 0;
+  const sleeps: number[] = [];
+  expect(await pollAskModalStillUp(async () => { checks++; return false; }, async (ms) => { sleeps.push(ms); })).toBe(false);
+  expect(checks).toBe(4);
+  expect(sleeps).toEqual([150, 150, 150]);
+  // Reappears on the LAST recheck (a slow repaint after the resize) → still up.
+  let n = 0;
+  expect(await pollAskModalStillUp(async () => ++n === 4, async () => {})).toBe(true);
+  // Up immediately → no sleeps at all.
+  const none: number[] = [];
+  expect(await pollAskModalStillUp(async () => true, async (ms) => { none.push(ms); })).toBe(true);
+  expect(none).toEqual([]);
+  // A card registered meanwhile ends the wait.
+  expect(await pollAskModalStillUp(async () => false, async () => {}, () => true)).toBe(true);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * paneGrowInFlight — the flag `collectAskQuestionsFromPane` brackets around
+ * the ONLY window a stuck `window-size manual` pin is legitimate (docs/plans/
+ * fix-minimized-agent-tmux-attach.md §3 I1). `healWindowSize` refuses to heal
+ * while this is true, so the flag must be set for the actual duration of the
+ * grow and reliably cleared afterward — including when the grow is aborted
+ * mid-flight (the session was disposed/respawned out from under it).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("collectAskQuestionsFromPane: paneGrowInFlight is set for the duration of a grow and cleared once it completes", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Alpha", preview: ["a-1"] }],
+  }];
+  const { io: baseIo } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flag-live", "/tmp/never-read.jsonl");
+  let sawInFlightDuringResize = false;
+  // Peek at the flag from inside the reflow sleep that follows `io.resize` —
+  // this is the one moment production code guarantees it's already true.
+  const io = {
+    ...baseIo,
+    sleep: async (_ms: number) => {
+      if (state.paneGrowInFlight) sawInFlightDuringResize = true;
+      await baseIo.sleep();
+    },
+  };
+  try {
+    expect(state.paneGrowInFlight).toBe(false);
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(sawInFlightDuringResize).toBe(true);
+    // Cleared by the `finally` in the collector once the grow settles.
+    expect(state.paneGrowInFlight).toBe(false);
+  } finally {
+    __forTest.uninstallSession("ask-flag-live");
+  }
+});
+
+test("collectAskQuestionsFromPane: paneGrowInFlight clears via the early-abort path when the session identity changes mid-grow", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [
+      { label: "Alpha", preview: ["a-1"] },
+      { label: "Beta", preview: ["b-1"] },
+    ],
+  }];
+  const { io: baseIo, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flag-abort", "/tmp/never-read.jsonl");
+  let swapped = false;
+  // Simulate the session being disposed + respawned mid-grow (e.g. a
+  // concurrent dropSession/reattach racing the scraper). `queueTmuxOp`'s
+  // `stillCurrent()` gate is `sessions.get(taskId) === state` (captured at
+  // schedule time) — replacing the map entry mid-await flips it to false
+  // right after this sleep resolves, driving the collector's early-return
+  // branch (`if (!stillCurrent()) { io.restore(...); paneGrowInFlight =
+  // false; return; }`).
+  const io = {
+    ...baseIo,
+    sleep: async (_ms: number) => {
+      await baseIo.sleep();
+      if (!swapped) {
+        swapped = true;
+        __forTest.installSession("ask-flag-abort", "/tmp/never-read.jsonl");
+      }
+    },
+  };
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    // Aborted before any tab was collected.
+    expect(res).toBeNull();
+    expect(state.paneGrowInFlight).toBe(false);
+    // The pane was still restored on the abort path...
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    // ...but we bailed before ever touching the option cursor.
+    expect(log.filter((l) => l === "Down" || l === "Up")).toEqual([]);
+  } finally {
+    __forTest.uninstallSession("ask-flag-abort");
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * healWindowSize — best-effort heal of a stuck `window-size manual` pin,
+ * called before an `open-tmux` attach and on boot reattach (docs/plans/
+ * fix-minimized-agent-tmux-attach.md §3 I1). Real tmux isn't used here — a
+ * small fake `tmux` (sh script) logs every invocation's argv and answers
+ * `has-session` with a scripted verdict, mirroring the `fakeTmux` helper in
+ * reconcile.test.ts and the `fakeRoutingTmuxBin` helper in
+ * claude-turn-routing.test.ts.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Write an executable fake `tmux` that appends every invocation's argv
+ *  (space-joined, one line per call) to `logPath`, and answers `has-session`
+ *  with `hasSessionExitCode` (0 = "exists", 1 = "doesn't") — anything else
+ *  exits 0. Returns the bin path; caller points AGETOR_TMUX_BIN at it. */
+function fakeHealTmuxBin(hasSessionExitCode: number, logPath: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-faketmux-"));
+  const bin = path.join(dir, "tmux");
+  writeFileSync(
+    bin,
+    "#!/bin/sh\n" +
+      `printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}\n` +
+      'case "$*" in\n' +
+      `  *has-session*) exit ${hasSessionExitCode} ;;\n` +
+      "  *) exit 0 ;;\n" +
+      "esac\n",
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+/** Swap AGETOR_TMUX_BIN (module-pinned to /bin/echo at the top of this file,
+ *  which would make `has-session` always "succeed" and defeat the
+ *  missing-session case) for the duration of `fn`, restoring afterward. */
+async function withFakeTmuxBin<T>(bin: string, fn: () => T | Promise<T>): Promise<T> {
+  const prev = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = bin;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prev;
+  }
+}
+
+test("healWindowSize issues no tmux call at all when a pane-grow is in flight for the session", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  // Even a "session exists" verdict must never be reached — the in-flight
+  // check short-circuits before healWindowSize ever calls sessionExists.
+  const bin = fakeHealTmuxBin(0, logPath);
+  const state = __forTest.installSession("heal-inflight", "/tmp/never-read.jsonl");
+  state.paneGrowInFlight = true;
+  try {
+    await withFakeTmuxBin(bin, async () => {
+      await healWindowSize("heal-inflight");
+    });
+    const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+    expect(log).toBe("");
+  } finally {
+    __forTest.uninstallSession("heal-inflight");
+  }
+});
+
+test("healWindowSize probes has-session but issues no set-window-option when the session doesn't exist", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  const bin = fakeHealTmuxBin(1, logPath); // has-session always "fails"
+  await withFakeTmuxBin(bin, async () => {
+    // No installed SessionState for this taskId at all — mirrors the boot
+    // path where a session outlived the process with no state rebuilt yet.
+    await healWindowSize("heal-missing-task-id");
+  });
+  const log = readFileSync(logPath, "utf8");
+  expect(log).toContain("has-session");
+  expect(log).not.toContain("set-window-option");
+});
+
+test("healWindowSize resets window-size to latest with a single call when the session exists and no grow is in flight", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  const bin = fakeHealTmuxBin(0, logPath); // has-session always "succeeds"
+  await withFakeTmuxBin(bin, async () => {
+    await healWindowSize("heal-live-task-id");
+  });
+  const lines = readFileSync(logPath, "utf8").trim().split("\n");
+  expect(lines.length).toBe(2);
+  expect(lines[0]).toContain("has-session");
+  expect(lines[1]).toContain("set-window-option");
+  expect(lines[1]).toContain("window-size");
+  expect(lines[1]).toContain("latest");
+});

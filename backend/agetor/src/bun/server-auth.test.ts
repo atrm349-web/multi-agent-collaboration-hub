@@ -1,0 +1,352 @@
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-server-auth-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+// Use a different port so we don't fight any running dev instance.
+process.env.AGETOR_API_PORT = "4399";
+
+let server: { stop: () => void; port: number };
+let token: string;
+let cliToken: string;
+
+beforeAll(async () => {
+  await import("./db.ts");
+  const { startApiServer } = await import("./server.ts");
+  // The tokens come from api-config (api-config deletes AGETOR_API_TOKEN from
+  // process.env after reading it, so the env var can't be re-read here).
+  const { API_TOKEN, CLI_TOKEN } = await import("./api-config.ts");
+  server = startApiServer() as unknown as { stop: () => void; port: number };
+  token = API_TOKEN;
+  cliToken = CLI_TOKEN;
+});
+
+afterAll(() => {
+  server?.stop?.();
+});
+
+const url = (p: string) => `http://127.0.0.1:4399${p}`;
+
+test("/health responds unauthenticated", async () => {
+  const res = await fetch(url("/health"));
+  expect(res.status).toBe(200);
+});
+
+test("a request without a token is rejected with 401", async () => {
+  const res = await fetch(url("/tasks"));
+  expect(res.status).toBe(401);
+});
+
+test("a request with a wrong token is rejected with 401", async () => {
+  const res = await fetch(url("/tasks"), {
+    headers: { authorization: "Bearer not-the-real-token" },
+  });
+  expect(res.status).toBe(401);
+});
+
+test("a request with the correct bearer token succeeds", async () => {
+  const res = await fetch(url("/tasks"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+});
+
+test("a same-length wrong token is rejected, in the header and the query string", async () => {
+  const wrong = token.slice(0, -1) + (token.endsWith("0") ? "1" : "0");
+  expect(wrong).toHaveLength(token.length);
+  const viaHeader = await fetch(url("/tasks"), { headers: { authorization: `Bearer ${wrong}` } });
+  expect(viaHeader.status).toBe(401);
+  const viaQuery = await fetch(url(`/tasks?token=${encodeURIComponent(wrong)}`));
+  expect(viaQuery.status).toBe(401);
+});
+
+test("the token with extra characters, or without the exact Bearer scheme, is rejected", async () => {
+  for (const authorization of [`Bearer ${token}x`, `bearer ${token}`, `Bearer  ${token}`, token]) {
+    const res = await fetch(url("/tasks"), { headers: { authorization } });
+    expect(res.status).toBe(401);
+  }
+  const prefixOnly = await fetch(url(`/tasks?token=${encodeURIComponent(token.slice(0, 8))}`));
+  expect(prefixOnly.status).toBe(401);
+});
+
+test("the master token is never accepted in a query string (D13)", async () => {
+  const res = await fetch(url(`/tasks?token=${encodeURIComponent(token)}`));
+  expect(res.status).toBe(401);
+  // Not even on the SSE GETs that accept the CLI token that way.
+  for (const p of ["/events", "/app/events", "/tasks/any/events"]) {
+    const sse = await fetch(url(`${p}?token=${encodeURIComponent(token)}`));
+    expect(sse.status).toBe(401);
+  }
+});
+
+test("the CLI token is accepted as ?token= on the three legacy SSE GETs only (P6)", async () => {
+  for (const p of ["/events", "/app/events", "/tasks/any/events"]) {
+    const ctrl = new AbortController();
+    const res = await fetch(url(`${p}?token=${encodeURIComponent(cliToken)}`), { signal: ctrl.signal });
+    // /tasks/any/events 404s for an unknown task: what matters is it got past auth.
+    expect(res.status).not.toBe(401);
+    expect(res.status).not.toBe(403);
+    ctrl.abort();
+  }
+});
+
+test("the CLI token is refused as ?token= on a non-legacy route", async () => {
+  const res = await fetch(url(`/tasks?token=${encodeURIComponent(cliToken)}`));
+  expect(res.status).toBe(401);
+});
+
+test("the CLI token works as a bearer header on an app+cli route", async () => {
+  const res = await fetch(url("/tasks"), { headers: { authorization: `Bearer ${cliToken}` } });
+  expect(res.status).toBe(200);
+});
+
+test("/agent-discovery requires a known agent kind", async () => {
+  const res = await fetch(url("/agent-discovery?agent=nope"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(400);
+});
+
+test("POST /harnesses/:id/open-terminal requires auth", async () => {
+  const res = await fetch(url("/harnesses/claude-code/open-terminal"), {
+    method: "POST",
+  });
+  expect(res.status).toBe(401);
+});
+
+test("POST /harnesses/:id/open-terminal 404s for an unknown harness", async () => {
+  const res = await fetch(url("/harnesses/nope-not-a-harness/open-terminal"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(404);
+});
+
+test("POST /harnesses rejects an invalid env var name", async () => {
+  const res = await fetch(url("/harnesses"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "claude-badenv",
+      kind: "claude-code",
+      label: "Bad Env",
+      env: { "X; rm -rf ~": "1" },
+    }),
+  });
+  expect(res.status).toBe(400);
+});
+
+test("/ask-questions/:id/answer rejects unauthenticated POSTs", async () => {
+  const res = await fetch(url("/ask-questions/any/answer"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers: [{ selected: ["A"] }] }),
+  });
+  expect(res.status).toBe(401);
+});
+
+test("/agent-discovery returns commands + extensions for a known agent", async () => {
+  const res = await fetch(url("/agent-discovery?agent=claude-code"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(Array.isArray(body.commands)).toBe(true);
+  expect(Array.isArray(body.extensions)).toBe(true);
+});
+
+test("PATCH ignores server-managed fields and only writes the allow-listed ones", async () => {
+  // Seed a task we can poke at.
+  const created = await fetch(url("/tasks"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "t",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+    }),
+  });
+  expect(created.status).toBe(200);
+  const task = await created.json();
+
+  // Try to set fields that should NOT be patchable, plus a couple that should.
+  const patched = await fetch(url(`/tasks/${task.id}`), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "renamed",
+      column: "review",
+      branch: "/etc/passwd",
+      worktreePath: "/etc/passwd",
+      baseRef: "deadbeef",
+      runId: "fake-run",
+      id: "different-id",
+      isolation: "worktree",
+    }),
+  });
+  expect(patched.status).toBe(200);
+  const after = await patched.json();
+  expect(after.id).toBe(task.id);                 // id can't be overridden
+  expect(after.title).toBe("renamed");            // allowed
+  expect(after.column).toBe("review");            // allowed
+  expect(after.branch).toBeNull();                // not in allow-list, stayed null
+  expect(after.worktreePath).toBeNull();          // not in allow-list
+  expect(after.baseRef).toBeNull();               // not in allow-list
+  expect(after.runId).toBeNull();                 // not in allow-list
+  expect(after.isolation).toBe("none");           // not in allow-list, stayed
+});
+
+test("PATCH /harnesses/:id accepts `enabled` on a built-in (carve-out from immutability)", async () => {
+  // Sanity: claude-code starts enabled.
+  const before = await fetch(url("/harnesses/claude-code"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(before.status).toBe(200);
+  expect((await before.json()).enabled).toBe(true);
+
+  const patched = await fetch(url("/harnesses/claude-code"), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: false }),
+  });
+  expect(patched.status).toBe(200);
+  expect((await patched.json()).enabled).toBe(false);
+
+  // Re-enable so the surrounding tests (which use claude-code as the agent)
+  // keep working.
+  const reenable = await fetch(url("/harnesses/claude-code"), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: true }),
+  });
+  expect(reenable.status).toBe(200);
+});
+
+test("PATCH /harnesses/:id rejects mixed enabled+config on built-in without partial-applying", async () => {
+  // Mixed body on a built-in must be a single 400 — and the `enabled` flag
+  // must NOT have been mutated as a side effect.
+  const res = await fetch(url("/harnesses/claude-code"), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: false, label: "Renamed" }),
+  });
+  expect(res.status).toBe(400);
+
+  const after = await fetch(url("/harnesses/claude-code"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(after.status).toBe(200);
+  const harness = await after.json();
+  expect(harness.enabled).toBe(true);
+  expect(harness.label).toBe("Claude Code");
+});
+
+test("GET /harnesses/:id/usage reports running task ids and total count", async () => {
+  // Seed two tasks pointing at claude-code so the usage probe has something
+  // to count. They live in `backlog` (not running), so `runningTaskIds`
+  // should stay empty even with `totalTaskCount > 0`.
+  for (let i = 0; i < 2; i++) {
+    const created = await fetch(url("/tasks"), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        title: `usage-probe-${i}`,
+        prompt: "p",
+        agent: "claude-code",
+        workdir: process.cwd(),
+        isolation: "none",
+      }),
+    });
+    expect(created.status).toBe(200);
+  }
+
+  const res = await fetch(url("/harnesses/claude-code/usage"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.harnessId).toBe("claude-code");
+  expect(body.totalTaskCount).toBeGreaterThanOrEqual(2);
+  expect(Array.isArray(body.runningTaskIds)).toBe(true);
+});
+
+test("PATCH /tasks/:id rejects an unknown harness id with 400", async () => {
+  // Create a task we can patch.
+  const created = await fetch(url("/tasks"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "t",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+    }),
+  });
+  expect(created.status).toBe(200);
+  const task = await created.json();
+
+  // Bogus harness id → 400, no mutation. The kanban relies on this so a
+  // typo can't strand a task with an unresolvable agent value.
+  const bad = await fetch(url(`/tasks/${task.id}`), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ agent: "does-not-exist" }),
+  });
+  expect(bad.status).toBe(400);
+  const body = await bad.json();
+  expect(body.error).toContain("unknown harness");
+
+  // Built-in id still works (the same PATCH that was failing before).
+  const ok = await fetch(url(`/tasks/${task.id}`), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ agent: "codex" }),
+  });
+  expect(ok.status).toBe(200);
+  const after = await ok.json();
+  expect(after.agent).toBe("codex");
+});
+
+// Codex is now an opt-in harness: creating a codex alias and re-enabling the
+// built-in codex row both succeed (the old "coming soon" lock is gone).
+
+test("POST /harnesses with kind=codex is accepted", async () => {
+  const res = await fetch(url("/harnesses"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "codex-new",
+      kind: "codex",
+      label: "Codex (new)",
+    }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.kind).toBe("codex");
+  expect(body.id).toBe("codex-new");
+});
+
+test("PATCH /harnesses/codex enabled toggles both directions", async () => {
+  // Re-enabling the built-in codex row now succeeds (it ships disabled via
+  // migration 016, so the user opts in here).
+  const on = await fetch(url("/harnesses/codex"), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: true }),
+  });
+  expect(on.status).toBe(200);
+  expect((await on.json()).enabled).toBe(true);
+
+  const off = await fetch(url("/harnesses/codex"), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: false }),
+  });
+  expect(off.status).toBe(200);
+  expect((await off.json()).enabled).toBe(false);
+});

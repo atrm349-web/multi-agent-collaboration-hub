@@ -1,0 +1,10 @@
+# Scope `bun test` discovery to src/ — e2e/*.spec.ts are Playwright specs
+# (playwright.config.ts testDir "e2e", run via `bunx playwright test`) and
+# crash under bun's runner: test.describe.configure() only works inside the
+# Playwright harness. Every bun-runner test lives under src/.
+[test]
+root = "src"
+# Relative to the repo root (where bunfig.toml lives), not to `root`. Keeps unit
+# tests from running the real `opencode` binary (it writes into $HOME on every
+# call) — see src/test-preload.ts.
+preload = ["./src/test-preload.ts"]

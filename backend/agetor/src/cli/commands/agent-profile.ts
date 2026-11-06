@@ -1,0 +1,364 @@
+import { readFileSync } from "node:fs";
+import { getClient, type Flags } from "../context.ts";
+import { c, out, printJson, table } from "../output.ts";
+import { flagValue } from "../args.ts";
+import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag, usageError } from "../usage.ts";
+import { cmdExportOne, cmdImportAs, printableLines } from "./bundle.ts";
+import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { effectiveOpencodeServer, opencodeMajor } from "../../shared/opencode.ts";
+import {
+  AGENT_OPTIONS,
+  type AgentKind,
+  type AgentProfile,
+  type Harness,
+  type HarnessStatus,
+  type OpencodeServerMode,
+  type Speed,
+} from "../../shared/types.ts";
+
+export async function cmdAgentProfile(args: string[], flags: Flags): Promise<void> {
+  const sub = args[0] ?? "ls";
+  // The agetor bundle (docs/plans/agents-pipelines-import-export.md). Handled
+  // before `getClient`, which may start a daemon: an `--out` that would be
+  // overwritten, or an unreadable/invalid import file, fails first — the
+  // same order as top-level `agetor export`/`agetor import`.
+  if (sub === "export") return cmdExportOne("profile", args.slice(1), flags);
+  if (sub === "import") return cmdImportAs("profile", args.slice(1), flags);
+  const client = await getClient(flags);
+  switch (sub) {
+    case "ls":
+    case "list": {
+      const profiles = await client.listAgentProfiles();
+      if (flags.json) return printJson(profiles);
+      if (profiles.length === 0) {
+        out(c.dim("no profiles defined — create one: agetor profile add <name> --harness <id> --model <id>"));
+        return;
+      }
+      const rows = profiles.map((pr) => formatAgentProfileListRow(pr));
+      out(table(["name", "harness", "model", "effort", "mode", "skills", "tasks", "instructions"], rows));
+      return;
+    }
+    case "show": {
+      const ref = args[1];
+      if (!ref) throw usageError("profile");
+      const profile = await resolveProfile(client, ref);
+      if (flags.json) return printJson(profile);
+      // The harness row + status decide whether the OpenCode server line
+      // applies and what it actually runs as; a failed lookup falls back to
+      // the built-in-id heuristic and prints the stored value alone.
+      const harnessInfo = await client.listHarnesses().catch(() => null);
+      for (const line of formatAgentProfileShow(profile, profileHarnessContext(profile.harness, harnessInfo))) out(line);
+      return;
+    }
+    case "add": {
+      const name = args[1];
+      if (!name || name.startsWith("-")) throw usageError("profile add");
+      const f = parseAgentProfileFlags(args.slice(2));
+      if (!f.harness || !f.model) throw usageError("profile add");
+      const instructions = await resolveInstructions(f);
+      const input: AgentProfileInput = {
+        name,
+        harness: f.harness,
+        model: f.model,
+        effort: f.effort ?? null,
+        mode: f.mode ?? null,
+        speed: f.speed ?? "off",
+        maxMode: f.maxMode ?? false,
+        ...(f.opencodeServer !== undefined ? { opencodeServer: f.opencodeServer } : {}),
+        instructions: instructions ?? "",
+        skills: normalizeSkillList(f.skills),
+      };
+      const created = await client.createAgentProfile(input);
+      if (flags.json) return printJson(created);
+      out(`${c.green("✓")} created profile ${c.bold(safe(created.name))} (${c.dim(created.id)})`);
+      return;
+    }
+    case "edit": {
+      const ref = args[1];
+      if (!ref) throw usageError("profile edit");
+      const f = parseAgentProfileFlags(args.slice(2));
+      const hasAnyFlag =
+        f.name !== undefined ||
+        f.harness !== undefined ||
+        f.model !== undefined ||
+        f.effort !== undefined ||
+        f.mode !== undefined ||
+        f.speed !== undefined ||
+        f.maxMode !== undefined ||
+        f.opencodeServer !== undefined ||
+        f.instructions !== undefined ||
+        f.instructionsFile !== undefined ||
+        f.skills.length > 0 ||
+        f.clearSkills;
+      if (!hasAnyFlag) {
+        throw new Error(
+          "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--opencode-server/--instructions/--instructions-file/--skill/--clear-skills",
+        );
+      }
+      const profile = await resolveProfile(client, ref);
+      const instructions = await resolveInstructions(f);
+      const patch: Partial<AgentProfileInput> = {};
+      if (f.name !== undefined) patch.name = f.name;
+      if (f.harness !== undefined) patch.harness = f.harness;
+      if (f.model !== undefined) patch.model = f.model;
+      if (f.effort !== undefined) patch.effort = f.effort;
+      if (f.mode !== undefined) patch.mode = f.mode;
+      if (f.speed !== undefined) patch.speed = f.speed;
+      if (f.maxMode !== undefined) patch.maxMode = f.maxMode;
+      if (f.opencodeServer !== undefined) patch.opencodeServer = f.opencodeServer;
+      if (instructions !== undefined) patch.instructions = instructions;
+      if (f.clearSkills) {
+        patch.skills = normalizeSkillList(f.skills);
+      } else if (f.skills.length > 0) {
+        patch.skills = normalizeSkillList([...profile.skills, ...f.skills]);
+      }
+      const updated = await client.patchAgentProfile(profile.id, patch);
+      if (flags.json) return printJson(updated);
+      out(`${c.green("✓")} updated profile ${c.bold(safe(updated.name))} (${c.dim(updated.id)})`);
+      return;
+    }
+    case "duplicate": {
+      const ref = args[1];
+      if (!ref) throw usageError("profile duplicate");
+      let name: string | undefined;
+      let withTasks = false;
+      const rest = args.slice(2);
+      for (let i = 0; i < rest.length; i++) {
+        const a = rest[i]!;
+        if (a === "--name") name = flagValue(rest, ++i, a);
+        else if (a === "--with-tasks") withTasks = true;
+        else if (a.startsWith("-")) {
+          throw new Error(
+            `profile duplicate does not accept '${safe(a)}' — duplicate first, then change the copy with 'agetor profile edit'`,
+          );
+        } else throw usageError("profile duplicate");
+      }
+      const profile = await resolveProfile(client, ref);
+      const result = await client.duplicateAgentProfile(profile.id, {
+        ...(name !== undefined ? { name } : {}),
+        ...(withTasks ? { copyTasks: true } : {}),
+      });
+      if (flags.json) return printJson(result);
+      out(`${c.green("✓")} duplicated profile ${c.bold(safe(result.profile.name))} (${c.dim(result.profile.id)})`);
+      if (withTasks) out(`copied ${taskCountText(result.copiedTasks.length)}`);
+      for (const err of result.taskCopyErrors) {
+        out(c.yellow(`could not copy task ${escapeFreeText(err.sourceTaskId.slice(0, 8))}: ${escapeFreeText(err.error)}`));
+      }
+      return;
+    }
+    case "rm":
+    case "delete": {
+      const ref = args[1];
+      if (!ref) throw usageError("profile");
+      const profile = await resolveProfile(client, ref);
+      await client.deleteAgentProfile(profile.id);
+      if (flags.json) return printJson({ removed: profile.id });
+      out(`${c.red("✗")} removed profile ${c.bold(safe(profile.name))} — existing tasks keep their snapshot`);
+      return;
+    }
+    default:
+      throw new Error(`unknown profile subcommand: ${sub} (use ls | show | add | edit | duplicate | rm | export | import)`);
+  }
+}
+
+async function resolveProfile(client: AgetorClient, ref: string): Promise<AgentProfile> {
+  const profiles = await client.listAgentProfiles();
+  const result = matchAgentProfileRef(profiles, ref);
+  if ("error" in result) throw new Error(asProfileError(result.error));
+  return result.profile;
+}
+
+/** Dedupe (case-sensitive, first-occurrence order) a list of raw skill
+ *  tokens through {@link normalizeSkillName}, dropping any that normalize to
+ *  `""` (invalid / over the length cap). Server-side validation still owns
+ *  the count cap (`AGENT_PROFILE_LIMITS.skills`) and the final say on each
+ *  entry — this just keeps the CLI from sending obviously-wrong tokens
+ *  (`/foo` verbatim, duplicate whitespace) that the webview would never
+ *  produce either. */
+function normalizeSkillList(raw: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const r of raw) {
+    const name = normalizeSkillName(r);
+    if (name && !seen.has(name)) {
+      seen.add(name);
+      normalized.push(name);
+    }
+  }
+  return normalized;
+}
+
+function label(s: string): string {
+  return c.dim(s + ":");
+}
+
+/** Profile text escaped for the terminal: an imported or hand-written
+ *  value can hold an ESC, a C1 control or a bidi override, which would
+ *  otherwise drive the terminal or hide what the text says. */
+const safe = (s: string): string => escapeControlChars(s);
+
+/** `"N task"` / `"N tasks"` — the singular/plural form both `profile ls`'s
+ *  `tasks` column and `profile show`'s `used by:` line render. `taskCount` is
+ *  server-derived (`docs/plans/agent-profiles.md`'s "used by N tasks"
+ *  counter) and may be `undefined` on a payload from an older server; the
+ *  call sites default it to `0` before calling this, so this itself just
+ *  pluralizes a plain number. */
+export function taskCountText(n: number): string {
+  return `${n} task${n === 1 ? "" : "s"}`;
+}
+
+/** Pure row formatter for `agetor profile ls`'s table — one exported function
+ *  so the `tasks` column (placed after `skills`, ahead of `instructions`)
+ *  is unit-testable without a client/daemon. */
+export function formatAgentProfileListRow(pr: AgentProfile): string[] {
+  return [
+    c.bold(safe(pr.name)),
+    c.gray(safe(pr.harness)),
+    safe(pr.model),
+    safe(pr.effort ?? "-"),
+    safe(pr.mode ?? "-"),
+    String(pr.skills.length),
+    String(pr.taskCount ?? 0),
+    // Free text: whitespace folded to one line, cut without splitting a
+    // surrogate pair, then escaped with the multi-line rule so a Persian or
+    // Hindi ZWNJ/ZWJ prints as text rather than `\u200c`.
+    c.dim(escapeFreeText(truncateText(pr.instructions.replace(/\s+/g, " ").trim(), 60))),
+  ];
+}
+
+/** What `profile show` knows about the profile's harness: its kind (for
+ *  the opencode-only line) and, when the harness row was found, its home and
+ *  probed version (for what the stored server option actually runs as). */
+export interface ProfileHarnessContext {
+  kind: AgentKind | null;
+  home?: string | null;
+  version?: string | null;
+}
+
+/** Resolve {@link ProfileHarnessContext} from a `listHarnesses()` answer
+ *  (or `null` when that call failed): the harness row's kind, else the
+ *  harness id itself when it names a built-in kind, else unknown. */
+export function profileHarnessContext(
+  harnessId: string,
+  info: { harnesses: Harness[]; statuses?: HarnessStatus[] } | null,
+): ProfileHarnessContext {
+  const harness = info?.harnesses.find((h) => h.id === harnessId);
+  if (harness) {
+    return {
+      kind: harness.kind,
+      home: harness.home ?? null,
+      version: info?.statuses?.find((s) => s.harnessId === harnessId)?.version ?? null,
+    };
+  }
+  return { kind: harnessId in AGENT_OPTIONS ? (harnessId as AgentKind) : null };
+}
+
+/** The `opencode server:` value for an opencode task or profile: the stored
+ *  mode, plus a note when the harness makes it run otherwise — standalone for
+ *  a harness with its own home, unused on OpenCode 1. Shared with
+ *  `agetor show`. */
+export function opencodeServerText(
+  stored: OpencodeServerMode,
+  ctx: { home?: string | null; version?: string | null },
+): string {
+  if (ctx.version !== undefined && ctx.version !== null && opencodeMajor(ctx.version) === 1) {
+    return `${stored} ${c.dim("(not used by OpenCode 1)")}`;
+  }
+  const effective = effectiveOpencodeServer({ mode: stored, harnessHome: ctx.home ?? null, major: 2 });
+  if (effective !== stored) return `${stored} ${c.dim("(runs standalone: the harness has its own home)")}`;
+  return stored;
+}
+
+/** Pure line formatter for `agetor profile show` — exported so the printed
+ *  fields (the `speed:` tier among them) are unit-testable without a
+ *  client/daemon, like {@link formatAgentProfileListRow}. `harness` adds the
+ *  `opencode server:` line for an OpenCode profile. */
+export function formatAgentProfileShow(profile: AgentProfile, harness?: ProfileHarnessContext): string[] {
+  const lines = [
+    `${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`,
+    `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
+      `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
+    `  ${label("speed")} ${safe(profile.speed)}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`,
+    ...(harness?.kind === "opencode"
+      ? [`  ${label("opencode server")} ${opencodeServerText(profile.opencodeServer ?? "shared", harness)}`]
+      : []),
+    `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,
+    `  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`,
+    `  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`,
+  ];
+  if (profile.instructions) {
+    for (const line of printableLines(profile.instructions.replace(/\s+$/, ""))) lines.push(`    ${line}`);
+  }
+  return lines;
+}
+
+/** Canonicalize instructions text read from any `--instructions-file`
+ *  delivery channel (a real path or the `-` stdin marker) so the stored
+ *  value doesn't depend on which one was used — a pure, exported helper so
+ *  it's unit-testable without touching the filesystem/stdin. */
+export function canonicalInstructions(text: string): string {
+  return text.trim();
+}
+
+/** Read `--instructions-file` (a real path, or `-` for stdin) when given,
+ *  else pass `--instructions` through verbatim, else `undefined` (caller
+ *  decides the "unset" behavior — `""` on create, "don't touch" on edit). */
+async function resolveInstructions(f: AgentProfileFlags): Promise<string | undefined> {
+  if (f.instructionsFile !== undefined) {
+    const raw =
+      f.instructionsFile === "-" ? await Bun.stdin.text() : readFileSync(f.instructionsFile, "utf8");
+    return canonicalInstructions(raw);
+  }
+  return f.instructions;
+}
+
+export interface AgentProfileFlags {
+  name?: string;
+  harness?: string;
+  model?: string;
+  effort?: string;
+  mode?: string;
+  /** `--speed <tier>`, or `--fast` (`fast`) / `--no-fast` (`off`) — the
+   *  later of several speed flags wins. */
+  speed?: Speed;
+  maxMode?: boolean;
+  /** `--opencode-server shared|standalone` (OpenCode 2's server option). */
+  opencodeServer?: OpencodeServerMode;
+  instructions?: string;
+  instructionsFile?: string;
+  skills: string[];
+  clearSkills?: boolean;
+}
+
+/** Pure flag parser for `agetor profile add|edit` — no I/O (the
+ *  `--instructions-file`/stdin read happens in `resolveInstructions`, kept
+ *  out of here so this stays unit-testable without touching the filesystem,
+ *  mirroring `parseHarnessFlags`). */
+export function parseAgentProfileFlags(args: string[]): AgentProfileFlags {
+  const f: AgentProfileFlags = { skills: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
+    switch (a) {
+      case "--name": f.name = val(); break;
+      case "--harness": f.harness = val(); break;
+      case "--model": f.model = val(); break;
+      case "--effort": f.effort = val(); break;
+      case "--mode": f.mode = val(); break;
+      case "--speed": f.speed = parseSpeedFlag(val()); break;
+      case "--fast": f.speed = "fast"; break;
+      case "--no-fast": f.speed = "off"; break;
+      case "--max-mode": f.maxMode = true; break;
+      case "--no-max-mode": f.maxMode = false; break;
+      case "--opencode-server": f.opencodeServer = parseOpencodeServerFlag(val()); break;
+      case "--instructions": f.instructions = val(); break;
+      case "--instructions-file": f.instructionsFile = val(true); break;
+      case "--skill": f.skills.push(val()); break;
+      case "--clear-skills": f.clearSkills = true; break;
+      default: break;
+    }
+  }
+  return f;
+}

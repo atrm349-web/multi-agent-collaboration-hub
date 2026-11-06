@@ -1,0 +1,2121 @@
+import { test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
+import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
+import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
+import retireGemini3ProPreview from "./migrations/049_retire_gemini_3_pro_preview.sql" with { type: "text" };
+import normalizeCursorGrok47 from "./migrations/055_normalize_cursor_grok_4_7.sql" with { type: "text" };
+import normalizeCursorOpus55 from "./migrations/056_normalize_cursor_opus_5_5.sql" with { type: "text" };
+import normalizeCursorSonnet55 from "./migrations/060_normalize_cursor_sonnet_5_5.sql" with { type: "text" };
+import normalizeCursorHaiku55 from "./migrations/062_normalize_cursor_haiku_5_5.sql" with { type: "text" };
+import normalizeCursorGemini4Argon from "./migrations/064_normalize_cursor_gemini_4_argon.sql" with { type: "text" };
+import antigravityEffortInModelId from "./migrations/065_antigravity_effort_in_model_id.sql" with { type: "text" };
+import retireGemini37And35Flash from "./migrations/066_retire_gemini_3_7_and_3_5_flash.sql" with { type: "text" };
+import retentionSweptTasks from "./migrations/067_retention_swept_tasks.sql" with { type: "text" };
+import claudeSessionSeen from "./migrations/071_claude_session_seen.sql" with { type: "text" };
+import taskSpeed from "./migrations/072_task_speed.sql" with { type: "text" };
+import harnessProfileMcpServers from "./migrations/073_harness_profile_mcp_servers.sql" with { type: "text" };
+import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: "text" };
+import retireCodexGpt55 from "./migrations/075_retire_codex_gpt_5_5.sql" with { type: "text" };
+import normalizeCursorNewFamilies from "./migrations/076_normalize_cursor_new_families.sql" with { type: "text" };
+import copilotHarness from "./migrations/077_copilot_harness.sql" with { type: "text" };
+import opencodeHarness from "./migrations/078_opencode_harness.sql" with { type: "text" };
+import opencodeTaskFields from "./migrations/079_opencode_task_fields.sql" with { type: "text" };
+import harnessAutoEnabled from "./migrations/080_harness_auto_enabled.sql" with { type: "text" };
+import { migrations } from "./migrations/index.ts";
+import { cursorModelArg } from "../shared/types.ts";
+
+// Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
+const HARNESSES_DDL = `
+  CREATE TABLE harnesses (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('claude-code', 'codex')),
+    label TEXT NOT NULL,
+    is_builtin INTEGER NOT NULL DEFAULT 0,
+    home TEXT, bin TEXT, env_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+  );`;
+
+test("applies pending migrations in order, skips already-applied ones", () => {
+  const db = new Database(":memory:");
+  const m: Migration[] = [
+    { id: "001_init", sql: "CREATE TABLE foo (id INTEGER);" },
+    { id: "002_add",  sql: "CREATE TABLE bar (id INTEGER);" },
+  ];
+
+  expect(migrate(db, m)).toEqual(["001_init", "002_add"]);
+  expect(migrate(db, m)).toEqual([]); // idempotent
+
+  const extra: Migration = { id: "003_extra", sql: "CREATE TABLE baz (id INTEGER);" };
+  expect(migrate(db, [...m, extra])).toEqual(["003_extra"]);
+
+  const tables = db.query<{ name: string }, []>(
+    `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`,
+  ).all().map((r) => r.name);
+  expect(tables).toEqual(["_migrations", "bar", "baz", "foo"]);
+});
+
+test("skips a renamed migration when a legacy alias is already applied", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, cursor_session_id TEXT);
+    CREATE TABLE _migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+    INSERT INTO _migrations (id, applied_at) VALUES ('025_cursor_session_id', 1);
+  `);
+
+  const renamed: Migration = {
+    id: "033_cursor_session_id",
+    aliases: ["025_cursor_session_id"],
+    sql: "ALTER TABLE runs ADD COLUMN cursor_session_id TEXT;",
+  };
+
+  expect(migrate(db, [renamed])).toEqual([]);
+  expect(migrate(db, [renamed])).toEqual([]);
+
+  const applied = db
+    .query<{ id: string }, []>(`SELECT id FROM _migrations ORDER BY id`)
+    .all()
+    .map((r) => r.id);
+  expect(applied).toEqual(["025_cursor_session_id", "033_cursor_session_id"]);
+});
+
+test("rolls back a failing migration so it can be retried", () => {
+  const db = new Database(":memory:");
+  const bad: Migration = {
+    id: "001_bad",
+    sql: "CREATE TABLE ok (id INTEGER); INSERT INTO missing VALUES (1);",
+  };
+  expect(() => migrate(db, [bad])).toThrow();
+
+  const applied = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all();
+  expect(applied).toEqual([]);
+
+  const hasOk = db.query<{ name: string }, []>(
+    `SELECT name FROM sqlite_master WHERE name='ok'`,
+  ).all();
+  expect(hasOk).toEqual([]);
+});
+
+test("a CHECK-constraint failure mid-migration rolls back statements that ran before AND after it", () => {
+  // Regression: `Database.exec()`/`.run()` given a multi-statement string
+  // does NOT stop at a failing statement the way the "rolls back a failing
+  // migration" test above might suggest — that test's failure ("no such
+  // table") is a different SQLite error class than a CHECK-constraint
+  // violation, and only the former aborts the batch. Verified directly
+  // against bun:sqlite: a 3-statement string where statement 2 violates a
+  // CHECK constraint throws no error at all, and statement 3 (which would
+  // succeed on its own) still runs. For the table-rebuild recipe several
+  // migrations use (CREATE new / INSERT...SELECT / DROP old / RENAME), that
+  // silently no-ops the row copy on a CHECK violation while the DROP and
+  // RENAME after it still execute — permanently replacing the old table
+  // with an empty one, with no thrown error to catch. This is why
+  // `migrate()` runs each statement through its own `db.run()` call
+  // (`splitSqlStatements`) instead of one `db.exec()` per file.
+  const db = new Database(":memory:");
+  const bad: Migration = {
+    id: "001_bad_check",
+    sql: `
+      CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL CHECK (v IN ('a', 'b')));
+      INSERT INTO t (id, v) VALUES (1, 'z');
+      INSERT INTO t (id, v) VALUES (2, 'b');
+    `,
+  };
+  expect(() => migrate(db, [bad])).toThrow(/CHECK constraint failed/);
+
+  // Whole migration rolled back — not just the table create, but also the
+  // second INSERT that would have succeeded on its own.
+  const tables = db.query<{ name: string }, []>(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='t'`,
+  ).all();
+  expect(tables).toEqual([]);
+  const applied = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all();
+  expect(applied).toEqual([]);
+});
+
+test("splitSqlStatements respects semicolons inside string literals and comments", () => {
+  const sql = `
+    -- a comment; with a semicolon
+    INSERT INTO t (v) VALUES ('has; a semicolon'' and '' quotes');
+    /* block; comment */
+    INSERT INTO t (v) VALUES ('second');
+  `;
+  const statements = splitSqlStatements(sql);
+  expect(statements).toHaveLength(2);
+  expect(statements[0]).toContain("has; a semicolon");
+  expect(statements[1]).toContain("second");
+});
+
+test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and preserves enabled", () => {
+  const db = new Database(":memory:");
+  db.exec(HARNESSES_DDL);
+
+  // Simulate the damaged prod state: builtins wiped out by a bad table rebuild.
+  expect(db.query(`SELECT COUNT(*) n FROM harnesses`).get() as { n: number }).toEqual({ n: 0 });
+
+  db.exec(reseedBuiltins);
+  const afterFirst = db
+    .query<{ id: string; kind: string; enabled: number; is_builtin: number }, []>(
+      `SELECT id, kind, enabled, is_builtin FROM harnesses ORDER BY id`,
+    )
+    .all();
+  expect(afterFirst).toEqual([
+    { id: "claude-code", kind: "claude-code", enabled: 1, is_builtin: 1 },
+    { id: "codex", kind: "codex", enabled: 0, is_builtin: 1 },
+  ]);
+
+  // Idempotent: re-running does not duplicate or overwrite. Flip claude-code
+  // off first to prove OR IGNORE leaves an existing row's enabled untouched.
+  db.run(`UPDATE harnesses SET enabled = 0 WHERE id = 'claude-code'`);
+  db.exec(reseedBuiltins);
+  const afterSecond = db
+    .query<{ id: string; enabled: number }, []>(`SELECT id, enabled FROM harnesses ORDER BY id`)
+    .all();
+  expect(afterSecond).toEqual([
+    { id: "claude-code", enabled: 0 }, // preserved, not reset to 1
+    { id: "codex", enabled: 0 },
+  ]);
+});
+
+test("049_retire_gemini_3_pro_preview rewrites only tasks pinned to the shut-down id (any harness), clears the stale lastModel:gemini preference, normalizes suffixed Cursor Gemini Flash variants to base id + effort, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('gemini', 'gemini'), ('gemini-2', 'gemini'),
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'),
+      ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort) VALUES
+      ('t01', 'gemini', 'gemini-3-pro-preview', NULL),
+      ('t02', 'gemini-2', 'gemini-3-pro-preview', NULL),
+      ('t03', 'gemini', 'gemini-3.7-flash', NULL),
+      ('t04', 'cursor', 'gemini-3.1-pro', 'high'),
+      ('t05', 'fx', 'google/gemini-3.1-pro-preview', NULL),
+      ('t06', 'codex', 'gpt-5.6-sol', 'high'),
+      ('t07', 'gemini', NULL, NULL),
+      ('t08', 'cursor', 'gemini-3.8-flash-high', NULL),
+      ('t09', 'cursor-2', 'gemini-3.7-flash-low', 'high'),
+      ('t10', 'cursor', 'gemini-3.8-flash-medium', 'medium'),
+      ('t11', 'gemini', 'gemini-3.8-flash-medium', NULL),
+      ('t12', 'cursor', 'gemini-3.6-flash', 'minimal');
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3-pro-preview', 1),
+      ('lastModel:codex', 'gpt-5.6-sol', 1),
+      ('lastMode:gemini', 'auto', 1),
+      ('lastModel:cursor', 'gemini-3.1-pro', 1);
+  `);
+
+  const readAll = () =>
+    db
+      .query<{ id: string; agent: string; model: string | null; effort: string | null }, []>(
+        `SELECT id, agent, model, effort FROM tasks ORDER BY id`,
+      )
+      .all();
+
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string }, []>(
+        `SELECT key, value FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual([
+    { id: "t01", agent: "gemini", model: "gemini-3.1-pro-preview", effort: null }, // rewritten
+    { id: "t02", agent: "gemini-2", model: "gemini-3.1-pro-preview", effort: null }, // rewritten — additional-account harness, no join needed
+    { id: "t03", agent: "gemini", model: "gemini-3.7-flash", effort: null }, // untouched
+    { id: "t04", agent: "cursor", model: "gemini-3.1-pro", effort: "high" }, // untouched — different literal
+    { id: "t05", agent: "fx", model: "google/gemini-3.1-pro-preview", effort: null }, // untouched — different literal
+    { id: "t06", agent: "codex", model: "gpt-5.6-sol", effort: "high" }, // untouched — unrelated kind
+    { id: "t07", agent: "gemini", model: null, effort: null }, // untouched — still NULL
+    { id: "t08", agent: "cursor", model: "gemini-3.8-flash", effort: "high" }, // variant → base + effort
+    { id: "t09", agent: "cursor-2", model: "gemini-3.7-flash", effort: "low" }, // variant wins over a stale effort; additional cursor harness via the kind join
+    { id: "t10", agent: "cursor", model: "gemini-3.8-flash", effort: "medium" }, // variant → base, effort already matched
+    { id: "t11", agent: "gemini", model: "gemini-3.8-flash-medium", effort: null }, // untouched — not a cursor-kind harness
+    { id: "t12", agent: "cursor", model: "gemini-3.6-flash", effort: "minimal" }, // untouched — already base + effort
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:gemini", value: "auto" }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "gpt-5.6-sol" }, // untouched — other kind
+    { key: "lastModel:cursor", value: "gemini-3.1-pro" }, // untouched — other kind
+    // lastModel:gemini (the dead id) is gone
+  ]);
+
+  // Idempotent: re-applying against the already-rewritten rows is a no-op
+  // for both tables.
+  const tasksBeforeSecond = readAll();
+  const prefsBeforeSecond = readPrefs();
+  db.exec(retireGemini3ProPreview);
+  expect(readAll()).toEqual(tasksBeforeSecond);
+  expect(readPrefs()).toEqual(prefsBeforeSecond);
+});
+
+test("049 leaves a lastModel:gemini pref that already points at a live model alone", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3.7-flash', 1);
+  `);
+
+  db.exec(retireGemini3ProPreview);
+
+  const prefs = db
+    .query<{ key: string; value: string }, []>(
+      `SELECT key, value FROM preferences ORDER BY key`,
+    )
+    .all();
+  expect(prefs).toEqual([{ key: "lastModel:gemini", value: "gemini-3.7-flash" }]);
+});
+
+test("054 is registered right after 053 in the migrations index", () => {
+  // Located by id, not by distance from the end — 055 appended after it.
+  const at = migrations.findIndex((m) => m.id === "054_account_usage");
+  expect(at).toBeGreaterThan(0);
+  const last = migrations[at];
+  expect(last?.sql).toContain("CREATE TABLE usage_files");
+  expect(last?.sql).toContain("CREATE TABLE usage_daily");
+  expect(last?.sql).toContain("CREATE TABLE usage_seen");
+  const prev = migrations[at - 1];
+  expect(prev?.id).toBe("053_task_agent_profile");
+  expect(prev?.sql).toContain("ADD COLUMN agent_profile_id TEXT");
+  expect(prev?.sql).toContain("ADD COLUMN agent_profile TEXT");
+});
+
+test("055_normalize_cursor_grok_4_7 folds suffixed grok-4.7 variants into base id + effort + fast on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'grok-4.7-high', NULL, 0),
+      ('t02', 'cursor-2', 'grok-4.7-xhigh-fast', 'low', 0),
+      ('t03', 'cursor', 'grok-4.7-medium', 'medium', 1),
+      ('t04', 'cursor', 'grok-4.7-low-fast', NULL, 1),
+      ('t05', 'cursor', 'grok-4.7', 'high', 1),
+      ('t06', 'cursor', 'cursor-grok-4.6', 'xhigh', 0),
+      ('t07', 'cursor', 'cursor-grok-4.6-high', NULL, 0),
+      ('t08', 'fx', 'spacexai/grok-4.7', NULL, 0),
+      ('t09', 'codex', 'grok-4.7-high', 'high', 0),
+      ('t10', 'cursor', NULL, NULL, 0),
+      ('t11', 'cursor', 'grok-4.7-max', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'grok-4.7-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'grok-4.7-high-fast', 'high', 0),
+      ('p03', 'cursor', 'grok-4.7', 'medium', 0),
+      ('p04', 'codex', 'grok-4.7-low', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'grok-4.7-high-fast', 1),
+      ('lastModel:codex', 'grok-4.7-high', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorGrok47);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "grok-4.7", effort: "high", fast: 0 }, // variant → base + effort
+    { id: "t02", model: "grok-4.7", effort: "xhigh", fast: 1 }, // variant wins over a stale effort; -fast sets fast; additional cursor harness via the kind join
+    { id: "t03", model: "grok-4.7", effort: "medium", fast: 0 }, // stale fast=1 cleared — the verbatim id ran the regular tier
+    { id: "t04", model: "grok-4.7", effort: "low", fast: 1 },
+    { id: "t05", model: "grok-4.7", effort: "high", fast: 1 }, // untouched — already base + effort + fast
+    { id: "t06", model: "cursor-grok-4.6", effort: "xhigh", fast: 0 }, // untouched — other model
+    { id: "t07", model: "cursor-grok-4.6-high", effort: null, fast: 0 }, // untouched — 4.6 variants are out of scope
+    { id: "t08", model: "spacexai/grok-4.7", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t09", model: "grok-4.7-high", effort: "high", fast: 0 }, // untouched — not a cursor-kind harness
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — still NULL
+    { id: "t11", model: "grok-4.7-max", effort: null, fast: 0 }, // untouched — not a real variant id
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "grok-4.7", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "grok-4.7", effort: "high", fast: 1 },
+    { id: "p03", model: "grok-4.7", effort: "medium", fast: 0 }, // untouched
+    { id: "p04", model: "grok-4.7-low", effort: null, fast: 0 }, // untouched — not a cursor-kind harness
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "grok-4.7-high", updated_at: 1 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "grok-4.7", updated_at: 1 }, // variant → base
+  ]);
+
+  // Idempotent: re-applying against the already-normalized rows is a no-op.
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorGrok47);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("056_normalize_cursor_opus_5_5 folds suffixed claude-opus-5-5 variants into base id + effort + fast on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'claude-opus-5-5-high', NULL, 0),
+      ('t02', 'cursor-2', 'claude-opus-5-5-xhigh-fast', 'low', 0),
+      ('t03', 'cursor', 'claude-opus-5-5-medium', 'medium', 1),
+      ('t04', 'cursor', 'claude-opus-5-5-low-fast', NULL, 1),
+      ('t05', 'cursor', 'claude-opus-5-5-max', NULL, 0),
+      ('t06', 'cursor', 'claude-opus-5-5', 'high', 1),
+      ('t07', 'cursor', 'claude-opus-5-thinking-high', NULL, 0),
+      ('t08', 'cursor', 'claude-opus-5', NULL, 0),
+      ('t09', 'fx', 'anthropic/claude-opus-5.5', NULL, 0),
+      ('t10', 'codex', 'claude-opus-5-5-high', 'high', 0),
+      ('t11', 'cursor', NULL, NULL, 0),
+      ('t12', 'cursor', 'claude-opus-5-5-minimal', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'claude-opus-5-5-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'claude-opus-5-5-high-fast', 'high', 0),
+      ('p03', 'cursor', 'claude-opus-5-5', 'medium', 0),
+      ('p04', 'codex', 'claude-opus-5-5-low', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'claude-opus-5-5-high-fast', 1),
+      ('lastModel:codex', 'claude-opus-5-5-high', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorOpus55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "claude-opus-5-5", effort: "high", fast: 0 }, // variant → base + effort
+    { id: "t02", model: "claude-opus-5-5", effort: "xhigh", fast: 1 }, // variant wins over a stale effort; -fast sets fast; additional cursor harness via the kind join
+    { id: "t03", model: "claude-opus-5-5", effort: "medium", fast: 0 }, // stale fast=1 cleared — the verbatim id ran the regular tier
+    { id: "t04", model: "claude-opus-5-5", effort: "low", fast: 1 },
+    { id: "t05", model: "claude-opus-5-5", effort: "max", fast: 0 }, // variant → base + effort (max IS a real Opus 5.5 tier, unlike grok-4.7's)
+    { id: "t06", model: "claude-opus-5-5", effort: "high", fast: 1 }, // untouched — already base + effort + fast
+    { id: "t07", model: "claude-opus-5-thinking-high", effort: null, fast: 0 }, // untouched — Opus 5 variant, no `-5-5-`
+    { id: "t08", model: "claude-opus-5", effort: null, fast: 0 }, // untouched — other model (Opus 5, not 5.5)
+    { id: "t09", model: "anthropic/claude-opus-5.5", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t10", model: "claude-opus-5-5-high", effort: "high", fast: 0 }, // untouched — not a cursor-kind harness
+    { id: "t11", model: null, effort: null, fast: 0 }, // untouched — still NULL
+    { id: "t12", model: "claude-opus-5-5-minimal", effort: null, fast: 0 }, // untouched — not a real variant id
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "claude-opus-5-5", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "claude-opus-5-5", effort: "high", fast: 1 },
+    { id: "p03", model: "claude-opus-5-5", effort: "medium", fast: 0 }, // untouched
+    { id: "p04", model: "claude-opus-5-5-low", effort: null, fast: 0 }, // untouched — not a cursor-kind harness
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "claude-opus-5-5-high", updated_at: 1 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "claude-opus-5-5", updated_at: 1 }, // variant → base
+  ]);
+
+  // Idempotent: re-applying against the already-normalized rows is a no-op.
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorOpus55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("056 (cursor Opus 5.5) sits right after 055, followed by the renumbered pipelines pair 057/058 with their pre-merge ids as aliases", () => {
+  const at = migrations.findIndex((m) => m.id === "056_normalize_cursor_opus_5_5");
+  expect(migrations[at - 1]?.id).toBe("055_normalize_cursor_grok_4_7");
+  expect(migrations[at]?.sql).toContain("claude-opus-5-5");
+  // Pipelines landed on a branch as 056/057 while `main` took 056 above —
+  // renumbered on merge; a dev DB that already applied them under the old
+  // ids must not re-run them, hence the aliases.
+  expect(migrations[at + 1]?.id).toBe("057_pipelines");
+  expect(migrations[at + 1]?.aliases).toEqual(["056_pipelines"]);
+  expect(migrations[at + 2]?.id).toBe("058_task_pipeline");
+  expect(migrations[at + 2]?.aliases).toEqual(["057_task_pipeline"]);
+  // 059 (L-S8): the partial `tasks(pipeline_id)` index the pipeline-parent
+  // lookups were missing — appended after the renumbered pair (060, the
+  // cursor Sonnet 5.5 normalization, follows it — pinned by its own test).
+  expect(migrations[at + 3]?.id).toBe("059_task_pipeline_id_index");
+  expect(migrations[at + 3]?.aliases).toBeUndefined();
+  expect(migrations[at + 3]?.sql).toContain("CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_id ON tasks(pipeline_id) WHERE pipeline_id IS NOT NULL");
+});
+
+test("059 creates the partial tasks(pipeline_id) index, is idempotent, and only indexes non-NULL pipeline_id rows", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  const idx = db
+    .query<{ name: string; sql: string }, []>(
+      `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_tasks_pipeline_id'`,
+    )
+    .get();
+  expect(idx?.sql).toContain("WHERE pipeline_id IS NOT NULL");
+  // Re-running the migration set is a no-op (recorded in `_migrations`), and
+  // the statement itself is `IF NOT EXISTS`, so applying it a second time
+  // by hand doesn't throw either.
+  migrate(db, migrations);
+  db.exec(migrations.find((m) => m.id === "059_task_pipeline_id_index")!.sql);
+  // The query planner actually uses the partial index for the parent lookup
+  // `pipelines.taskCounts()` runs.
+  const plan = db
+    .query<{ detail: string }, []>(
+      `EXPLAIN QUERY PLAN SELECT pipeline_id, COUNT(*) FROM tasks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id`,
+    )
+    .all();
+  expect(plan.some((row) => row.detail.includes("idx_tasks_pipeline_id"))).toBe(true);
+  db.close();
+});
+
+test("060_normalize_cursor_sonnet_5_5 folds suffixed claude-sonnet-5-5 variants into base id + effort (fast reset to 0) on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL
+    );
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+  `);
+
+  db.exec(`
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'claude-sonnet-5-5-high', NULL, 0),
+      ('t02', 'cursor-2', 'claude-sonnet-5-5-xhigh', 'low', 0),
+      ('t03', 'cursor', 'claude-sonnet-5-5-medium', 'medium', 1),
+      ('t04', 'cursor', 'claude-sonnet-5-5-low', NULL, 1),
+      ('t05', 'cursor', 'claude-sonnet-5-5-max', NULL, 0),
+      ('t06', 'cursor', 'claude-sonnet-5-5', 'high', 1),
+      ('t07', 'cursor', 'claude-sonnet-5-max', NULL, 0),
+      ('t08', 'cursor', 'claude-opus-5-5-high', NULL, 0),
+      ('t09', 'fx', 'anthropic/claude-sonnet-5.5', NULL, 0),
+      ('t10', 'codex', 'claude-sonnet-5-5-high', 'high', 0),
+      ('t11', 'cursor', NULL, NULL, 0),
+      ('t12', 'cursor', 'claude-sonnet-5-5-minimal', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'claude-sonnet-5-5-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'claude-sonnet-5-5-high', 'high', 1),
+      ('p03', 'cursor', 'claude-sonnet-5-5', 'medium', 0),
+      ('p04', 'codex', 'claude-sonnet-5-5-low', NULL, 0);
+  `);
+
+  db.exec(`
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'claude-sonnet-5-5-high', 1),
+      ('lastModel:codex', 'claude-sonnet-5-5-high', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorSonnet55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "claude-sonnet-5-5", effort: "high", fast: 0 }, // variant → base + effort
+    { id: "t02", model: "claude-sonnet-5-5", effort: "xhigh", fast: 0 }, // variant wins over a stale effort; additional cursor harness via the kind join
+    { id: "t03", model: "claude-sonnet-5-5", effort: "medium", fast: 0 }, // stale fast=1 cleared — the verbatim id ran the regular tier
+    { id: "t04", model: "claude-sonnet-5-5", effort: "low", fast: 0 }, // stale fast=1 cleared — no -fast forms exist for Sonnet 5.5
+    { id: "t05", model: "claude-sonnet-5-5", effort: "max", fast: 0 }, // variant → base + effort (max IS a real Sonnet 5.5 tier)
+    { id: "t06", model: "claude-sonnet-5-5", effort: "high", fast: 1 }, // untouched — already the base id (not in the variant list)
+    { id: "t07", model: "claude-sonnet-5-max", effort: null, fast: 0 }, // untouched — Sonnet 5 variant, no `-5-5-`
+    { id: "t08", model: "claude-opus-5-5-high", effort: null, fast: 0 }, // untouched — Opus 5.5 variant (056's territory)
+    { id: "t09", model: "anthropic/claude-sonnet-5.5", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t10", model: "claude-sonnet-5-5-high", effort: "high", fast: 0 }, // untouched — not a cursor-kind harness
+    { id: "t11", model: null, effort: null, fast: 0 }, // untouched — still NULL
+    { id: "t12", model: "claude-sonnet-5-5-minimal", effort: null, fast: 0 }, // untouched — not a real variant id
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "claude-sonnet-5-5", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "claude-sonnet-5-5", effort: "high", fast: 0 }, // stale fast=1 cleared
+    { id: "p03", model: "claude-sonnet-5-5", effort: "medium", fast: 0 }, // untouched
+    { id: "p04", model: "claude-sonnet-5-5-low", effort: null, fast: 0 }, // untouched — not a cursor-kind harness
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 }, // untouched — not a lastModel key
+    { key: "lastModel:codex", value: "claude-sonnet-5-5-high", updated_at: 1 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "claude-sonnet-5-5", updated_at: 1 }, // variant → base
+  ]);
+
+  // Idempotent: re-applying against the already-normalized rows is a no-op.
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorSonnet55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("060 (cursor Sonnet 5.5) sits right after 059, with its pre-rebase id as an alias", () => {
+  const at = migrations.findIndex((m) => m.id === "060_normalize_cursor_sonnet_5_5");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("059_task_pipeline_id_index");
+  // 061 still follows 060. 062 (Haiku 5.5) is what moved "last" off 061.
+  expect(migrations[at + 1]?.id).toBe("061_antigravity_harness");
+  // Written on its branch as 057 while `main` took 057–059 for pipelines —
+  // renumbered on rebase; a dev DB that applied it under the old id must not
+  // re-run it, hence the alias (the SQL is idempotent either way).
+  expect(migrations[at]?.aliases).toEqual(["057_normalize_cursor_sonnet_5_5"]);
+  expect(migrations[at]?.sql).toContain("claude-sonnet-5-5");
+});
+
+test("062_normalize_cursor_haiku_5_5 folds claude-haiku-5-5-thinking-* ids into base id + effort (fast reset to 0) on cursor-kind tasks, agent profiles and the lastModel:cursor pref, idempotently", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      fast INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO harnesses (id, kind) VALUES
+      ('cursor', 'cursor'), ('cursor-2', 'cursor'), ('fx', 'fx'), ('codex', 'codex');
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'claude-haiku-5-5-thinking-max', NULL, 0),
+      ('t02', 'cursor-2', 'claude-haiku-5-5-thinking-xhigh', 'low', 0),
+      ('t03', 'cursor', 'claude-haiku-5-5-thinking-high', NULL, 1),
+      ('t04', 'cursor', 'claude-haiku-5-5-thinking-medium', 'high', 0),
+      ('t05', 'cursor', 'claude-haiku-5-5-thinking-low', NULL, 0),
+      ('t06', 'cursor', 'claude-haiku-5-5-low', NULL, 0),
+      ('t07', 'cursor', 'claude-haiku-5-5-thinking-minimal', NULL, 0),
+      ('t08', 'cursor', 'claude-sonnet-5-5-high', NULL, 0),
+      ('t09', 'fx', 'anthropic/claude-haiku-5.5', NULL, 0),
+      ('t10', 'cursor', NULL, NULL, 0),
+      ('t11', 'codex', 'claude-haiku-5-5-thinking-high', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'claude-haiku-5-5-thinking-xhigh', NULL, 0),
+      ('p02', 'cursor-2', 'claude-haiku-5-5-thinking-high', 'low', 1),
+      ('p03', 'codex', 'claude-haiku-5-5-thinking-low', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'claude-haiku-5-5-thinking-medium', 1),
+      ('lastModel:codex', 'claude-haiku-5-5-thinking-medium', 1),
+      ('lastMode:cursor', 'auto', 1);
+  `);
+
+  const readTasks = () =>
+    db
+      .query<{ id: string; model: string | null; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM tasks ORDER BY id`,
+      )
+      .all();
+  const readProfiles = () =>
+    db
+      .query<{ id: string; model: string; effort: string | null; fast: number }, []>(
+        `SELECT id, model, effort, fast FROM agent_profiles ORDER BY id`,
+      )
+      .all();
+  const readPrefs = () =>
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all();
+
+  db.exec(normalizeCursorHaiku55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "claude-haiku-5-5", effort: "max", fast: 0 },
+    { id: "t02", model: "claude-haiku-5-5", effort: "xhigh", fast: 0 }, // variant wins over stale effort; extra cursor harness via kind join
+    { id: "t03", model: "claude-haiku-5-5", effort: "high", fast: 0 }, // stale fast=1 cleared
+    { id: "t04", model: "claude-haiku-5-5", effort: "medium", fast: 0 },
+    { id: "t05", model: "claude-haiku-5-5", effort: "low", fast: 0 },
+    { id: "t06", model: "claude-haiku-5-5-low", effort: null, fast: 0 }, // untouched — No Thinking row
+    { id: "t07", model: "claude-haiku-5-5-thinking-minimal", effort: null, fast: 0 }, // untouched — not a real tier
+    { id: "t08", model: "claude-sonnet-5-5-high", effort: null, fast: 0 }, // untouched — Sonnet
+    { id: "t09", model: "anthropic/claude-haiku-5.5", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t11", model: "claude-haiku-5-5-thinking-high", effort: "high", fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "claude-haiku-5-5", effort: "xhigh", fast: 0 },
+    { id: "p02", model: "claude-haiku-5-5", effort: "high", fast: 0 },
+    { id: "p03", model: "claude-haiku-5-5-thinking-low", effort: null, fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 },
+    { key: "lastModel:codex", value: "claude-haiku-5-5-thinking-medium", updated_at: 1 },
+    { key: "lastModel:cursor", value: "claude-haiku-5-5", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorHaiku55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("062 (cursor Haiku 5.5) is registered right after 061_antigravity_harness", () => {
+  const at = migrations.findIndex((m) => m.id === "062_normalize_cursor_haiku_5_5");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("061_antigravity_harness");
+  expect(migrations[at]?.sql).toContain("claude-haiku-5-5");
+});
+
+test("063 (task checkout branch) is registered right after 062 and adds the column", () => {
+  const at = migrations.findIndex((m) => m.id === "063_task_checkout_branch");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("062_normalize_cursor_haiku_5_5");
+  expect(migrations[at]?.sql).toContain("ADD COLUMN checkout_branch TEXT");
+});
+
+// Shared in-memory schema + readers for the 064-066 tests (same table shapes
+// as the 062 test above). `tierColumn` picks the tier column the seed schema
+// carries: the pre-072 boolean `fast` (default, what the 064-074 tests seed)
+// or the post-072 `speed` text column (the 076 test). The readers return that
+// column under its own name.
+function makeModelMigrationDb(
+  harnessRows: Array<[string, string]>,
+  seedSql: string,
+  tierColumn: "fast" | "speed" = "fast",
+) {
+  const tierDdl =
+    tierColumn === "fast" ? "fast INTEGER NOT NULL DEFAULT 0" : "speed TEXT NOT NULL DEFAULT 'off'";
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE harnesses (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      agent TEXT NOT NULL,
+      model TEXT,
+      effort TEXT,
+      ${tierDdl}
+    );
+    CREATE TABLE agent_profiles (
+      id TEXT PRIMARY KEY,
+      harness_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      effort TEXT,
+      ${tierDdl}
+    );
+    CREATE TABLE preferences (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  const ins = db.prepare(`INSERT INTO harnesses (id, kind) VALUES (?, ?)`);
+  for (const [id, kind] of harnessRows) ins.run(id, kind);
+  db.exec(seedSql);
+  return {
+    db,
+    readTasks: () =>
+      db
+        .query<{ id: string; model: string | null; effort: string | null; fast?: number; speed?: string }, []>(
+          `SELECT id, model, effort, ${tierColumn} FROM tasks ORDER BY id`,
+        )
+        .all(),
+    readProfiles: () =>
+      db
+        .query<{ id: string; model: string; effort: string | null; fast?: number; speed?: string }, []>(
+          `SELECT id, model, effort, ${tierColumn} FROM agent_profiles ORDER BY id`,
+        )
+        .all(),
+    readPrefs: () =>
+      db
+        .query<{ key: string; value: string; updated_at: number }, []>(
+          `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+        )
+        .all(),
+  };
+}
+
+test("064_normalize_cursor_gemini_4_argon folds gemini-4-argon-* ids into base id + effort (fast reset to 0) on cursor-kind rows only, leaving antigravity's identical curated ids verbatim, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["cursor", "cursor"],
+      ["cursor-2", "cursor"],
+      ["antigravity", "antigravity"],
+      ["fx", "fx"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'cursor', 'gemini-4-argon-high', NULL, 0),
+      ('t02', 'cursor-2', 'gemini-4-argon-medium', 'low', 0),
+      ('t03', 'cursor', 'gemini-4-argon-low', NULL, 1),
+      ('t04', 'antigravity', 'gemini-4-argon-high', NULL, 0),
+      ('t05', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('t06', 'cursor', 'gemini-3.8-flash-high', NULL, 0),
+      ('t07', 'fx', 'google/gemini-4-argon', NULL, 0),
+      ('t08', 'cursor', NULL, NULL, 0),
+      ('t09', 'codex', 'gemini-4-argon-high', 'high', 0),
+      ('t10', 'antigravity', 'gemini-4-argon-low', 'low', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'cursor', 'gemini-4-argon-high', NULL, 0),
+      ('p02', 'cursor-2', 'gemini-4-argon-low', 'high', 1),
+      ('p03', 'antigravity', 'gemini-4-argon-medium', NULL, 0),
+      ('p04', 'codex', 'gemini-4-argon-low', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'gemini-4-argon-medium', 1),
+      ('lastModel:antigravity', 'gemini-4-argon-high', 1),
+      ('lastModel:codex', 'gemini-4-argon-medium', 1),
+      ('lastMode:cursor', 'auto', 1);
+    `,
+  );
+
+  db.exec(normalizeCursorGemini4Argon);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-4-argon", effort: "high", fast: 0 },
+    { id: "t02", model: "gemini-4-argon", effort: "medium", fast: 0 }, // variant wins over stale effort; extra cursor harness via kind join
+    { id: "t03", model: "gemini-4-argon", effort: "low", fast: 0 }, // stale fast=1 cleared
+    { id: "t04", model: "gemini-4-argon-high", effort: null, fast: 0 }, // untouched — antigravity's curated id (the kind-join control)
+    { id: "t05", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — already a bare base id
+    { id: "t06", model: "gemini-3.8-flash-high", effort: null, fast: 0 }, // untouched — other model
+    { id: "t07", model: "google/gemini-4-argon", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t08", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t09", model: "gemini-4-argon-high", effort: "high", fast: 0 }, // untouched — not cursor-kind
+    { id: "t10", model: "gemini-4-argon-low", effort: "low", fast: 0 }, // untouched — antigravity
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-4-argon", effort: "high", fast: 0 },
+    { id: "p02", model: "gemini-4-argon", effort: "low", fast: 0 },
+    { id: "p03", model: "gemini-4-argon-medium", effort: null, fast: 0 }, // untouched — antigravity
+    { id: "p04", model: "gemini-4-argon-low", effort: null, fast: 0 }, // untouched — not cursor-kind
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:cursor", value: "auto", updated_at: 1 },
+    { key: "lastModel:antigravity", value: "gemini-4-argon-high", updated_at: 1 }, // untouched
+    { key: "lastModel:codex", value: "gemini-4-argon-medium", updated_at: 1 }, // untouched
+    { key: "lastModel:cursor", value: "gemini-4-argon", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorGemini4Argon);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("065_antigravity_effort_in_model_id clears effort on antigravity-kind tasks and agent profiles (model untouched) and deletes lastEffort:antigravity, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["antigravity", "antigravity"],
+      ["antigravity-2", "antigravity"],
+      ["gemini", "gemini"],
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+      ["fx", "fx"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'antigravity', 'gemini-4-argon-high', 'high', 0),
+      ('t02', 'antigravity-2', 'gemini-3.8-flash-low', 'max', 0),
+      ('t03', 'antigravity', 'gemini-4-argon-medium', 'xhigh', 0),
+      ('t04', 'antigravity', 'gemini-4-argon-low', NULL, 0),
+      ('t05', 'gemini', 'gemini-3.8-flash', 'high', 0),
+      ('t06', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('t07', 'codex', 'gpt-6-sol', 'xhigh', 0),
+      ('t08', 'fx', 'google/gemini-4-argon', 'max', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'antigravity', 'gemini-4-argon-high', 'high', 0),
+      ('p02', 'antigravity-2', 'gemini-3.8-flash-medium', 'max', 0),
+      ('p03', 'antigravity', 'gemini-4-argon-low', NULL, 0),
+      ('p04', 'cursor', 'gemini-4-argon', 'high', 0),
+      ('p05', 'gemini', 'gemini-3.8-flash', 'xhigh', 0),
+      ('p06', 'codex', 'gpt-6-sol', 'max', 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastEffort:antigravity', 'high', 1),
+      ('lastEffort:cursor', 'high', 1),
+      ('lastModel:antigravity', 'gemini-4-argon-high', 1);
+    `,
+  );
+
+  db.exec(antigravityEffortInModelId);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-4-argon-high", effort: null, fast: 0 },
+    { id: "t02", model: "gemini-3.8-flash-low", effort: null, fast: 0 }, // extra antigravity harness via kind join
+    { id: "t03", model: "gemini-4-argon-medium", effort: null, fast: 0 },
+    { id: "t04", model: "gemini-4-argon-low", effort: null, fast: 0 }, // already NULL
+    { id: "t05", model: "gemini-3.8-flash", effort: "high", fast: 0 }, // untouched — gemini
+    { id: "t06", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — cursor keeps base id + effort
+    { id: "t07", model: "gpt-6-sol", effort: "xhigh", fast: 0 }, // untouched — codex
+    { id: "t08", model: "google/gemini-4-argon", effort: "max", fast: 0 }, // untouched — fx
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-4-argon-high", effort: null, fast: 0 },
+    { id: "p02", model: "gemini-3.8-flash-medium", effort: null, fast: 0 },
+    { id: "p03", model: "gemini-4-argon-low", effort: null, fast: 0 },
+    { id: "p04", model: "gemini-4-argon", effort: "high", fast: 0 }, // untouched — cursor
+    { id: "p05", model: "gemini-3.8-flash", effort: "xhigh", fast: 0 }, // untouched — gemini
+    { id: "p06", model: "gpt-6-sol", effort: "max", fast: 0 }, // untouched — codex
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:cursor", value: "high", updated_at: 1 }, // untouched
+    { key: "lastModel:antigravity", value: "gemini-4-argon-high", updated_at: 1 }, // untouched
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(antigravityEffortInModelId);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("066_retire_gemini_3_7_and_3_5_flash moves gemini-kind 3.7/3.5 Flash rows to gemini-3.8-flash and antigravity-kind gemini-3.7-flash-<effort> rows to gemini-3.8-flash-<effort>, leaving cursor and fx rows alone, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["gemini", "gemini"],
+      ["gemini-2", "gemini"],
+      ["antigravity", "antigravity"],
+      ["antigravity-2", "antigravity"],
+      ["cursor", "cursor"],
+      ["fx", "fx"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'gemini', 'gemini-3.7-flash', NULL, 0),
+      ('t02', 'gemini-2', 'gemini-3.5-flash', NULL, 0),
+      ('t03', 'antigravity', 'gemini-3.7-flash-high', NULL, 0),
+      ('t04', 'antigravity-2', 'gemini-3.7-flash-medium', NULL, 0),
+      ('t05', 'antigravity', 'gemini-3.7-flash-low', NULL, 0),
+      ('t06', 'cursor', 'gemini-3.7-flash', 'low', 0),
+      ('t07', 'cursor', 'gemini-3.7-flash-high', NULL, 0),
+      ('t08', 'gemini', 'gemini-3.8-flash', NULL, 0),
+      ('t09', 'gemini', 'gemini-2.5-flash', NULL, 0),
+      ('t10', 'gemini', NULL, NULL, 0),
+      ('t11', 'fx', 'google/gemini-3.7-flash', NULL, 0),
+      ('t12', 'cursor', 'gemini-3.5-flash', NULL, 0),
+      ('t13', 'antigravity', 'gemini-3.7-flash', NULL, 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'gemini', 'gemini-3.7-flash', NULL, 0),
+      ('p02', 'gemini-2', 'gemini-3.5-flash', NULL, 0),
+      ('p03', 'antigravity', 'gemini-3.7-flash-high', NULL, 0),
+      ('p04', 'antigravity-2', 'gemini-3.7-flash-low', NULL, 0),
+      ('p05', 'cursor', 'gemini-3.7-flash', 'low', 0),
+      ('p06', 'cursor', 'gemini-3.7-flash-medium', NULL, 0),
+      ('p07', 'gemini', 'gemini-3.8-flash', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:gemini', 'gemini-3.5-flash', 1),
+      ('lastModel:antigravity', 'gemini-3.7-flash-low', 1),
+      ('lastModel:cursor', 'gemini-3.7-flash', 1),
+      ('lastMode:gemini', 'auto', 1);
+    `,
+  );
+
+  db.exec(retireGemini37And35Flash);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "t02", model: "gemini-3.8-flash", effort: null, fast: 0 }, // extra gemini harness via kind join
+    { id: "t03", model: "gemini-3.8-flash-high", effort: null, fast: 0 },
+    { id: "t04", model: "gemini-3.8-flash-medium", effort: null, fast: 0 },
+    { id: "t05", model: "gemini-3.8-flash-low", effort: null, fast: 0 },
+    { id: "t06", model: "gemini-3.7-flash", effort: "low", fast: 0 }, // untouched — Cursor keeps 3.7 Flash (the kind-join control)
+    { id: "t07", model: "gemini-3.7-flash-high", effort: null, fast: 0 }, // untouched — cursor
+    { id: "t08", model: "gemini-3.8-flash", effort: null, fast: 0 }, // untouched — already the successor
+    { id: "t09", model: "gemini-2.5-flash", effort: null, fast: 0 }, // untouched — other model
+    { id: "t10", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t11", model: "google/gemini-3.7-flash", effort: null, fast: 0 }, // untouched — fx id
+    { id: "t12", model: "gemini-3.5-flash", effort: null, fast: 0 }, // untouched — cursor
+    { id: "t13", model: "gemini-3.7-flash", effort: null, fast: 0 }, // untouched — bare id is not an antigravity row
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "p02", model: "gemini-3.8-flash", effort: null, fast: 0 },
+    { id: "p03", model: "gemini-3.8-flash-high", effort: null, fast: 0 },
+    { id: "p04", model: "gemini-3.8-flash-low", effort: null, fast: 0 },
+    { id: "p05", model: "gemini-3.7-flash", effort: "low", fast: 0 }, // untouched — cursor
+    { id: "p06", model: "gemini-3.7-flash-medium", effort: null, fast: 0 }, // untouched — cursor
+    { id: "p07", model: "gemini-3.8-flash", effort: null, fast: 0 },
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastMode:gemini", value: "auto", updated_at: 1 },
+    { key: "lastModel:antigravity", value: "gemini-3.8-flash-low", updated_at: 1 },
+    { key: "lastModel:cursor", value: "gemini-3.7-flash", updated_at: 1 }, // untouched — Cursor keeps it
+    { key: "lastModel:gemini", value: "gemini-3.8-flash", updated_at: 1 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(retireGemini37And35Flash);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+});
+
+test("066 (retire gemini 3.7/3.5 Flash) is registered after 065, after 064, after 063 (task checkout branch)", () => {
+  const at = migrations.findIndex((m) => m.id === "066_retire_gemini_3_7_and_3_5_flash");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("065_antigravity_effort_in_model_id");
+  expect(migrations[at - 2]?.id).toBe("064_normalize_cursor_gemini_4_argon");
+  expect(migrations[at - 3]?.id).toBe("063_task_checkout_branch");
+  expect(migrations[at]?.sql).toContain("gemini-3.8-flash");
+  expect(migrations[at - 1]?.sql).toContain("lastEffort:antigravity");
+  expect(migrations[at - 2]?.sql).toContain("gemini-4-argon");
+});
+
+test("067 (retention swept tasks) is registered right after 066", () => {
+  const at = migrations.findIndex((m) => m.id === "067_retention_swept_tasks");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("066_retire_gemini_3_7_and_3_5_flash");
+  expect(migrations[at]?.sql).toBe(retentionSweptTasks);
+});
+
+test("070 (imported claude session backfill) is registered right after 069", () => {
+  const at = migrations.findIndex((m) => m.id === "070_imported_claude_session_backfill");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("069_imported_claude_session_unique");
+  expect(migrations[at - 2]?.id).toBe("068_imported_claude_session");
+  expect(migrations[at - 3]?.id).toBe("067_retention_swept_tasks");
+  expect(migrations[at - 1]?.sql).toContain("tasks_imported_claude_session_uidx");
+  expect(migrations[at]?.sql).toContain("imported_claude_session_id");
+});
+
+test("071 (claude session seen) is registered right after 070", () => {
+  const at = migrations.findIndex((m) => m.id === "071_claude_session_seen");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("070_imported_claude_session_backfill");
+  expect(migrations[at]?.sql).toBe(claudeSessionSeen);
+});
+
+test("074 (retire fx models) sits right after 073 (harness profile MCP servers), after 072 (task speed), after 071", () => {
+  const at = migrations.findIndex((m) => m.id === "074_retire_fx_models");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("073_harness_profile_mcp_servers");
+  expect(migrations[at - 2]?.id).toBe("072_task_speed");
+  expect(migrations[at - 3]?.id).toBe("071_claude_session_seen");
+  expect(migrations[at]?.sql).toBe(retireFxModels);
+  expect(migrations[at - 1]?.sql).toBe(harnessProfileMcpServers);
+  expect(migrations[at - 2]?.sql).toBe(taskSpeed);
+});
+
+test("077 (copilot harness) sits right after 076 (normalize cursor new families), right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("076_normalize_cursor_new_families");
+  expect(migrations[at - 2]?.id).toBe("075_retire_codex_gpt_5_5");
+  expect(migrations[at - 3]?.id).toBe("074_retire_fx_models");
+  expect(migrations[at]?.sql).toBe(copilotHarness);
+  expect(migrations[at - 1]?.sql).toBe(normalizeCursorNewFamilies);
+  expect(migrations[at - 2]?.sql).toBe(retireCodexGpt55);
+  expect(migrations[at - 3]?.sql).toBe(retireFxModels);
+  // Authored as 075 before main claimed 075/076; the old id stays an alias.
+  expect(migrations[at]?.aliases).toEqual(["075_copilot_harness"]);
+});
+
+test("071 moves the seen-id preference into claude_session_seen in order and drops the preference", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('claudeSessions.seenIds', '["a","b",3,"","c","a"]', 1000),
+      ('claudeSessions.launchScan', '0', 1);
+  `);
+  db.exec(claudeSessionSeen);
+  expect(
+    db.query<{ key: string }, []>(`SELECT key FROM preferences ORDER BY key`).all().map((r) => r.key),
+  ).toEqual(["claudeSessions.launchScan"]);
+  const rows = db.query<{ session_id: string; seen_at: number }, []>(
+    `SELECT session_id, seen_at FROM claude_session_seen ORDER BY seen_at`,
+  ).all();
+  // Oldest first, ending at the preference's write time. Non-strings and
+  // blanks are dropped; a repeated id keeps its first position.
+  expect(rows.map((r) => r.session_id)).toEqual(["a", "b", "c"]);
+  expect(rows.at(-1)?.seen_at).toBeLessThanOrEqual(1000);
+});
+
+test("071 reads a malformed seen-id preference as empty instead of failing", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    INSERT INTO preferences (key, value, updated_at) VALUES ('claudeSessions.seenIds', '{not json', 1);
+  `);
+  expect(() => db.exec(claudeSessionSeen)).not.toThrow();
+  expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM claude_session_seen`).get()?.n).toBe(0);
+  expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM preferences`).get()?.n).toBe(0);
+});
+
+test("067 creates retention_swept_tasks (cascading on task delete) and drops the old retention:sweptTasks preference only", () => {
+  const db = new Database(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(`
+    CREATE TABLE tasks (id TEXT PRIMARY KEY);
+    CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    INSERT INTO tasks (id) VALUES ('t1'), ('t2');
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('retention:sweptTasks', '{"t1":"1:4096:9"}', 1),
+      ('retention:lastRunAt', '5', 1),
+      ('theme', 'dark', 1);
+  `);
+  db.exec(retentionSweptTasks);
+  expect(
+    db.query<{ key: string }, []>(`SELECT key FROM preferences ORDER BY key`).all().map((r) => r.key),
+  ).toEqual(["retention:lastRunAt", "theme"]);
+
+  db.exec(`INSERT INTO retention_swept_tasks (task_id, sweep_key) VALUES ('t1', 'a'), ('t2', 'b')`);
+  expect(() => db.exec(`INSERT INTO retention_swept_tasks (task_id, sweep_key) VALUES ('ghost', 'c')`)).toThrow();
+  db.exec(`DELETE FROM tasks WHERE id = 't1'`);
+  expect(
+    db.query<{ task_id: string }, []>(`SELECT task_id FROM retention_swept_tasks`).all().map((r) => r.task_id),
+  ).toEqual(["t2"]);
+});
+
+test("the Gemini 4 Argon migrations were renumbered 063-065 -> 064-066 when main took 063; their pre-merge ids stay as aliases so a DB that already applied them does not re-run them", () => {
+  const renumbered = [
+    ["064_normalize_cursor_gemini_4_argon", "063_normalize_cursor_gemini_4_argon"],
+    ["065_antigravity_effort_in_model_id", "064_antigravity_effort_in_model_id"],
+    ["066_retire_gemini_3_7_and_3_5_flash", "065_retire_gemini_3_7_and_3_5_flash"],
+  ] as const;
+  for (const [id, alias] of renumbered) {
+    expect(migrations.find((m) => m.id === id)?.aliases).toEqual([alias]);
+  }
+  // Every id/alias is unique across the registry (an alias that equalled another
+  // migration's id would silently mark that migration applied).
+  const seen = new Set<string>();
+  for (const m of migrations) {
+    for (const key of [m.id, ...(m.aliases ?? [])]) {
+      expect(seen.has(key)).toBe(false);
+      seen.add(key);
+    }
+  }
+
+  // A DB that applied the pre-merge ids (the branch's own dev data dir) gets
+  // the renumbered rows recorded, not re-applied; main's 063 still runs.
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE _migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+  `);
+  const insert = db.prepare(`INSERT INTO _migrations (id, applied_at) VALUES (?, 1)`);
+  for (const m of migrations) {
+    if (m.id.startsWith("063_task_") || renumbered.some(([id]) => id === m.id)) continue;
+    insert.run(m.id);
+  }
+  for (const [, alias] of renumbered) insert.run(alias);
+  db.exec(`CREATE TABLE tasks (id TEXT PRIMARY KEY, branch TEXT)`);
+  const ran = migrate(db, migrations);
+  expect(ran).toEqual(["063_task_checkout_branch"]);
+  const ids = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all().map((r) => r.id);
+  for (const [id] of renumbered) expect(ids).toContain(id);
+});
+
+function columnNames(db: Database, table: string): string[] {
+  return db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all()
+    .map((r) => r.name);
+}
+
+test("072_task_speed turns fast 1/0 into speed fast/off on tasks and agent profiles, drops the fast column, and moves lastFast:<kind> prefs to lastSpeed:<kind>", () => {
+  const { db } = makeModelMigrationDb(
+    [
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t1', 'cursor', 'composer-2', NULL, 1),
+      ('t2', 'cursor', 'composer-2', NULL, 0),
+      ('t3', 'codex', 'gpt-6.1-sol', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p1', 'cursor', 'composer-2', NULL, 1),
+      ('p2', 'codex', 'gpt-6.1-sol', 'high', 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastFast:cursor', 'true', 7),
+      ('lastFast:codex', 'false', 8),
+      ('lastFast:fx', 'garbage', 9),
+      ('lastSpeed:codex', 'fast', 1),
+      ('lastModel:cursor', 'composer-2', 3);
+    `,
+  );
+
+  db.exec(taskSpeed);
+
+  expect(columnNames(db, "tasks")).not.toContain("fast");
+  expect(columnNames(db, "tasks")).toContain("speed");
+  expect(columnNames(db, "agent_profiles")).not.toContain("fast");
+  expect(columnNames(db, "agent_profiles")).toContain("speed");
+
+  expect(
+    db.query<{ id: string; model: string; speed: string }, []>(`SELECT id, model, speed FROM tasks ORDER BY id`).all(),
+  ).toEqual([
+    { id: "t1", model: "composer-2", speed: "fast" },
+    { id: "t2", model: "composer-2", speed: "off" },
+    { id: "t3", model: "gpt-6.1-sol", speed: "off" },
+  ]);
+  expect(
+    db.query<{ id: string; speed: string }, []>(`SELECT id, speed FROM agent_profiles ORDER BY id`).all(),
+  ).toEqual([
+    { id: "p1", speed: "fast" },
+    { id: "p2", speed: "off" },
+  ]);
+  // The migrated value replaces a pre-existing lastSpeed key; a non-'true'
+  // value reads as off; updated_at is carried over; every lastFast key goes.
+  expect(
+    db
+      .query<{ key: string; value: string; updated_at: number }, []>(
+        `SELECT key, value, updated_at FROM preferences ORDER BY key`,
+      )
+      .all(),
+  ).toEqual([
+    { key: "lastModel:cursor", value: "composer-2", updated_at: 3 },
+    { key: "lastSpeed:codex", value: "off", updated_at: 8 },
+    { key: "lastSpeed:cursor", value: "fast", updated_at: 7 },
+    { key: "lastSpeed:fx", value: "off", updated_at: 9 },
+  ]);
+
+  // New rows default to off, and the CHECK rejects anything but the three ids.
+  db.exec(`INSERT INTO tasks (id, agent) VALUES ('t4', 'cursor')`);
+  expect(db.query<{ speed: string }, []>(`SELECT speed FROM tasks WHERE id = 't4'`).get()?.speed).toBe("off");
+  db.exec(`UPDATE tasks SET speed = 'ultrafast' WHERE id = 't4'`);
+  expect(db.query<{ speed: string }, []>(`SELECT speed FROM tasks WHERE id = 't4'`).get()?.speed).toBe("ultrafast");
+  expect(() => db.exec(`UPDATE tasks SET speed = 'bogus' WHERE id = 't4'`)).toThrow();
+  expect(() => db.exec(`INSERT INTO tasks (id, agent, speed) VALUES ('t5', 'cursor', 'bogus')`)).toThrow();
+  expect(() =>
+    db.exec(`INSERT INTO agent_profiles (id, harness_id, model, speed) VALUES ('p3', 'cursor', 'x', 'bogus')`),
+  ).toThrow();
+  expect(() => db.exec(`UPDATE agent_profiles SET speed = NULL WHERE id = 'p1'`)).toThrow();
+  db.close();
+});
+
+test("073_harness_profile_mcp_servers adds profile_mcp_servers defaulting existing and new harness rows to 1", () => {
+  const db = new Database(":memory:");
+  db.exec(HARNESSES_DDL);
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, created_at, updated_at) VALUES
+      ('claude-code', 'claude-code', 'Claude Code', 1, 1, 1),
+      ('codex', 'codex', 'Codex', 1, 1, 1);
+  `);
+  db.exec(harnessProfileMcpServers);
+  expect(columnNames(db, "harnesses")).toContain("profile_mcp_servers");
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('codex-2', 'codex', 'Codex 2', 2, 2)`);
+  expect(
+    db
+      .query<{ id: string; profile_mcp_servers: number }, []>(
+        `SELECT id, profile_mcp_servers FROM harnesses ORDER BY id`,
+      )
+      .all(),
+  ).toEqual([
+    { id: "claude-code", profile_mcp_servers: 1 },
+    { id: "codex", profile_mcp_servers: 1 },
+    { id: "codex-2", profile_mcp_servers: 1 },
+  ]);
+  db.exec(`UPDATE harnesses SET profile_mcp_servers = 0 WHERE id = 'codex'`);
+  expect(
+    db.query<{ v: number }, []>(`SELECT profile_mcp_servers AS v FROM harnesses WHERE id = 'codex'`).get()?.v,
+  ).toBe(0);
+  db.close();
+});
+
+test("074_retire_fx_models moves fx-kind rows on the 3 retired ids to deepseek/deepseek-v4-flash, leaves other kinds and zai/glm-5.3-flash rows alone, moves lastModel:fx off the retired ids and glm-5.3-flash, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["fx", "fx"],
+      ["fx-2", "fx"],
+      ["cursor", "cursor"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'fx', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('t02', 'fx', 'mistral/devstral-2', NULL, 0),
+      ('t03', 'fx-2', 'anthropic/claude-3-haiku', NULL, 0),
+      ('t04', 'fx', 'zai/glm-5.3-flash', 'auto', 0),
+      ('t05', 'fx', 'openai/gpt-5.2', 'high', 0),
+      ('t06', 'fx', NULL, NULL, 0),
+      ('t07', 'cursor', 'anthropic/claude-3-haiku', NULL, 0),
+      ('t08', 'codex', 'mistral/devstral-2', NULL, 0),
+      ('t09', 'deleted-fx', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('t10', 'fx', 'deepseek/deepseek-v4-flash', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'fx', 'mistral/devstral-2', NULL, 0),
+      ('p02', 'fx-2', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('p03', 'fx', 'zai/glm-5.3-flash', NULL, 0),
+      ('p04', 'cursor', 'alibaba/qwen3-coder-plus', NULL, 0),
+      ('p05', 'codex', 'anthropic/claude-3-haiku', NULL, 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:fx', 'anthropic/claude-3-haiku', 5),
+      ('lastModel:cursor', 'mistral/devstral-2', 5),
+      ('lastModel:codex', 'zai/glm-5.3-flash', 5),
+      ('lastEffort:fx', 'auto', 5);
+    `,
+  );
+
+  db.exec(retireFxModels);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "t02", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "t03", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 }, // extra fx harness via kind join
+    { id: "t04", model: "zai/glm-5.3-flash", effort: "auto", fast: 0 }, // untouched — not retired
+    { id: "t05", model: "openai/gpt-5.2", effort: "high", fast: 0 }, // untouched — other model
+    { id: "t06", model: null, effort: null, fast: 0 }, // untouched — NULL
+    { id: "t07", model: "anthropic/claude-3-haiku", effort: null, fast: 0 }, // untouched — cursor (kind-join control)
+    { id: "t08", model: "mistral/devstral-2", effort: null, fast: 0 }, // untouched — codex
+    { id: "t09", model: "alibaba/qwen3-coder-plus", effort: null, fast: 0 }, // untouched — orphan
+    { id: "t10", model: "deepseek/deepseek-v4-flash", effort: "high", fast: 0 },
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "p02", model: "deepseek/deepseek-v4-flash", effort: null, fast: 0 },
+    { id: "p03", model: "zai/glm-5.3-flash", effort: null, fast: 0 }, // untouched — not retired
+    { id: "p04", model: "alibaba/qwen3-coder-plus", effort: null, fast: 0 }, // untouched — cursor
+    { id: "p05", model: "anthropic/claude-3-haiku", effort: null, fast: 0 }, // untouched — codex
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:fx", value: "auto", updated_at: 5 },
+    { key: "lastModel:codex", value: "zai/glm-5.3-flash", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "mistral/devstral-2", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:fx", value: "deepseek/deepseek-v4-flash", updated_at: 5 },
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(retireFxModels);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+  db.close();
+});
+
+test("074 moves lastModel:fx off each retired id and off zai/glm-5.3-flash, and leaves a live fx pick alone", () => {
+  const cases: Array<[string, string]> = [
+    ["alibaba/qwen3-coder-plus", "deepseek/deepseek-v4-flash"],
+    ["mistral/devstral-2", "deepseek/deepseek-v4-flash"],
+    ["anthropic/claude-3-haiku", "deepseek/deepseek-v4-flash"],
+    ["zai/glm-5.3-flash", "deepseek/deepseek-v4-flash"],
+    ["openai/gpt-5.2", "openai/gpt-5.2"],
+    ["spacexai/grok-4.7", "spacexai/grok-4.7"],
+  ];
+  for (const [before, after] of cases) {
+    const { db, readPrefs } = makeModelMigrationDb(
+      [["fx", "fx"]],
+      `INSERT INTO preferences (key, value, updated_at) VALUES ('lastModel:fx', '${before}', 1);`,
+    );
+    db.exec(retireFxModels);
+    expect(readPrefs()).toEqual([{ key: "lastModel:fx", value: after, updated_at: 1 }]);
+    db.close();
+  }
+});
+
+test("a fresh DB migrated through 074 has speed (no fast) on tasks and agent_profiles and profile_mcp_servers on harnesses; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  expect(columnNames(db, "tasks")).toContain("speed");
+  expect(columnNames(db, "tasks")).not.toContain("fast");
+  expect(columnNames(db, "agent_profiles")).toContain("speed");
+  expect(columnNames(db, "agent_profiles")).not.toContain("fast");
+  expect(columnNames(db, "harnesses")).toContain("profile_mcp_servers");
+  // Seeded built-in harnesses picked up the default.
+  const flags = db
+    .query<{ v: number }, []>(`SELECT profile_mcp_servers AS v FROM harnesses`)
+    .all()
+    .map((r) => r.v);
+  expect(flags.length).toBeGreaterThan(0);
+  expect(flags.every((v) => v === 1)).toBe(true);
+  // The CHECK survives in the stored schema.
+  const tasksSql = db
+    .query<{ sql: string }, []>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`)
+    .get()?.sql;
+  expect(tasksSql).toContain("'ultrafast'");
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("076 (normalize cursor new families) sits right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+  const at = migrations.findIndex((m) => m.id === "076_normalize_cursor_new_families");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("075_retire_codex_gpt_5_5");
+  expect(migrations[at - 2]?.id).toBe("074_retire_fx_models");
+  expect(migrations[at]?.sql).toBe(normalizeCursorNewFamilies);
+  expect(migrations[at - 1]?.sql).toBe(retireCodexGpt55);
+  expect(migrations[at - 2]?.sql).toBe(retireFxModels);
+});
+
+test("075_retire_codex_gpt_5_5 moves codex-kind gpt-5.5 rows to gpt-6.1-sol (effort kept when 6.1 Sol accepts it or NULL, else high), leaves cursor/fx/orphan rows, other codex models and lastEffort:codex alone, idempotently", () => {
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["codex", "codex"],
+      ["codex-2", "codex"],
+      ["cursor", "cursor"],
+      ["fx", "fx"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, fast) VALUES
+      ('t01', 'codex', 'gpt-5.5', 'none', 0),
+      ('t02', 'codex', 'gpt-5.5', 'minimal', 0),
+      ('t03', 'codex', 'gpt-5.5', 'xhigh', 0),
+      ('t04', 'codex', 'gpt-5.5', 'medium', 0),
+      ('t05', 'codex', 'gpt-5.5', NULL, 0),
+      ('t06', 'codex-2', 'gpt-5.5', 'none', 0),
+      ('t07', 'codex', 'gpt-5.5', 'ultra', 0),
+      ('t08', 'codex', 'gpt-5.5', 'auto', 0),
+      ('t09', 'codex', 'gpt-6-sol', 'none', 0),
+      ('t10', 'cursor', 'gpt-5.5', 'none', 0),
+      ('t11', 'fx', 'openai/gpt-5.5', 'none', 0),
+      ('t12', 'fx', 'gpt-5.5', 'none', 0),
+      ('t13', 'deleted-codex', 'gpt-5.5', 'none', 0),
+      ('t14', 'codex', NULL, 'none', 0),
+      ('t15', 'codex', 'gpt-6.1-sol', 'high', 0);
+    INSERT INTO agent_profiles (id, harness_id, model, effort, fast) VALUES
+      ('p01', 'codex', 'gpt-5.5', 'none', 0),
+      ('p02', 'codex-2', 'gpt-5.5', 'minimal', 0),
+      ('p03', 'codex', 'gpt-5.5', 'xhigh', 0),
+      ('p04', 'codex', 'gpt-5.5', NULL, 0),
+      ('p05', 'codex', 'gpt-6-sol', 'none', 0),
+      ('p06', 'cursor', 'gpt-5.5', 'none', 0),
+      ('p07', 'fx', 'openai/gpt-5.5', 'none', 0),
+      ('p08', 'fx', 'gpt-5.5', 'none', 0),
+      ('p09', 'deleted-codex', 'gpt-5.5', 'none', 0);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:codex', 'gpt-5.5', 5),
+      ('lastModel:cursor', 'gpt-5.5', 5),
+      ('lastModel:fx', 'openai/gpt-5.5', 5),
+      ('lastEffort:codex', 'none', 5);
+    `,
+  );
+
+  db.exec(retireCodexGpt55);
+  expect(readTasks()).toEqual([
+    { id: "t01", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // none -> high (6.1 Sol rejects none)
+    { id: "t02", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // minimal -> high
+    { id: "t03", model: "gpt-6.1-sol", effort: "xhigh", fast: 0 }, // kept
+    { id: "t04", model: "gpt-6.1-sol", effort: "medium", fast: 0 }, // kept
+    { id: "t05", model: "gpt-6.1-sol", effort: null, fast: 0 }, // NULL kept
+    { id: "t06", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // extra codex harness via kind join
+    { id: "t07", model: "gpt-6.1-sol", effort: "ultra", fast: 0 }, // kept
+    { id: "t08", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // auto -> high
+    { id: "t09", model: "gpt-6-sol", effort: "none", fast: 0 }, // untouched — none is legit on gpt-6-sol
+    { id: "t10", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — cursor gpt-5.5 is live (kind-join control)
+    { id: "t11", model: "openai/gpt-5.5", effort: "none", fast: 0 }, // untouched — fx gateway id
+    { id: "t12", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — fx row carrying the bare literal (kind-join control)
+    { id: "t13", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — orphan
+    { id: "t14", model: null, effort: "none", fast: 0 }, // untouched — NULL model
+    { id: "t15", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // untouched — already moved
+  ]);
+  expect(readProfiles()).toEqual([
+    { id: "p01", model: "gpt-6.1-sol", effort: "high", fast: 0 },
+    { id: "p02", model: "gpt-6.1-sol", effort: "high", fast: 0 }, // extra codex harness
+    { id: "p03", model: "gpt-6.1-sol", effort: "xhigh", fast: 0 },
+    { id: "p04", model: "gpt-6.1-sol", effort: null, fast: 0 },
+    { id: "p05", model: "gpt-6-sol", effort: "none", fast: 0 }, // untouched
+    { id: "p06", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — cursor
+    { id: "p07", model: "openai/gpt-5.5", effort: "none", fast: 0 }, // untouched — fx
+    { id: "p08", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — fx literal
+    { id: "p09", model: "gpt-5.5", effort: "none", fast: 0 }, // untouched — orphan
+  ]);
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:codex", value: "none", updated_at: 5 }, // untouched
+    { key: "lastModel:codex", value: "gpt-6.1-sol", updated_at: 5 },
+    { key: "lastModel:cursor", value: "gpt-5.5", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:fx", value: "openai/gpt-5.5", updated_at: 5 }, // untouched — other kind
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(retireCodexGpt55);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+  db.close();
+});
+
+test("075 leaves a lastModel:codex pick on any other model alone", () => {
+  for (const live of ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol"]) {
+    const { db, readPrefs } = makeModelMigrationDb(
+      [["codex", "codex"]],
+      `INSERT INTO preferences (key, value, updated_at) VALUES ('lastModel:codex', '${live}', 1);`,
+    );
+    db.exec(retireCodexGpt55);
+    expect(readPrefs()).toEqual([{ key: "lastModel:codex", value: live, updated_at: 1 }]);
+    db.close();
+  }
+});
+
+const NEW_CURSOR_FAMILY_VARIANTS: Array<[string, string[]]> = [
+  ["muse-wonder-1.0", ["max", "xhigh", "high", "medium", "low", "minimal"]],
+  ["muse-spark-1.3", ["max", "xhigh", "high", "medium", "low", "minimal"]],
+  ["deepseek-v41-flash-1017", ["max", "high", "medium", "low", "none"]],
+];
+
+test("076_normalize_cursor_new_families folds all 17 variant ids into base id + effort (speed reset to off) on cursor-kind tasks and profiles and lastModel:cursor, leaving base ids, other kinds, unknown suffixes and orphans alone, idempotently", () => {
+  const variants = NEW_CURSOR_FAMILY_VARIANTS.flatMap(([base, efforts]) =>
+    efforts.map((e) => ({ base, effort: e, id: `${base}-${e}` })),
+  );
+  expect(variants).toHaveLength(17);
+
+  const taskRows = variants.map(
+    (v, i) => `('v${String(i).padStart(2, "0")}', 'cursor', '${v.id}', NULL, 'fast')`,
+  );
+  const profileRows = variants.map(
+    (v, i) => `('pv${String(i).padStart(2, "0")}', 'cursor-2', '${v.id}', 'low', 'fast')`,
+  );
+  const { db, readTasks, readProfiles, readPrefs } = makeModelMigrationDb(
+    [
+      ["cursor", "cursor"],
+      ["cursor-2", "cursor"],
+      ["fx", "fx"],
+      ["codex", "codex"],
+    ],
+    `
+    INSERT INTO tasks (id, agent, model, effort, speed) VALUES
+      ${taskRows.join(",\n      ")},
+      ('u01', 'cursor', 'muse-wonder-1.0', 'high', 'fast'),
+      ('u02', 'cursor', 'muse-spark-1.3', 'low', 'off'),
+      ('u03', 'cursor', 'deepseek-v41-flash-1017', 'none', 'off'),
+      ('u04', 'fx', 'meta/muse-wonder-1.0', NULL, 'off'),
+      ('u05', 'codex', 'muse-spark-1.3-high', 'low', 'off'),
+      ('u06', 'fx', 'muse-wonder-1.0-high', 'low', 'fast'),
+      ('u07', 'cursor', 'muse-wonder-1.0-ultra', 'low', 'fast'),
+      ('u08', 'cursor', 'deepseek-v41-flash-1017-xhigh', 'low', 'fast'),
+      ('u09', 'deleted-cursor', 'muse-wonder-1.0-high', 'low', 'fast'),
+      ('u10', 'cursor', NULL, 'low', 'off'),
+      ('u11', 'cursor', 'gpt-5.5', 'high', 'off');
+    INSERT INTO agent_profiles (id, harness_id, model, effort, speed) VALUES
+      ${profileRows.join(",\n      ")},
+      ('pu01', 'cursor', 'muse-spark-1.3', 'high', 'off'),
+      ('pu02', 'fx', 'muse-wonder-1.0-low', 'low', 'fast'),
+      ('pu03', 'codex', 'deepseek-v41-flash-1017-none', 'low', 'fast'),
+      ('pu04', 'cursor', 'muse-spark-1.3-ultra', 'low', 'fast'),
+      ('pu05', 'deleted-cursor', 'muse-wonder-1.0-high', 'low', 'fast');
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:cursor', 'deepseek-v41-flash-1017-none', 5),
+      ('lastModel:fx', 'muse-wonder-1.0-high', 5),
+      ('lastModel:codex', 'muse-spark-1.3-high', 5),
+      ('lastEffort:cursor', 'none', 5);
+    `,
+    "speed",
+  );
+
+  db.exec(normalizeCursorNewFamilies);
+
+  const tasks = readTasks();
+  variants.forEach((v, i) => {
+    expect(tasks.find((t) => t.id === `v${String(i).padStart(2, "0")}`)).toEqual({
+      id: `v${String(i).padStart(2, "0")}`,
+      model: v.base,
+      effort: v.effort,
+      speed: "off",
+    });
+  });
+  expect(tasks.filter((t) => !t.id.startsWith("v"))).toEqual([
+    { id: "u01", model: "muse-wonder-1.0", effort: "high", speed: "fast" }, // untouched — already a base id
+    { id: "u02", model: "muse-spark-1.3", effort: "low", speed: "off" },
+    { id: "u03", model: "deepseek-v41-flash-1017", effort: "none", speed: "off" },
+    { id: "u04", model: "meta/muse-wonder-1.0", effort: null, speed: "off" }, // untouched — fx gateway id
+    { id: "u05", model: "muse-spark-1.3-high", effort: "low", speed: "off" }, // untouched — codex (kind-join control)
+    { id: "u06", model: "muse-wonder-1.0-high", effort: "low", speed: "fast" }, // untouched — fx (kind-join control)
+    { id: "u07", model: "muse-wonder-1.0-ultra", effort: "low", speed: "fast" }, // untouched — unknown suffix
+    { id: "u08", model: "deepseek-v41-flash-1017-xhigh", effort: "low", speed: "fast" }, // untouched — not a listed deepseek tier
+    { id: "u09", model: "muse-wonder-1.0-high", effort: "low", speed: "fast" }, // untouched — orphan
+    { id: "u10", model: null, effort: "low", speed: "off" }, // untouched — NULL model
+    { id: "u11", model: "gpt-5.5", effort: "high", speed: "off" }, // untouched — live cursor pick
+  ]);
+
+  const profiles = readProfiles();
+  variants.forEach((v, i) => {
+    expect(profiles.find((p) => p.id === `pv${String(i).padStart(2, "0")}`)).toEqual({
+      id: `pv${String(i).padStart(2, "0")}`,
+      model: v.base,
+      effort: v.effort,
+      speed: "off",
+    }); // extra cursor harness via kind join
+  });
+  expect(profiles.filter((p) => !p.id.startsWith("pv"))).toEqual([
+    { id: "pu01", model: "muse-spark-1.3", effort: "high", speed: "off" },
+    { id: "pu02", model: "muse-wonder-1.0-low", effort: "low", speed: "fast" }, // untouched — fx
+    { id: "pu03", model: "deepseek-v41-flash-1017-none", effort: "low", speed: "fast" }, // untouched — codex
+    { id: "pu04", model: "muse-spark-1.3-ultra", effort: "low", speed: "fast" }, // untouched — unknown suffix
+    { id: "pu05", model: "muse-wonder-1.0-high", effort: "low", speed: "fast" }, // untouched — orphan
+  ]);
+
+  expect(readPrefs()).toEqual([
+    { key: "lastEffort:cursor", value: "none", updated_at: 5 }, // untouched
+    { key: "lastModel:codex", value: "muse-spark-1.3-high", updated_at: 5 }, // untouched — other kind
+    { key: "lastModel:cursor", value: "deepseek-v41-flash-1017", updated_at: 5 },
+    { key: "lastModel:fx", value: "muse-wonder-1.0-high", updated_at: 5 }, // untouched — other kind
+  ]);
+
+  const tasksBefore = readTasks();
+  const profilesBefore = readProfiles();
+  const prefsBefore = readPrefs();
+  db.exec(normalizeCursorNewFamilies);
+  expect(readTasks()).toEqual(tasksBefore);
+  expect(readProfiles()).toEqual(profilesBefore);
+  expect(readPrefs()).toEqual(prefsBefore);
+  db.close();
+});
+
+test("076 moves lastModel:cursor off every one of the 17 variant ids and leaves a live cursor pick alone", () => {
+  for (const [base, efforts] of NEW_CURSOR_FAMILY_VARIANTS) {
+    for (const e of efforts) {
+      const { db, readPrefs } = makeModelMigrationDb(
+        [["cursor", "cursor"]],
+        `INSERT INTO preferences (key, value, updated_at) VALUES ('lastModel:cursor', '${base}-${e}', 1);`,
+        "speed",
+      );
+      db.exec(normalizeCursorNewFamilies);
+      expect(readPrefs()).toEqual([{ key: "lastModel:cursor", value: base, updated_at: 1 }]);
+      db.close();
+    }
+  }
+  for (const live of ["muse-wonder-1.0", "muse-wonder-1.0-ultra", "gpt-5.5"]) {
+    const { db, readPrefs } = makeModelMigrationDb(
+      [["cursor", "cursor"]],
+      `INSERT INTO preferences (key, value, updated_at) VALUES ('lastModel:cursor', '${live}', 1);`,
+      "speed",
+    );
+    db.exec(normalizeCursorNewFamilies);
+    expect(readPrefs()).toEqual([{ key: "lastModel:cursor", value: live, updated_at: 1 }]);
+    db.close();
+  }
+});
+
+test("a fresh DB applies 075, 076 and 077 cleanly and re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  const applied = migrate(db, migrations);
+  expect(applied).toContain("075_retire_codex_gpt_5_5");
+  expect(applied).toContain("076_normalize_cursor_new_families");
+  expect(applied).toContain("077_copilot_harness");
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness self-heals wiped built-ins with their original enabled defaults and never overwrites an existing row", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  db.exec(`DELETE FROM harnesses WHERE id IN ('codex', 'fx', 'antigravity')`);
+  db.exec(`UPDATE harnesses SET enabled = 0, label = 'My Claude' WHERE id = 'claude-code'`);
+  migrate(db, migrations);
+  const byId = Object.fromEntries(
+    db
+      .query<{ id: string; label: string; enabled: number }, []>(`SELECT id, label, enabled FROM harnesses WHERE is_builtin = 1`)
+      .all()
+      .map((r) => [r.id, r]),
+  );
+  expect(byId["codex"]?.enabled).toBe(0);
+  expect(byId["fx"]?.enabled).toBe(0);
+  expect(byId["antigravity"]?.enabled).toBe(1);
+  expect(byId["copilot"]?.enabled).toBe(1);
+  expect(byId["cursor"]?.enabled).toBe(0);
+  expect(byId["gemini"]?.enabled).toBe(0);
+  // An existing row the user customised is left alone.
+  expect(byId["claude-code"]).toMatchObject({ label: "My Claude", enabled: 0 });
+  db.close();
+});
+
+// End to end on the REAL schema (the tests above use a minimal hand-built one):
+// a DB migrated through 074 with real task/profile/preference rows, then the
+// pending 075 + 076 applied by the runner the app itself uses at boot.
+test("075 + 076 on the real schema: codex gpt-5.5 rows move, cursor variants fold to a base id that re-composes the same --model, and updated_at plus frozen snapshots are left alone", () => {
+  const db = new Database(":memory:");
+  const i074 = migrations.findIndex((m) => m.id === "074_retire_fx_models");
+  expect(i074).toBeGreaterThan(0);
+  migrate(db, migrations.slice(0, i074 + 1));
+
+  db.run(
+    `INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('codex-2', 'codex', 'Codex (secondary)', 1, 1)`,
+  );
+  const snapshot = JSON.stringify({ name: "Old", harness: "codex", model: "gpt-5.5", effort: "none" });
+  const pipelineRun = JSON.stringify({ status: "done", snapshot: { profiles: { p: { model: "gpt-5.5" } } } });
+  const insertTask = db.prepare(
+    `INSERT INTO tasks (id, title, prompt, "column", agent, workdir, model, effort, speed, agent_profile, pipeline_run, created_at, updated_at)
+     VALUES (?, 't', 'p', 'backlog', ?, '/tmp', ?, ?, ?, ?, ?, 100, ?)`,
+  );
+  insertTask.run("codex-none", "codex", "gpt-5.5", "none", "off", snapshot, pipelineRun, 111);
+  insertTask.run("codex2-xhigh", "codex-2", "gpt-5.5", "xhigh", "off", null, null, 112);
+  insertTask.run("cursor-gpt55", "cursor", "gpt-5.5", "none", "off", null, null, 113);
+  insertTask.run("fx-gpt55", "fx", "openai/gpt-5.5", "none", "off", null, null, 114);
+  insertTask.run("fx-muse", "fx", "meta/muse-wonder-1.0", "auto", "off", null, null, 115);
+
+  // Every variant id cursor-agent lists for the three new families, on a
+  // cursor task with a stale `fast` speed (the migration resets it).
+  const variantIds = Object.entries({
+    "muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal"],
+    "muse-spark-1.3": ["max", "xhigh", "high", "medium", "low", "minimal"],
+    "deepseek-v41-flash-1017": ["max", "high", "medium", "low", "none"],
+  }).flatMap(([base, tiers]) => tiers.map((t) => `${base}-${t}`));
+  expect(variantIds).toHaveLength(17);
+  variantIds.forEach((id, i) => insertTask.run(`cursor-v${i}`, "cursor", id, null, "fast", null, null, 200 + i));
+
+  const insertProfile = db.prepare(
+    `INSERT INTO agent_profiles (id, name, name_key, harness_id, model, effort, speed, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 100, ?)`,
+  );
+  insertProfile.run("p-codex", "Codex", "codex", "codex", "gpt-5.5", "minimal", "off", 311);
+  insertProfile.run("p-cursor", "Cursor", "cursor", "cursor", "deepseek-v41-flash-1017-none", "high", "fast", 312);
+  insertProfile.run("p-cursor-gpt55", "Cursor 5.5", "cursor 5.5", "cursor", "gpt-5.5", "xhigh", "fast", 313);
+
+  db.run(
+    `INSERT INTO preferences (key, value, updated_at) VALUES
+       ('lastModel:codex', 'gpt-5.5', 7),
+       ('lastEffort:codex', 'none', 7),
+       ('lastModel:cursor', 'muse-spark-1.3-minimal', 7),
+       ('lastModel:fx', 'openai/gpt-5.5', 7)`,
+  );
+
+  expect(migrate(db, migrations.slice(0, i074 + 3))).toEqual(["075_retire_codex_gpt_5_5", "076_normalize_cursor_new_families"]);
+
+  type Row = {
+    id: string;
+    model: string | null;
+    effort: string | null;
+    speed: string;
+    agent_profile: string | null;
+    pipeline_run: string | null;
+    updated_at: number;
+  };
+  const task = (id: string) =>
+    db
+      .query<Row, [string]>(
+        `SELECT id, model, effort, speed, agent_profile, pipeline_run, updated_at FROM tasks WHERE id = ?`,
+      )
+      .get(id)!;
+
+  expect(task("codex-none")).toEqual({
+    id: "codex-none",
+    model: "gpt-6.1-sol",
+    effort: "high", // GPT-6.1 Sol rejects none
+    speed: "off",
+    agent_profile: snapshot, // frozen snapshot still names gpt-5.5
+    pipeline_run: pipelineRun,
+    updated_at: 111,
+  });
+  expect(task("codex2-xhigh")).toMatchObject({ model: "gpt-6.1-sol", effort: "xhigh", updated_at: 112 });
+  expect(task("cursor-gpt55")).toMatchObject({ model: "gpt-5.5", effort: "none", updated_at: 113 });
+  expect(task("fx-gpt55")).toMatchObject({ model: "openai/gpt-5.5", effort: "none", updated_at: 114 });
+  expect(task("fx-muse")).toMatchObject({ model: "meta/muse-wonder-1.0", effort: "auto", updated_at: 115 });
+
+  variantIds.forEach((id, i) => {
+    const row = task(`cursor-v${i}`);
+    expect(row.model, id).not.toBe(id);
+    expect(row.speed, id).toBe("off");
+    expect(row.updated_at, id).toBe(200 + i);
+    // The folded row launches exactly the variant it was pinned to.
+    expect(cursorModelArg(row.model!, row.effort, row.speed === "fast"), id).toBe(id);
+  });
+
+  const profile = (id: string) =>
+    db
+      .query<{ model: string; effort: string | null; speed: string; updated_at: number }, [string]>(
+        `SELECT model, effort, speed, updated_at FROM agent_profiles WHERE id = ?`,
+      )
+      .get(id)!;
+  expect(profile("p-codex")).toEqual({ model: "gpt-6.1-sol", effort: "high", speed: "off", updated_at: 311 });
+  expect(profile("p-cursor")).toEqual({ model: "deepseek-v41-flash-1017", effort: "none", speed: "off", updated_at: 312 });
+  expect(profile("p-cursor-gpt55")).toEqual({ model: "gpt-5.5", effort: "xhigh", speed: "fast", updated_at: 313 });
+
+  const prefs = db
+    .query<{ key: string; value: string; updated_at: number }, []>(
+      `SELECT key, value, updated_at FROM preferences WHERE key IN ('lastModel:codex', 'lastEffort:codex', 'lastModel:cursor', 'lastModel:fx') ORDER BY key`,
+    )
+    .all();
+  expect(prefs).toEqual([
+    { key: "lastEffort:codex", value: "none", updated_at: 7 },
+    { key: "lastModel:codex", value: "gpt-6.1-sol", updated_at: 7 },
+    { key: "lastModel:cursor", value: "muse-spark-1.3", updated_at: 7 },
+    { key: "lastModel:fx", value: "openai/gpt-5.5", updated_at: 7 },
+  ]);
+
+  // The runner records both and never re-applies them.
+  const recorded = db
+    .query<{ id: string }, []>(`SELECT id FROM _migrations ORDER BY id DESC LIMIT 2`)
+    .all()
+    .map((r) => r.id);
+  expect(recorded).toEqual(["076_normalize_cursor_new_families", "075_retire_codex_gpt_5_5"]);
+  expect(migrate(db, migrations.slice(0, i074 + 3))).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness rebuilds harnesses keeping every row and column, seeds copilot enabled, adds runs.copilot_session_id; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  // A real 076-state database: every migration up to (not including) 077.
+  expect(migrate(db, migrations.slice(0, at)).length).toBe(at);
+  expect(columnNames(db, "runs")).not.toContain("copilot_session_id");
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers) VALUES
+      ('claude-work', 'claude-code', 'Claude (work)', 0, '/tmp/agetor-test-home', '/opt/bin/claude', '{"FOO":"bar"}', 11, 12, 1, 1),
+      ('fx-off', 'fx', 'fx off', 0, NULL, NULL, '{}', 21, 22, 0, 0),
+      ('grok-legacy', 'grok', 'Grok', 0, '/tmp/grok-home', NULL, '{"A":"b"}', 31, 32, 1, 1);
+    UPDATE harnesses SET enabled = 0, updated_at = 99 WHERE id = 'codex';
+  `);
+  type Row = Record<string, unknown>;
+  const snapshot = () => db.query<Row, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  const before = snapshot();
+  const beforeColumns = columnNames(db, "harnesses");
+  expect(beforeColumns).toContain("profile_mcp_servers");
+
+  // Apply only through 077: the OpenCode migrations that follow it add their own
+  // built-in row and are covered by the 078-080 tests below.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual(["077_copilot_harness"]);
+
+  // Same columns, same order.
+  expect(columnNames(db, "harnesses")).toEqual(beforeColumns);
+  const after = snapshot();
+  // Every pre-existing row survives byte-for-byte (incl. the user's disabled
+  // codex, the alias home/bin/env, profile_mcp_servers=0 and the legacy grok row).
+  for (const row of before) {
+    expect(after.find((r) => r.id === row.id)).toEqual(row);
+  }
+  expect(after.find((r) => r.id === "fx-off")?.profile_mcp_servers).toBe(0);
+  expect(after.find((r) => r.id === "codex")?.enabled).toBe(0);
+  expect(after.find((r) => r.id === "grok-legacy")?.kind).toBe("grok");
+
+  // Exactly one new row: the built-in copilot, enabled, default profile_mcp_servers.
+  expect(after.length).toBe(before.length + 1);
+  const copilot = after.find((r) => r.id === "copilot")!;
+  expect(copilot).toMatchObject({
+    kind: "copilot",
+    label: "GitHub Copilot",
+    is_builtin: 1,
+    home: null,
+    bin: null,
+    env_json: "{}",
+    enabled: 1,
+    profile_mcp_servers: 1,
+  });
+
+  // The widened CHECK admits copilot (and opencode), still refuses garbage.
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-2', 'copilot', 'Copilot 2', 1, 1)`);
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'OC', 1, 1)`);
+  expect(() =>
+    db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'Bad', 1, 1)`),
+  ).toThrow();
+
+  expect(columnNames(db, "runs")).toContain("copilot_session_id");
+
+  // Re-running is a no-op.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness is only backfilled, never re-run, on a DB that already applied it as 075_copilot_harness", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  // The dev-DB shape: the SQL ran under the branch's original id.
+  migrate(db, [{ id: "075_copilot_harness", sql: copilotHarness }]);
+  db.exec(`UPDATE harnesses SET label = 'My Copilot' WHERE id = 'copilot'`);
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  expect(
+    db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id IN ('075_copilot_harness', '077_copilot_harness') ORDER BY id`).all().map((r) => r.id),
+  ).toEqual(["075_copilot_harness", "077_copilot_harness"]);
+  // Not re-seeded over the user's edit.
+  expect(db.query<{ label: string }, []>(`SELECT label FROM harnesses WHERE id = 'copilot'`).get()?.label).toBe("My Copilot");
+  db.close();
+});
+
+test("081 (cursor asks) preserves its registered order before the additive Hub migration", () => {
+  const at = migrations.findIndex((m) => m.id === "081_cursor_asks");
+  expect(at).toBe(migrations.length - 3);
+  expect(migrations[at + 1]?.id).toBe("082_hub_execution");
+  expect(migrations[at + 1]?.sql).toContain("CREATE TABLE hub_entities");
+  expect(migrations[at - 1]?.id).toBe("080_harness_auto_enabled");
+  expect(migrations[at - 2]?.id).toBe("079_opencode_task_fields");
+  expect(migrations[at - 3]?.id).toBe("078_opencode_harness");
+  expect(migrations[at - 4]?.id).toBe("077_copilot_harness");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE cursor_asks");
+  expect(migrations[at - 1]?.sql).toBe(harnessAutoEnabled);
+  expect(migrations[at - 2]?.sql).toBe(opencodeTaskFields);
+  expect(migrations[at - 3]?.sql).toBe(opencodeHarness);
+});
+
+/** Migrate a fresh DB up to (and including) `lastId`. */
+function migrateThrough(db: Database, lastId: string): void {
+  const at = migrations.findIndex((m) => m.id === lastId);
+  expect(at).toBeGreaterThanOrEqual(0);
+  migrate(db, migrations.slice(0, at + 1));
+}
+
+test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabled opencode built-in, and keep admitting opencode/copilot kinds (N-1 recipe)", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  // A user alias with every column off its default, plus a disabled built-in
+  // flipped on by the user, so the explicit-column copy is load-bearing.
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+    VALUES ('fx-2', 'fx', 'fx second', 0, '/tmp/agetor-home/fx-2', '/opt/fx/bin/fx', '{"FX_REVIEW_MODEL":"x/y"}', 11, 22, 0, 0);
+    UPDATE harnesses SET enabled = 1 WHERE id = 'codex';
+    INSERT INTO runs (id, task_id, agent, status, started_at) VALUES ('r1', 't-missing', 'fx', 'succeeded', 5);
+  `);
+  const before = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  // 077 (copilot) already widened the CHECK to admit opencode, but seeds no
+  // opencode built-in: that row arrives with 078.
+  expect(db.query(`SELECT 1 FROM harnesses WHERE id = 'opencode'`).get()).toBeNull();
+
+  expect(migrate(db, migrations)).toEqual([
+    "078_opencode_harness",
+    "079_opencode_task_fields",
+    "080_harness_auto_enabled",
+    "081_cursor_asks",
+    "082_hub_execution",
+    "083_hub_service",
+  ]);
+  expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
+
+  const after = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id != 'opencode' ORDER BY id`).all();
+  expect(after).toEqual(before);
+  expect(columnNames(db, "harnesses")).toEqual([
+    "id", "kind", "label", "is_builtin", "home", "bin", "env_json", "created_at", "updated_at", "enabled", "profile_mcp_servers",
+  ]);
+  const oc = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id = 'opencode'`).get();
+  expect(oc).toMatchObject({ kind: "opencode", label: "OpenCode", is_builtin: 1, home: null, bin: null, env_json: "{}", enabled: 0, profile_mcp_servers: 1 });
+
+  // The widened CHECK keeps admitting copilot and additional opencode harnesses;
+  // junk is still refused.
+  db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('cp', 'copilot', 'Copilot', 1, 1)`);
+  db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('opencode-2', 'opencode', 'OC 2', 1, 1)`);
+  expect(() =>
+    db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'x', 1, 1)`),
+  ).toThrow();
+
+  // runs gains opencode_session_id; the pre-existing row reads NULL.
+  expect(columnNames(db, "runs")).toContain("opencode_session_id");
+  expect(db.query<{ v: string | null }, []>(`SELECT opencode_session_id AS v FROM runs WHERE id = 'r1'`).get()?.v).toBeNull();
+  db.close();
+});
+
+test("078 self-heal re-seeds a deleted built-in with its own enabled default", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  db.exec(`DELETE FROM harnesses WHERE id IN ('claude-code', 'cursor', 'antigravity')`);
+  migrate(db, migrations);
+  const enabled = Object.fromEntries(
+    db.query<{ id: string; enabled: number }, []>(`SELECT id, enabled FROM harnesses WHERE is_builtin = 1`).all().map((r) => [r.id, r.enabled]),
+  );
+  expect(enabled).toEqual({
+    "claude-code": 1, codex: 0, cursor: 0, gemini: 0, fx: 0, antigravity: 1, opencode: 0, copilot: 1,
+  });
+  db.close();
+});
+
+test("079 adds opencode_server (default shared, CHECK-guarded) to tasks and agent_profiles, the imported-opencode pair with a unique claim, and the runs session-id index", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  db.exec(`
+    INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'codex', '/w', 1, 1);
+    INSERT INTO agent_profiles (id, name, name_key, harness_id, model, instructions, skills_json, created_at, updated_at)
+      VALUES ('p1', 'P', 'p', 'codex', 'm', '', '[]', 1, 1);
+  `);
+  migrate(db, migrations);
+  expect(db.query<{ v: string }, []>(`SELECT opencode_server AS v FROM tasks WHERE id = 't1'`).get()?.v).toBe("shared");
+  expect(db.query<{ v: string }, []>(`SELECT opencode_server AS v FROM agent_profiles WHERE id = 'p1'`).get()?.v).toBe("shared");
+  db.run(`UPDATE tasks SET opencode_server = 'standalone' WHERE id = 't1'`);
+  expect(() => db.run(`UPDATE tasks SET opencode_server = 'junk' WHERE id = 't1'`)).toThrow();
+  expect(() => db.run(`UPDATE agent_profiles SET opencode_server = 'junk' WHERE id = 'p1'`)).toThrow();
+  expect(columnNames(db, "tasks")).toEqual(expect.arrayContaining(["imported_opencode", "imported_opencode_session_id"]));
+
+  db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t2', 't', 'p', 'backlog', 'codex', '/w', 1, 1)`);
+  db.run(`UPDATE tasks SET imported_opencode_session_id = 'ses_abc' WHERE id = 't1'`);
+  expect(() => db.run(`UPDATE tasks SET imported_opencode_session_id = 'ses_abc' WHERE id = 't2'`)).toThrow();
+  // NULL claims never collide.
+  db.run(`UPDATE tasks SET imported_opencode_session_id = NULL WHERE id = 't2'`);
+
+  const indexes = db.query<{ name: string }, []>(`SELECT name FROM sqlite_master WHERE type = 'index'`).all().map((r) => r.name);
+  expect(indexes).toEqual(expect.arrayContaining(["tasks_imported_opencode_session_uidx", "runs_opencode_session_id_idx"]));
+  db.close();
+});
+
+test("080 creates harness_auto_enabled with no foreign key, surviving a harnesses rebuild", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  expect(columnNames(db, "harness_auto_enabled")).toEqual(["harness_id", "enabled_at", "notified"]);
+  expect(db.query<unknown, []>(`PRAGMA foreign_key_list(harness_auto_enabled)`).all()).toEqual([]);
+  db.run(`INSERT INTO harness_auto_enabled (harness_id, enabled_at) VALUES ('codex', 5)`);
+  expect(db.query<{ n: number }, []>(`SELECT notified AS n FROM harness_auto_enabled`).get()?.n).toBe(0);
+  // A later rebuild (the recipe 077 uses) leaves the bookkeeping intact.
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.exec(`CREATE TABLE h2 AS SELECT * FROM harnesses; DROP TABLE harnesses; ALTER TABLE h2 RENAME TO harnesses;`);
+  expect(db.query<{ id: string }, []>(`SELECT harness_id AS id FROM harness_auto_enabled`).all()).toEqual([{ id: "codex" }]);
+  db.close();
+});

@@ -1,0 +1,12 @@
+import { writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { buildFrontendAssets } from '../../work/upstream/agetor/packages/core/frontend.ts';
+const token = randomBytes(32).toString('hex');
+const built = await buildFrontendAssets(new URL('./source', import.meta.url).pathname, token);
+const app = built.assets.get('/app.js')!.body;
+const html = built.assets.get('/')!.body.split(built.nonce).join('__HUB_CSP_NONCE__').split(token).join('__HUB_BOOTSTRAP_TOKEN__');
+await writeFile(new URL('./app.live-native.js', import.meta.url), app);
+await writeFile(new URL('./index.live-native.html', import.meta.url), html);
+const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+await writeFile(new URL('./manifest.json', import.meta.url), JSON.stringify({schemaVersion:1,delivery:'Codex F02-r3',checkedAt:new Date().toISOString(),sourceHashes:built.sourceHashes,nativeBundleHashes:{'app.live-native.js':hash(app),'index.live-native.html':hash(html)},reviewStatus:'accepted-macos-mvp-scoped',evidence:'browser/ui-checks.json'},null,2)+'\n');
+console.log('Native bridge built and normalized hashes recorded');

@@ -1,0 +1,8961 @@
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
+import {
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
+} from "lucide-react";
+import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
+import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { driftOf, driftTitle } from "@/lib/branch-drift";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
+import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
+import { mergePendingInteraction, mergePendingInteractionSnapshot } from "@/lib/merge-pending-interaction";
+import { EXPAND_EVENT } from "@/lib/expand-on-jump";
+import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
+import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
+import { useExpandOnJump } from "@/lib/use-expand-on-jump";
+import { latestPrProposal } from "@/lib/pr-proposal";
+import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
+import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
+import { eventWindowKeepCount } from "@/lib/event-window";
+import { appendQuote } from "@/lib/quote-selection";
+import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { cursorAskCanAdvance, cursorAskCardHeading, cursorAskFromToolUse, cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues, cursorAskToolFooter, cursorAskWireCustom } from "../../../shared/cursor-ask.ts";
+import { CURSOR_ASK_FREEFORM } from "../../../shared/cursor-ask-verdict.ts";
+import { foldToolUseRevisions, supersededToolUseIndexes } from "../../../shared/tool-use-revisions.ts";
+import { isMacPlatform } from "@/lib/platform";
+import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
+import { AtFileAutocomplete } from "./AtFileAutocomplete";
+import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
+import { shortenTaskPaths } from "@/lib/shorten-task-paths";
+import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
+import { useCountdown } from "@/lib/fx-auto-resume";
+import { renderLinkified } from "@/lib/linkify";
+import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
+import {
+  FX_RESUME_UNSUPPORTED_TEXT,
+  fxRecoveryNoticeText,
+  fxRecoverySummaryLine,
+  fxSupportsContinueRecovery,
+  isFxRecoveryResumable,
+  parseFxRecoveryPayload,
+} from "../../../shared/fx-recovery.ts";
+import { reconcileById } from "@/lib/reconcile";
+import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
+import { QuoteSelectionButton } from "./QuoteSelectionButton";
+import type { GitHubPullPrefill } from "./GitHubDialog";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
+import { Badge, badgeVariants } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { abbreviateHome, cn } from "@/lib/utils";
+import { iconForRef, refBasename } from "@/lib/file-icons";
+import {
+  AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  defaultModeFor,
+  EVENTS_WINDOW_MAX,
+  FX_AUTO_RESUME_MAX,
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
+  FX_SESSION_TITLE_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  isInternalStatusSentinel,
+  cursorModelIdCoveredByCatalog,
+  cursorModelSupportsMaxMode,
+  EFFORT_OPTIONS,
+  retainableEfforts,
+  supportedEfforts,
+  supportedModes,
+  type AgentKind,
+  type AgentProfile,
+  type AgentStatus,
+  type Harness,
+  type BacklogMessage,
+  type FxRecoveryPayload,
+  type AgentProfileSnapshot,
+  type FxUsagePayload,
+  type GitHubPullMergeability,
+  type PipelineGraph,
+  type PipelineRunState,
+  type PipelineStepRecord,
+  type Run,
+  type RunEvent,
+  type Subagent,
+  type SubagentEvent,
+  type Task,
+  type TaskDraft,
+  type TaskEventsReplayMeta,
+  type TaskFxRecovery,
+  type TaskPlan,
+  type TaskReference,
+  type ToolResultAttachment,
+  type ToolResultRetention,
+  retentionTrimNote,
+} from "../../../shared/types.ts";
+import { appendReferences } from "../../../shared/refs.ts";
+import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
+import { stepNameById } from "../../../shared/pipeline.ts";
+import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
+import { supportedSpeeds } from "../../../shared/speed.ts";
+import { parseIssueUrl } from "../../../shared/issue-task.ts";
+import { draftsEqual, normalizeDraft } from "@/lib/draft";
+import { createEventDeduper } from "@/lib/event-dedup";
+import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
+import { isHiddenToolEvent } from "../../../shared/tool-visibility.ts";
+import { createEventBuffer } from "@/lib/event-buffer";
+import { createInteractionRefetchTracker, mergeRefetchedInteractions } from "@/lib/interaction-refetch";
+import {
+  TASK_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+} from "../../../shared/task-stream-resume.ts";
+import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
+import { cleanPromptPane } from "@/lib/prompt-noise";
+import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
+import { isHandoffReminderMarker, mapTextOutsideHandoffSpans } from "../../../shared/pipeline.ts";
+import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
+import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfileDetailsDialog } from "./AgentProfileDetailsDialog";
+import { AttachmentChips } from "./AttachmentChips";
+import { SentFilesCard } from "./SentFilesCard";
+import {
+  ReferencesPicker,
+  captureDroppedOrPastedItems,
+} from "./ReferencesPicker";
+import { PromptComposer, usePromptCapture, useAgentCapabilities, useSavedPrompts } from "./PromptComposer";
+import { MessageHistoryPicker } from "./MessageHistoryPicker";
+import { TerminalView } from "./TerminalView";
+import { deriveTodoProgress } from "@/lib/todo-progress";
+import { TodoProgressCard } from "./TodoProgressCard";
+import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
+import { ASSISTANT_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
+import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
+import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
+import { HandoffViewContext, stepNameFor, useHandoffView, type HandoffViewValue } from "@/components/handoff/handoff-context";
+import { AssistantHandoffMessage, UserHandoffMarkdown } from "@/components/handoff/HandoffMessage";
+import { handoffCardsEnabled, handoffUsage, indexLastHandoffEventByRun } from "@/lib/handoff-view";
+import { SpeedPicker } from "./SpeedPicker";
+import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
+import { importedSessionOf } from "../../../shared/imported-session.ts";
+
+/**
+ * Resolve a task's harness id to its underlying kind. Falls back to
+ * claude-code when the id doesn't match any known harness (e.g. the alias
+ * was just deleted) — every kind-keyed lookup downstream expects a valid
+ * AgentKind, and claude-code is the safer default than codex.
+ */
+function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
+  return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
+}
+
+/** Stable empty-array reference for `RunEventList`'s `plans` prop on a task
+ *  whose agent never produces plan records (codex, gemini — see
+ *  docs/plans/cursor-plan-approval.md §3 for cursor's `createPlanToolCall`
+ *  and docs/plans/claude-code-plan-mode-and-todo-tracker.md §2-3 for
+ *  claude-code's `ExitPlanMode`). Reused instead of an inline `[]` literal
+ *  so a re-render doesn't hand `RunEventList` a fresh identity for no
+ *  reason. */
+const NO_PLANS: TaskPlan[] = [];
+
+/** Signature substrings of claude-code's `ExitPlanMode` native approval
+ *  modal pane text — shared so `TmuxPromptCard`'s `isPlan` detection and
+ *  `RunEventList`'s `latestPlanMarkdown`/plan-signature gating test the
+ *  exact same pattern instead of two independently-maintained literals. */
+const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
+
+/**
+ * `RunEvent` as held in the panel's local `events` state, tagged with a
+ * client-assigned monotonic id. `id` here is always assigned by
+ * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
+ * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
+ * event apart from one observed before the JSONL snapshot was captured when
+ * deciding whether the JSONL rebuild snapshot has gone stale —
+ * it is NEVER the server's own event id, even when one is available (see
+ * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
+ * being contiguous and monotonic per-connection.
+ *
+ * `dbId`, when present, is the REAL `run_events.id` row id. Every saved row
+ * carries it — replayed frames, "Load earlier" pages and live frames alike
+ * (the server stamps the stored id on each live send). Only an event the
+ * server never saved lacks one (the live-only `interaction`/`subagent`
+ * frames are consumed before they reach the window). It's what lets the
+ * live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh `beforeId`
+ * cursor after eating into previously-loaded earlier history: if the new
+ * front-of-window event
+ * carries a `dbId`, that becomes the new `earliestId`; if it doesn't (a
+ * never-saved event at the front of the window), "Load earlier" has nothing
+ * reliable to page from and hides until the next snapshot or fresh connect
+ * re-seeds `earliestId` from `replay_meta`.
+ */
+type StreamEvent = RunEvent & { id: number; dbId?: number };
+
+/**
+ * Resolved display data for the pipeline strip (`run-panel-pipeline-strip`)
+ * a step task's panel renders under its header — the pipeline's name plus
+ * this step's name, fetched from the parent pipeline task via
+ * `api.getPipelineRun`. See `RunPanelBody`'s `pipelineStripCacheRef` /
+ * `pipelineStrip` state for how this is fetched and cached.
+ *
+ * `stepIndex`/`stepTotal` back the D7 "(k/N)" suffix (`docs/plans/
+ * pipelines.md` line 209): `stepTotal` is the frozen graph's step count,
+ * and `stepIndex` is this step's 1-based POSITION WITHIN THE GRAPH (not an
+ * execution ordinal) — a cycle can revisit the same step several times, and
+ * indexing by `pipelineRun.history` position produced nonsensical values
+ * like "(7/3)" for a step's 7th execution in a 3-step graph. `null` when the
+ * step id can't be found in the graph (or there's no graph yet).
+ */
+interface PipelineStripInfo {
+  pipelineName: string;
+  stepName: string;
+  stepIndex: number | null;
+  stepTotal: number;
+}
+
+interface Props {
+  /** When null, the panel slides off-screen and unmounts after the exit animation. */
+  task: Task | null;
+  /** Pin the current user message while its response scrolls (default mode). */
+  stickyUserMessages: boolean;
+  agents: AgentStatus[];
+  /** Registered harnesses — needed so the panel's agent dropdown can list
+   *  every known harness (built-ins + aliases). */
+  harnesses: Harness[];
+  /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
+   *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
+   *  controls are locked (`task.agentProfileId != null`). `null` means the
+   *  first `GET /agent-profiles` fetch hasn't succeeded yet (see
+   *  `useAgentProfiles`'s `loaded` flag) — `resolveTaskProfileDisplay` never
+   *  reports `deleted` in that state, so a bound task's chip can't flash
+   *  "(deleted)" while loading or after a failed fetch. */
+  profiles: AgentProfile[] | null;
+  /** Optimistically merges partial fields into this task in the parent's
+   *  `tasks` state (e.g. after detaching an agent profile) — mirrors the
+   *  `unread`-only merge App.tsx already does on mark-seen, never a
+   *  wholesale Task replace (would revert a concurrent optimistic patch). */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** "Manage agents…" — wired to the task-details Detach hint's sibling
+   *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
+  onOpenSettingsAgents: (profileId?: string) => void;
+  agentModels: AgentModelMap;
+  /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
+   *  on the api client. Preferred over `agentModels` for the task's own
+   *  harness id wherever the panel resolves the model picker's options. */
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  /** Force a fresh discovery probe (one harness, or every enabled harness
+   *  when omitted) then refetch both model maps. Threaded down to
+   *  `TaskDetails`' inline editor for the same manual-↻ affordance
+   *  NewTaskForm has; the SSE `agent_models_changed` path keeps both maps
+   *  fresh regardless, so this is a convenience, not the only freshness
+   *  source. */
+  onRefreshModels: (harnessId?: string) => Promise<void>;
+  homeDir: string;
+  onClose: () => void;
+  /** Open the git diff viewer for the given task. */
+  onShowDiff: (task: Task) => void;
+  onArchive: (t: Task) => void;
+  onUnarchive: (t: Task) => void;
+  /** Open GitHubDialog's New-PR composer prefilled for this task — see the
+   *  "Open PR" chip below. Owned by App so the dialog stays a single
+   *  App-level singleton instead of one instance per task panel. */
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  /** Open GitHubDialog directly on the PR detail subpage for this task's
+   *  `prUrl` — see the header "View PR" affordance below. Same App-level-
+   *  singleton ownership rationale as `onOpenPullRequest`. */
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
+  /** Open GitHubDialog directly on the issue detail subpage for this task's
+   *  `issueUrl` — see the header "View issue" affordance below. Same
+   *  App-level-singleton ownership rationale as `onOpenPullRequest`. */
+  onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
+  /** Opens the pipeline run view for a pipeline task — a step task's own
+   *  `pipelineParentId`, or a pipeline-parent task's own `id`. Backs the
+   *  "Open pipeline" button in the pipeline strip (see D7,
+   *  `docs/plans/pipelines.md`). Defaults to a no-op so `RunPanel` compiles
+   *  and renders standalone before `App.tsx` threads the real handler. */
+  onOpenPipeline?: (parentTaskId: string) => void;
+  /** One-shot request to land on a specific subagent's tab once the panel
+   *  knows that subagent (the pipeline run view's "Open transcript" on a
+   *  satellite's helper). `nonce` makes each request distinct so the same
+   *  id can be re-requested; the panel honours a request exactly once and
+   *  never re-forces the tab on later polls. Also keeps the tab strip
+   *  visible for that helper even after everything has finished. */
+  focusSubagent?: { id: string; nonce: number; consumed?: boolean } | null;
+  /** Called with the request's `nonce` the moment the panel has actually
+   *  selected that helper's tab. App flips the request's `consumed` flag
+   *  in ITS state in response — the "already honoured" bookkeeping lives
+   *  there, not in a ref inside `RunPanelBody`, so a body remount can never
+   *  replay a nonce (M-A2). */
+  onFocusSubagentConsumed?: (nonce: number) => void;
+}
+
+/** No-op default for `Props.onOpenPipeline` — module-level so it's a stable
+ *  reference across renders (never triggers a memoized child to re-render
+ *  just because the caller omitted the prop). */
+function noOpOpenPipeline(): void {}
+
+const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
+  running: "default",
+  succeeded: "secondary",
+  cancelled: "outline",
+  orphaned: "outline",
+  failed: "destructive",
+};
+
+export const EXIT_DURATION_MS = 250;
+
+// Distance-from-bottom (px) below which the log counts as "near bottom" for
+// auto-scroll purposes. Shared by the onScroll handler and the ResizeObserver
+// pin effect below — the two heuristics must not drift apart, or a user
+// parked just past one threshold but within the other would see the pin
+// fire inconsistently depending on which path last updated `nearBottomRef`.
+const NEAR_BOTTOM_PX = 80;
+
+// Upper bound on how long the git-status and PR-mergeability fetches (each
+// declared further down `RunPanelBody`) wait behind the SSE subscription's
+// first `replay_meta` frame before firing anyway — see `markStreamReady`/
+// `awaitStreamReady` near `runsLoaded`. A dead task (no SSE endpoint
+// reachable at all) or an unusually slow replay must not starve those
+// fetches forever; 400ms is comfortably above a normal replay's latency
+// while still well inside "the switch burst" the deferral exists to avoid.
+const STREAM_READY_FALLBACK_MS = 400;
+
+// Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
+const IS_MAC_PLATFORM = isMacPlatform();
+
+/**
+ * Prefills the "Closes #N" (GitHub/GitLab) / "Issue #N" (Bitbucket) line
+ * into a Create-PR body when the task was created from an issue — the
+ * counterpart to `buildIssueTaskPrompt`'s in-prompt directive, but applied
+ * at PR-open time since the body itself is only assembled here (the "Create
+ * PR" click handler below, which builds the `GitHubPullPrefill` passed to
+ * `onOpenPullRequest`). No-op when `issueUrl` doesn't parse (not an
+ * issue-sourced task) or the body already references the issue number, so a
+ * user-edited body already mentioning the issue is never double-appended.
+ * The re-check is a word-boundary regex (`#7` must not match `#71`) rather
+ * than a plain substring test.
+ */
+function appendIssueCloseDirective(body: string, issueUrl: string | null | undefined): string {
+  const parsed = parseIssueUrl(issueUrl);
+  if (!parsed) return body;
+  const marker = `#${parsed.number}`;
+  if (new RegExp(`#${parsed.number}(?!\\d)`).test(body)) return body;
+  const directive = parsed.provider === "bitbucket" ? `Issue ${marker}` : `Closes ${marker}`;
+  return body ? `${body}\n\n${directive}` : directive;
+}
+
+function formatDuration(r: Run): string {
+  const end = r.endedAt ?? Date.now();
+  const ms = end - r.startedAt;
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m${s % 60}s`;
+}
+
+function formatTime(ts: number): string {
+  return new Date(ts).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// fx's usage payload (`FxUsagePayload`, imported from shared/types.ts) and
+// its parse/merge/format helpers now live in `@/lib/fx-usage` — pure, no
+// React, shared with bun-side tests.
+
+/**
+ * Right-side overlay that shows a task's run history + the live log of the
+ * selected run. Renders as a fixed-position panel with a blurred backdrop so
+ * the kanban behind it stays visible but de-emphasized. The panel keeps the
+ * last task mounted during the exit animation so the slide-out doesn't snap.
+ */
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
+  // `mountedTask` lags behind `task` so that when the parent sets task → null
+  // we keep rendering the old contents while the exit animation plays.
+  const [mountedTask, setMountedTask] = useState<Task | null>(task);
+  const [open, setOpen] = useState<boolean>(!!task);
+  // Synchronously-written mirror of `open` for listeners that must not
+  // outlive the close: `open` itself only flips on a re-render scheduled
+  // from a passive effect (the `[task]` effect below calls `setOpen(false)`
+  // from inside a passive effect, which is default-priority, not sync), so
+  // it can land at least one scheduler task after App's `selectedIdRef` has
+  // already gone null. `openRef` is written at the same moment as the
+  // `setOpen` call it mirrors, so a listener that reads it sees the close
+  // immediately instead of racing the deferred re-render.
+  const openRef = useRef(false);
+
+  // User-resizable width, persisted in localStorage (`panel-width.ts`).
+  // Resolved synchronously in the initializer — an effect-time read would
+  // paint the default width first and snap. Live drag frames update only
+  // this local state; the committed value (drag end / keyboard / reset) is
+  // also written to storage.
+  const [width, setWidth] = useState<number>(() => readPanelWidth(window.innerWidth));
+  const [resizing, setResizing] = useState(false);
+  const dragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+  // The user's chosen width, independent of the current viewport clamp —
+  // shrinking the window squeezes `width` down (resize listener below) but
+  // re-growing it restores this preference rather than the squeezed value.
+  const preferredWidthRef = useRef(width);
+
+  const commitWidth = useCallback((w: number) => {
+    preferredWidthRef.current = w;
+    setWidth(w);
+    writePanelWidth(w);
+  }, []);
+
+  // Single owner for every non-React consumer of the width: publish it as a
+  // CSS custom property on the document root. The Toaster's offset reads
+  // `var(--run-panel-width)` instead of threading the value through App —
+  // no mirror state, and any future consumer is a zero-prop CSS read.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--run-panel-width", `${width}px`);
+    return () => {
+      document.documentElement.style.removeProperty("--run-panel-width");
+    };
+  }, [width]);
+
+  // Re-clamp when the window resizes, so state can never disagree with the
+  // rendered width (the CSS `max-w-[90vw]` on the `<aside>` would otherwise
+  // win silently and leave stale numbers in the CSS variable above —
+  // off-screen toasts on a persisted-wide panel in a shrunken window).
+  useEffect(() => {
+    const onResize = () => setWidth(clampPanelWidth(preferredWidthRef.current, window.innerWidth));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const onResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startWidth: width };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setResizing(true);
+  };
+  const onResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    // Panel is anchored to the right edge, so dragging LEFT grows it.
+    setWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    setResizing(false);
+    // Recompute from the event rather than reading `width` — the last
+    // pointermove's setState may not have flushed into this closure yet.
+    commitWidth(clampPanelWidth(drag.startWidth + (drag.startX - e.clientX), window.innerWidth));
+  };
+  const onResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Handle sits on the panel's LEFT edge: ArrowLeft moves it left = wider.
+    const delta = e.key === "ArrowLeft" ? 32 : e.key === "ArrowRight" ? -32 : 0;
+    if (delta === 0) return;
+    e.preventDefault();
+    commitWidth(clampPanelWidth(width + delta, window.innerWidth));
+  };
+
+  useEffect(() => {
+    if (task) {
+      setMountedTask(task);
+      // Defer the open flip to the next frame so the panel mounts at
+      // translate-x-full first, then animates to translate-x-0. Cancel on
+      // cleanup: without this, a pending rAF from a truthy run can fire AFTER
+      // a later task→null run set open=false, wedging the panel open (open=true
+      // while task=null, so every close path's setSelected(null) is a no-op).
+      // The 2s kanban poll re-creates `selected` — and so re-runs this effect —
+      // every tick, which is what made the bug intermittent.
+      const raf = requestAnimationFrame(() => {
+        openRef.current = true;
+        setOpen(true);
+      });
+      return () => cancelAnimationFrame(raf);
+    }
+    openRef.current = false;
+    setOpen(false);
+  }, [task]);
+
+  // After the exit animation completes, drop the mountedTask so we don't keep
+  // a stale subscription / poll loop alive. The timer is cancelled if the user
+  // re-opens the panel before it fires.
+  useEffect(() => {
+    if (open || !mountedTask) return;
+    const t = setTimeout(() => setMountedTask(null), EXIT_DURATION_MS);
+    return () => clearTimeout(t);
+  }, [open, mountedTask]);
+
+  // Escape closes the panel — but only when no higher-priority dismissable
+  // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
+  // each renders `[role="dialog"][aria-modal="true"]`), an open search-select
+  // / multi-search-select popover (marked with `[data-popover-open]`), the
+  // floating quote pill (marked with `[data-quote-open]` — see
+  // QuoteSelectionButton), or the in-panel message search bar (marked with
+  // `[data-search-open]` — see RunPanelBody). Esc peels one layer at a time,
+  // top down.
+  //
+  // Note: stopPropagation/stopImmediatePropagation can't help here because
+  // both the panel and the popovers attach to `document`, so DOM markers
+  // are the order-independent way to coordinate the handoff.
+  //
+  // An Escape that a layer already handled arrives `defaultPrevented`, and
+  // that alone is enough to bail: a popover listening on the textarea (the
+  // `@` autocomplete, `/` autocomplete) dismisses itself in the same event,
+  // and its marker can already be gone by the time this bubble-phase
+  // listener runs — React may flush the dismiss between the two listeners.
+  // Under load that closed the whole panel on the first Escape (reproduced
+  // 2/8 in e2e/at-file-autocomplete.spec.ts with every core busy).
+  // dialog.tsx bails the same way.
+  //
+  // onClose is captured into a ref because the parent passes an inline arrow
+  // function — depending on it directly would tear down + re-add the listener
+  // on every kanban poll (every 2s).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      e.preventDefault();
+      onCloseRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  if (!mountedTask) return null;
+
+  return (
+    <>
+      <button
+        type="button"
+        aria-label="Close task panel"
+        onClick={onClose}
+        className={cn(
+          // Deliberately NO backdrop blur utility: a full-window backdrop filter makes
+          // WebKit re-blur the entire board every frame anything beneath it
+          // repaints or animates (an awaiting card's glow, a poll-driven
+          // re-render) for as long as the panel is open — i.e. exactly while
+          // the user sits watching a run. A slightly denser plain scrim gives
+          // the same "focus on the panel" read for zero per-frame cost.
+          "fixed inset-0 z-30 bg-background/50 transition-opacity duration-200",
+          open ? "opacity-100" : "pointer-events-none opacity-0",
+        )}
+      />
+      <aside
+        style={{ width }}
+        className={cn(
+          "fixed right-0 top-0 z-40 flex h-full max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out",
+          open ? "translate-x-0" : "translate-x-full",
+        )}
+      >
+        {/* Resize handle on the panel's left edge. `touch-none` so pointer
+            capture isn't hijacked by scroll gestures; `select-none` plus the
+            pointerdown preventDefault keep a drag from starting a text
+            selection in the transcript underneath. */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize task panel"
+          aria-valuenow={width}
+          aria-valuemin={RUN_PANEL_MIN_WIDTH}
+          tabIndex={0}
+          data-testid="run-panel-resize"
+          onPointerDown={onResizePointerDown}
+          onPointerMove={onResizePointerMove}
+          onPointerUp={onResizePointerEnd}
+          onPointerCancel={onResizePointerEnd}
+          onDoubleClick={() => commitWidth(clampPanelWidth(RUN_PANEL_DEFAULT_WIDTH, window.innerWidth))}
+          onKeyDown={onResizeKeyDown}
+          title="Drag to resize · double-click to reset"
+          className={cn(
+            "absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize touch-none select-none outline-none transition-colors",
+            "hover:bg-primary/40 focus-visible:bg-primary/40",
+            resizing && "bg-primary/50",
+          )}
+        />
+        <RunPanelBody
+          task={mountedTask}
+          stickyUserMessages={stickyUserMessages}
+          agents={agents}
+          harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={onOpenSettingsAgents}
+          agentModels={agentModels}
+          harnessModels={harnessModels}
+          onRefreshModels={onRefreshModels}
+          homeDir={homeDir}
+          onTaskFieldsChanged={onTaskFieldsChanged}
+          open={open}
+          openRef={openRef}
+          onClose={onClose}
+          onShowDiff={onShowDiff}
+          onArchive={onArchive}
+          onUnarchive={onUnarchive}
+          onOpenPullRequest={onOpenPullRequest}
+          onViewPullRequest={onViewPullRequest}
+          onViewIssue={onViewIssue}
+          onOpenPipeline={onOpenPipeline}
+          focusSubagent={focusSubagent}
+          onFocusSubagentConsumed={onFocusSubagentConsumed}
+        />
+      </aside>
+    </>
+  );
+}
+
+/**
+ * Inner content of the slide-over. Split out so the wrapper can manage mount /
+ * animation state without re-running effects every animation tick.
+ */
+function RunPanelBody({
+  task,
+  stickyUserMessages,
+  agents,
+  harnesses,
+  profiles,
+  onOpenSettingsAgents,
+  agentModels,
+  harnessModels,
+  onRefreshModels,
+  homeDir,
+  onTaskFieldsChanged,
+  open,
+  openRef,
+  onClose,
+  onShowDiff,
+  onArchive,
+  onUnarchive,
+  onOpenPullRequest,
+  onViewPullRequest,
+  onViewIssue,
+  onOpenPipeline,
+  focusSubagent,
+  onFocusSubagentConsumed,
+}: {
+  task: Task;
+  stickyUserMessages: boolean;
+  agents: AgentStatus[];
+  harnesses: Harness[];
+  profiles: AgentProfile[] | null;
+  onOpenSettingsAgents: (profileId?: string) => void;
+  agentModels: AgentModelMap;
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  onRefreshModels: (harnessId?: string) => Promise<void>;
+  homeDir: string;
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** Whether the panel is in its "open" (not mid-close-animation, not
+   *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
+   *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
+   *  panel is animating out or not actually visible. */
+  open: boolean;
+  /** Synchronously-written mirror of `open` — see its doc comment in
+   *  `RunPanel`. Checked inside the Cmd/Ctrl+F handler itself (not just the
+   *  attaching effect) so the listener stays inert through the close-edge
+   *  window where `open` hasn't re-rendered yet but the board's own
+   *  `selectedIdRef` is already null. */
+  openRef: React.RefObject<boolean>;
+  onClose: () => void;
+  onShowDiff: (task: Task) => void;
+  onArchive: (t: Task) => void;
+  onUnarchive: (t: Task) => void;
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
+  onViewIssue: (input: { projectPath: string; issueUrl: string }) => void;
+  /** Opens the pipeline run view — see `Props.onOpenPipeline`'s doc comment
+   *  on the outer `RunPanel` component. Always a function by the time it
+   *  reaches here (defaulted at the `RunPanel` call site). */
+  onOpenPipeline: (parentTaskId: string) => void;
+  /** See `Props.focusSubagent` on the outer `RunPanel`. */
+  focusSubagent: { id: string; nonce: number; consumed?: boolean } | null;
+  /** See `Props.onFocusSubagentConsumed` on the outer `RunPanel`. */
+  onFocusSubagentConsumed: ((nonce: number) => void) | undefined;
+}) {
+  const archived = task.archivedAt != null;
+  const kind = harnessKindOf(task.agent, harnesses);
+  /** The task id this render's async handlers should be writing state for.
+   *  RunPanelBody is NOT remounted on task switch (see `RunPanel`'s call
+   *  site in App.tsx), so an async handler (`send`, `saveForLater`,
+   *  `rebuildFromJsonl`, the backlog CRUD helpers, …) that captured task A's
+   *  id before an `await` must not write its post-await result into state
+   *  once the panel has moved on to task B. Written synchronously at the top
+   *  of the `[task.id]` reset effect below — a ref, not state, so the write
+   *  is visible to an already-in-flight async closure the instant the reset
+   *  effect runs, with no render latency. Handlers capture `task.id` into a
+   *  local (e.g. `sentTaskId`) before their first `await`, then compare it
+   *  against `currentTaskIdRef.current` after every `await` before writing
+   *  shared per-task state. */
+  const currentTaskIdRef = useRef(task.id);
+  // Agent-profile header chip: `resolveTaskProfileDisplay` gives the
+  // deleted flag + summary (live profile until the task's first run — plan
+  // D2 — else the frozen snapshot); `agentProfileForCard` resolves the
+  // richer object `AgentProfileCard` itself renders from (model/effort/
+  // mode/instructions/skills), same live-or-snapshot preference.
+  const agentProfileDisplay = resolveTaskProfileDisplay(task, profiles, harnesses);
+  const agentProfileForCard: AgentProfile | AgentProfileSnapshot | null =
+    (task.agentProfileId ? (profiles?.find((p) => p.id === task.agentProfileId) ?? null) : null)
+    ?? task.agentProfile
+    ?? null;
+  const [runs, setRuns] = useState<Run[]>([]);
+  /** Structured event stream — one entry per claude JSONL block or per
+   *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
+   *  pick a component (assistant text, thinking, tool call, tool result,
+   *  status divider, error). Events from EVERY run of the task are
+   *  merged here so the user sees one unified scrollback. Each event is
+   *  tagged with a client-assigned `id` (see `StreamEvent`) as it's
+   *  accepted, in arrival order. */
+  const [events, setEvents] = useState<StreamEvent[]>([]);
+  /** When the user clicks "Rebuild from session JSONL" (or the auto-
+   *  rebuild fires after a run finishes), we patch the latest claude
+   *  session's events with the freshly-parsed on-disk version.
+   *  `sessionId` is the `claudeSessionId` the rebuild covers — used at
+   *  render time to splice the rebuilt events into the unified stream
+   *  in place of the live ones for runs that share that session id.
+   *  `maxLiveEventIdAtSnapshot` is the highest `StreamEvent.id` observed
+   *  at capture time — the SSE delivery path (below) uses it, together
+   *  with `rebuiltRunIds`, to detect a genuinely NEW live event landing
+   *  for a masked run and clear the snapshot so live events render again
+   *  (see `rebuilt-mask.ts`). Null means "use the live streamed events
+   *  as normal". */
+  const [rebuilt, setRebuilt] = useState<
+    { sessionId: string; events: RunEvent[]; maxLiveEventIdAtSnapshot: number } | null
+  >(null);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildNote, setRebuildNote] = useState<string | null>(null);
+  /** Bumped when a snapshot reset replaces the whole stream window (see the
+   *  `replay_meta` handler in the subscription effect). It is the auto-rebuild
+   *  effect's one extra dependency: the reset drops `rebuilt`, and the JSONL
+   *  splice for the current latest run has to be recomputed against the fresh
+   *  window exactly as on first open. Never needs resetting on task switch —
+   *  only changes ever trigger the effect, and a task switch re-runs it anyway
+   *  via `latestRun`. */
+  const [rebuildEpoch, setRebuildEpoch] = useState(0);
+  /** True after a reconnect had to fall back to a fresh window because the
+   *  gap was too large to replay (a snapshot `replay_meta`); renders the
+   *  muted `TASK_STREAM_GAP_NOTICE` line under "Load earlier messages". */
+  const [streamGapNotice, setStreamGapNotice] = useState(false);
+  const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
+  /** Ids the live stream or the card itself already resolved. The bootstrap
+   *  fetch below may have started before that, and must not put them back. */
+  const resolvedInteractionIdsRef = useRef(new Set<string>());
+  /** Background/sub agents this task's main agent has spawned. Seeded from the
+   *  snapshot endpoint on open + kept live by `stream: "subagent"` SSE deltas
+   *  and a 2s poll backstop. Drives the read-only tab strip. */
+  const [subagentList, setSubagentList] = useState<Subagent[]>([]);
+  /** Which stream the log is showing: "main" (the task's own agent) or a
+   *  subagent id. Background-agent streams are READ-ONLY — the composer is
+   *  hidden while one is active. */
+  const [activeStream, setActiveStream] = useState<string>("main");
+  /** Formatted handoff cards render (and search indexes handoff field values
+   *  instead of the raw JSON — `docs/plans/formatted-handoff.md` D10) only on
+   *  a pipeline step task's Main stream, on a harness whose assistant events
+   *  carry whole messages (K2: gemini/antigravity delta streams stay raw).
+   *  Derived from primitives up here so the search memo below can read it;
+   *  the full `handoffView` context value is built further down, next to the
+   *  roots and the parent's run it also needs. */
+  const handoffCardsOn = handoffCardsEnabled({
+    isStepTask: task.pipelineParentId != null,
+    kind,
+    mainStream: activeStream === "main",
+  });
+  /** In-panel search over whichever stream is currently displayed (see
+   *  lib/event-search.ts). Read-only and deliberately NOT gated on
+   *  `activeStream === "main"` or archival state — it works identically on a
+   *  subagent tab or an archived task's frozen log. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  /** The live query, for the imperative highlight effect's `EXPAND_EVENT`
+   *  detail (the handoff card's "in handoff" hint reads it) — a ref so the
+   *  effect doesn't re-run, and re-scroll, on every keystroke. */
+  const searchQueryRef = useRef(searchQuery);
+  searchQueryRef.current = searchQuery;
+  /** The selected match, as an index into `displayedEvents` — NOT a
+   *  `StreamEvent.id`. A JSONL-rebuilt event has no client-assigned id at
+   *  all (see `StreamEvent`'s doc comment above), so `findMatchingEventIds`
+   *  (lib/event-search.ts) uses each event's position in `displayedEvents`
+   *  as its id, scoped to whatever's currently displayed. `null` means no
+   *  match is selected. */
+  const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
+  // Wraps the log's conditional content (empty states + the event list) so a
+  // ResizeObserver can watch content height growth independent of the scroll
+  // container's own box — see the pin-to-bottom effects below.
+  const logContentRef = useRef<HTMLDivElement>(null);
+  // The DOM element currently carrying the search-match highlight classes
+  // (imperatively toggled, not driven by a React prop/memo dep — see the
+  // effect below). `null` when nothing is highlighted.
+  const highlightedElRef = useRef<HTMLElement | null>(null);
+  // Set by explicit match navigation (Enter / Shift+Enter / the ↑↓ nav
+  // buttons — see `stepSearch`) and consumed by the highlight effect below.
+  // Typing re-resolves the active match on every keystroke too (the resolve
+  // effect above), which would otherwise dispatch `EXPAND_EVENT` on every
+  // character typed and leave a trail of force-expanded cards behind as the
+  // query narrows — gating the dispatch on "the user actually asked to jump"
+  // keeps auto-expand tied to intentional navigation only.
+  const jumpIntentRef = useRef(false);
+  // Bumped by every explicit jump (`stepSearch`) and listed in the highlight
+  // effect's deps, so a jump that resolves to the SAME match — the only match,
+  // or a wrap back onto the current one — still re-runs that effect (re-centre
+  // + `EXPAND_EVENT`). Without it a 1/1 match never expanded its collapsed
+  // block, and the unconsumed `jumpIntentRef` leaked into the next keystroke.
+  const [jumpSeq, setJumpSeq] = useState(0);
+  // Tracks whether the log was scrolled near the bottom at the last user
+  // interaction. Auto-scroll-to-bottom on new events only fires when this is
+  // true, so a user who scrolls up to read history isn't yanked back down on
+  // every streamed chunk.
+  const nearBottomRef = useRef(true);
+  // Timestamp (performance.now()) until which the ResizeObserver pin effect
+  // below must not force-scroll. Armed on every pointerdown inside the log
+  // (capture phase, see `onPointerDownCapture` on the scroll container) so a
+  // user expanding/collapsing an `ExpandableBlock`, a `UserMessageBlock`, or
+  // any other in-log toggle isn't yanked back to the bottom mid-interaction.
+  // Every user-initiated content-size change starts with a pointerdown
+  // inside the log; async growth (replay-buffer flushes, markdown settling,
+  // a tab strip mounting) never does — so this single timestamp is enough
+  // to distinguish the two without threading a suppression ref through every
+  // collapsible in the tree. A pin skipped because unrelated async content
+  // happened to land inside the window is recovered on the next growth event
+  // or by the pre-paint layout-effect pin (path 1 below).
+  const pinSuppressUntilRef = useRef(0);
+  // Monotonic id source for `StreamEvent.id`, incremented once per event as
+  // it's accepted into the unified stream (see the SSE subscription effect
+  // below). Assigning synchronously at push time — rather than deriving from
+  // `events.length` inside a render — means it's always current even while a
+  // batch is buffered and hasn't flushed into React state yet, which is what
+  // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
+  // 0 on task switch alongside the rest of the stream state.
+  const nextEventIdRef = useRef(0);
+  // Descending id source for events PREPENDED via "Load earlier" (see
+  // `loadEarlierEvents`). Always negative and always decreasing, so a
+  // page-fetched historical event's client `id` sorts before every live/replay
+  // `StreamEvent.id` (which start at 0 and only increase) — this keeps it
+  // outside `rebuilt-mask.ts`'s "genuinely newer than the snapshot" check
+  // without needing any special-casing there. Reset to -1 on task switch.
+  const prevEventIdRef = useRef(-1);
+  // Mirrors `events` synchronously (state updates land a render later) so the
+  // SSE batch-flush callback and `loadEarlierEvents` can read/trim the
+  // "current" array without relying on React's functional-setState form —
+  // doing the window-cap trim (see EVENTS_WINDOW_MAX below) inside a
+  // setState updater would run twice under StrictMode's dev double-invoke.
+  const eventsRef = useRef<StreamEvent[]>([]);
+  /** Every real `run_events.id` (`StreamEvent.dbId`) currently represented in
+   *  `eventsRef.current`, whether it arrived via SSE replay, a live push, or
+   *  a "Load earlier" page fetch. Populated as events are accepted (see the
+   *  SSE subscription effect and `loadEarlierEvents` below); reset on task
+   *  switch. Lets `loadEarlierEvents` defensively drop rows it's already
+   *  holding — e.g. after an SSE reconnect moves `earliestId` backward (see
+   *  the `replay_meta` handler below) a subsequent page fetch can legitimately
+   *  overlap the tail of what a previous page fetch (or the live window)
+   *  already loaded. */
+  const loadedDbIdsRef = useRef<Set<number>>(new Set());
+  /** DB id of the earliest event currently anchoring the "Load earlier"
+   *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
+   *  and the window-trim comment in the SSE effect below). Seeded from the
+   *  SSE `replay_meta` frame on (re)connect; advanced by each successful
+   *  "Load earlier" page fetch; recomputed (possibly to null) when live
+   *  growth trims the window's front past a known anchor. */
+  const [earliestId, setEarliestId] = useState<number | null>(null);
+  /** Whether older history exists before `earliestId` — gates the "Load
+   *  earlier" button together with `earliestId !== null`. */
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** Generation of the transcript window "Load earlier" pages extend.
+   *  Bumped whenever the window is thrown away and rebuilt — a task switch
+   *  (the reset effect below) and a `snapshotRequired` reconnect (the SSE
+   *  `replay_meta` handler), which keeps the same task id. A page fetched
+   *  under an older generation must never be applied: its rows sit before
+   *  the OLD window's front, so prepending them onto the fresh window (and
+   *  taking its `earliestId`) would leave a hole paging can never fill.
+   *  Every bump also clears `loadingEarlier`, which is what lets the
+   *  `finally` below key the busy-flag reset on the generation without
+   *  ever stranding it. */
+  const historyGenRef = useRef(0);
+  /** True once the FIRST `listRuns` response for the CURRENT task has
+   *  landed (see the runs-poll effect below, which sets this — guarded by
+   *  that effect's own `cancelled` flag, so a late response for a task the
+   *  user has already switched away from can never flip it). Drives the
+   *  transcript's loading skeleton: `runs.length === 0` and
+   *  `displayedEvents.length === 0` both read as "nothing here" whether the
+   *  task genuinely has no runs yet or its runs just haven't loaded — this
+   *  flag is what tells those two states apart so a freshly opened task
+   *  shows "Loading messages…" instead of a premature "no runs yet". */
+  const [runsLoaded, setRunsLoaded] = useState(false);
+  // ── Stream-first gating for non-essential fetches ─────────────────────────
+  // Git status and PR-mergeability (below, each declared later in this
+  // component) must not fire in the same burst as a task switch — they'd
+  // otherwise compete with the SSE subscription for the webview's shared
+  // per-host connection budget. Both wait on this gate instead: ready the
+  // instant the SSE subscription effect's `replay_meta` frame arrives for
+  // THIS task, or after STREAM_READY_FALLBACK_MS, whichever comes first
+  // (both signals are owned by the SSE subscription effect below). Refs,
+  // not state: `markStreamReady`/`awaitStreamReady` are called from inside
+  // async closures set up by effects declared later in the component, and a
+  // ref mutation is visible to those closures the instant it happens — no
+  // render latency — which matters because the reset effect right below and
+  // the SSE effect that marks readiness both fire within the same
+  // task-switch commit; a state-based gate could still be read stale by an
+  // effect that re-runs in that same commit before the state update lands.
+  //
+  // The gate is keyed by TASK ID, not a bare boolean: `streamReadyForRef`
+  // holds the id of the task whose stream is ready (or null), and every
+  // waiter records which task it is waiting for. This matters for children
+  // keyed on `task.id` (`TerminalsSection`): React runs a child's mount
+  // effect BEFORE the parent's effects in the same commit, so on a switch
+  // the new task's section mounts and asks the gate before the reset effect
+  // below has cleared it — a bare boolean would still read the PREVIOUS
+  // task's `true` and let the terminal list fetch into the switch burst.
+  const streamReadyForRef = useRef<string | null>(null);
+  const streamReadyWaitersRef = useRef<Array<{ taskId: string; resolve: () => void }>>([]);
+  const markStreamReady = () => {
+    const forTaskId = currentTaskIdRef.current;
+    if (streamReadyForRef.current === forTaskId) return;
+    streamReadyForRef.current = forTaskId;
+    const waiters = streamReadyWaitersRef.current;
+    streamReadyWaitersRef.current = waiters.filter((w) => w.taskId !== forTaskId);
+    for (const w of waiters) if (w.taskId === forTaskId) w.resolve();
+  };
+  /** Resolves once the stream is ready for `forTaskId` (default: the task
+   *  currently mounted in this body). Callers keyed per task (children that
+   *  remount on switch) MUST pass their own `task.id` — see the note above. */
+  const awaitStreamReady = (forTaskId: string = currentTaskIdRef.current): Promise<void> => {
+    if (streamReadyForRef.current === forTaskId) return Promise.resolve();
+    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push({ taskId: forTaskId, resolve }); });
+  };
+
+  // Reset on task switch (no remount because we no longer key on task.id —
+  // see `RunPanelBody`'s call site in `App.tsx`). Re-arm the auto-scroll
+  // heuristic so opening a different task pins the viewport to the most
+  // recent message instead of inheriting the previous task's scrolled-up
+  // position. This effect resets every piece of state in `RunPanelBody`
+  // that isn't itself keyed by task id or re-seeded from `task` via its own
+  // `useEffect` (`backlogItems`/`plans` above do that already) — the goal is
+  // that nothing task A produced (an in-flight send, a busy flag, cached
+  // git/PR status) is visible while task B's panel is still catching up.
+  useEffect(() => {
+    currentTaskIdRef.current = task.id;
+    setEvents([]);
+    eventsRef.current = [];
+    prevEventIdRef.current = -1;
+    loadedDbIdsRef.current = new Set();
+    setEarliestId(null);
+    setHasMoreEarlier(false);
+    historyGenRef.current++;
+    setLoadingEarlier(false);
+    setRebuilt(null);
+    setRebuildNote(null);
+    setStreamGapNotice(false);
+    setInteractions([]);
+    resolvedInteractionIdsRef.current = new Set();
+    setSubagentList([]);
+    setActiveStream("main");
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
+    nearBottomRef.current = true;
+    setRuns([]);
+    setRunsLoaded(false);
+    // Resolve any waiters a still-tearing-down previous task's git-status/
+    // PR-mergeability effects left pending — each one's own `cancelled` flag
+    // (captured in its effect's cleanup) makes the resume a no-op, so this
+    // just prevents the promise from dangling forever unresolved.
+    // Only waiters for OTHER tasks are stale here: a waiter the incoming
+    // task's own keyed child already registered (its mount effect ran before
+    // this parent effect) must stay queued until this task's stream is ready.
+    const staleWaiters = streamReadyWaitersRef.current.filter((w) => w.taskId !== task.id);
+    streamReadyWaitersRef.current = streamReadyWaitersRef.current.filter((w) => w.taskId === task.id);
+    for (const w of staleWaiters) w.resolve();
+    streamReadyForRef.current = null;
+    // Reset the pipeline-strip display state (the fetch/cache effect near
+    // `pipelineStripCacheRef` re-derives it, from the cache when possible,
+    // for whichever task this switch landed on). The cache itself (the ref)
+    // deliberately survives this reset — see that effect's doc comment.
+    setPipelineStrip(null);
+    // The parent pipeline run the formatted handoff surfaces read (K7) is
+    // per-task too: a switch to another step (or a non-step task) must never
+    // show the previous parent's run until its own fetch lands.
+    setStepPipelineRun(null);
+    // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
+    // must not survive into the new task: RunPanelBody isn't remounted on
+    // task switch, so without this a stale `prStatus` from task A could sit
+    // around and let the button send task A's PR prompt into task B's agent
+    // before the `[task.id, task.prUrl]` fetch effect below resolves. These
+    // setters/refs are declared further down this component (with the rest
+    // of the PR-status state) — safe to reference here since this closure
+    // only runs after the full component body (and their declarations) has
+    // executed at least once.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setPrStatusLoading(false);
+    // Invalidate any in-flight `fetchPrStatus` (including a pending self-heal
+    // retry) task A's effects left running — without this, a slow response
+    // that lands after the switch would pass its own `requestId !==
+    // prStatusSeqRef.current` staleness check (it captured the pre-bump
+    // value) and write task A's mergeability into task B's `prStatus`.
+    prStatusSeqRef.current++;
+    setResolveConflictsSent(false);
+    setResolvingConflicts(false);
+    setSending(false);
+    setSendHint(null);
+    setBacklogBusy(false);
+    setRebuildBusy(false);
+    // fx-only busy flags (Resume / Cancel auto-resume buttons) — same per-task
+    // scope as `sending`: a click on task A must not leave B's button disabled.
+    setResumeBusy(false);
+    setCancelAutoBusy(false);
+    setGitStatus(null);
+    setImportRetryBusy(false);
+    setImportRetryError(null);
+    setImportRetryOk(false);
+    setImportedBranchBusy(false);
+    setImportedBranchError(null);
+    // `editingId` (the backlog tray's inline-editor state) lives inside the
+    // `BacklogTray` child component, not here — it's reset by keying that
+    // component on `task.id` at its call site below instead (a fresh mount
+    // per task), which is simpler than plumbing a reset callback down.
+    if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    prStatusRetryTimerRef.current = null;
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+    resolveConflictsSentTimerRef.current = null;
+  }, [task.id]);
+
+  // Latest run for this task — drives the send button, indicator, and
+  // JSONL rebuild target. Newest first in `runs`.
+  const latestRun = runs[0] ?? null;
+
+  const rebuildFromJsonl = async () => {
+    if (!latestRun || !latestRun.claudeSessionId || rebuildBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setRebuildBusy(true);
+    setRebuildNote(null);
+    try {
+      const res = await api.rebuildRunEvents(latestRun.id);
+      if (currentTaskIdRef.current !== sentTaskId) return;
+      if (res.events.length === 0) {
+        setRebuildNote(res.reason ?? "no events found in JSONL");
+        return;
+      }
+      setRebuilt({
+        sessionId: latestRun.claudeSessionId,
+        events: res.events,
+        // "Everything observed so far" — see `nextEventIdRef`.
+        maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+      });
+      // The route byte-budgets the snapshot (newest events first); when it
+      // had to cut older ones it says so, and "Load earlier" pages the rest
+      // — same handling as the auto-rebuild effect below.
+      if (res.hasMore) setHasMoreEarlier(true);
+      setRebuildNote(
+        res.hasMore
+          ? `Loaded the most recent ${res.events.length} events from session JSONL — older history is available via "Load earlier messages".`
+          : `Loaded ${res.events.length} events from session JSONL.`,
+      );
+    } catch (e) {
+      if (currentTaskIdRef.current !== sentTaskId) return;
+      setRebuildNote(`rebuild failed: ${(e as Error).message}`);
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setRebuildBusy(false);
+    }
+  };
+
+  // One unified task-level stream: every event from every run, merged in
+  // chronological order. Replaces the old per-run subscription so the
+  // panel shows the whole conversation as a single scrollback.
+  //
+  // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
+  // and every other one-shot fetch in this component — deliberately.
+  // Passive effects commit in declaration order, so on a task switch this
+  // effect's `api.subscribeTask` call (which opens the event-stream fetch) fires
+  // before any of those `fetch()` calls are issued. The webview has a
+  // small, shared per-host connection budget (WKWebView observed at 6 at
+  // rest), and a switch used to fire ~8 one-shot requests ahead of the new
+  // task's own event stream — starving it behind whatever else was still
+  // in flight (e.g. another task's slow session restore). This effect also
+  // owns the `markStreamReady`/`awaitStreamReady` gate (declared above,
+  // near `runsLoaded`) that the git-status and PR-mergeability effects
+  // further below wait on before firing their own requests — see the
+  // `readyTimer` and the `meta` callback's `markStreamReady()` call below.
+  useEffect(() => {
+    setEvents([]);
+    nextEventIdRef.current = 0;
+    // Fallback half of the stream-ready gate (see the comment above): if
+    // `replay_meta` (below) hasn't arrived within STREAM_READY_FALLBACK_MS,
+    // let the deferred fetches go anyway rather than waiting on a stream
+    // that may never connect (task deleted mid-switch, backend down).
+    const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
+    // Collapse the dual-emit duplicates the server stream carries (live echo +
+    // JSONL twin per user message). The deduper keeps `user` keys in a
+    // never-trimmed set so a follow-up folded into a long in-flight turn —
+    // whose live echo and JSONL twin are separated by thousands of intervening
+    // events — still collapses to a single bubble. See `event-dedup.ts`.
+    // Reassignable: a snapshot reset (below) replaces the whole window, so the
+    // old keys must not suppress the fresh rows.
+    let dedupe = createEventDeduper();
+    // Highest server row id accepted on this subscription. A reconnect resumes
+    // after the transport's last SSE id, but a row can still arrive twice (the
+    // replay racing a live send), so the consumer keeps its own mark and drops
+    // anything at or below it before dedupe. Id-less frames always pass.
+    const highWater = createIdHighWater();
+    // `replay_meta` frames seen on this subscription. The first is covered by
+    // the `[task.id]` bootstrap fetch; every later one is a reconnect, which
+    // refetches what the stream does not persist (see the handler below).
+    let metaCount = 0;
+    // Bookkeeping for that reconnect refetch: cards that land or resolve over
+    // SSE while the request is in flight are merged into its response.
+    const interactionRefetch = createInteractionRefetchTracker<PendingInteraction>();
+    // Coalesce the open-time replay burst into one state update per batch. On
+    // connect the server streams the whole history as one SSE frame per event;
+    // each `onmessage` is its own event-loop task, so React can't auto-batch
+    // them. Appending one-at-a-time meant N renders of the full list = O(N²) on
+    // open. Buffering + a single flush makes it O(N). Dedup (below) stays
+    // synchronous so it's unaffected by the batching.
+    //
+    // BUT a raw rAF is not a safe *delivery* guarantee: Electrobun runs in a
+    // native macOS WKWebView, which suspends requestAnimationFrame while its
+    // window is occluded / minimized / on another Space. If the user
+    // backgrounds agetor mid-turn, the scheduled rAF never fires, buffered
+    // events pile up, and the stream looks frozen until the window is
+    // re-activated (which is why "open the tmux session" — i.e. clicking back
+    // into agetor — appeared to "refresh" it). So the buffer races the rAF
+    // against a setTimeout fallback (for when the webview isn't painting), and
+    // we also drain on visibility/focus the instant the window returns. The
+    // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
+    // the freeze) lives in `createEventBuffer` so it can be unit-tested.
+    const FLUSH_FALLBACK_MS = 250;
+    // Wall-clock connect time, used below to suppress poll kicks for the
+    // first ~1s of a (re)connect. The SSE replay burst can contain many
+    // historical `status`/`user` events (a big backlog dumps its whole
+    // recent window in one go), and each used to fire an immediate
+    // `runsPollKickRef`/`subagentsPollKickRef` call — a fetch storm at
+    // panel-open time. Wall-clock time (rather than "has the first batch
+    // flushed yet") is the right gate: a slow flush doesn't shrink the
+    // window, and a burst that keeps arriving past 1s still degrades
+    // gracefully into the debounce below rather than firing on every event.
+    const CONNECT_SETTLE_MS = 1000;
+    const connectedAtRef = { current: Date.now() };
+    // Debounce for kicks that land after the settle window: at most one
+    // poll-kick per second, trailing-edge, so a burst of live `status`/`user`
+    // events (e.g. several follow-ups folding into a turn in quick
+    // succession) can't each trigger their own fetch.
+    const KICK_DEBOUNCE_MS = 1000;
+    const lastKickAtRef = { current: 0 };
+    let kickTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedKick = () => {
+      const now = Date.now();
+      const elapsed = now - lastKickAtRef.current;
+      if (elapsed >= KICK_DEBOUNCE_MS) {
+        lastKickAtRef.current = now;
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+        return;
+      }
+      if (kickTimer) return;
+      kickTimer = setTimeout(() => {
+        kickTimer = null;
+        lastKickAtRef.current = Date.now();
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+      }, KICK_DEBOUNCE_MS - elapsed);
+    };
+    const buffer = createEventBuffer<StreamEvent>(
+      (batch) => {
+        // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
+        // (see StreamEvent's `dbId` doc comment for how the new earliestId is
+        // derived — saved rows always carry one, so it only fails to be when
+        // the new front event was never saved). `eventsRef` mirrors
+        // `events` synchronously so this math doesn't need React's
+        // functional-setState form (which would run twice under StrictMode's
+        // dev double-invoke and could double-decrement counters/side effects
+        // if this logic lived inside it).
+        //
+        // The trim itself is deferred (see `eventWindowKeepCount` in
+        // `lib/event-window.ts`) while the user is mid-history
+        // (`!nearBottomRef.current`): trimming unconditionally deletes
+        // content above the viewport on every flush, and with
+        // `[overflow-anchor:none]` on the log container (see that div's
+        // className comment below) there's no browser-side absorber left to
+        // paper over the resulting jump — the reader would get yanked
+        // forward with no pin path armed to catch it (`nearBottomRef` is
+        // false, so neither pin fires, and "Load earlier"'s scroll-restore
+        // only covers its own prepend). Deferral is hard-capped at 2x
+        // `EVENTS_WINDOW_MAX` so memory still stays bounded for a reader who
+        // never returns to the bottom; the jerk can still happen once that
+        // cap is hit, which is the accepted trade-off.
+        // A Cursor tool revision is another `tool_use` with the same id.
+        // Fold it onto the row already in the window before the cap, so
+        // partials do not push real transcript lines out.
+        const merged = batch.some((event) => event.stream === "tool_use")
+          ? foldToolUseRevisions([...eventsRef.current, ...batch])
+          : [...eventsRef.current, ...batch];
+        let next = merged;
+        const keep = eventWindowKeepCount(merged.length, nearBottomRef.current, EVENTS_WINDOW_MAX);
+        if (keep != null) {
+          next = merged.slice(merged.length - keep);
+          const front = next[0];
+          const newEarliestId = front?.dbId ?? null;
+          setEarliestId(newEarliestId);
+          setHasMoreEarlier(newEarliestId != null);
+        }
+        eventsRef.current = next;
+        setEvents(next);
+        // A newer live MAIN-stream event landing for a run the rebuilt-from-
+        // JSONL snapshot is currently masking means the snapshot is stale —
+        // clear it so `displayedEvents` falls back to the live stream. This
+        // is what un-freezes the panel when a post-`end_turn` background-
+        // agent continuation keeps emitting into a run the panel already
+        // considers finished (the snapshot only ever covers events observed
+        // up to the moment it was captured). `rebuiltMaskRef` (defined below,
+        // synced from `rebuilt`/`rebuiltRunIds`) is read fresh on every batch
+        // rather than closed over at effect-setup time, since this callback
+        // is created once per SSE subscription and would otherwise see a
+        // stale snapshot. Clearing here does NOT touch `latestRun`, so the
+        // auto-rebuild effect (deps: latestRun id/status/claudeSessionId)
+        // does not immediately re-fire and re-mask — it only fires again
+        // when the newest run itself next resolves.
+        const mask = rebuiltMaskRef.current;
+        if (mask) {
+          const invalidated = batch.some((e) =>
+            invalidatesRebuiltSnapshot(
+              { maxLiveEventIdAtSnapshot: mask.maxLiveEventIdAtSnapshot },
+              e,
+              mask.runIds,
+            ),
+          );
+          if (invalidated) {
+            setRebuilt(null);
+            setRebuildNote(null);
+          }
+        }
+      },
+      (flush) => {
+        const raf = requestAnimationFrame(flush);
+        const timer = setTimeout(flush, FLUSH_FALLBACK_MS);
+        return () => { cancelAnimationFrame(raf); clearTimeout(timer); };
+      },
+    );
+    // When the window comes back to the foreground, drain immediately rather
+    // than waiting for a throttled timer/rAF to resume on its own.
+    const onVisible = () => { if (document.visibilityState === "visible") buffer.flushNow(); };
+    const onFocus = () => buffer.flushNow();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    const unsub = api.subscribeTask(
+      task.id,
+      (e) => {
+        if (!highWater.accept(e.id)) return;
+        if (!dedupe.accept(e)) return;
+        if (e.stream === "interaction") {
+          try {
+            const req = JSON.parse(e.data) as PendingInteraction;
+            // Same id is an update, not a duplicate. A Cursor card keeps its
+            // id when the child exits and delivery becomes "restart-followup".
+            interactionRefetch.noteArrived(req);
+            setInteractions((cur) => mergePendingInteraction(cur, req));
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "subagent") {
+          // Live lifecycle delta for a background/sub agent — upsert into the tab
+          // list instead of pushing to the log buffer. The agent's actual
+          // transcript rides the normal user/assistant/tool_* streams (tagged
+          // via `subagentId`) and flows through to `buffer.push` below.
+          try {
+            const { subagent } = JSON.parse(e.data) as SubagentEvent;
+            setSubagentList((cur) => {
+              const i = cur.findIndex((s) => s.id === subagent.id);
+              if (i === -1) return [...cur, subagent];
+              const next = cur.slice();
+              next[i] = subagent;
+              return next;
+            });
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "interaction_resolved") {
+          // Server-side resolution (scraper auto-cancel, run cancellation,
+          // delete) — drop the matching card so the UI doesn't keep
+          // showing a stale prompt. The card's own submit handler also
+          // calls `dismissInteraction(id)` directly; both paths are
+          // idempotent under `id`-based filtering.
+          try {
+            const { id } = JSON.parse(e.data) as { id: string };
+            resolvedInteractionIdsRef.current.add(id);
+            interactionRefetch.noteResolved(id);
+            setInteractions((cur) => cur.filter((x) => x.id !== id));
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        // "Life sign" re-arm for the runs/subagents polls (see the poll-gating
+        // block above): a `status` or `user` event is the rare, low-volume
+        // signal that a run's lifecycle actually moved (started/hibernated/
+        // ended, or a follow-up was sent) — worth an immediate poll kick.
+        // Every other stream (assistant/thinking/tool_use/tool_result/stdout/
+        // stderr) can arrive at high frequency mid-turn, so those only get the
+        // cheap no-fetch `evaluate()`. Gated on wall-clock time since connect
+        // so the open-time replay burst (which can contain many historical
+        // status/user events) never turns into a fetch storm, and further
+        // debounced to at most one kick/second so a rapid live burst past the
+        // settle window can't do the same — see `CONNECT_SETTLE_MS`/
+        // `debouncedKick` above.
+        if (e.stream === "status" || e.stream === "user") {
+          if (Date.now() - connectedAtRef.current < CONNECT_SETTLE_MS) {
+            runsPollEvaluateRef.current();
+            subagentsPollEvaluateRef.current();
+          } else {
+            debouncedKick();
+          }
+        } else {
+          runsPollEvaluateRef.current();
+          subagentsPollEvaluateRef.current();
+        }
+        // Tag with the next client-assigned id (see `StreamEvent`) — this
+        // client id space is distinct from the server's own `RunEvent.id`
+        // (present on every saved row, see its doc comment), and the
+        // invalidation check above needs a monotonic ordering to tell a
+        // genuinely new event from the ones already observed. Capture the
+        // server id as `dbId` when present so the window-cap trim above can
+        // derive an exact `earliestId` cursor without waiting on a "Load
+        // earlier" page fetch.
+        const dbId = e.id;
+        if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
+        buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
+      },
+      (meta) => {
+        // First (successful) half of the stream-ready gate: this frame is
+        // always the very first thing the server sends on (re)connect (see
+        // below), so it's the earliest reliable signal that this task's
+        // stream is actually live — clear the deferral for git-status/
+        // PR-mergeability now instead of waiting out the fallback timer.
+        markStreamReady();
+        // The server sends `replay_meta` as the FIRST frame of every (re)connect
+        // — including a reconnect `openEventStream` makes on its own after a network blip,
+        // which reuses this same subscription/effect instance rather than
+        // re-running it. Re-arming the settle window here (not just at effect
+        // setup) is what makes the kick-storm suppression above cover BOTH the
+        // initial open and every later reconnect's replay burst.
+        connectedAtRef.current = Date.now();
+        const kind = classifyReplayMeta(meta);
+        if (kind === "snapshot") {
+          // The server could not resume from our cursor (gap too large or the
+          // cursor is ahead of it) and is sending today's fresh window. Throw
+          // away everything built from the old window BEFORE those rows are
+          // pushed — they follow this frame immediately. `nextEventIdRef` is
+          // deliberately NOT reset: client ids stay monotonic for the life of
+          // the subscription so `rebuilt-mask.ts` stays sound.
+          buffer.discard();
+          // Any "Load earlier" page still in flight belongs to the old
+          // window — invalidate it and free the button for the new one.
+          historyGenRef.current++;
+          setLoadingEarlier(false);
+          highWater.reset();
+          dedupe = createEventDeduper();
+          eventsRef.current = [];
+          setEvents([]);
+          loadedDbIdsRef.current = new Set();
+          prevEventIdRef.current = -1;
+          // Replace, don't merge: the fresh window is the only history we hold.
+          setEarliestId(meta.earliestId);
+          setHasMoreEarlier(meta.hasMore);
+          // The JSONL splice masked the old window; drop it and let the
+          // auto-rebuild effect recompute it for the current latest run.
+          setRebuilt(null);
+          setRebuildNote(null);
+          setRebuildEpoch((n) => n + 1);
+          setActiveMatchId(null);
+          nearBottomRef.current = true;
+          setStreamGapNotice(true);
+        } else if (kind === "fresh") {
+          // Never move the cursor FORWARD on a reconnect: a fresh
+          // `replay_meta` reflects only the just-replayed window, which is
+          // capped at EVENTS_REPLAY_LIMIT and so always starts later than
+          // whatever earlier history "Load earlier" may have already paged in
+          // before the reconnect. Losing that progress would silently re-show
+          // a narrower "Load earlier" cursor (or hide it) after every SSE
+          // drop — taking the min (treating null as "no bound yet") keeps
+          // whichever cursor reaches furthest back. `hasMore` only ever grows
+          // for the same reason: once we know older history exists, a later
+          // replay that (re)confirms a narrower window can't un-know that.
+          // (A `resumed` meta carries neither field and changes nothing: the
+          // rows that follow are just the gap after our cursor.)
+          setEarliestId((prev) =>
+            prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+          );
+          setHasMoreEarlier((prev) => prev || meta.hasMore);
+        }
+        // Every meta after the first is a reconnect. Pending interactions,
+        // subagent lifecycle deltas and run status are live-only or polled, so
+        // whatever the dropped connection missed is recovered here instead of
+        // waiting for the next poll tick.
+        if (metaCount++ > 0) {
+          const token = interactionRefetch.begin();
+          void api.listPendingInteractions(task.id).then((list) => {
+            // Null: superseded by a newer refetch, or the task switched /
+            // the effect cleaned up (cancel) — never apply a stale response.
+            const settled = interactionRefetch.finish(token);
+            if (!settled) return;
+            setInteractions(mergeRefetchedInteractions(list, settled.arrived, settled.resolvedIds));
+          }).catch(() => {
+            // Keep the cards we have; the next reconnect tries again.
+            interactionRefetch.finish(token);
+          });
+          runsPollKickRef.current();
+          subagentsPollKickRef.current();
+        }
+      },
+    );
+    return () => {
+      clearTimeout(readyTimer);
+      interactionRefetch.cancel();
+      buffer.dispose();
+      if (kickTimer) clearTimeout(kickTimer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+      unsub();
+    };
+  }, [task.id]);
+
+  // Bootstrap any interactions that fired before the panel opened (race
+  // between claude tool calls and the panel mount). The SSE subscription
+  // picks up new ones from here on. The fetch is in flight while that
+  // stream can update a card or resolve one, so the snapshot is merged
+  // into the live list — replacing it would put the stale card back.
+  useEffect(() => {
+    let cancelled = false;
+    void api.listPendingInteractions(task.id).then((list) => {
+      if (cancelled) return;
+      setInteractions((cur) => mergePendingInteractionSnapshot(cur, list, resolvedInteractionIdsRef.current));
+    }).catch(() => { /* ignore — empty start is fine */ });
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
+  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
+  // stable setter, so the empty dep list is correct.
+  const dismissInteraction = useCallback(
+    (id: string) => {
+      resolvedInteractionIdsRef.current.add(id);
+      setInteractions((cur) => cur.filter((x) => x.id !== id));
+    },
+    [],
+  );
+
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // Skips a tick while the previous `load()` for this same task is still
+    // in flight — a slow response (e.g. the server itself busy with another
+    // task's session restore) must not let ticks pile up into a burst of
+    // overlapping requests once it finally resolves. Reset on cleanup only
+    // implicitly (the effect instance, and this closure's `inFlight`, don't
+    // survive past task switch anyway).
+    let inFlight = false;
+    // A `kick()` (SSE live sign / focus / visibility) that arrives while a
+    // load is already in flight would otherwise be silently dropped — record
+    // it here and replay it once, right after the in-flight load settles, so
+    // the signal that prompted the kick isn't lost.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listRuns(task.id);
+        if (cancelled) return;
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        // First response for this task — flips the transcript's loading
+        // skeleton off. Safe to call on every subsequent tick too: React
+        // bails out a same-value `setState(true)` without a re-render.
+        setRunsLoaded(true);
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [task.id, task.runId]);
+
+  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
+  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
+  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // See the runs-poll effect above for why a tick is skipped while the
+    // previous `load()` is still in flight.
+    let inFlight = false;
+    // See the runs-poll effect above for why a kick that arrives mid-flight
+    // is recorded and replayed once, rather than silently dropped.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listSubagents(task.id);
+        if (cancelled) return;
+        setSubagentList((cur) => {
+          // Union by id: the poll (DB) is authoritative on status, but keep any
+          // id we only know from a just-arrived SSE delta that the poll query
+          // raced. Sort by spawn order so tabs don't reshuffle.
+          const byId = new Map<string, Subagent>();
+          for (const s of cur) byId.set(s.id, s);
+          for (const s of list) byId.set(s.id, s);
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
+        });
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
+    void load();
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [task.id]);
+
+  // Holds a pre-prepend `{scrollHeight, scrollTop}` snapshot for the layout
+  // effect just below to restore from — see that effect's doc comment.
+  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+
+  /**
+   * "Load earlier messages" — fetches one older page (`beforeId = earliestId`)
+   * and prepends it to `events`. Prepended events get a descending client id
+   * from `prevEventIdRef` (see `StreamEvent`'s doc comment) and carry the
+   * real server `dbId`, which is what lets a later window-cap trim re-derive
+   * `earliestId` after eating into this history. Scroll position is
+   * preserved by capturing the log's `scrollHeight`/`scrollTop` before the
+   * prepend and restoring `scrollTop` by the height delta once the DOM has
+   * grown (see the layout effect below) — the "simple approach" from the
+   * plan rather than anchoring to a specific DOM node.
+   */
+  const loadEarlierEvents = useCallback(() => {
+    if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
+    const el = logRef.current;
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow page fetch
+    // resolving after the user has moved to a different task must not
+    // prepend task A's history into task B's transcript state.
+    const sentTaskId = task.id;
+    // The task id alone isn't enough: a `snapshotRequired` reconnect
+    // replaces the window under the same task — see `historyGenRef`.
+    const sentGen = historyGenRef.current;
+    setLoadingEarlier(true);
+    void api.fetchTaskEventsPage(sentTaskId, earliestId)
+      .then((page) => {
+        if (currentTaskIdRef.current !== sentTaskId || historyGenRef.current !== sentGen) return;
+        // Defensive dedupe: `earliestId` can point past events this panel
+        // already holds — e.g. an SSE reconnect moved it backward (see the
+        // `replay_meta` handler's "never move forward" comment above), so a
+        // page fetched from that cursor can legitimately overlap the tail of
+        // what a previous fetch (or the live/replayed window) already loaded.
+        const fresh = page.events.filter((ev) => !loadedDbIdsRef.current.has(ev.id));
+        if (fresh.length > 0) {
+          // Set BEFORE the prepend's setState: the pin effect below is a
+          // layout effect declared AFTER this scroll-restore layout effect
+          // (see that effect just below), so on the same commit the restore
+          // runs first and the pin — reading `nearBottomRef` on every
+          // `events` change — would immediately overwrite it if the ref
+          // were still (stale) `true`. This flag is the only thing that
+          // makes the pin skip that commit instead of clobbering the
+          // restored scrollTop.
+          nearBottomRef.current = false;
+          const mapped: StreamEvent[] = fresh.map((ev) => {
+            loadedDbIdsRef.current.add(ev.id);
+            return { ...ev, id: prevEventIdRef.current--, dbId: ev.id };
+          });
+          if (el) {
+            scrollRestoreRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+          }
+          const next = [...mapped, ...eventsRef.current];
+          eventsRef.current = next;
+          setEvents(next);
+        }
+        setEarliestId(page.earliestId);
+        setHasMoreEarlier(page.hasMore);
+      })
+      .catch(() => { /* transient failure — button stays enabled to retry */ })
+      .finally(() => {
+        // Keyed on the generation, not the task id: a reset already cleared
+        // the flag, and a page started after it owns the flag now — an
+        // older request settling late must not re-enable the button under
+        // it (A→B→A task switches included).
+        if (historyGenRef.current === sentGen) setLoadingEarlier(false);
+      });
+  }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
+
+  // Restores scroll position after "Load earlier" prepends older events above
+  // the current viewport — without this the browser leaves `scrollTop`
+  // unchanged, which visually yanks the previously-visible content down by
+  // however tall the newly-inserted history is. Runs after every commit (the
+  // ref-guarded early return keeps that cheap) rather than being keyed to a
+  // dependency, since the meaningful trigger is "did `loadEarlierEvents` just
+  // prepend", not any particular prop.
+  useLayoutEffect(() => {
+    const pending = scrollRestoreRef.current;
+    if (!pending) return;
+    scrollRestoreRef.current = null;
+    const el = logRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - pending.prevScrollHeight;
+    el.scrollTop = pending.prevScrollTop + delta;
+  });
+
+  // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
+  // a user who scrolled up to read history is never yanked back down:
+  //   1. On every event / rebuild / interaction change, scroll once as a
+  //      layout effect — pre-paint, before the browser gets a chance to
+  //      dispatch any scroll event of its own. This is the cheap backstop:
+  //      it only fires on the dependencies listed below, so it covers
+  //      commits that change content without changing either box the
+  //      ResizeObserver watches, and it also recovers any pin that path 2
+  //      skipped under the suppression window (see below) once the next
+  //      real growth or a dependency change comes through. Running
+  //      pre-paint (not as a passive effect) matters most on a violent
+  //      commit — e.g. the live→rebuilt `displayedEvents` swap, where every
+  //      event's key changes and the whole transcript remounts. The two
+  //      changes here are jointly, not independently, sufficient:
+  //      `[overflow-anchor:none]` (see the container's className comment)
+  //      removes native anchoring as a competing `scrollTop` writer — left
+  //      enabled, it runs during layout, which happens AFTER layout
+  //      effects, so even with the pin converted to `useLayoutEffect` an
+  //      anchoring-driven jump would still land after the pin and override
+  //      it. The layout-effect conversion, in turn, closes the remaining
+  //      window where a same-frame scroll event could latch `nearBottomRef`
+  //      false before the pin gets a chance to read it. With both in place,
+  //      the pin runs while `nearBottomRef` still holds its pre-commit
+  //      value, and no post-effect scroll adjustment is left that could
+  //      latch it false first.
+  //   2. A ResizeObserver on both the scroll container (`logRef`) and the
+  //      content wrapper (`logContentRef`) below. The container's own box
+  //      shrinks when something mounts above it in the flex column —
+  //      `SubagentTabs` or a terminal tab strip resolving from an async
+  //      list fetch — which otherwise leaves the log short with no event to
+  //      hook. The content wrapper's height grows asynchronously for
+  //      reasons invisible to path 1's dependency list: replay-buffer
+  //      flushes landing on their own timer, markdown/code block layout
+  //      settling after mount, and a `UserMessageBlock`'s "Show more"
+  //      toggle appearing once it measures itself. Observing both, rather
+  //      than enumerating every async cause as a dependency, makes the pin
+  //      self-healing against future async widgets. Both paths now run
+  //      pre-paint (path 1 as a layout effect, this one via ResizeObserver's
+  //      own pre-paint delivery in the same rendering opportunity as the
+  //      resize), so neither is "ahead" of the other in the sense that used
+  //      to matter; ResizeObserver still earns its keep as a separate path
+  //      because it fires on box-size changes path 1's dependency list
+  //      can't see (see above). Assigning `scrollTop` does not change
+  //      either observed element's size, so the pin can't feed back into
+  //      its own observer; the resulting scroll event just re-confirms
+  //      `nearBottomRef` as true. Mount-scoped (`[]`) is correct —
+  //      `RunPanelBody` doesn't remount on task switch, so both refs stay
+  //      attached to the same DOM nodes across tasks and a fresh
+  //      `observe()` isn't needed per task.
+  //
+  //      Two additional guards keep path 2 from hijacking a user-initiated
+  //      resize (e.g. expanding/collapsing a "Show more" toggle while
+  //      parked near the bottom):
+  //        - `pinSuppressUntilRef`, armed for a short window by any
+  //          pointerdown inside the log (see `onPointerDownCapture` below),
+  //          skips the pin entirely so it doesn't fight a deliberate toggle
+  //          or the `pendingAdjustRef` scroll compensation in
+  //          `UserMessageBlock`.
+  //        - `prevDist`, the distance-from-bottom computed from box sizes
+  //          tracked across deliveries, re-checks bottom-proximity against
+  //          the pre-resize layout rather than trusting `nearBottomRef`
+  //          alone — that ref is latched by scroll events, which WebKit can
+  //          throttle during momentum scrolling, so it can still read stale
+  //          `true` mid-fling. `el.scrollTop` read synchronously is always
+  //          current even when scroll events lag, so the pre-resize
+  //          distance is trustworthy where the latched ref may not be.
+  useLayoutEffect(() => {
+    if (!nearBottomRef.current) return;
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [events, rebuilt, interactions.length, activeStream]);
+
+  useEffect(() => {
+    const el = logRef.current;
+    const content = logContentRef.current;
+    if (!el || !content) return;
+    let lastScrollHeight = el.scrollHeight;
+    let lastClientHeight = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const prevDist = lastScrollHeight - el.scrollTop - lastClientHeight;
+      // Update tracked sizes from the current element before any early
+      // return, so the next delivery's `prevDist` stays correct even on a
+      // delivery that itself skips the pin (suppressed, or not near bottom).
+      lastScrollHeight = el.scrollHeight;
+      lastClientHeight = el.clientHeight;
+      if (performance.now() < pinSuppressUntilRef.current) return;
+      if (!nearBottomRef.current) return;
+      if (prevDist >= NEAR_BOTTOM_PX) return;
+      el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);      // viewport shrink: SubagentTabs / terminals mounting above
+    ro.observe(content); // content growth: replay flushes, markdown, "Show more" toggles
+    return () => ro.disconnect();
+  }, []);
+
+  // Auto-rebuild from the latest run's on-disk JSONL when the run is
+  // finished and has a claude session id. The persisted `run_events`
+  // rows were truncated by an older agetor mapper (tool inputs capped
+  // at 500 chars), so the JSONL is the canonical source. Skips while
+  // a run is in flight (live tailing is still appending) and codex
+  // (no JSONL transcript).
+  //
+  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId plus
+  // `rebuildEpoch`, which is deliberate and load-bearing: when the SSE
+  // batch-flush callback above detects a newer live event for a masked run
+  // and calls `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
+  // change (the run itself hasn't — its status is still whatever it was),
+  // so this effect does NOT re-run and immediately re-mask the stream it
+  // was just un-frozen from. It only fires again — legitimately re-snapshot-
+  // ting — when the newest run's own id/status/sessionId next changes, i.e.
+  // when a later run resolves. This is what makes clearing the snapshot on a
+  // background-agent continuation's post-`end_turn` activity actually stick
+  // instead of flapping. `rebuildEpoch` is bumped ONLY by a snapshot reset
+  // (the reconnect fell back to a fresh window and dropped `rebuilt`), so it
+  // re-runs the JSONL splice for the current latest run against the new window
+  // exactly like first open — and, bumping on that one event only, it keeps
+  // the no-re-mask-after-invalidation property above.
+  useEffect(() => {
+    if (!latestRun) return;
+    if (latestRun.status === "running") {
+      // The newest run just became "running" again — e.g. a background-agent
+      // continuation turn that shares `claudeSessionId` with the run the
+      // current `rebuilt` snapshot was captured from, whose first live events
+      // can land before the 2s runs-poll updates `runs`/`latestRun` (see
+      // `rebuiltRunIds` and the SSE batch-flush invalidation above). If a
+      // snapshot is still set at that point, `displayedEvents` will mask the
+      // new run's live events behind it — and because this effect only
+      // re-fires on `latestRun` id/status/claudeSessionId changes, the
+      // freeze would persist until the run resolves. Clear eagerly instead:
+      // "the newest run is live again ⇒ no snapshot should mask the stream."
+      // Functional updaters read the current value without adding
+      // `rebuilt`/`rebuildNote` to this effect's deps, so this can't loop —
+      // clearing them doesn't change `latestRun`, the only thing gating
+      // re-runs, and is a no-op (bails to the same reference) once already
+      // clear.
+      setRebuilt((prev) => (prev ? null : prev));
+      setRebuildNote((prev) => (prev ? null : prev));
+      return;
+    }
+    if (!latestRun.claudeSessionId) return;
+    const sessionId = latestRun.claudeSessionId;
+    let cancelled = false;
+    // Bounded to EVENTS_WINDOW_MAX — the same cap the live stream itself is
+    // held to (see the SSE batch-flush trim above). Without a limit here, the
+    // auto-rebuild silently replaced the panel's bounded window with an
+    // unbounded full-session dump on every run completion, defeating the
+    // whole point of capping live/replayed history (code review finding).
+    void api.rebuildRunEvents(latestRun.id, EVENTS_WINDOW_MAX).then((res) => {
+      if (cancelled) return;
+      if (res.events.length > 0) {
+        setRebuilt({
+          sessionId,
+          events: res.events,
+          // "Everything observed so far" — see `nextEventIdRef`.
+          maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+        });
+        setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+        // The rebuild itself has no DB row ids to page from (JSONL events are
+        // synthesized, not persisted `run_events` rows), so this only ever
+        // grows the affordance's visibility — it never clobbers an
+        // `earliestId` cursor the live/replayed stream already established.
+        if (res.hasMore) setHasMoreEarlier(true);
+      } else if (res.reason) {
+        setRebuildNote(res.reason);
+      }
+    }).catch(() => { /* network blip — stay on streamed events silently */ });
+    return () => { cancelled = true; };
+  }, [latestRun?.id, latestRun?.status, latestRun?.claudeSessionId, rebuildEpoch]);
+
+  /** All run ids that share `rebuilt.sessionId`. A single claude session
+   *  spans every turn within one tmux session, and each turn is its own
+   *  run row, so the rebuild's events stand in for events from any run
+   *  with that sessionId — not just the latest one. */
+  const rebuiltRunIds = useMemo(() => {
+    if (!rebuilt) return null;
+    const ids = new Set<string>();
+    for (const r of runs) {
+      if (r.claudeSessionId === rebuilt.sessionId) ids.add(r.id);
+    }
+    return ids;
+  }, [rebuilt, runs]);
+
+  /** Live mirror of `{ maxLiveEventIdAtSnapshot, runIds }` derived from
+   *  `rebuilt`/`rebuiltRunIds`, read by the SSE batch-flush callback in the
+   *  subscription effect above. That callback is created once per task
+   *  subscription and closes over whatever `rebuilt`/`rebuiltRunIds` were at
+   *  effect-setup time — without this ref it would keep checking against a
+   *  stale (or even already-cleared) snapshot instead of the current one.
+   *  `null` (no active snapshot) short-circuits the check entirely. */
+  const rebuiltMaskRef = useRef<{ maxLiveEventIdAtSnapshot: number; runIds: Set<string> } | null>(null);
+  useEffect(() => {
+    rebuiltMaskRef.current = rebuilt && rebuiltRunIds
+      ? { maxLiveEventIdAtSnapshot: rebuilt.maxLiveEventIdAtSnapshot, runIds: rebuiltRunIds }
+      : null;
+  }, [rebuilt, rebuiltRunIds]);
+
+  /** The task's own (main) agent events — everything not tagged to a subagent.
+   *  The rebuild-from-JSONL path only ever covers the main session transcript,
+   *  so it splices against these. */
+  const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
+
+  /** Merged usage / fx provider / title / recovery per run, each keyed by
+   *  `runId` — feed the run-row chips in `RunsList` (usage/provider/title)
+   *  and the bottom-of-transcript recovery notices below (`recoveryByRunId`
+   *  — see `liveRecoveryNotice`/`pausedRecovery`). Sourced from the raw
+   *  (unfiltered) `events` state rather than `displayedEvents` so the chips
+   *  stay correct regardless of which subagent tab is active or whether a
+   *  JSONL rebuild snapshot has spliced the main stream. `events` arrives in
+   *  arrival order, so folding every usage sentinel through `mergeFxUsage`
+   *  (a shallow `{...prev, ...next}`) in order naturally keeps the latest
+   *  value per key — the `usage_update` half (`used`/`size`/`cost`) and the
+   *  per-turn half (`turn`, from the `session/prompt` result) can arrive as
+   *  separate sentinel chunks on the same run, so a plain last-wins
+   *  overwrite would clobber whichever half arrived first — while the
+   *  provider/title/recovery maps are plain last-wins (each sentinel —
+   *  `fx-provider:`/`fx-title:`/`fx-recovery:` — is already a complete
+   *  value; for recovery specifically, the newest sentinel for a run is
+   *  exactly the state that matters, since fx emits one per retry attempt
+   *  plus a final terminal one). The usage sentinel is fed by fx and by
+   *  cursor (whose `result.usage` the cursor mapper forwards on the same
+   *  `{turn}` shape), the other three by fx alone — so the scan is skipped
+   *  outright for every other agent kind, which never emits any of them
+   *  (scanning the full, possibly windowed, event list on every render for
+   *  them would be pure waste) — and combined into a single pass over
+   *  `events` so a streamed fx task doesn't pay for four independent full
+   *  scans of the same (up to `EVENTS_WINDOW_MAX`-sized) array on every
+   *  chunk. Note the same
+   *  windowing applies here as everywhere else `events` is read: once an
+   *  older run's events slide out of the kept window
+   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips (and any
+   *  recovery notice derived from it) disappear too — intended, not a bug
+   *  to chase. */
+  const { usageByRunId, providerByRunId, titleByRunId, recoveryByRunId } = useMemo(() => {
+    const usage = new Map<string, FxUsagePayload>();
+    const provider = new Map<string, string>();
+    const title = new Map<string, string>();
+    const recovery = new Map<string, FxRecoveryPayload>();
+    if (kind !== "fx" && kind !== "cursor" && kind !== "opencode" && kind !== "copilot") {
+      return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
+    }
+    for (const e of events) {
+      if (e.stream !== "status") continue;
+      if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) {
+        const parsed = parseFxUsage(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
+        if (parsed) usage.set(e.runId, mergeFxUsage(usage.get(e.runId), parsed));
+      } else if (kind !== "fx") {
+        continue;
+      } else if (e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) {
+        const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
+        if (value) provider.set(e.runId, value);
+      } else if (e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) {
+        const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
+        if (value) title.set(e.runId, value);
+      } else if (e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
+        const parsed = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+        if (parsed) recovery.set(e.runId, parsed);
+      }
+    }
+    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
+  }, [events, kind]);
+
+  /** Background/sub-agent events bucketed by subagent id, in arrival order. */
+  const subagentEventsById = useMemo(() => {
+    const m = new Map<string, RunEvent[]>();
+    for (const e of events) {
+      if (!e.subagentId) continue;
+      const arr = m.get(e.subagentId);
+      if (arr) arr.push(e);
+      else m.set(e.subagentId, [e]);
+    }
+    return m;
+  }, [events]);
+
+  /** Events for whichever stream the tab strip has selected. For "main", splice
+   *  `rebuilt` in by dropping events from runs that share its sessionId and
+   *  appending the rebuilt set (earlier sessions stay visible). A subagent tab
+   *  shows that subagent's transcript directly (no rebuild path applies).
+   *
+   *  `status` events are the one exception to "drop the rebuilt run's live
+   *  events": they're synthesized by the orchestrator (e.g. "session
+   *  hibernated after idle…"), never appear in the JSONL transcript, and so
+   *  can never duplicate against `rebuilt.events` — dropping them would just
+   *  hide legitimate lifecycle notices for as long as the rebuild snapshot is
+   *  active. Kept in original arrival order, then re-sorted by `ts` against
+   *  the appended rebuild set (whose synthetic timestamps are anchored at the
+   *  run's start, not real wall-clock time) so a status event doesn't jump to
+   *  the wrong end of the transcript. */
+  // `collapseRepeatedStatusChips` MUST run here — not inside `RunEventList`'s
+  // `normalised` memo — because `findMatchingEventIds` below derives each
+  // match's id from an event's own position in `displayedEvents`, and that
+  // same array (uncollapsed) is what supplied the `data-evid` index at render
+  // time. Collapsing downstream of this memo would shorten the rendered
+  // array while search still matched against the longer, uncollapsed one,
+  // scrolling/highlighting the wrong block whenever history has duplicate
+  // permission-mode chips (review-caught bug). Doing it here keeps search,
+  // todo-progress, and rendering all reading from one shared index space.
+  // `dropHiddenToolEvents` runs here for the same reason: an internal tool
+  // call (and its answer) must vanish from the index space search matches
+  // against, not just from the rendered blocks.
+  const displayedEvents = useMemo(() => {
+    if (activeStream !== "main")
+      return collapseRepeatedStatusChips(dropHiddenToolEvents(subagentEventsById.get(activeStream) ?? []));
+    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedStatusChips(dropHiddenToolEvents(mainEvents));
+    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
+    return collapseRepeatedStatusChips(
+      dropHiddenToolEvents([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts)),
+    );
+  }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
+
+  /** The current to-do list for whichever stream is selected. Claude re-emits
+   *  the whole TodoWrite list on every change, so this is a latest-wins scan
+   *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
+   *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
+  const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
+
+  // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
+  // straight — it derives each event's search id from its own position in
+  // the array, so there's no separate pre-mapped/id-tagged array to build
+  // or memoize here. (It matches a `user` event against its NORMALIZED text —
+  // lead-in stripped, `<pasted_content>` unwrapped — i.e. what the bubble
+  // actually shows; see `searchableEventText`.)
+  // On a step task's Main stream, a handoff block is indexed by its field
+  // VALUES (what the card and its modal show), not its JSON keys — D10.
+  const matches = useMemo(
+    () => findMatchingEventIds(displayedEvents, searchQuery, { handoffCards: handoffCardsOn }),
+    [displayedEvents, searchQuery, handoffCardsOn],
+  );
+
+  // Derived purely for display — no state, so there's no "0/0" flash before
+  // an effect catches up and no risk of the position silently desyncing from
+  // `activeMatchId`/`matches`. `-1` (no match) renders as "0/0" below.
+  const activeMatchPosition = resolveActiveMatchIndex(matches, activeMatchId);
+
+  // A splice/clear of the JSONL-rebuild snapshot swaps `displayedEvents` out
+  // from under the current scope exactly like a tab/task switch does (the
+  // positional ids `matches` holds no longer refer to the same events), so
+  // its identity has to be part of the scope key below. `maxLiveEventIdAtSnapshot`
+  // is set fresh every time a snapshot is (re)captured for a session, so
+  // `sessionId:maxLiveEventIdAtSnapshot` is a stable id for "this particular
+  // rebuild snapshot" — distinct from both "no snapshot" and any prior
+  // snapshot of the same session.
+  const rebuiltScopeKey = rebuilt ? `${rebuilt.sessionId}:${rebuilt.maxLiveEventIdAtSnapshot}` : "";
+
+  // Resolve which match is active whenever the match set changes — either
+  // because the query changed, or because `displayedEvents` shifted under an
+  // open search (new streamed events, a JSONL rebuild splice, or a tab/task
+  // switch). `activeMatchId` is read directly from the render closure rather
+  // than a ref: since this effect's callback is recreated fresh every render
+  // but only *invoked* when `matches` changes, the value captured is exactly
+  // "whatever was active before this recompute" — precisely the `prevActiveId`
+  // `resolveActiveMatchIndex` wants. Deliberately excludes `activeMatchId`
+  // from deps: including it would make the effect re-fire the moment it sets
+  // it, driven by its own write instead of a genuine match-set change (the
+  // `nextId !== activeMatchId` guard would still no-op on that redundant run,
+  // but there's no reason to pay for it).
+  //
+  // A tab/task switch OR a rebuild-snapshot splice reuses this SAME effect
+  // rather than a separate reset: `matches` are positional indices scoped to
+  // `displayedEvents`, so an id that was active before any of those changes
+  // is a coincidence, not a carry-over — `searchScopeRef` detects the change
+  // and forces `prevActiveId` to `null` so the resolution can't accidentally
+  // "keep" an unrelated index that happens to also be a match in the new
+  // scope.
+  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}:${rebuiltScopeKey}`);
+  useEffect(() => {
+    const scopeKey = `${task.id}:${activeStream}:${rebuiltScopeKey}`;
+    const scopeChanged = scopeKey !== searchScopeRef.current;
+    searchScopeRef.current = scopeKey;
+    const prevActiveId = scopeChanged ? null : activeMatchId;
+    const idx = resolveActiveMatchIndex(matches, prevActiveId);
+    const nextId = idx >= 0 ? matches[idx]! : null;
+    if (nextId !== activeMatchId) setActiveMatchId(nextId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
+
+  // Highlight + scroll the active match imperatively rather than through a
+  // React prop/memo dep: `RunEventList`'s `blocks` memo used to take
+  // `activeMatchId` as a dep purely so it could stamp a highlight class on
+  // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
+  // block tree on every match navigation. Toggling classList directly on
+  // the previous/next `[data-evid]` element is O(1) instead. Runs after the
+  // resolve effect above (and after any tab/task/rebuild-scope switch), so by
+  // the time this fires `activeMatchId` already points at an event rendered
+  // in the CURRENT `displayedEvents`.
+  useEffect(() => {
+    const HIGHLIGHT_CLASSES = ["ring-1", "ring-primary/60", "bg-primary/5", "rounded-md"];
+    const prev = highlightedElRef.current;
+    if (prev) {
+      prev.classList.remove(...HIGHLIGHT_CLASSES);
+      highlightedElRef.current = null;
+    }
+    if (activeMatchId === null) {
+      jumpIntentRef.current = false;
+      return;
+    }
+    const el = logRef.current?.querySelector<HTMLElement>(`[data-evid="${activeMatchId}"]`);
+    if (!el) {
+      jumpIntentRef.current = false;
+      return;
+    }
+    el.classList.add(...HIGHLIGHT_CLASSES);
+    highlightedElRef.current = el;
+    // The scrollIntoView below can land the log outside the "near bottom"
+    // band (or an SSE flush landing in the same tick could otherwise yank
+    // the view back to the bottom before the browser paints the scroll) —
+    // clear it immediately so neither auto-scroll path fights the jump.
+    nearBottomRef.current = false;
+    // Only an explicit jump (Enter / Shift+Enter / the ↑↓ nav buttons — see
+    // `jumpIntentRef`) auto-expands a collapsed tool-call card; a keystroke
+    // re-resolving the active match while typing gets the highlight + scroll
+    // below but not the dispatch, so narrowing a query doesn't leave a trail
+    // of force-expanded cards.
+    const isExplicitJump = jumpIntentRef.current;
+    jumpIntentRef.current = false;
+    // `detail.query` lets a listener that shows only part of its content
+    // inline (the formatted handoff card) tell whether the match is visible
+    // or only inside its modal (`ExpandOnJumpDetail`, D10).
+    if (isExplicitJump) {
+      el.dispatchEvent(new CustomEvent(EXPAND_EVENT, { bubbles: true, detail: { query: searchQueryRef.current } }));
+    }
+    el.scrollIntoView({ block: "center" });
+    if (isExplicitJump) {
+      // The dispatch above can expand a collapsed card AFTER this
+      // scrollIntoView already centered it at its collapsed height — the
+      // newly revealed body then pushes the matched text below the fold.
+      // Re-center on the next frame, once the expand's re-render has
+      // committed and the browser has laid out the taller card.
+      requestAnimationFrame(() => el.scrollIntoView({ block: "center" }));
+    }
+  }, [activeMatchId, jumpSeq]);
+
+  // Tell the handoff cards which search is on screen, so a card's "Match in
+  // handoff" hint clears when the search closes or its query changes.
+  useEffect(() => {
+    publishHandoffSearchSession({ open: searchOpen, query: searchQuery });
+  }, [searchOpen, searchQuery]);
+  useEffect(() => () => publishHandoffSearchSession({ open: false, query: "" }), []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
+  }, []);
+
+  const stepSearch = useCallback((dir: 1 | -1) => {
+    jumpIntentRef.current = true;
+    setJumpSeq((n) => n + 1);
+    setActiveMatchId((cur) => {
+      const idx = matches.indexOf(cur ?? -1);
+      const next = stepMatchIndex(matches.length, idx, dir);
+      return next >= 0 ? matches[next]! : null;
+    });
+  }, [matches]);
+
+  // Cmd/Ctrl+F opens the search bar and focuses its input (or, if the bar is
+  // already open, re-selects the existing query so typing replaces it
+  // outright) while the panel is actually open — not mid-close-animation or
+  // pre-mount, matching the panel's own Escape-to-close listener's `if
+  // (!open) return;` gate. Guarded the same way that listener guards against
+  // a higher-priority dismissable layer (modal dialog / open search-select
+  // popover) so it doesn't hijack the browser/OS's own find behavior — or a
+  // dialog's own input — while one of those is up. Also bails when focus is
+  // inside a terminal pane (`.xterm` — see TerminalView.tsx, which mounts
+  // xterm.js's own container carrying that class): Cmd/Ctrl+F there should
+  // reach the shell/program running in the PTY, not this panel's search.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      // The effect's `if (!open) return;` gate above only controls
+      // attachment — it can't see a close that happened after this effect
+      // last ran but before the deferred re-render that would detach it.
+      // This ref check makes the handler itself inert during that window,
+      // so the board's own listener (App.tsx) is the only one that acts on
+      // a chord landing there.
+      if (!openRef.current) return;
+      if (!isFindShortcut(e, IS_MAC_PLATFORM)) return;
+      // See `FIND_SHORTCUT_BLOCKING_LAYERS`'s doc comment for the escape-only carve-out.
+      if (document.querySelector(FIND_SHORTCUT_BLOCKING_LAYERS)) return;
+      if ((e.target as Element | null)?.closest?.(".xterm")) return;
+      e.preventDefault();
+      if (searchOpen) {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
+      setSearchOpen(true);
+      // The input isn't mounted yet on the render this triggers (the bar
+      // renders conditionally on `searchOpen`) — focus after the next paint.
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, searchOpen]);
+
+  // Escape closes the search bar regardless of where focus currently is
+  // within the panel (not just while the input itself is focused) — matching
+  // "Escape peels one layer at a time" from the panel's own listener. Gated
+  // on `searchOpen` so it's only attached while there's something to close,
+  // and bails on the same higher-priority dismissable layers (modal dialog /
+  // open search-select popover / floating quote pill) as every other
+  // document-level listener here so Escape closes the topmost layer first
+  // instead of skipping straight to the search bar underneath it.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // Already handled by a layer above (see the panel-close listener).
+      if (e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
+      e.preventDefault();
+      closeSearch();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [searchOpen, closeSearch]);
+
+  /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
+   *  the agent is working is folded into the active run (the backend pastes it
+   *  into the live session — no new run row), so there's only ever one
+   *  in-flight run per task: the heartbeat is simply on ("Agent is working…")
+   *  or off. Hidden while an interaction card is up. */
+  const indicatorMode: RunIndicatorMode = useMemo(() => {
+    // A background-agent tab's heartbeat tracks that subagent's own status,
+    // independent of the main turn (the parent turn may already be in `review`
+    // while a background workflow keeps running).
+    if (activeStream !== "main") {
+      const s = subagentList.find((x) => x.id === activeStream);
+      return s?.status === "running" ? "active" : "off";
+    }
+    if (interactions.length > 0) return "off";
+    return runs.some((r) => r.status === "running") ? "active" : "off";
+  }, [activeStream, subagentList, interactions.length, runs]);
+
+  /** Summary for the "Holding in running" line on the Main stream: the turn
+   *  itself has resolved (no run is `running`, no interaction card is up) but
+   *  the card is still parked in the `running` column because background work
+   *  (a Monitor, a bg shell, a workflow, or an in-session subagent) hasn't
+   *  settled yet — see `holdForSubagents` in orchestrator.ts, the DB-side
+   *  predicate this line explains to the user. `null` whenever nothing is
+   *  held, so the render site can gate on a single truthy check. Cheap: one
+   *  pass over `subagentList`, which the 2s poll already rebuilds regardless.
+   */
+  const holdSummary = useMemo(() => {
+    if (activeStream !== "main") return null;
+    if (task.column !== "running") return null;
+    if (interactions.length > 0) return null;
+    if (runs.some((r) => r.status === "running")) return null;
+    if (!anySubagentRunning(subagentList)) return null;
+    const running = subagentList.filter((s) => s.status === "running");
+    let monitors = 0;
+    let shells = 0;
+    let workflows = 0;
+    let agents = 0;
+    for (const s of running) {
+      if (s.parentKind === "monitor") monitors++;
+      else if (s.parentKind === "bg_session") shells++;
+      else if (s.parentKind === "workflow") workflows++;
+      // Task-tool subagents, workflow agents and OpenCode child sessions
+      // (`opencode_subagent`) all read as agents.
+      else agents++;
+    }
+    const parts: string[] = [];
+    if (monitors > 0) parts.push(`${monitors} monitor${monitors > 1 ? "s" : ""}`);
+    if (shells > 0) parts.push(`${shells} shell${shells > 1 ? "s" : ""}`);
+    if (workflows > 0) parts.push(`${workflows} workflow${workflows > 1 ? "s" : ""}`);
+    if (agents > 0) parts.push(`${agents} agent${agents > 1 ? "s" : ""}`);
+    return parts.length > 0 ? `Holding in running — ${parts.join(" · ")} still active` : null;
+  }, [activeStream, task.column, interactions.length, runs, subagentList]);
+
+  // The run-status RunEventList uses to gate its bottom heartbeat. On a
+  // background-agent tab this must reflect THAT subagent's status, not the main
+  // run's — otherwise a subagent still running after the parent turn resolved
+  // to `review` (the core background-workflow case) would have its heartbeat
+  // suppressed because the main run reads `succeeded`. Map the subagent's
+  // status onto the Run["status"] shape the child expects.
+  const activeRunStatus: Run["status"] | null = useMemo(() => {
+    if (activeStream === "main") return latestRun?.status ?? null;
+    return subagentList.find((s) => s.id === activeStream)?.status === "running"
+      ? "running"
+      : "succeeded";
+  }, [activeStream, subagentList, latestRun?.status]);
+
+  // Tabs are shown only while background agents are active (see
+  // `shouldShowSubagentTabs`). Logic is extracted + unit-tested in
+  // lib/subagent-tabs.ts (the repo has no DOM test harness).
+  const parentRunRunning = useMemo(() => runs.some((r) => r.status === "running"), [runs]);
+  // A focus request for a helper this task actually has keeps the strip
+  // visible even once everything finished — otherwise a satellite's "Open
+  // transcript" on a done run would land on a collapsed strip and be forced
+  // straight back to Main by `resolveActiveStream`. Consumed or not, the
+  // request keeps the strip open for as long as App holds it — App clears it
+  // (→ `null`, and this stops force-showing the strip) the moment the panel
+  // closes or switches to another task (M-A2).
+  const focusedSubagentKnown = !!focusSubagent && subagentList.some((sub) => sub.id === focusSubagent.id);
+  const showSubagentTabs = useMemo(
+    () => shouldShowSubagentTabs(subagentList, parentRunRunning) || focusedSubagentKnown,
+    [subagentList, parentRunRunning, focusedSubagentKnown],
+  );
+
+  // When the strip collapses (or the active subagent disappears), fall back to
+  // the Main stream so the log + composer can't be stranded on a hidden tab.
+  useEffect(() => {
+    const resolved = resolveActiveStream(activeStream, showSubagentTabs, subagentList);
+    if (resolved !== activeStream) setActiveStream(resolved);
+  }, [showSubagentTabs, subagentList, activeStream]);
+
+  // Honour a `focusSubagent` request exactly once — as soon as the polled
+  // list knows the id (a freshly-opened panel may not have it on the first
+  // render). The "already honoured" flag is the request's own `consumed`
+  // field, flipped by App via `onFocusSubagentConsumed` — NOT a ref in this
+  // body: `RunPanelBody` can remount (the panel's open/close animation, a
+  // stream re-issue) and a ref would reset with it and replay the nonce
+  // (M-A2). The local ref is only a belt-and-braces guard for a consumer
+  // that passes no callback, so a later poll (or the user switching back to
+  // Main) still never re-forces the tab.
+  const consumedFocusNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!focusSubagent || focusSubagent.consumed || consumedFocusNonceRef.current === focusSubagent.nonce) return;
+    if (!subagentList.some((sub) => sub.id === focusSubagent.id)) return;
+    consumedFocusNonceRef.current = focusSubagent.nonce;
+    setActiveStream(focusSubagent.id);
+    onFocusSubagentConsumed?.(focusSubagent.nonce);
+  }, [focusSubagent, subagentList, onFocusSubagentConsumed]);
+
+  // Two separate affordances:
+  //   • `canControl` — Stop button is only meaningful when there's an in-flight
+  //     turn (column running/blocked). Stopping a finished run is a no-op.
+  //   • `canSend`   — once the task has ever been run, the user can keep
+  //     talking to it. When the tmux session is dead (orphan-reconciled, app
+  //     restarted, run cancelled, …), the backend's `spawnResumedSession`
+  //     spins up a fresh tmux + `claude --resume <claudeSessionId>` so the
+  //     conversation continues from the same JSONL transcript. `task.runId`
+  //     is null in that orphan-reconciled state, so we fall back to the most
+  //     recent run id to identify which task → which claude session to
+  //     resume. Codex has no resume mechanism; restrict to claude-code.
+  const liveRunId = task.runId;
+  // Reconcile against the independently-polled runs list: if the live run has
+  // already resolved (succeeded/failed/cancelled/orphaned), the task isn't
+  // running regardless of what `task.column` says. `task.column` is a snapshot
+  // polled into the board and can briefly lag the DB; `runs` is polled here
+  // (with its own error handling) so a resolved live run is the more
+  // trustworthy "no longer running" signal. When the live run hasn't been
+  // polled in yet (freshly started — not in `runs` yet), `liveRun` is null and
+  // we fall back to trusting `task.column`, so Stop never hides on a genuinely
+  // in-flight turn.
+  const liveRun = liveRunId ? runs.find((r) => r.id === liveRunId) ?? null : null;
+  const liveRunTerminal = !!liveRun && liveRun.status !== "running";
+  const canControl = !!liveRunId
+    && (task.column === "running" || task.column === "blocked")
+    && !liveRunTerminal;
+  // Archive gate mirrors TaskCard's `active` — running/blocked, regardless of
+  // whether a live run row has been polled in yet, so Archive shows up as
+  // soon as the board would call this task "active" too.
+  const active = task.column === "running" || task.column === "blocked";
+  // codex/gemini excluded from the fallback — see the matching comment in
+  // DiffDialog.tsx for why (both technically support taskId-scoped resume,
+  // but this ad-hoc affordance stays claude-only pending a product call).
+  const resumableRunId = liveRunId
+    ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
+  // Send is enabled whenever the task has ever been run. While a turn is
+  // in flight, the backend pastes the new prompt into the live tmux session —
+  // claude queues it in its TUI input buffer and replays it as part of the
+  // current response. The message folds into the active run (recorded in the
+  // conversation stream, no new run row), so the task stays a single in-flight
+  // run rather than stacking queued rows that could strand "running".
+  // An imported session (Claude Code or OpenCode, `importedSessionOf`) can't
+  // take a message until its history has finished importing — the server
+  // refuses the send (`OpenCode history is still importing` for OpenCode).
+  const importedSession = importedSessionOf(task);
+  const canSend = !!resumableRunId && (!importedSession || importedSession.status === "ready");
+  // While a native modal (question / plan / permission prompt) is pending,
+  // the agent is blocked on it — a typed message would go astray instead of
+  // reaching the agent (and the run would hang "working"). This gate is
+  // kind-agnostic over the `interactions` array: for claude, a typed message
+  // would paste into the live tmux modal instead of reaching claude; for fx,
+  // the turn is parked awaiting the ACP permission reply, so a follow-up
+  // would only sit in `fxTurnQueue` behind an unanswered card. Either way the
+  // gate keeps the UX consistent across kinds: answer via the card above, or
+  // press Stop to cancel cleanly first. AskUserQuestion's own card carries a
+  // per-question "Custom answer" field, so custom input isn't lost.
+  const modalPending = interactions.length > 0;
+
+  const [input, setInput] = useState("");
+  const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
+
+  // ── Composer draft persistence ──────────────────────────────────────────
+  // `RunPanelBody` is a single long-lived instance (no `key={task.id}` — see
+  // the reset-on-task-switch effect above), and the parent keeps a 250ms-
+  // lagged `mountedTask` for the exit animation, so seeding/flushing has to
+  // be driven off `task.id` changes and an unmount effect rather than mount
+  // lifecycle alone.
+  //
+  // Which task.id the composer was last seeded for. Guards against the 2s
+  // board poll: every poll hands this component a freshly-refreshed `task`
+  // object, and reseeding `input`/`sendRefs` from `task.draft` on every one
+  // of those would stomp in-progress typing. Only a genuine task switch
+  // reseeds.
+  const seededTaskIdRef = useRef<string | null>(null);
+  // The draft value last known to be persisted server-side (or null) —
+  // either because we just seeded from `task.draft`, or because our own
+  // autosave/flush/clear just wrote it. Used to skip redundant writes.
+  const lastSavedDraftRef = useRef<TaskDraft | null>(null);
+  // Pending debounce timer for the autosave effect below.
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref mirrors of the latest composer state + task id, read by the mount-
+  // scoped flush effect's cleanup (a cleanup closes over the values from the
+  // render that registered it, not the latest ones) and by the seed effect
+  // when flushing the OUTGOING task before reseeding.
+  const inputRef = useRef(input);
+  const sendRefsRef = useRef(sendRefs);
+  const taskIdRef = useRef(task.id);
+  inputRef.current = input;
+  sendRefsRef.current = sendRefs;
+  // True from the moment the composer is (re)seeded for the current task
+  // until the user actually diverges from that baseline (see the autosave
+  // effect below). While true, a fresher server draft is allowed to adopt
+  // INTO the composer (stale-poll fix, code review finding #2); once false,
+  // nothing may touch `input`/`sendRefs` again until the task changes —
+  // typing must never be silently overwritten.
+  const draftPristineRef = useRef(true);
+  // Monotonic write generation. Every draft write (autosave, unmount/pagehide
+  // flush, task-switch flush) stamps the generation it was issued under and
+  // only advances `lastSavedDraftRef` in its `.then` if that generation is
+  // still current when the response lands — so a slow/late write can never
+  // clobber a newer baseline with stale data (code review finding #4).
+  // send()/saveForLater() bump this *before* firing their clear so an
+  // in-flight autosave PUT that resolves afterward is a no-op against
+  // `lastSavedDraftRef` (it can still land on the wire after the DELETE —
+  // that residual risk is accepted; the next open's fresh `getTask` +
+  // pristine-adopt below will reconcile against whatever the server has).
+  const draftGenRef = useRef(0);
+
+  const cancelDraftSaveTimer = () => {
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+  };
+
+  // Shared write path for every draft persistence site. Advances
+  // `lastSavedDraftRef` only on success (code review finding #3 — a failed
+  // write must stay retryable, not look "saved"), gated by the generation
+  // guard above (finding #4).
+  const writeDraft = (targetTaskId: string, next: TaskDraft | null) => {
+    const gen = ++draftGenRef.current;
+    const p = next ? api.setTaskDraft(targetTaskId, next) : api.clearTaskDraft(targetTaskId);
+    void p
+      .then(() => {
+        if (gen === draftGenRef.current) lastSavedDraftRef.current = next;
+      })
+      .catch(() => {});
+  };
+
+  // Seed (or reseed on task switch) the composer from the server-persisted
+  // draft. Flushes the OUTGOING task's unsaved draft first, using the id
+  // still held in `taskIdRef` from before this run updates it.
+  useEffect(() => {
+    const prevTaskId = taskIdRef.current;
+    if (seededTaskIdRef.current !== null && seededTaskIdRef.current !== task.id) {
+      const pending = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (!draftsEqual(pending, lastSavedDraftRef.current)) {
+        writeDraft(prevTaskId, pending);
+      }
+    }
+    cancelDraftSaveTimer();
+    taskIdRef.current = task.id;
+    const seeded = task.draft ?? null;
+    // StrictMode double-invoke lockstep (code review finding #1): the app
+    // runs under <StrictMode>, which invokes effect setup → cleanup → setup
+    // before React flushes queued state updates. If the ref mirrors below
+    // were left to update lazily (via the `inputRef.current = input` lines
+    // above, which only run on the NEXT render), the StrictMode cleanup of
+    // the unmount-flush effect could fire in between — observing the
+    // pre-seed `inputRef` ("") against the just-set `lastSavedDraftRef`
+    // (the seeded draft), which looks exactly like "the user cleared the
+    // draft" and fires a spurious `clearTaskDraft` that wipes it. Writing
+    // the mirrors here, synchronously and in lockstep with the state calls
+    // and the baseline, closes that window.
+    setInput(seeded?.text ?? "");
+    setSendRefs(seeded?.references ?? []);
+    inputRef.current = seeded?.text ?? "";
+    sendRefsRef.current = seeded?.references ?? [];
+    lastSavedDraftRef.current = seeded;
+    seededTaskIdRef.current = task.id;
+    draftPristineRef.current = true;
+
+    // Stale-poll seed fix (code review finding #2): `task` here is whatever
+    // the last 2s board poll handed us — reopening the panel within that
+    // window can seed from a draft that predates a very recent flush
+    // elsewhere, and the next keystroke would then permanently overwrite the
+    // newer server draft. Re-fetch the task fresh; if we're still on the
+    // same task AND the user hasn't touched the composer since (pristine),
+    // adopt the fresher draft. Swallow errors — the polled seed above
+    // already stands as a reasonable fallback.
+    const seededForTaskId = task.id;
+    let cancelled = false;
+    void api.getTask(task.id).then((fresh) => {
+      if (cancelled) return;
+      if (taskIdRef.current !== seededForTaskId) return; // switched tasks meanwhile
+      if (!draftPristineRef.current) return; // user already typed — never clobber
+      const freshDraft = fresh.draft ?? null;
+      if (draftsEqual(freshDraft, lastSavedDraftRef.current)) return;
+      setInput(freshDraft?.text ?? "");
+      setSendRefs(freshDraft?.references ?? []);
+      inputRef.current = freshDraft?.text ?? "";
+      sendRefsRef.current = freshDraft?.references ?? [];
+      lastSavedDraftRef.current = freshDraft;
+    }).catch(() => { /* polled seed stands */ });
+    return () => { cancelled = true; };
+    // Only `task.id` — deliberately NOT `task.draft` (would reseed on every
+    // 2s poll refresh) or `task` itself. The pristine-adopt effect below
+    // covers the "newer draft arrives via the poll" case instead, guarded by
+    // `draftPristineRef` so it can never stomp in-progress typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id]);
+
+  // Second half of the stale-poll fix: while still pristine, also adopt
+  // `task.draft` changes that arrive via the normal 2s board poll (covers
+  // the case where the one-shot `getTask` fetch above failed or hasn't
+  // resolved yet). Once the user edits (pristine flips false, below),
+  // nothing here may touch `input`/`sendRefs` again until the task changes.
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return;
+    if (!draftPristineRef.current) return;
+    const polled = task.draft ?? null;
+    if (draftsEqual(polled, lastSavedDraftRef.current)) return;
+    setInput(polled?.text ?? "");
+    setSendRefs(polled?.references ?? []);
+    inputRef.current = polled?.text ?? "";
+    sendRefsRef.current = polled?.references ?? [];
+    lastSavedDraftRef.current = polled;
+  }, [task.draft, task.id]);
+
+  // Debounced autosave: 600ms after the composer settles, persist the
+  // current text+refs if they differ from what's already saved. Errors are
+  // swallowed — a failed autosave must never toast; the next keystroke (or
+  // the unmount flush) naturally retries (see `writeDraft`).
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return; // not seeded for this task yet
+    const next = normalizeDraft(input, sendRefs);
+    // The composer has diverged from the last known-saved/seeded baseline —
+    // this is a genuine user edit (typing, or a ref attached/removed), not
+    // an effect re-run caused by our own seed/adopt paths (those set
+    // `lastSavedDraftRef` in lockstep, so `next` already matches there).
+    // Once tripped, stays false until the next task switch reseeds it.
+    if (!draftsEqual(next, lastSavedDraftRef.current)) {
+      draftPristineRef.current = false;
+    }
+    cancelDraftSaveTimer();
+    draftSaveTimerRef.current = setTimeout(() => {
+      draftSaveTimerRef.current = null;
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      writeDraft(task.id, next);
+    }, 600);
+    return cancelDraftSaveTimer;
+  }, [input, sendRefs, task.id]);
+
+  // Flush on unmount (close of the details modal, after the 250ms exit
+  // animation drops `mountedTask`) — a crash or an abrupt close shouldn't
+  // lose a draft the debounce hasn't gotten to yet. Mount-scoped (empty
+  // deps) so the cleanup only runs once, on actual unmount, not on every
+  // dependency change. Also flushes on `pagehide` (code review finding #5):
+  // React effect cleanups don't run when the webview itself is torn down
+  // (app quit), so `pagehide` is the only remaining hook to persist an
+  // unsaved draft in that path. Same flush logic, fire-and-forget either way.
+  useEffect(() => {
+    const flush = () => {
+      cancelDraftSaveTimer();
+      const next = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      writeDraft(taskIdRef.current, next);
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const [sending, setSending] = useState(false);
+  const [sendHint, setSendHint] = useState<string | null>(null);
+  // fx-only: true while a Resume click is in flight for this task's paused
+  // recovery checkpoint (`pausedRecovery` below). Disables the Resume button
+  // so a second click can't fire a second `resumeFxRecovery` call while the
+  // first is still resolving — the server also guards this with a synchronous
+  // in-flight claim, but this keeps the button honest client-side too.
+  const [resumeBusy, setResumeBusy] = useState(false);
+  // The `latestRun.id` this panel had at the moment Resume was clicked —
+  // read by the busy-clearing effect below to detect when the runs
+  // snapshot has actually caught up with the resume, rather than clearing
+  // busy the instant the server call resolves. `null` once there's nothing
+  // left to wait for (no run at click time, or the request itself failed).
+  const resumeClickedRunIdRef = useRef<string | null>(null);
+  // Resume a paused fx recovery checkpoint (see `pausedRecovery` below) —
+  // continues the SAME model turn via `_meta.fx.continueRecovery` server-side,
+  // no new user message. On success there's nothing else to do here: the runs
+  // poll + SSE pick up the new run row, `latestRun` changes, and
+  // `pausedRecovery` recomputes to `null` on its own — `runsPollKickRef` just
+  // short-circuits the up-to-2s poll delay so the notice clears immediately
+  // instead of lagging behind the click. A failure (e.g. fx's own
+  // "No paused model response to continue" `-32602`) surfaces through the
+  // same `sendHint` line every other send-path error uses, verbatim.
+  //
+  // Deliberately does NOT clear `resumeBusy` in a `.finally` on the request
+  // itself: the server accepting the resume only means a new run row now
+  // exists somewhere in the DB — it says nothing about whether THIS panel's
+  // `runs`/`latestRun` state (2s poll + SSE) has observed it yet. Clearing
+  // busy on request-success would re-enable the button for the ~1-2s window
+  // between "server accepted" and "this panel's snapshot caught up", during
+  // which `pausedRecovery` below could still be reading the OLD failed run
+  // as resumable and re-offer the very checkpoint that was just consumed —
+  // a second click would then race the first resume against fx's own
+  // "already resumed"/"no paused response" error. So busy is left `true` on
+  // success and only cleared by the effect below, once `latestRun.id` has
+  // actually moved on from what it was at click time; a request failure has
+  // nothing new to wait for, so it clears busy immediately instead.
+  const handleResumeFxRecovery = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `resumeFxRecovery`
+    // resolving/rejecting after the user has moved to a different task must
+    // not touch task B's `resumeBusy`/`sendHint`/click-tracking state.
+    const sentTaskId = task.id;
+    resumeClickedRunIdRef.current = latestRun?.id ?? null;
+    setResumeBusy(true);
+    api.resumeFxRecovery(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
+      .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        setSendHint(e instanceof Error ? e.message : String(e));
+        resumeClickedRunIdRef.current = null;
+        setResumeBusy(false);
+      });
+  }, [task.id, latestRun]);
+  // Clears `resumeBusy` once the runs snapshot has observed a run identity
+  // different from the one captured at click time (see the comment above) —
+  // i.e. the new resumed run has actually shown up in `runs`/`latestRun`,
+  // not merely that the resume request round-tripped. Paired with the
+  // `task.column !== "running"` guard added to `pausedRecovery` below: that
+  // guard hides the notice as soon as the column SSE event flips (usually
+  // faster than the 2s runs poll), and this effect is the backstop for the
+  // gap before either signal has caught up — without both, the button (or
+  // the whole notice, before the column fix) could stay clickable long
+  // enough for a second resume to fire against the same stale checkpoint.
+  useEffect(() => {
+    if (!resumeBusy) return;
+    if (latestRun?.id !== resumeClickedRunIdRef.current) {
+      resumeClickedRunIdRef.current = null;
+      setResumeBusy(false);
+    }
+  }, [resumeBusy, latestRun]);
+  // fx-only: true while a "Cancel" click is in flight for this task's
+  // pending auto-resume timer (`pausedRecovery.autoResume` below). Unlike
+  // `resumeBusy` above, cancelling doesn't spawn a new run to wait for — it
+  // only clears `task.fxRecovery.autoResume` server-side — so busy is
+  // simply cleared once the request settles either way (`.finally`), no
+  // run-identity bookkeeping needed. `runsPollKickRef` still short-circuits
+  // the up-to-2s task/runs poll so the countdown line disappears (or the
+  // "cancelled" reason appears) as soon as the server has actually applied
+  // it, rather than lagging behind the click.
+  const [cancelAutoBusy, setCancelAutoBusy] = useState(false);
+  const handleCancelFxAutoResume = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setCancelAutoBusy(true);
+    api.cancelFxAutoResume(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
+      .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        setSendHint(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setCancelAutoBusy(false);
+      });
+  }, [task.id]);
+  /** Live fx recovery notice for the bottom-pinned heartbeat slot — fx's own
+   *  retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … · retrying
+   *  request in 8s · attempt 5/10"), rendered directly under
+   *  `RunningIndicator` while the CURRENT run is still mid-retry. It lives in
+   *  that slot (not as a transcript row) because it's ephemeral, in-place
+   *  progress — the same reason the heartbeat itself isn't a transcript row
+   *  — and updates live as new `fx-recovery:` sentinels arrive since
+   *  `recoveryByRunId` is derived from `events`. Gated on `kind === "fx"` and
+   *  `activeStream === "main"` (a background-agent tab never carries fx's own
+   *  retry loop — only the Main stream's turn does) same as `indicatorMode`/
+   *  `holdSummary` above. `null` whenever there's nothing live: wrong kind, a
+   *  subagent tab, no run currently `running`, or the latest run's newest
+   *  recovery sentinel isn't `state: "active"` — `paused` gets the notice
+   *  below instead, and `recovered`/`cleared`/`failed` have nothing left to
+   *  show here (the persisted summary line for those transitions lives in the
+   *  transcript itself, written once by the driver, not derived on every
+   *  render by this memo). Ignores a `replayed: true` payload — on
+   *  `session/resume` fx replays the PRIOR turn's recovery updates onto the
+   *  new run before it starts making progress of its own, so a naive read
+   *  would flash a stale "attempt 10/10" (or worse, a stale `paused`) as if
+   *  it were live. `payload.replayed` is fx-acp.ts's own stamp, present only
+   *  while replay is in flight, never on a genuinely live sentinel — so this
+   *  memo simply reads as `null` (no live notice) until real progress on the
+   *  resumed turn arrives. `pausedRecovery` below deliberately does NOT
+   *  apply the same guard — see its comment. */
+  const liveRecoveryNotice = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main") return null;
+    if (!latestRun || latestRun.status !== "running") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || payload.state !== "active" || payload.replayed === true) return null;
+    return fxRecoveryNoticeText(payload);
+  }, [kind, activeStream, latestRun, recoveryByRunId]);
+  /** Paused fx recovery notice + Resume affordance, same bottom slot as
+   *  `liveRecoveryNotice` (mutually exclusive with it — a run is either
+   *  `running` with an active retry or `failed` with a paused one, never
+   *  both). When fx pauses a response it keeps the turn's checkpoint: the
+   *  run already settled `failed` and the card is back off `running`, but the model's
+   *  mid-turn checkpoint is still resumable via `POST /tasks/:id/fx-resume`
+   *  as long as fx's own `requiredAction` says so (`isFxRecoveryResumable`).
+   *  `latestRun.status === "failed"` alone is enough to know no newer run is
+   *  in flight — `runs` is newest-first, so a failed `latestRun` IS the
+   *  newest run for this task. `null` for every non-fx kind, a subagent tab,
+   *  or an archived task (no mutation affordances on a frozen task — matches
+   *  every other archived-gated action in this panel), or once the latest
+   *  sentinel for that run no longer reads as resumable (e.g. a later
+   *  `cleared` sentinel from a normal follow-up prompt consuming the
+   *  checkpoint, or a terminal `failed` state / `surface_stall` action,
+   *  neither of which `isFxRecoveryResumable` accepts — a failed recovery
+   *  shows only the driver's persisted summary line, never a notice, Resume
+   *  or the board's paused badge). The text itself (`fxRecoverySummaryLine`)
+   *  is the same paused summary line the driver already persisted into the
+   *  transcript at the pause transition — this is
+   *  purely a live, disappearing-once-acted-on affordance layered on top,
+   *  not a second source of truth for what happened.
+   *
+   *  `latestRun.status === "failed"` alone is stale for up to the 2s runs-
+   *  poll interval after a new turn actually starts (Resume itself, or an
+   *  ordinary follow-up message sent from the composer): `runs` only
+   *  refreshes on that poll, so for that window `latestRun` can still be the
+   *  OLD failed run with its (still-resumable) payload even though a new run
+   *  is already `running` server-side — the button would stay clickable and
+   *  a second click could race the in-flight turn. `task.column !== "running"`
+   *  closes that window: the `column` field flips to `"running"` promptly via
+   *  the column SSE event (independent of the runs poll), so it's the
+   *  faster-arriving of the two signals here. The `resumeBusy`/
+   *  `resumeClickedRunIdRef` bookkeeping above is the complementary backstop
+   *  for a Resume click specifically (busy stays true until `latestRun.id`
+   *  itself has moved on) — this column check additionally covers an
+   *  ordinary new message reopening the same window.
+   *
+   *  Deliberately does NOT gate on `payload.replayed` the way
+   *  `liveRecoveryNotice` above does: a `paused` sentinel replayed onto a
+   *  resume run that itself died before making progress (e.g. the resume
+   *  turn's own connection dropped) is still an accurate description of
+   *  fx's checkpoint — fx never cleared it, so Resume must stay offered.
+   *  `liveRecoveryNotice` hides replayed sentinels because it renders
+   *  in-progress retry noise that goes stale the moment real progress
+   *  resumes; `pausedRecovery` renders a terminal state that stays true
+   *  until something explicit changes it (a `cleared` sentinel, or a
+   *  genuinely new run). */
+  // `autoResume`/`stopped` (below) are read straight off `task.fxRecovery` —
+  // the server-managed schedule/counter for THIS same paused checkpoint —
+  // rather than derived from the sentinel payload; the sentinel-derived
+  // `isFxRecoveryResumable` gate above still decides whether the notice
+  // shows at all, `task.fxRecovery` only adds the auto-resume-specific
+  // detail on top once it does.
+  //
+  // fx 0.0.15 and later can't continue a pause, so on that version the
+  // notice keeps its text but trades Resume and the auto-resume lines for a
+  // "send a new message" hint. The version is the installed binary's (the
+  // `/harnesses` poll), not the one that paused; unknown keeps Resume.
+  const fxVersion = agents.find((a) => a.harnessId === task.agent)?.version ?? null;
+  const resumeSupported = fxSupportsContinueRecovery(fxVersion);
+  const pausedRecovery = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main" || archived) return null;
+    if (task.column === "running") return null;
+    if (!latestRun || latestRun.status !== "failed") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || !isFxRecoveryResumable(payload)) return null;
+    const text = fxRecoverySummaryLine(payload) ?? fxRecoveryNoticeText(payload);
+    if (!resumeSupported) return { text, busy: false, unsupportedHint: FX_RESUME_UNSUPPORTED_TEXT };
+    return {
+      text,
+      busy: resumeBusy,
+      onResume: handleResumeFxRecovery,
+      autoResume: task.fxRecovery?.autoResume,
+      stopped: task.fxRecovery?.autoResumeStopped,
+      onCancelAuto: handleCancelFxAutoResume,
+      cancelBusy: cancelAutoBusy,
+    };
+  }, [
+    kind, activeStream, archived, task.column, latestRun, recoveryByRunId, resumeBusy,
+    handleResumeFxRecovery, task.fxRecovery, handleCancelFxAutoResume, cancelAutoBusy,
+    resumeSupported,
+  ]);
+  // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
+  // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
+  // each mutation also updates this optimistically from the endpoint's returned
+  // Task so the tray reacts immediately instead of waiting for the next poll.
+  const [backlogItems, setBacklogItems] = useState<BacklogMessage[]>(task.backlog);
+  // Guards concurrent backlog mutations (and shares the send lock so a
+  // "Send now" from the tray can't race a composer send).
+  const [backlogBusy, setBacklogBusy] = useState(false);
+  useEffect(() => { setBacklogItems(task.backlog); }, [task.backlog]);
+  // Cursor plans — same local-mirror-resynced-from-prop pattern as
+  // `backlogItems` above: seeded from `task.plans`, kept in sync as the 2s
+  // task poll refreshes it, and updated immediately from the Task returned
+  // by the plan edit/approve endpoints so the dialog (and the plan card)
+  // reflect an approval/edit without waiting for the next poll.
+  const [plans, setPlans] = useState<TaskPlan[]>(task.plans);
+  useEffect(() => { setPlans(task.plans); }, [task.plans]);
+  // Which plan's modal is open, by id (not the object) — see PlanDialog's
+  // doc comment for why the live plan is resolved from `plans` on every
+  // render instead of being captured at open time.
+  const [planDialogId, setPlanDialogId] = useState<string | null>(null);
+  const openPlan = planDialogId ? plans.find((p) => p.id === planDialogId) ?? null : null;
+  const onOpenPlan = useCallback((planId: string) => setPlanDialogId(planId), []);
+  // Clear a `planDialogId` that no longer resolves to a plan (e.g. `plans`
+  // refreshed mid-close and the id vanished) instead of leaving it set with
+  // the dialog merely closed for lack of a matching `openPlan` — a stale id
+  // left in state would silently reopen the dialog if it ever reappeared in
+  // a later poll (e.g. an id gets reused, or the same plan comes back after
+  // a transient sync gap).
+  useEffect(() => {
+    if (planDialogId && !plans.some((p) => p.id === planDialogId)) setPlanDialogId(null);
+  }, [planDialogId, plans]);
+  // The task's live git status (uncommitted changes / unpushed commits).
+  // Drives the "Commit & push" action chip above the textarea via
+  // `shouldOfferCommitPush`. Deliberately independent of run status —
+  // background agents can dirty the worktree (or add unpushed commits)
+  // while the latest run is still `running`, so the chip must be able to
+  // surface then too, not just after a run succeeds. `null` means unknown
+  // (not yet polled, or the last poll failed) and hides the chip. A
+  // polling effect keeps this in sync with the actual git state for as
+  // long as the panel is mounted.
+  const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
+  const [importedBranchBusy, setImportedBranchBusy] = useState(false);
+  const [importedBranchError, setImportedBranchError] = useState<string | null>(null);
+  const [importRetryBusy, setImportRetryBusy] = useState(false);
+  const [importRetryError, setImportRetryError] = useState<string | null>(null);
+  /** True after a retry response of ok, until the task prop leaves `failed`.
+   *  The prop still carries the old error until the board refresh lands. */
+  const [importRetryOk, setImportRetryOk] = useState(false);
+  useEffect(() => {
+    setImportRetryOk(false);
+    // A transport abort can land after the server has already left `failed`.
+    // The next status is the source of truth, so the stale error does not
+    // stay on a transcript that finished.
+    setImportRetryError(null);
+  }, [importedSession?.status]);
+  const [sendDragging, setSendDragging] = useState(false);
+  // `/`-command, skill autocomplete, and saved-prompts loading for the send
+  // field render through `PromptComposer`'s own `useAgentCapabilities`/
+  // `useSavedPrompts` hooks — the same ones NewTaskForm/
+  // CreateTaskFromIssueDialog/ResolveConflictsDialog go through, so this
+  // dock can't drift from those. RunPanel calls both hooks itself (near
+  // where `capture` is built below) and passes the results down via the
+  // composer's `capabilities`/`savedPrompts` props, rather than letting the
+  // composer's internal calls own them — the dock unmounts on every Main ↔
+  // subagent tab switch and the archived-without-canSend swap, and hoisting
+  // the hooks to this stable parent keeps their fetches (a disk walk of
+  // MCP/skills/plugins) alive across those remounts instead of refiring
+  // them every time.
+  const sendRef = useRef<HTMLTextAreaElement>(null);
+  // "Chat about it" affordance for a plan modal — same `requestAnimationFrame`
+  // + focus idiom as `MessageHistoryPicker`'s insert-and-focus above. No
+  // caret placement needed here (unlike the picker) since we're not inserting
+  // text, just moving focus into the already-composed (or empty) textarea.
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() => { sendRef.current?.focus(); });
+  }, []);
+  // Append a quoted selection (see QuoteSelectionButton) to the composer and
+  // land the caret at its end. Caret BEFORE focus — SlashAutocomplete syncs
+  // its tracked caret on the native `focus` event, so focusing first would
+  // read the stale pre-insert offset (same fix as ExtensionPicker's `insert`,
+  // commit bcf0d07).
+  const handleQuote = useCallback(
+    (quoted: string) => {
+      const { text, caret } = appendQuote(input, quoted);
+      setInput(text);
+      requestAnimationFrame(() => {
+        const el = sendRef.current;
+        if (!el) return;
+        el.setSelectionRange(caret, caret);
+        el.focus();
+        // A textarea doesn't scroll to reveal a programmatically-set caret —
+        // when the composer already overflows, the appended quote (and the
+        // caret, which appendQuote always lands at the very end) sits below
+        // the fold until the user scrolls. Bottom IS the caret here, so
+        // pinning scrollTop to scrollHeight is exact, not approximate.
+        el.scrollTop = el.scrollHeight;
+      });
+    },
+    [input],
+  );
+
+  // Poll the task's git status every 5s for as long as the panel is
+  // mounted, regardless of run status — with background agents, most of a
+  // task's life is spent `running`, and the worktree can get dirty (or
+  // gain unpushed commits) during that window, not just after a run
+  // succeeds. The 5s cadence also lets the chip disappear if the agent (or
+  // the user, from a separate terminal) commits the changes through
+  // another path. The loop is sequential (each tick waits for the
+  // previous git status to resolve before sleeping) so a slow `git
+  // status` can't produce out-of-order setGitStatus calls.
+  //
+  // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
+  // the task object each tick, so depending on `latestRun`/`task` fields
+  // here would restart this effect (and its poll cadence) every 2s.
+  //
+  // The first fetch waits on `awaitStreamReady()` (declared near
+  // `runsLoaded`, above) — a non-essential request like this one must not
+  // compete with the new task's SSE connection in the switch burst; see the
+  // subscription effect's leading comment. Deferring the loop's START this
+  // way (rather than adding `streamReady` to the dependency array) keeps the
+  // 5s cadence itself untouched once the loop is running, and keeps this
+  // effect's deps exactly as they were.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      await awaitStreamReady();
+      if (cancelled) return;
+      while (!cancelled) {
+        try {
+          const res = await api.getTaskGitStatus(task.id);
+          if (cancelled) return;
+          setGitStatus(res);
+        } catch {
+          if (cancelled) return;
+          setGitStatus(null);
+        }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    };
+    void tick();
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Pipeline strip (T9, docs/plans/pipelines.md D7) — resolves a step
+  // task's pipeline name + step name (+ "(k/N)" progress) for the "Part of
+  // pipeline …" strip rendered directly under the header. A step task
+  // (`pipelineParentId` set) doesn't carry its own pipeline name, so this
+  // fetches the PARENT pipeline task via `api.getPipelineRun` and reads
+  // `pipelineRun.pipelineName` plus `stepNameById`/history against the
+  // parent's frozen graph snapshot. `pipelineStripCacheRef` caches only the
+  // STABLE part — `pipelineName` + the frozen `graph` — keyed by parent task
+  // id; it deliberately never caches a derived step name (M14: every step of
+  // the same pipeline used to show whichever step name was cached first) or
+  // the dynamic `history` (a run's progress keeps changing). It's a ref (not
+  // React state) precisely so it survives the `[task.id]` reset effect above
+  // untouched. `pipelineStrip` itself IS reset there like every other
+  // per-task piece of state; this effect always re-fetches on a task switch
+  // (belt and braces — the cache only fast-paths the FIRST paint of a
+  // switch, from which the real fetch's result then supersedes it), and a
+  // `pipeline` global event for the parent — delivered through the
+  // `subscribePipelineGlobalEvents` store App.tsx feeds from its single
+  // `/events` subscription, never a second event stream — evicts that
+  // parent's entry outright (see the subscription right below), since a
+  // Restart re-captures the frozen graph and the cached one would then be
+  // wrong on the next switch. `"missing"` is the parent 404-ing (deleted out
+  // from under this step) — the strip then reads as an orphan and its "Open
+  // pipeline" button is disabled, since there's no run view left to open
+  // (L-A10); `"error"` is any other fetch failure.
+  const pipelineStripCacheRef = useRef<Map<string, { pipelineName: string; graph: PipelineGraph | null }>>(new Map());
+  const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | "missing" | null>(null);
+  // The parent's FULL run state (`docs/plans/formatted-handoff.md` K7): the
+  // formatted handoff surfaces need its frozen graph (where `next` resolves),
+  // this step's history record (the Used / Not used rule, D21) and the whole
+  // history (the handoff-file chip's record lookup, D18). Filled by the strip
+  // fetch below (which already GETs the untrimmed run) and kept live by the
+  // debounced refetch on the parent's `pipeline` events right after it. Per
+  // task: reset to `null` in the `[task.id]` reset effect above. `forTaskId`
+  // tags which step task the run was fetched for, so a response that lands
+  // after a switch can never be read as the new task's.
+  const [stepPipelineRunState, setStepPipelineRun] = useState<{ forTaskId: string; run: PipelineRunState | null; sig: string } | null>(null);
+  // Both fetchers (the strip fetch, the debounced refetch) take a ticket from
+  // this counter before their GET and apply a result only if no LATER-issued
+  // request has already been applied — so an older response landing last
+  // can never overwrite a newer run state.
+  const stepRunReqSeqRef = useRef(0);
+  const stepRunAppliedSeqRef = useRef(0);
+  const applyStepPipelineRun = (seq: number, forTaskId: string, run: PipelineRunState | null) => {
+    if (seq <= stepRunAppliedSeqRef.current) return;
+    stepRunAppliedSeqRef.current = seq;
+    // The debounced refetch hands back a freshly parsed run on every
+    // `pipeline` event, mostly with unchanged content: keep the stored
+    // object (and so the identity of everything derived from it — graph,
+    // record, the handoff view context) unless the content differs.
+    const sig = contentSignature(run);
+    setStepPipelineRun((prev) =>
+      prev !== null && prev.forTaskId === forTaskId && prev.sig === sig ? prev : { forTaskId, run, sig },
+    );
+  };
+  const stepPipelineRun = stepPipelineRunState !== null && stepPipelineRunState.forTaskId === task.id
+    ? stepPipelineRunState.run
+    : null;
+  useEffect(() => subscribePipelineGlobalEvents((ev) => {
+    if (ev.kind === "pipeline") pipelineStripCacheRef.current.delete(ev.taskId);
+  }), []);
+  useEffect(() => {
+    const parentId = task.pipelineParentId;
+    if (!parentId) return;
+    const stepId = task.pipelineStepId;
+    const buildInfo = (pipelineName: string, graph: PipelineGraph | null): PipelineStripInfo => {
+      const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
+      const stepTotal = graph?.steps.length ?? 0;
+      let stepIndex: number | null = null;
+      if (graph && stepId) {
+        const pos = graph.steps.findIndex((s) => s.id === stepId);
+        if (pos >= 0) stepIndex = pos + 1;
+      }
+      return { pipelineName, stepName, stepIndex, stepTotal };
+    };
+
+    const cached = pipelineStripCacheRef.current.get(parentId);
+    if (cached) {
+      // Immediate first paint from the cache — identical shape to the
+      // background refetch below since `stepIndex` is derived purely from
+      // the (frozen, cacheable) graph, not the ever-changing history.
+      setPipelineStrip(buildInfo(cached.pipelineName, cached.graph));
+    } else {
+      setPipelineStrip("loading");
+    }
+    let cancelled = false;
+    const stripTaskId = task.id;
+    const runSeq = ++stepRunReqSeqRef.current;
+    void (async () => {
+      try {
+        const { task: parentTask } = await api.getPipelineRun(parentId);
+        const run = parentTask.pipelineRun ?? null;
+        const graph = run?.snapshot?.graph ?? null;
+        const pipelineName = run?.pipelineName || parentTask.title || "pipeline";
+        pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
+        if (cancelled) return;
+        setPipelineStrip(buildInfo(pipelineName, graph));
+        applyStepPipelineRun(runSeq, stripTaskId, run);
+      } catch (e) {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 404) {
+          // The parent is gone — nothing cached is worth showing either.
+          pipelineStripCacheRef.current.delete(parentId);
+          setPipelineStrip("missing");
+          applyStepPipelineRun(runSeq, stripTaskId, null);
+          return;
+        }
+        if (!cached) setPipelineStrip("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [task.id, task.pipelineParentId, task.pipelineStepId]);
+
+  // Keep `stepPipelineRun` live while a step task is open (K7): every
+  // `pipeline` global event for this step's parent (the runner persisted —
+  // a settle stamped `handoffRunId`, a step launched, a Restart re-captured
+  // the graph) schedules ONE debounced (500 ms, trailing) GET of the parent's
+  // run. No second event stream — the events come from App's single
+  // `/events` subscription via `subscribePipelineGlobalEvents` (WKWebView's
+  // ~6-connection budget). At most one request is in flight; an event that
+  // lands meanwhile marks it dirty and one more GET follows once it settles,
+  // so the last state is never missed. The timer is cleared and any late
+  // response dropped on a task switch / unmount (the cleanup below), and the
+  // `forTaskId` tag guards the setter too. The strip's own cache eviction
+  // (the subscription above) is untouched.
+  useEffect(() => {
+    const parentId = task.pipelineParentId;
+    if (!parentId) return;
+    const forTaskId = task.id;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let dirty = false;
+    const refetch = async () => {
+      if (disposed) return;
+      if (inFlight) {
+        dirty = true;
+        return;
+      }
+      inFlight = true;
+      dirty = false;
+      const seq = ++stepRunReqSeqRef.current;
+      try {
+        const { task: parentTask } = await api.getPipelineRun(parentId);
+        if (!disposed) applyStepPipelineRun(seq, forTaskId, parentTask.pipelineRun ?? null);
+      } catch {
+        // A transient failure keeps the last known run; a 404 (the parent
+        // deleted) is the strip's to report — the next event or task switch
+        // re-derives everything.
+      } finally {
+        inFlight = false;
+        if (dirty && !disposed) void refetch();
+      }
+    };
+    const unsubscribe = subscribePipelineGlobalEvents((ev) => {
+      if (ev.kind !== "pipeline" || ev.taskId !== parentId) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void refetch();
+      }, 500);
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [task.id, task.pipelineParentId]);
+
+  // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
+  // is derived once per `task.prUrl` change and reused for both the fetch
+  // effect and the render-time gate (`canOfferResolveConflicts`).
+  const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
+  const [prStatus, setPrStatus] = useState<GitHubPullMergeability | null>(null);
+  const [prStatusLoading, setPrStatusLoading] = useState(false);
+  const [prStatusError, setPrStatusError] = useState<string | null>(null);
+  // Invalidates an in-flight fetch (including a pending self-heal retry)
+  // when a newer one starts — manual refresh, turn-end retrigger, or the
+  // task switching to a different PR before the previous fetch settled.
+  const prStatusSeqRef = useRef(0);
+  // Self-heal retry budget: GitHub's `mergeable` field is null while it's
+  // still computing in the background. One delayed re-poll (mirrors
+  // GitHubDialog's mergeability self-heal) before giving up; reset to 0
+  // whenever a fresh fetch starts (manual refresh or turn-end retrigger).
+  const prStatusRetriesRef = useRef(0);
+  // Holds the self-heal retry's `setTimeout` id so it can be cancelled on
+  // unmount (or superseded by a fresh fetch) instead of firing later against
+  // an unmounted tree — see the mount-scoped cleanup effect below.
+  const prStatusRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchPrStatus = useCallback((path: string, number: number) => {
+    const requestId = ++prStatusSeqRef.current;
+    if (prStatusRetryTimerRef.current) {
+      clearTimeout(prStatusRetryTimerRef.current);
+      prStatusRetryTimerRef.current = null;
+    }
+    // Clear stale data at fetch start (not just on completion) so a task
+    // switch never leaves the previous task's mergeability visible — and
+    // therefore actionable via "Resolve Conflicts" — while this fetch is
+    // still in flight.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setPrStatusLoading(true);
+    api.getGitHubPullMergeability({ path, number })
+      .then((payload) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(payload);
+        if (payload.mergeable === null && !payload.merged && prStatusRetriesRef.current < 1) {
+          prStatusRetriesRef.current += 1;
+          prStatusRetryTimerRef.current = setTimeout(() => {
+            prStatusRetryTimerRef.current = null;
+            if (requestId !== prStatusSeqRef.current) return;
+            fetchPrStatus(path, number);
+          }, 2_500);
+        }
+      })
+      .catch((e: unknown) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(null);
+        setPrStatusError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatusLoading(false);
+      });
+  }, []);
+  // Mount-scoped cleanup: drop any in-flight fetch/self-heal retry and clear
+  // its timer on unmount, so a late response never calls setState on an
+  // unmounted tree (RunPanelBody isn't remounted on task switch, but it *is*
+  // unmounted when the run panel itself closes).
+  useEffect(() => {
+    return () => {
+      prStatusSeqRef.current++;
+      if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    };
+  }, []);
+
+  // Deps are `[task.id, task.prUrl]` ONLY — not `[task]` — for the same
+  // reason as the git-status poll effect above: App.tsx's 2s /tasks poll
+  // rebuilds the task object every tick, and depending on the whole object
+  // (or on `task.workdir`, read via closure below) would refetch on every
+  // poll tick instead of only on an actual task/PR change.
+  //
+  // The "no PR" branch clears state immediately (there's no request to
+  // defer); the actual `fetchPrStatus` call waits on `awaitStreamReady()`
+  // (same non-essential-fetch deferral as the git-status effect above) so it
+  // doesn't compete with the new task's SSE connection in the switch burst.
+  // `cancelled` guards against a task switch (or a `task.prUrl` change)
+  // landing between the await and the fetch — `fetchPrStatus` itself would
+  // otherwise fire for a task this effect instance no longer represents.
+  useEffect(() => {
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) {
+      prStatusSeqRef.current++; // invalidate any in-flight fetch/retry
+      prStatusRetriesRef.current = 0;
+      setPrStatus(null);
+      setPrStatusLoading(false);
+      setPrStatusError(null);
+      return;
+    }
+    let cancelled = false;
+    prStatusRetriesRef.current = 0;
+    void awaitStreamReady().then(() => {
+      if (cancelled) return;
+      fetchPrStatus(task.workdir, parsed.number);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id, task.prUrl]);
+
+  // Re-check mergeability at turn-end: track whether the task was "running"
+  // on the previous render and refetch once it transitions away from
+  // "running" (succeeded, failed, blocked, …) — the agent may have pushed
+  // commits that resolve, or newly introduce, a conflict. `task.runId` is
+  // NOT a usable signal for this: it's never nulled on normal turn
+  // completion (only the orphan-reconciliation/error paths null it — see
+  // the comment at `liveRunTerminal` above), so a non-null → null transition
+  // never fires in the common case. `task.column` is authoritative instead.
+  const wasRunningForPrStatusRef = useRef(task.column === "running");
+  useEffect(() => {
+    const wasRunning = wasRunningForPrStatusRef.current;
+    wasRunningForPrStatusRef.current = task.column === "running";
+    if (!wasRunning || task.column === "running") return;
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsed.number);
+  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
+
+  const refreshPrStatus = () => {
+    if (!parsedPrUrl) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsedPrUrl.number);
+  };
+
+  const send = async () => {
+    const line = input.trim();
+    if (!line && !sendRefs.length) return;
+    if (!resumableRunId) return;
+    // Never deliver while a native modal is up: claude is blocked on it inside
+    // the tmux REPL, so the keystrokes would paste into the modal instead of
+    // reaching the agent (and the run would hang "working"). The Send button is
+    // already disabled here, but the textarea now stays typable while a prompt
+    // is pending — so you can stash a draft — which means Enter can reach this
+    // function. Guard it at the source rather than relying on the field.
+    if (modalPending) return;
+    // Don't fire a send while a backlog op (e.g. Save-for-later stashing this
+    // same text) is mid-flight — otherwise a fast Enter could both send and
+    // save the same message.
+    if (sending || backlogBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `sendRunInput` (or
+    // its follow-up `listRuns`/`getTask` refresh) resolving after the user
+    // has moved on to a different task must not write task A's response into
+    // task B's composer/transcript state.
+    const sentTaskId = task.id;
+    setSending(true);
+    setSendHint(null);
+    const body = appendReferences(line, sendRefs);
+    try {
+      const res = await api.sendRunInput(resumableRunId, body);
+      if (res.delivered) {
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+        }
+        // The composer is now empty — clear the persisted draft so it can't
+        // resurrect on next open. Cancel any pending autosave first, then
+        // bump the write generation *before* firing the clear so an
+        // in-flight autosave PUT that resolves afterward can't win the race
+        // and clobber `lastSavedDraftRef` back to the just-sent text (code
+        // review finding #4). Also drop pristine: the composer was just
+        // consumed, so nothing should reseed it from a stale poll that still
+        // shows the pre-clear draft (finding #2's adopt effects check this).
+        // These refs track THIS panel's currently-displayed task's draft, so
+        // they must only be touched when the panel hasn't moved on.
+        if (currentTaskIdRef.current === sentTaskId) {
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        // Task A's persisted draft is cleared regardless of whether the panel
+        // has since switched away — the message was sent, so A's stashed
+        // draft should go either way. `sentTaskId` (not the possibly-stale
+        // `task.id` closure) is what was actually sent to.
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
+        // Drop the frozen JSONL snapshot — the auto-rebuild effect set
+        // it from the last finished run, and the live SSE stream now
+        // carries the new turn's events. Without this, the display
+        // stays pinned on the pre-send transcript and the user's own
+        // message never appears.
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        // Refresh the runs list right away so the new run row appears
+        // immediately, rather than waiting up to 2s for the next poll.
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        // Pin the view to the newest content the moment the message is
+        // accepted — the user's own message lands first, followed by
+        // streamed assistant chunks. The unified task-level stream picks
+        // up the new turn's events automatically; no run-switching needed.
+        // Flip nearBottom so the streamed chunks that follow keep auto-
+        // scrolling until the user manually scrolls up again.
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the paste was withheld and the server
+        // already re-stashed this exact message into the task's backlog tray
+        // rather than lose it (orchestrator's `sendInput` / `handlePasteWithheld`).
+        // Clear the composer + persisted draft exactly like the delivered
+        // branch above: the text now lives in the tray, so leaving it here
+        // too would duplicate it on next send. Refresh the tray right away
+        // instead of waiting for the next 2s task poll, and toast the
+        // outcome — there's no run/turn here to carry a status line the way
+        // a mid-turn withhold would.
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        // Not per-task display state — surface regardless of which task the
+        // panel is showing now, same as any other toast.
+        toast(res.reason);
+      } else if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(res.reason);
+      }
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      // Do not clear task B's `sending` flag from task A's `finally` — if the
+      // panel has moved on, the reset effect already cleared it for B (or B
+      // has its own send in flight that owns it).
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
+    }
+  };
+
+  const stop = async () => {
+    if (!liveRunId) return;
+    try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
+  };
+
+  // Park the current composer content on the backlog instead of sending it —
+  // "a message that came to mind but isn't ready to send yet." Consumes the
+  // composer (text + refs) exactly like `send()` does, so the two actions feel
+  // symmetric. Available in every state the composer renders — including before
+  // the task's first run and while a prompt is pending. Those are exactly the
+  // moments you can't send but most want to jot something down, so the textarea
+  // stays typable there and only *sending* is gated (see `send()`).
+  const saveForLater = async () => {
+    const text = input.trim();
+    if (!text && !sendRefs.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.addBacklogItem(sentTaskId, { text, references: sendRefs });
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(updated.backlog);
+        setInput("");
+        setSendRefs([]);
+        // Stashed into the backlog — clear the draft slot so it doesn't also
+        // resurrect in the composer on next open. Cancel any pending autosave
+        // first, then bump the write generation before firing the clear so an
+        // in-flight autosave PUT can't win the race and resurrect the
+        // just-stashed text (code review finding #4), and drop pristine so a
+        // stale poll can't reseed it either (finding #2).
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+      }
+      void api.clearTaskDraft(sentTaskId).catch(() => {});
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
+    }
+  };
+
+  // Send a saved draft to the agent, then consume it from the backlog. Reuses
+  // the exact `sendRunInput` plumbing (and success side-effects) as the
+  // composer's `send()` so a backlog send is indistinguishable from a typed
+  // one — same run row, streamed events, scroll-to-bottom. Only removes the
+  // item once the send is actually accepted.
+  const sendBacklogItem = async (item: BacklogMessage) => {
+    if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setSending(true);
+    setBacklogBusy(true);
+    setSendHint(null);
+    const body = appendReferences(item.text, item.references);
+    try {
+      const res = await api.sendRunInput(resumableRunId, body);
+      if (res.delivered) {
+        try {
+          const updated = await api.deleteBacklogItem(sentTaskId, item.id);
+          if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
+        } catch {
+          // The send landed; if the consume call fails, drop it locally so the
+          // user doesn't accidentally resend. The next task poll reconciles.
+          if (currentTaskIdRef.current === sentTaskId) {
+            setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          }
+        }
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        // No optimistic git-status touch here (main's #94 dropped that): the
+        // git-status polling effect keeps `gitStatus` current on its own.
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
+      } else if (res.withheld && res.savedToBacklog) {
+        // `item` was never deleted above (delivery failed), so it's still
+        // sitting in `backlogItems` — do NOT delete it here. The server's
+        // re-stash (`restashPasteWithheldText`, orchestrator.ts) now dedupes
+        // against the WHOLE backlog rather than just its most-recent item
+        // (finding #3, §10 re-review), so it recognizes `item`'s own text is
+        // already present and does NOT write a duplicate entry — no local
+        // filtering needed here any more. Just refetch and adopt whatever the
+        // server has.
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        toast(res.reason);
+      } else if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(res.reason);
+      }
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSending(false);
+        setBacklogBusy(false);
+      }
+    }
+  };
+
+  const editBacklogItem = async (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.updateBacklogItem(sentTaskId, itemId, patch);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
+    }
+  };
+
+  const removeBacklogItem = async (itemId: string) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setBacklogBusy(true);
+    setSendHint(null);
+    const prev = backlogItems;
+    setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
+    try {
+      const updated = await api.deleteBacklogItem(sentTaskId, itemId);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(prev); // roll back
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
+    }
+  };
+
+  // Move a draft up (dir -1) or down (dir +1) one slot and persist the new
+  // order. Optimistic: reorders locally first, then confirms from the server's
+  // returned Task.
+  const moveBacklogItem = async (itemId: string, dir: -1 | 1) => {
+    const idx = backlogItems.findIndex((m) => m.id === itemId);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    const next = [...backlogItems];
+    const [moved] = next.splice(idx, 1);
+    next.splice(to, 0, moved!);
+    setBacklogItems(next);
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.reorderBacklog(sentTaskId, next.map((m) => m.id));
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
+    }
+  };
+
+  // One-click follow-up: ask the agent to commit & push the changes it just
+  // made. Reuses the same `sendRunInput` plumbing as a typed message so the
+  // resulting turn shows up as a normal run row with streamed events.
+  const sendCommitPush = async () => {
+    if (!canSend || !resumableRunId || sending) return;
+    // Nomenclature-aware: the commit subject is prefixed with the task's branch
+    // prefix and the push hint names the real branch. Shared with the CLI's
+    // `agetor commit` / dashboard `c` so every surface sends the same text.
+    const message = commitPushPrompt(task);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
+    // side action that shouldn't discard text the user has typed for the
+    // next turn. `send()` clears those because it consumed them.
+    setSending(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, message);
+      if (res.delivered) {
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the canned commit/push message was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away and toast the outcome; there's no
+        // run/turn here to carry a status line the way a mid-turn withhold
+        // would.
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        toast(res.reason);
+      } else if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(res.reason);
+      }
+    } catch (e) {
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
+    }
+  };
+
+  // One-click follow-up: ask the agent to merge the base branch and resolve
+  // the conflicts blocking this task's PR. Reuses the same `sendRunInput`
+  // plumbing as `sendCommitPush`. `resolvingConflicts` is its own in-flight
+  // flag (rather than reusing `sending`) so the button's own disabled state
+  // and "Sent to agent" confirmation don't get tangled up with the composer's.
+  const [resolvingConflicts, setResolvingConflicts] = useState(false);
+  const [resolveConflictsSent, setResolveConflictsSent] = useState(false);
+  // Offer survives `!canSend` (e.g. an orphan-reconciled run) — the button
+  // then renders disabled with its "start the task" tooltip instead of
+  // vanishing from the row.
+  const showResolveConflicts = !archived && canOfferResolveConflicts(parsedPrUrl, prStatus);
+  // Head branch a "Create PR" would open from — agetor's worktree branch, or
+  // the workdir's live non-default branch for an isolation:"none" task. `null`
+  // means "nothing sensible to PR from", which is also the chip's gate.
+  const prHead = prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
+  // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
+  // tolerated, never corrected — the header and details say where it is.
+  const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
+  // Claude-only: an OpenCode import carries no transcript branch, so the
+  // "Switch to <branch>" banner never shows for one.
+  const importedGitBranch = importedSession?.kind === "claude-code" ? (task.importedClaude?.gitBranch ?? null) : null;
+  const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
+  // The import-time branch is only a hint until the session continues here.
+  // After an Agetor turn the folder's branch is whatever that turn left, so
+  // the banner would keep naming a branch the session has moved past.
+  const continuedInAgetor = runs.some((r) => r.origin !== "imported");
+  const importedBranchMismatch = runsLoaded
+    && !continuedInAgetor
+    && !!importedGitBranch
+    && !!folderBranch
+    && importedGitBranch !== folderBranch;
+  const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+  }, []);
+  const switchImportedBranch = async () => {
+    const sessionId = importedSession?.kind === "claude-code" ? importedSession.sessionId : undefined;
+    // Check out the branch this banner names, not the transcript's latest.
+    const branch = importedGitBranch;
+    if (!sessionId || !branch || importedBranchBusy) return;
+    const taskId = task.id;
+    setImportedBranchBusy(true);
+    setImportedBranchError(null);
+    try {
+      const res = await api.checkoutClaudeSession(sessionId, branch);
+      if (currentTaskIdRef.current !== taskId) return;
+      if ("error" in res) {
+        setImportedBranchError(res.error);
+        return;
+      }
+      // The checkout succeeded; a failed status refresh is left to the 5s
+      // git-status poll rather than reported as a failed switch.
+      try {
+        const status = await api.getTaskGitStatus(taskId);
+        if (currentTaskIdRef.current === taskId) setGitStatus(status);
+      } catch {
+        // The poll reconciles.
+      }
+    } catch (err) {
+      if (currentTaskIdRef.current !== taskId) return;
+      setImportedBranchError(err instanceof ApiError ? err.message : "Couldn't switch branch");
+    } finally {
+      if (currentTaskIdRef.current === taskId) setImportedBranchBusy(false);
+    }
+  };
+  const retryImportedHistory = async () => {
+    if (importRetryBusy) return;
+    const taskId = task.id;
+    setImportRetryBusy(true);
+    setImportRetryError(null);
+    try {
+      if (importedSession?.kind === "opencode") await api.retryOpencodeSessionImport(taskId);
+      else await api.retryClaudeSessionImport(taskId);
+      if (currentTaskIdRef.current === taskId) setImportRetryOk(true);
+    } catch (err) {
+      if (currentTaskIdRef.current !== taskId) return;
+      setImportRetryError(err instanceof ApiError ? err.message : "Couldn't retry the import");
+    } finally {
+      if (currentTaskIdRef.current === taskId) setImportRetryBusy(false);
+    }
+  };
+  const sendResolveConflicts = async () => {
+    // `resolveConflictsSent` in the guard turns the 5s "Sent to agent"
+    // confirmation window into a lockout, not just a label — otherwise the
+    // button re-enables the instant `resolvingConflicts` resets in `finally`
+    // and a second click pastes a duplicate merge prompt into the live tmux
+    // session (`sendRunInput` is deliberately retry:false).
+    if (!resumableRunId || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent) return;
+    // Belt-and-braces against the stale-`prStatus` case: even though the
+    // reset effect and fetch-start clear above should keep `prStatus` in
+    // sync with the current task's PR, refuse to send unless it still
+    // matches the PR the button is currently showing.
+    if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
+    const prompt = buildResolveConflictsPrompt({
+      repo: prStatus.repo,
+      number: prStatus.pullNumber,
+      title: null,
+      headRef: prStatus.headRef,
+      baseRef: prStatus.baseRef,
+    });
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setResolvingConflicts(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, prompt);
+      if (res.delivered) {
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+          if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+          setResolveConflictsSent(true);
+          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        }
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the merge/resolve-conflicts prompt was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away; toast (not toast.error — nothing
+        // failed, the message just landed somewhere other than the agent)
+        // since the button can be hidden by the time this resolves.
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        toast(res.reason);
+      } else {
+        if (currentTaskIdRef.current === sentTaskId) setSendHint(res.reason);
+        // The button can be hidden by the time this resolves — archived,
+        // a subagent tab (dock-level), or the mergeability re-fetch clearing
+        // `prStatus` — any of which would make `sendHint` invisible, so
+        // toast to surface the failure regardless.
+        toast.error(res.reason);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (currentTaskIdRef.current === sentTaskId) setSendHint(msg);
+      toast.error(msg);
+    } finally {
+      if (currentTaskIdRef.current === sentTaskId) setResolvingConflicts(false);
+    }
+  };
+
+  // Drag/drop + paste capture for the message textarea, via the module
+  // `NewTaskForm`/`CreateTaskFromIssueDialog`/`ResolveConflictsDialog` share
+  // through `PromptComposer` — pathful files come straight through, blob
+  // screenshots (macOS floating thumbnail, clipboard paste) get uploaded to
+  // `~/.agetor/screenshots/` first. Captured items land both as chips in
+  // `sendRefs` *and* as `[basename]` markers at the cursor. Built here
+  // (rather than left to `PromptComposer`'s own internal instance) because
+  // RunPanel owns an outer drop zone (the dock's `onDrop` below) that needs
+  // to share this exact drop-hint/caret path — same reason `NewTaskForm`
+  // builds its own instance for its aside-wide drop zone. `onReport` routes
+  // capture status messages into `sendHint` instead of the hook's own
+  // (otherwise-unused) internal `dropHint` state: `sendHint` is one shared
+  // status line written by nine call sites (send, backlog CRUD, commit &
+  // push, resolve conflicts) — a separate drop-only hint would let a stale
+  // send error and a fresh drop hint show on screen at once.
+  const capture = usePromptCapture({
+    textareaRef: sendRef,
+    setPrompt: setInput,
+    setReferences: setSendRefs,
+    onReport: setSendHint,
+  });
+  // Which tree the `@` file popover lists/validates against — derived via
+  // the shared `fileScopeForTask` (src/shared/file-scope.ts), the single
+  // source of truth for this rule across the webview, TUI and CLI. Declared
+  // above the `capabilities` hoist below — it feeds `useAgentCapabilities`
+  // the same scope, so project-level skill/command/MCP discovery reads
+  // exactly this tree too, never a stale `task.branch`-against-the-source-repo
+  // scope.
+  const fileScope = useMemo<FileScope>(() => {
+    const scope = fileScopeForTask(task);
+    return scope.ref ? { dir: scope.dir, ref: scope.ref } : { dir: scope.dir };
+  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
+  // Hoisted above the composer's own internal calls (passed down via
+  // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
+  // switches and the archived-without-canSend swap — which unmount and
+  // remount `<PromptComposer>` — don't refire the capabilities disk walk or
+  // the saved-prompts fetch on every round trip. See the comment above
+  // `sendRef`. Scoped by `fileScope` (the same `{dir, ref?}` pair the `@`
+  // popover uses), not a separate workdir/branch pair — see that memo above.
+  const capabilities = useAgentCapabilities(task.agent, fileScope);
+  const savedPromptsState = useSavedPrompts();
+  // Stable identity for RunEventList/UserMessageBlock's display-only path
+  // shortening (see the `pathRoots` prop doc) — both are memoized, so a
+  // fresh array each render would defeat them.
+  const pathRoots = useMemo(
+    () => [task.worktreePath, task.workdir],
+    [task.worktreePath, task.workdir],
+  );
+
+  // Formatted handoff context (`docs/plans/formatted-handoff.md` K6), read by
+  // the transcript's assistant bubbles, the step prompt bubble, its segments
+  // and its attachment chips. Every input is reduced to something whose
+  // identity only changes when its content does — the 2 s `runs` poll and
+  // `reconcileById` hand back fresh arrays, and a fresh value here would
+  // re-render every card in the transcript every poll.
+  //
+  // `settledRunIds` (A8): this task's runs that are no longer `running`,
+  // keyed by a sorted id signature so an unchanged set keeps its identity.
+  const settledRunKey = useMemo(
+    () => runs.filter((r) => r.status !== "running").map((r) => r.id).sort().join("\n"),
+    [runs],
+  );
+  const settledRunIds = useMemo<ReadonlySet<string>>(
+    () => new Set(settledRunKey === "" ? [] : settledRunKey.split("\n")),
+    [settledRunKey],
+  );
+  // The frozen graph: the parent run's snapshot once fetched, else what the
+  // strip cache already holds for this parent (its first paint on a switch).
+  // The ref read is re-evaluated whenever `pipelineStrip` changes — which is
+  // exactly when the cache-hit paint or a fetch result lands.
+  // Content-stabilised: the graph is frozen at run start, so a run that
+  // changed only in its history keeps the same graph identity.
+  const stepGraphRef = useRef<Signed<PipelineGraph | null> | null>(null);
+  const stepGraph = useMemo<PipelineGraph | null>(() => {
+    let graph: PipelineGraph | null = null;
+    if (stepPipelineRun?.snapshot?.graph) graph = stepPipelineRun.snapshot.graph;
+    else {
+      const parentId = task.pipelineParentId;
+      graph = parentId ? (pipelineStripCacheRef.current.get(parentId)?.graph ?? null) : null;
+    }
+    stepGraphRef.current = reuseIfSameContent(stepGraphRef.current, graph);
+    return stepGraphRef.current.value;
+  }, [stepPipelineRun, task.pipelineParentId, pipelineStrip]);
+  // This step task's history record — the latest execution if a cycle ran
+  // the same step task more than once.
+  const stepRecordRef = useRef<Signed<PipelineStepRecord | null> | null>(null);
+  const stepRecord = useMemo(() => {
+    const history = stepPipelineRun?.history;
+    let found: PipelineStepRecord | null = null;
+    if (history) {
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]!.taskId === task.id) {
+          found = history[i]!;
+          break;
+        }
+      }
+    }
+    stepRecordRef.current = reuseIfSameContent(stepRecordRef.current, found);
+    return stepRecordRef.current.value;
+  }, [stepPipelineRun, task.id]);
+  const handoffStepId = task.pipelineStepId ?? stepRecord?.stepId ?? null;
+  const handoffView = useMemo<HandoffViewValue>(
+    () => ({
+      enabled: handoffCardsOn,
+      taskId: task.id,
+      parentId: task.pipelineParentId ?? null,
+      roots: pathRoots,
+      homeDir: homeDir || null,
+      stepId: handoffStepId,
+      stepName: stepNameFor(stepGraph, handoffStepId),
+      graph: stepGraph,
+      run: stepPipelineRun,
+      record: stepRecord,
+      settledRunIds,
+    }),
+    [handoffCardsOn, task.id, task.pipelineParentId, pathRoots, homeDir, handoffStepId, stepGraph, stepPipelineRun, stepRecord, settledRunIds],
+  );
+  const onSendDragOver = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    // Always preventDefault on a file dragover so WKWebView doesn't fall back
+    // to its native handler (navigate / open). The visual ring only lights up
+    // when canSend is true, but the wrapper still claims the drop.
+    e.preventDefault();
+    if (canSend) setSendDragging(true);
+  };
+  const onSendDragLeave = (e: React.DragEvent) => {
+    // Always clear when `canSend` flipped to false mid-drag — otherwise the
+    // ring can outlive the drag if the task transitioned out of running.
+    if (!canSend) { setSendDragging(false); return; }
+    if (e.currentTarget === e.target) setSendDragging(false);
+  };
+  const onSendDrop = async (e: React.DragEvent) => {
+    // preventDefault unconditionally so a stray drop while !canSend doesn't
+    // hand the file to WKWebView's native handler.
+    e.preventDefault();
+    setSendDragging(false);
+    if (!canSend) return;
+    setSendHint(null);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // `capture.handleResult` writes into this composer's `setInput`/
+    // `setSendRefs`/`setSendHint`, which belong to whichever task is
+    // currently displayed — not necessarily the one the drop happened on.
+    const sentTaskId = task.id;
+    const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
+    if (currentTaskIdRef.current !== sentTaskId) return;
+    capture.handleResult(result);
+  };
+
+  // Captured as a local const (not read via `task.prUrl` inline) so its
+  // narrowing to non-null survives into the onClick closure below — TS
+  // drops narrowing on a mutable property access once it's referenced
+  // inside a nested function expression.
+  const prUrl = task.prUrl;
+  // Same capture rationale as `prUrl` above, for the "View issue" header
+  // affordance.
+  const issueUrl = task.issueUrl;
+
+  return (
+    <>
+      <header className="border-b border-border/60 p-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {/* Lives in the header (not the composer chip row) so the link stays
+              reachable on archived tasks and after orphan reconciliation
+              clears the resumable run — pr_url is durable, the link must be
+              too. When the URL parses to a PR number, open the in-app detail
+              subpage directly; otherwise (an unrecognized provider URL
+              shape) fall back to the plain external link, as before. */}
+          {prUrl && (
+            <Tooltip align="end" label="Open the pull request created for this task">
+              {parsePullNumber(prUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={prUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View PR"
+                >
+                  <GitPullRequest className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
+          )}
+          {/* Durable "View issue" sibling of "View PR" above — same
+              rationale (header, not the composer chip row) and the same
+              in-app-detail-vs-external-link branch, keyed on whether
+              `issueUrl` parses to a recognized provider issue URL. */}
+          {issueUrl && (
+            <Tooltip align="end" label="Open the issue this task was created from">
+              {parseIssueUrl(issueUrl) != null ? (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </Button>
+              ) : (
+                <ExternalLink
+                  href={issueUrl}
+                  className={cn(buttonVariants({ variant: "outline", size: "icon" }), "text-foreground no-underline hover:no-underline")}
+                  aria-label="View issue"
+                  data-testid="view-issue"
+                >
+                  <CircleDot className="size-4" />
+                </ExternalLink>
+              )}
+            </Tooltip>
+          )}
+          {/* Manual re-check — only once a first fetch has settled, so it
+              doesn't appear (and immediately duplicate) the initial load. */}
+          {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Tooltip align="end" label={prStatusError ?? "Re-check PR mergeability"}>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={refreshPrStatus}
+                disabled={prStatusLoading}
+                aria-label={prStatusError ? `Re-check PR status — ${prStatusError}` : "Re-check PR status"}
+              >
+                <RefreshCw className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip align="end" label="View this task's changes (git diff)">
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={() => onShowDiff(task)}
+              aria-label="View diff"
+            >
+              <GitCompare className="size-4" />
+            </Button>
+          </Tooltip>
+          <Tooltip
+            align="end"
+            label={
+              task.worktreePath
+                ? `Open the worktree in your file manager: ${task.worktreePath}`
+                : `Open the project workdir in your file manager: ${task.workdir}`
+            }
+          >
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={() =>
+                void api.openPath({
+                  path: task.worktreePath ?? task.workdir,
+                  taskId: task.id,
+                }).catch(() => { /* swallowed — openPath failures are best-effort */ })
+              }
+              aria-label="Open working folder"
+            >
+              <FolderOpen className="size-4" />
+            </Button>
+          </Tooltip>
+          {/* Stop targets the main run. Hide it while viewing a read-only
+              background-agent tab so the control doesn't read as "stop this
+              agent" — switch back to Main to stop the task. */}
+          {!archived && canControl && activeStream === "main" && (
+            <Tooltip align="end" label="Stop">
+              <Button size="icon" variant="destructive" onClick={stop} aria-label="Stop">
+                <Square className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          {/* Step tasks can't be archived individually — the server 409s
+              it, since the parent pipeline task owns their lifecycle (D9,
+              docs/plans/pipelines.md). Gated out here rather than left to
+              fail on click. */}
+          {!task.pipelineParentId && !archived && (task.column === "done" || active) && (
+            <Tooltip align="end" label={active ? "Stop the running agent and archive task" : "Archive task"}>
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={() => onArchive(task)}
+                aria-label={active ? "Stop the running agent and archive task" : "Archive task"}
+              >
+                <Archive className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          {!task.pipelineParentId && archived && (
+            <Tooltip align="end" label="Unarchive task">
+              <Button size="icon" variant="outline" onClick={() => onUnarchive(task)} aria-label="Unarchive">
+                <ArchiveRestore className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          <Tooltip align="end" label="Search messages">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Search messages"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                if (searchOpen) {
+                  closeSearch();
+                  return;
+                }
+                setSearchOpen(true);
+                // The input isn't mounted yet on the render this triggers (the
+                // bar renders conditionally on `searchOpen`) — focus after the
+                // next paint.
+                requestAnimationFrame(() => searchInputRef.current?.focus());
+              }}
+            >
+              <Search className="size-4" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close task details">
+            <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close task details">
+              <X className="size-4" />
+            </Button>
+          </Tooltip>
+        </div>
+        <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        {importedSession && (
+          <div
+            className="mt-1 space-y-1 text-xs"
+            data-testid={importedSession.kind === "opencode" ? "imported-opencode-status" : "imported-claude-status"}
+          >
+            {importedSession.kind === "claude-code" && importedBranchMismatch && (
+              <p className="text-warning" data-testid="imported-claude-branch">
+                This session was on <span className="font-mono">{importedGitBranch}</span>, folder is on{" "}
+                <span className="font-mono">{folderBranch}</span>.
+                <button
+                  type="button"
+                  className="ml-2 underline disabled:opacity-50"
+                  data-testid="imported-claude-switch"
+                  disabled={importedBranchBusy}
+                  onClick={() => { void switchImportedBranch(); }}
+                >
+                  Switch to {importedGitBranch}
+                </button>
+              </p>
+            )}
+            {importedBranchError && (
+              <p className="text-destructive" data-testid="imported-claude-switch-error">{importedBranchError}</p>
+            )}
+            {importedSession.status === "importing" && (
+              <p className="text-muted-foreground">
+                {importedSession.kind === "opencode" ? "OpenCode history is still importing…" : "Importing history…"}
+              </p>
+            )}
+            {importedSession.status === "failed" && !importRetryOk && (
+              <p className="text-destructive">
+                {importRetryBusy
+                  ? "Retrying…"
+                  : (importRetryError ?? importedSession.error ?? "Import failed")}
+                <button
+                  type="button"
+                  className="ml-2 underline disabled:opacity-50"
+                  data-testid={importedSession.kind === "opencode" ? "imported-opencode-retry" : "imported-claude-retry"}
+                  disabled={importRetryBusy}
+                  onClick={() => { void retryImportedHistory(); }}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+            {importRetryError && importedSession.status !== "failed" && (
+              <p
+                className="text-destructive"
+                data-testid={importedSession.kind === "opencode" ? "imported-opencode-retry-error" : "imported-claude-retry-error"}
+              >
+                {importRetryError}
+              </p>
+            )}
+          </div>
+        )}
+        <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+          <span className="truncate">
+            {task.agent} · {task.column}
+            {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
+            {branchDrift.drifted && (
+              <>
+                {" · "}
+                <span className="font-mono" title={driftTitle(task.branch ?? null)}>{branchDrift.live}</span>{" "}
+                <span
+                  data-testid="run-panel-branch-drift"
+                  title={driftTitle(task.branch ?? null)}
+                  className={cn(
+                    "rounded px-1 py-px text-[10px] font-medium",
+                    task.branchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                  )}
+                >
+                  {task.branchSource === "existing" ? "not on PR head" : "drifted"}
+                </span>
+              </>
+            )}
+            {task.baseRef && (
+              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            )}
+          </span>
+          {agentProfileDisplay && agentProfileForCard && (
+            <span data-testid="task-agent-profile-chip" title={agentProfileDisplay.summary} className="shrink-0">
+              <AgentProfileCard
+                profile={agentProfileForCard}
+                harnesses={harnesses}
+                variant="chip"
+                deleted={agentProfileDisplay.deleted}
+              />
+            </span>
+          )}
+        </div>
+      </header>
+
+      {/* Pipeline strip (T9, D7 in docs/plans/pipelines.md) — a step task's
+          panel gets a slim banner naming the pipeline + step it belongs to,
+          with a shortcut into the full-page run view; a pipeline-PARENT
+          task (normally never opened here — App routes those straight to
+          the run view — but reachable e.g. via the Worktrees dialog) gets
+          the same banner pointed at itself instead. The two are mutually
+          exclusive: a task is either a step (`pipelineParentId` set) or a
+          parent (`pipelineId` set), never both. */}
+      {task.pipelineParentId ? (
+        <div
+          data-testid="run-panel-pipeline-strip"
+          className="flex items-center justify-between gap-2 border-b border-border/60 bg-info/10 px-3 py-1.5 text-xs text-info"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Workflow className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">
+              {pipelineStrip && pipelineStrip !== "loading" && pipelineStrip !== "error" && pipelineStrip !== "missing" ? (
+                <>
+                  Part of pipeline <strong className="font-semibold">{pipelineStrip.pipelineName}</strong> · step{" "}
+                  <strong className="font-semibold">{pipelineStrip.stepName}</strong>
+                  {pipelineStrip.stepIndex !== null && pipelineStrip.stepTotal > 0
+                    ? ` (${pipelineStrip.stepIndex}/${pipelineStrip.stepTotal})`
+                    : null}
+                </>
+              ) : pipelineStrip === "missing" ? (
+                "Part of a pipeline whose task no longer exists"
+              ) : (
+                "Part of a pipeline"
+              )}
+            </span>
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 px-2 text-[10px]"
+            data-testid="run-panel-open-pipeline"
+            // The parent 404'd (L-A10) — there's no run view to open, and
+            // App's own vanished-row sync would bounce it straight back.
+            disabled={pipelineStrip === "missing"}
+            title={pipelineStrip === "missing" ? "The pipeline task was deleted" : undefined}
+            onClick={() => {
+              // Close first — otherwise the run view opens behind this
+              // non-portaled `fixed` <aside> (z-40 > the page views' < 30)
+              // and reads as if the click did nothing (m22b).
+              onClose();
+              onOpenPipeline(task.pipelineParentId!);
+            }}
+          >
+            Open pipeline
+          </Button>
+        </div>
+      ) : task.pipelineId ? (
+        <div
+          data-testid="run-panel-pipeline-strip"
+          className="flex items-center justify-between gap-2 border-b border-border/60 bg-info/10 px-3 py-1.5 text-xs text-info"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Workflow className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">Pipeline task — open the pipeline view</span>
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 px-2 text-[10px]"
+            data-testid="run-panel-open-pipeline"
+            onClick={() => {
+              // Same close-before-open rationale as the step-task button above.
+              onClose();
+              onOpenPipeline(task.id);
+            }}
+          >
+            Open pipeline
+          </Button>
+        </div>
+      ) : null}
+
+      {searchOpen && (
+        <div data-search-open="" className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+            <Input
+              ref={searchInputRef}
+              {...IDENTIFIER_INPUT_PROPS}
+              aria-label="Search messages"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  stepSearch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeSearch();
+                }
+              }}
+              placeholder="Search messages…"
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+          <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
+          </span>
+          <Tooltip align="end" label="Previous match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(-1)}
+              aria-label="Previous match"
+            >
+              <ChevronUp className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Next match">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-7"
+              disabled={matches.length === 0}
+              onClick={() => stepSearch(1)}
+              aria-label="Next match"
+            >
+              <ChevronDown className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Tooltip align="end" label="Close search">
+            <Button size="icon" variant="ghost" className="size-7" onClick={closeSearch} aria-label="Close search">
+              <X className="size-3.5" />
+            </Button>
+          </Tooltip>
+        </div>
+      )}
+
+      {/* Task details. Editable inline when the task is idle — agent / mode /
+          model / effort each PATCH the task on change, and if a live claude
+          tmux session exists the backend mirrors the change via slash commands
+          so the conversation context survives the edit. */}
+      <TaskDetails
+        task={task}
+        agents={agents}
+        harnesses={harnesses}
+        agentProfileDisplay={agentProfileDisplay}
+        agentProfileForCard={agentProfileForCard}
+        onOpenSettingsAgents={onOpenSettingsAgents}
+        agentModels={agentModels}
+        harnessModels={harnessModels}
+        onRefreshModels={onRefreshModels}
+        homeDir={homeDir}
+        onTaskFieldsChanged={onTaskFieldsChanged}
+        liveBranch={gitStatus?.branch ?? null}
+        tmuxSession={latestRun?.tmuxSession ?? null}
+        // "Has this task ever run" for the Agent-details dialog's status
+        // line — the union of every signal in scope, since each is
+        // individually incomplete: `runs` (this component's own polled
+        // `GET /tasks/:id/runs` history) is the most truthful match for the
+        // orchestrator's own freeze gate (`runs.countForTask(task.id) === 0`,
+        // CLAUDE.md item 15) because it counts a run regardless of outcome,
+        // but reads empty for one brief tick after a task remount before its
+        // first poll lands; `task.hasOpenableRun` is available immediately
+        // from the task row itself (no fetch race) but excludes
+        // failed/cancelled runs, so a task whose only run failed would read
+        // as "never run" even though the profile is already frozen;
+        // `task.runId` only reflects a currently in-flight run and reverts
+        // to null once it settles. ORing all three means any one of them
+        // proving a run happened is enough.
+        hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
+      />
+
+      <RunsList runs={runs} runsLoaded={runsLoaded} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
+
+      {/* Keyed on task id: RunPanelBody itself isn't remounted on a task
+          switch (see the `[task.id]` reset effect above), so without this key
+          `TerminalsSection` — and the `TerminalView` it mounts — would keep
+          the previous task's open/closed state and sockets. Keying forces a
+          fresh mount per task, which both re-seeds the open/closed toggle
+          from the new task's `openTerminalCount` and, via `TerminalView`'s
+          own unmount, closes the previous task's terminal sockets instead of
+          leaking them across the switch.
+
+          The key is NAMESPACED (`terminals-…`), never a bare `task.id`:
+          `BacklogTray` below is a sibling in this same children list and is
+          keyed per task too. Sibling keys share one namespace, and React's
+          keyed reconciliation keeps a single old fiber per key — with two
+          `key={task.id}` siblings the tray's fiber shadowed this one, so
+          every re-render on the reconciler's map-based slow path while the
+          tray was mounted — in practice all of them, since the normally
+          `false` `{searchOpen && …}` child above breaks the fast path —
+          mounted a NEW section and never deleted the old one (a growing
+          stack of TERMINAL rows, each holding a live `TerminalView`). The
+          rule for this fragment: every keyed child carries its component's
+          name in the key (`PlanDialog` below is the third one). See
+          docs/plans/terminal-section-duplication.md. */}
+      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
+
+      {showSubagentTabs && (
+        <SubagentTabs
+          subagents={subagentList}
+          active={activeStream}
+          onSelect={(id) => {
+            nearBottomRef.current = true; // pin the new stream to its latest message
+            setActiveStream(id);
+          }}
+        />
+      )}
+
+      {/* Full-bleed section with inner padding, matching RunsList /
+          TerminalsSection above — the card itself is rounded, so it needs the
+          px-3 inset to avoid sitting flush against the panel edges. */}
+      {todoProgress && (
+        <div className="border-b border-border/60 px-3 py-2">
+          <TodoProgressCard progress={todoProgress} />
+        </div>
+      )}
+
+      <div
+        ref={logRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+        }}
+        // Capture-phase so it fires before any in-log click handler (a
+        // collapsible's "Show more" toggle, a card's own setOpen, etc.).
+        // Arms `pinSuppressUntilRef` for a short window so the ResizeObserver
+        // pin effect doesn't hijack the resize that toggle causes — see the
+        // comment above that effect for the full rationale.
+        onPointerDownCapture={() => {
+          pinSuppressUntilRef.current = performance.now() + 400;
+        }}
+        // `min-w-0` lets the inner content actually shrink when long
+        // unbreakable strings (paths, URLs) try to exceed the panel
+        // width; `overflow-x-hidden` keeps the panel from gaining a
+        // horizontal scrollbar — text wraps via `break-all` on the
+        // problematic spots instead.
+        // `[overflow-anchor:none]` disables the browser's native scroll
+        // anchoring on this container. This component already owns
+        // bottom-pinning end to end (the two pin paths below), so native
+        // anchoring is just a second, uncoordinated writer of `scrollTop`.
+        // It mattered most on the live→rebuilt `displayedEvents` swap: every
+        // event gets a new React key, so the whole transcript remounts, and
+        // anchoring — seeing a wholesale DOM replacement — picked an
+        // arbitrary new anchor node and jumped `scrollTop` to keep it in
+        // view. Before this fix (when path 1 was still a plain `useEffect`
+        // and this property wasn't set), that scroll event landed before
+        // either pin effect got a chance to run, latching `nearBottomRef`
+        // false and permanently de-arming both auto-scroll paths for the
+        // rest of the panel's life — this property, together with
+        // converting path 1 to a layout effect (see the pin-paths comment
+        // above), is what closes that hole.
+        data-testid="transcript-log"
+        className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]"
+      >
+        <div ref={logContentRef}>
+          {/* "Load earlier messages" — only meaningful once we have a real DB
+              cursor to page from (see StreamEvent's `dbId` doc comment for why
+              `earliestId` can go null). Sits above everything else in the
+              scrollback, including the rebuild-from-JSONL row below. Lives
+              inside the `logContentRef` wrapper so its appearance/removal is
+              a content-size change the ResizeObserver pin effect can see —
+              though a pin never actually fires from it: the button is only
+              reachable at the top of the scrollback (nearBottomRef false),
+              and clicking it arms the pointerdown suppression window anyway. */}
+          {hasMoreEarlier && earliestId != null && (
+            <div className="mb-2 flex justify-center">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={loadEarlierEvents}
+                disabled={loadingEarlier}
+                className="h-6 px-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+              >
+                {loadingEarlier ? "Loading…" : "Load earlier messages"}
+              </Button>
+            </div>
+          )}
+          {/* Set by a snapshot reset: the reconnect could not replay the gap
+              and swapped in the latest window. Persists until the next task
+              switch (reset effect above). */}
+          {streamGapNotice && (
+            <div
+              className="mb-2 text-center text-[11px] text-muted-foreground"
+              data-testid="transcript-gap-notice"
+            >
+              {TASK_STREAM_GAP_NOTICE}
+            </div>
+          )}
+          {!runsLoaded && displayedEvents.length === 0 ? (
+            // Gated on BOTH `runsLoaded` and `displayedEvents.length` — the SSE
+            // subscription is now issued before `listRuns` (see the stream-first
+            // task-switch work), so a replay can land its events before the
+            // slower `listRuns` response arrives. Showing the skeleton on
+            // `!runsLoaded` alone would hide those already-rendered events
+            // behind "Loading messages…" until `listRuns` finally resolves.
+            <div className="text-muted-foreground" data-testid="transcript-loading">Loading messages…</div>
+          ) : runsLoaded && runs.length === 0 ? (
+            <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
+          ) : runsLoaded && displayedEvents.length === 0 ? (
+            <div className="text-muted-foreground">Waiting for the first event…</div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                {activeStream === "main" && latestRun?.claudeSessionId ? (
+                  <button
+                    type="button"
+                    onClick={() => void rebuildFromJsonl()}
+                    disabled={rebuildBusy}
+                    className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
+                    title="Re-parse the latest run's events from claude's on-disk session JSONL. Useful when the stored events were truncated by an older agetor version."
+                  >
+                    {rebuildBusy
+                      ? "Reloading…"
+                      : rebuilt
+                        ? `Reload from JSONL (${rebuilt.events.length} events)`
+                        : "Load from session JSONL"}
+                  </button>
+                ) : <span />}
+                {rebuildNote && (
+                  <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
+                )}
+              </div>
+              <HandoffViewContext.Provider value={handoffView}>
+                <RunEventList
+                  events={displayedEvents}
+                  stickyUserMessages={stickyUserMessages}
+                  interactions={interactions}
+                  onInteractionResolved={dismissInteraction}
+                  runStatus={activeRunStatus}
+                  indicatorMode={indicatorMode}
+                  holdSummary={holdSummary}
+                  recoveryNotice={liveRecoveryNotice}
+                  pausedRecovery={pausedRecovery}
+                  taskId={task.id}
+                  pathRoots={pathRoots}
+                  plans={kind === "cursor" || kind === "copilot" || kind === "claude-code" ? plans : NO_PLANS}
+                  onOpenPlan={onOpenPlan}
+                  agentKind={kind}
+                  onAskAnswerWithheld={(reason) => {
+                    // Same informational framing as `send()`'s withheld branch
+                    // above: claude was showing some OTHER blocking modal when
+                    // the free-text ask-card answer tried to land as a
+                    // follow-up turn, so the server re-stashed it into the
+                    // backlog tray instead of losing it. Refresh the tray right
+                    // away and toast (not toast.error — nothing failed).
+                    toast(reason);
+                    // Captured before the async gap — see `currentTaskIdRef`'s
+                    // doc comment: this panel may have switched to a different
+                    // task by the time `getTask` resolves.
+                    const sentTaskId = task.id;
+                    void api.getTask(sentTaskId).then((fresh) => {
+                      if (currentTaskIdRef.current !== sentTaskId) return;
+                      setBacklogItems(fresh.backlog);
+                    }).catch(() => {});
+                  }}
+                />
+              </HandoffViewContext.Provider>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Messages backlog — saved drafts to send later. Sits just above the
+          composer so the "stash a thought / send it when ready" loop is one
+          glance apart. Hidden when empty and on a background-agent (subagent)
+          tab — those streams are read-only, so an interactive tray whose "Send
+          now" targets the main run would sit contradictorily above the
+          read-only footer. On an archived task the tray still renders, but
+          view-only (`readOnly`), so saved drafts aren't silently invisible. */}
+      {activeStream === "main" && backlogItems.length > 0 && (
+        <BacklogTray
+          // Keyed on task id so a switch between two tasks that both have
+          // backlog items remounts the tray instead of carrying over its
+          // internal `editingId` (RunPanelBody itself isn't remounted — see
+          // the `[task.id]` reset effect above, which resets everything IT
+          // owns but can't reach into a child's local state without this).
+          // Namespaced, not a bare `task.id`: `TerminalsSection` above is a
+          // keyed sibling in this same children list, and two siblings with
+          // one key make React leak the earlier one on every re-render.
+          key={`backlog-${task.id}`}
+          fileScope={fileScope}
+          items={backlogItems}
+          canSend={canSend && !modalPending}
+          busy={sending || backlogBusy}
+          readOnly={archived}
+          startingFolder={task.worktreePath ?? task.workdir}
+          onSend={sendBacklogItem}
+          onEdit={editBacklogItem}
+          onDelete={removeBacklogItem}
+          onMove={moveBacklogItem}
+        />
+      )}
+
+      {/* Bottom-fixed input. Enabled the moment the task has had at least one
+          run — the backend reattaches to the live tmux session if there is one,
+          or spawns a fresh one seeded with the previous turn's last response
+          when the original session is gone. The button is given the same fixed
+          height as the textarea so they baseline together. The whole dock is
+          one drop zone so dragging a screenshot anywhere over the input area
+          (chips, textarea, send button gap) routes through the same capture
+          path. An archived task with a resumable run gets the same composer as
+          an idle one — the backend auto-unarchives and rematerializes the
+          worktree on send (see the inline hint below); only a genuinely
+          non-sendable archived task (no resumable run) falls back to the
+          static notice. A pipeline-PARENT task (`task.pipelineId` set) is
+          checked first and takes priority over every other branch here —
+          the parent itself never runs an agent turn (D9,
+          docs/plans/pipelines.md), so there's nothing for a composer to
+          talk to regardless of column/archived state. */}
+      {task.pipelineId ? (
+        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          This is a pipeline task — open the pipeline view to talk to its steps.
+        </div>
+      ) : archived && !canSend ? (
+        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          This task is archived. Unarchive it to interact.
+        </div>
+      ) : activeStream !== "main" ? (
+        // Background-agent streams are read-only — you can watch them but not
+        // talk to them. Switch back to Main to send a message.
+        <div className="flex shrink-0 items-center gap-2 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          <Eye className="size-3 shrink-0" />
+          <span>
+            Viewing a background agent — read-only.{" "}
+            <button
+              type="button"
+              onClick={() => setActiveStream("main")}
+              className="text-foreground underline underline-offset-2 hover:no-underline"
+            >
+              Back to Main
+            </button>{" "}
+            to send a message.
+          </span>
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "relative shrink-0 space-y-1.5 border-t border-border/60 p-2",
+            sendDragging && "ring-2 ring-inset ring-primary",
+          )}
+          onDragOver={onSendDragOver}
+          onDragLeave={onSendDragLeave}
+          onDrop={onSendDrop}
+        >
+          <PromptComposer
+            value={input}
+            onChange={setInput}
+            agent={task.agent}
+            references={sendRefs}
+            onReferencesChange={setSendRefs}
+            setReferences={setSendRefs}
+            textareaRef={sendRef}
+            capture={capture}
+            fileScope={fileScope}
+            // A column transition = a run settled (or started): the agent may
+            // have just written files while focus never left the composer —
+            // retrigger the listing fetch (see the prop's doc).
+            fileScopeRefreshToken={task.column}
+            // Pass the hoisted results down (see the comment above
+            // `capabilities`'s declaration) so this dock's remounts don't
+            // refire the composer's own internal fetches.
+            capabilities={capabilities}
+            savedPrompts={savedPromptsState}
+            // The dock's own wrapper above already gives every child
+            // `space-y-1.5` (it used to be one flat list of siblings); both
+            // spacing props here flatten the composer's default two-tier
+            // (space-y-3 outer / space-y-1 inner) spacing back down to that
+            // same single value so nesting the composer doesn't change any
+            // gap.
+            className="space-y-1.5"
+            innerClassName="space-y-1.5"
+            placement="above"
+            label={null}
+            // Shown once the task is sendable, OR as soon as there's
+            // something to stash — that's what lets "Save for later" work
+            // pre-run. Also shown whenever Resolve Conflicts is offerable
+            // (even disabled), so an offerable-but-not-yet-sendable task
+            // doesn't have the button pop in and out as the draft is typed.
+            toolbar={Boolean(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts)}
+            actions={
+              <>
+                {/* Backlog mutations are frozen server-side while archived
+                    (`backlogGuard`) — only Send (which auto-unarchives) is
+                    offered on an archived task. */}
+                {!archived && (input.trim() || sendRefs.length > 0) && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void saveForLater()}
+                    disabled={sending || backlogBusy}
+                    title="Save this message to the backlog to send later — without sending it now."
+                  >
+                    <BookmarkPlus className="mr-1 size-3" /> Save for later
+                  </Button>
+                )}
+                {/* Commit & push keys on live git state (uncommitted changes or
+                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    Can surface even mid-run (a background agent dirtied the tree).
+                    Hidden while `!canSend` — e.g. an imported session still
+                    importing, or whose import failed — since the send would be refused. */}
+                {canSend && shouldOfferCommitPush(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendCommitPush()}
+                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
+                  >
+                    <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                  </Button>
+                )}
+                {/* Offered once the branch is pushed and synced with its
+                    remote (git-state-only, same convention as Commit & push
+                    above). Requires a head branch to PR *from* — either
+                    agetor's own worktree branch, or (isolation:"none", where
+                    `task.branch` is NULL by construction) the workdir's live
+                    checked-out branch as long as it isn't the repo default,
+                    which would degenerate to base == head. See
+                    `prHeadBranch`. Gone once a PR exists (the durable
+                    "View PR" link lives in the panel header). The proposal
+                    parse runs on click, not per event flush — the stream can
+                    be long. */}
+                {!task.prUrl && prHead != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      const proposal = latestPrProposal(events);
+                      onOpenPullRequest({
+                        projectPath: task.workdir,
+                        head: prHead,
+                        title: proposal?.title ?? "",
+                        body: appendIssueCloseDirective(proposal?.description ?? "", task.issueUrl),
+                        taskId: task.id,
+                      });
+                    }}
+                    title="Create a pull request for this task's branch — prefilled from the agent's summary when available"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> Create PR
+                  </Button>
+                )}
+                {/* Post-PR counterpart to "Open PR" above: offered once the
+                    task's PR reports merge conflicts. Gated on `!archived`
+                    (the server silently auto-unarchives on other mutations,
+                    but this button must not act as though it were live on a
+                    frozen task — an archived-but-`canSend` task DOES render
+                    this dock, so the clause is live, not dead code). The
+                    composer dock as a whole already excludes subagent tabs
+                    (`activeStream !== "main"` renders a read-only footer
+                    instead), so no separate check is needed here. Rendered
+                    even when `!canSend` (see `showResolveConflicts` above) —
+                    disabled, with a tooltip explaining why. */}
+                {showResolveConflicts && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendResolveConflicts()}
+                    disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
+                    title={
+                      !canSend
+                        ? "Start the task before asking the agent to resolve conflicts"
+                        : modalPending
+                          ? "Answer the pending prompt before sending another message"
+                          : resolveConflictsSent
+                            ? "Already sent — waiting for the agent to pick it up"
+                            : sending || backlogBusy || resolvingConflicts
+                              ? "A message is already being sent"
+                              : "Ask the agent to merge the base branch and resolve the reported conflicts"
+                    }
+                  >
+                    <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
+                  </Button>
+                )}
+              </>
+            }
+            // Archived-but-sendable: the task has a resumable run, so the
+            // composer is fully live — but sending here has a side effect
+            // (auto-unarchive + worktree restore) that a non-archived idle
+            // task doesn't have, so call it out inline rather than silently.
+            notice={
+              archived && (
+                <p className="text-[10px] text-muted-foreground">
+                  Sending will unarchive this task and restore its worktree.
+                </p>
+              )
+            }
+            // Always available: refs can be attached to a draft you're only
+            // stashing, before the task has ever run.
+            referencesVariant="inline"
+            referencesPosition="before"
+            startingFolder={task.worktreePath ?? task.workdir}
+            inputAdornment={
+              <MessageHistoryPicker
+                taskId={task.id}
+                // Deliberately mirrors the textarea's own disabled condition
+                // (not `!canSend`/`modalPending`) — composing is decoupled
+                // from sending, so the history trigger stays usable before
+                // the first run and while a native prompt is pending.
+                disabled={sending || backlogBusy}
+                onPick={(text) => {
+                  setInput(text);
+                  requestAnimationFrame(() => {
+                    const el = sendRef.current;
+                    if (!el) return;
+                    // Pin the caret to the end of the inserted text, and do it
+                    // BEFORE focus() — SlashAutocomplete syncs its tracked
+                    // caret on the native `focus` event, so focusing first
+                    // reads the stale prior offset, which can land inside a
+                    // `/command` token and pop SlashAutocomplete (whose
+                    // keydown handler then swallows the next Enter). Same fix
+                    // as ExtensionPicker's `insert` (commit bcf0d07).
+                    el.setSelectionRange(text.length, text.length);
+                    el.focus();
+                  });
+                }}
+                className="absolute right-1.5 top-1.5 z-10"
+              />
+            }
+            trailing={
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              <Tooltip
+                align="end"
+                side="top"
+                className="shrink-0"
+                label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
+              >
+                <Button
+                  size="icon"
+                  onClick={() => void send()}
+                  disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
+                  aria-label="Send"
+                  className="h-16 w-12 shrink-0"
+                >
+                  <Send className="size-4" />
+                </Button>
+              </Tooltip>
+            }
+            rows={2}
+            textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
+            textareaTestId="send-textarea"
+            placeholder={
+              modalPending
+                ? "Answer the prompt above — or type a message and Save it for later."
+                : importedSession?.kind === "opencode" && importedSession.status === "importing"
+                ? "OpenCode history is still importing — type a message and Save it for later."
+                : importedSession?.kind === "opencode" && importedSession.status === "failed"
+                ? "OpenCode history didn't import — retry it above, or type a message and Save it for later."
+                : canSend
+                ? task.column === "running"
+                  ? "Agent is working — your message will be added to the current turn. Type / for commands, @ for files."
+                  : task.column === "blocked"
+                    ? "Answer the question, or send any follow-up. Type / for commands, @ for files."
+                    : "Send a message — resumes the conversation in a fresh session. Type / for commands, @ for files."
+                // `!canSend` covers two states: never run, and "ran but has
+                // no resumable session" (a codex task whose run_id was
+                // cleared — claude falls back to its newest run). Don't
+                // claim "not running yet" in the latter.
+                : runs.length > 0
+                  ? "No live session to send to — save this message for later, or re-run the task."
+                  : "Not running yet — type a message and Save it for later, ready to send once the task runs."
+            }
+            // Typing is allowed in every state the composer renders, even
+            // when we can't send: that's the point of "Save for later".
+            // Sending is gated separately — the Send button below plus the
+            // `canSend` / `modalPending` guards inside `send()` — so a
+            // keystroke can never leak into a live tmux modal. Note: the
+            // composer internally also disables its Extensions picker on
+            // `!workdir.trim()`, a condition this dock's old inline JSX
+            // never checked (`task.workdir` is required at task-create
+            // time, so it's always non-empty here) — a known, deliberate
+            // no-op delta from the migration, not a behavior change.
+            disabled={sending || backlogBusy}
+            onKeyDown={(e) => {
+              // Enter to send; Shift+Enter for a newline. SlashAutocomplete
+              // attaches a native keydown listener that calls preventDefault
+              // when it picks a suggestion — bail here so we don't *also*
+              // send the message in the same keystroke. React fires the
+              // synthetic handler even when the native default was
+              // prevented; `defaultPrevented` is the discriminator.
+              if (e.defaultPrevented) return;
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // The field is typable in states we can't send from (before
+                // the first run, or while a prompt is pending). Swallowing
+                // Enter there would be a dead key, so it does the thing the
+                // user means: stash the draft. `send()` guards both states
+                // too, so this is the only place that decides.
+                if (!canSend || modalPending) {
+                  // Archived tasks can't stash drafts (server freezes the
+                  // backlog) — swallow Enter instead of surfacing a 400.
+                  if (!archived) void saveForLater();
+                  return;
+                }
+                void send();
+              }
+            }}
+            hint={sendHint}
+            // Keeps this dock's hint paragraph's rendered class list
+            // byte-identical to before `hintClassName` existed on
+            // `PromptComposer` (see that prop's doc).
+            hintClassName="mt-1"
+          />
+        </div>
+      )}
+      {/* Same gate as the composer dock above (`archived && !canSend` ? static
+          notice, `activeStream !== "main"` ? read-only footer, else the live
+          composer) — the quote pill only makes sense where there's an
+          editable composer to insert into. `position: fixed`, so it doesn't
+          need to live inside the composer's own JSX branch. `disabled` mirrors
+          how ExtensionPicker/MessageHistoryPicker/Save-for-later gate
+          themselves (`sending || backlogBusy`) — a quote clicked while a send
+          is in flight would otherwise get wiped by the resolving
+          `setInput("")` + `clearTaskDraft`. */}
+      {!(archived && !canSend) && activeStream === "main" && (
+        <QuoteSelectionButton containerRef={logRef} disabled={sending || backlogBusy} onQuote={handleQuote} />
+      )}
+      {/* Keyed by plan id (stable across in-place status/edit updates as
+          `plans` refreshes from the poll or a mutation's returned Task) so
+          the dialog's internal text/mode state resets on genuine plan
+          switches but survives its own plan being updated in place.
+          Namespaced (`plan-…`) like the other two keyed children of this
+          fragment (`TerminalsSection`, `BacklogTray`): no two children here
+          may ever share a key — see the comment on `TerminalsSection`. */}
+      {openPlan && (
+        <PlanDialog
+          key={`plan-${openPlan.id}`}
+          task={task}
+          plan={openPlan}
+          agentKind={kind}
+          onClose={() => setPlanDialogId(null)}
+          onPlanUpdated={(updated) => setPlans(updated.plans)}
+          focusComposer={focusComposer}
+        />
+      )}
+    </>
+  );
+}
+
+/** Shared styling for the compact icon buttons in a backlog item's action row. */
+const BACKLOG_ICON_BTN =
+  "rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground "
+  + "disabled:pointer-events-none disabled:opacity-40";
+
+/**
+ * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just
+ * above the composer. Purely presentational — all mutations are handed back to
+ * RunPanelBody, which owns the optimistic state and the API calls. Manages only
+ * which item is currently in inline-edit mode.
+ */
+function BacklogTray({
+  fileScope,
+  items,
+  canSend,
+  busy,
+  readOnly,
+  startingFolder,
+  onSend,
+  onEdit,
+  onDelete,
+  onMove,
+}: {
+  /** The task's `@`-listing scope (same object the send composer uses) —
+   *  threaded into each row's inline editor for popover + highlight parity.
+   *  Display/suggestion layer only; expansion stays server-side. */
+  fileScope?: FileScope | null;
+  items: BacklogMessage[];
+  /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
+  canSend: boolean;
+  /** A send / backlog mutation is in flight — disables destructive actions. */
+  busy: boolean;
+  /** View-only mode (archived task): render the drafts but strip every
+   *  mutation affordance, since the server freezes backlog edits on archived
+   *  tasks. The drafts stay visible so they aren't silently hidden. */
+  readOnly: boolean;
+  startingFolder: string;
+  onSend: (item: BacklogMessage) => void;
+  onEdit: (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => void | Promise<void>;
+  onDelete: (itemId: string) => void;
+  onMove: (itemId: string, dir: -1 | 1) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  return (
+    <div className="shrink-0 border-t border-border/60">
+      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+        <ClipboardList className="size-3.5" />
+        <span>Backlog</span>
+        <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
+        <span className="ml-1 font-normal text-muted-foreground/70">
+          {readOnly
+            ? "saved messages — unarchive the task to edit or send"
+            : "saved messages — send when you're ready"}
+        </span>
+      </div>
+      {/* Grow the window while a row is being edited: the inline editor is
+          ~140px tall, so under the resting max-h-40 (160px) its Save/Cancel row
+          would be clipped below the fold whenever another draft sits above it —
+          which reads as "there is no save button". */}
+      <div
+        className={cn(
+          "space-y-1 overflow-y-auto px-2 pb-2",
+          editingId !== null ? "max-h-72" : "max-h-40",
+        )}
+      >
+        {items.map((item, i) => (
+          <BacklogItemRow
+            key={item.id}
+            item={item}
+            index={i}
+            total={items.length}
+            canSend={canSend}
+            busy={busy}
+            readOnly={readOnly}
+            editing={editingId === item.id}
+            fileScope={fileScope}
+            startingFolder={startingFolder}
+            onStartEdit={() => setEditingId(item.id)}
+            onCancelEdit={() => setEditingId(null)}
+            onSaveEdit={async (patch) => {
+              await onEdit(item.id, patch);
+              setEditingId(null);
+            }}
+            onSend={() => onSend(item)}
+            onDelete={() => onDelete(item.id)}
+            onMove={(dir) => onMove(item.id, dir)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One saved draft: a read-only row with hover actions, or an inline editor
+ *  (textarea + references picker) when `editing` is true. */
+function BacklogItemRow({
+  fileScope,
+  item,
+  index,
+  total,
+  canSend,
+  busy,
+  readOnly,
+  editing,
+  startingFolder,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onSend,
+  onDelete,
+  onMove,
+}: {
+  fileScope?: FileScope | null;
+  item: BacklogMessage;
+  index: number;
+  total: number;
+  canSend: boolean;
+  busy: boolean;
+  readOnly: boolean;
+  editing: boolean;
+  startingFolder: string;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (patch: { text: string; references: TaskReference[] }) => void;
+  onSend: () => void;
+  onDelete: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const [draft, setDraft] = useState(item.text);
+  const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  // `@` popover + highlight for the inline editor — scope gated on `editing`
+  // so a tray full of closed rows fetches nothing (the module-level cache is
+  // shared with the send composer anyway, so entering edit mode is a cache
+  // hit in practice). Expansion still happens server-side on send; this is
+  // the suggestion/validation layer only, same as every other composer.
+  const projectFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
+  // Re-seed the edit form only when we *enter* edit mode. We deliberately do
+  // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
+  // `task.backlog` into fresh objects (new array references) on every tick, so
+  // depending on them would re-run this effect every poll and clobber the
+  // user's in-progress edit back to the saved value. The row is keyed by
+  // `item.id`, so `useState` already seeds the initial value on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (editing) {
+      setDraft(item.text);
+      setDraftRefs(item.references);
+      // The editor expands the row well past what was visible before the
+      // click. Anchor the scroll on the Save/Cancel row — the form's last
+      // element — so the buttons are revealed even when the form itself is
+      // taller than the tray's scroll window (many reference chips).
+      actionsRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [editing]);
+
+  // `readOnly` wins over `editing` — an archived task can never open the editor
+  // (the Edit button is hidden), but guard here too so a stale `editingId` from
+  // just before an archive can't strand the row in an uncommittable form.
+  if (editing && !readOnly) {
+    const canSave = draft.trim().length > 0 || draftRefs.length > 0;
+    return (
+      <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
+        {/* Backdrop first, `relative` on the textarea — DOM order decides the
+            paint, see AtHighlightBackdrop's doc. Popover anchors above (the
+            tray sits at the panel's bottom edge). */}
+        <div className="relative">
+          {fileScope && (
+            <AtHighlightBackdrop textareaRef={editorRef} value={draft} validPaths={projectFiles.validPaths} />
+          )}
+          <Textarea
+            ref={editorRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={2}
+            autoFocus
+            className="relative min-h-0 w-full resize-none text-xs"
+          />
+          {fileScope && (
+            <AtFileAutocomplete
+              entries={projectFiles.entries}
+              truncated={projectFiles.truncated}
+              error={projectFiles.error}
+              value={draft}
+              onChange={setDraft}
+              textareaRef={editorRef}
+              placement="above"
+              fileScope={fileScope}
+            />
+          )}
+        </div>
+        <ReferencesPicker
+          variant="inline"
+          refs={draftRefs}
+          onChange={setDraftRefs}
+          startingFolder={startingFolder}
+        />
+        <div ref={actionsRef} className="flex items-center justify-end gap-1.5">
+          <Button size="sm" variant="ghost" onClick={onCancelEdit}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={!canSave || busy}
+            onClick={() => onSaveEdit({ text: draft.trim(), references: draftRefs })}
+          >
+            <Check className="mr-1 size-3" /> Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-border/60 hover:bg-background/40">
+      <div className="min-w-0 flex-1">
+        <p className="line-clamp-3 whitespace-pre-wrap break-words text-xs text-foreground/90">
+          {item.text || (
+            <span className="italic text-muted-foreground">(references only)</span>
+          )}
+        </p>
+        {item.references.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {item.references.map((r) => {
+              const Icon = iconForRef(r);
+              return (
+                <span
+                  key={r.path}
+                  title={r.path}
+                  className="inline-flex items-center gap-1 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <Icon className="size-3 shrink-0 opacity-70" />
+                  {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          <Tooltip align="end" side="top" label="Move up">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === 0 || busy}
+              onClick={() => onMove(-1)}
+              aria-label="Move up"
+            >
+              <ArrowUp className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Move down">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={index === total - 1 || busy}
+              onClick={() => onMove(1)}
+              aria-label="Move down"
+            >
+              <ArrowDown className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Edit">
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              onClick={onStartEdit}
+              aria-label="Edit"
+            >
+              <FilePenLine className="size-3.5" />
+            </button>
+          </Tooltip>
+          {/* `canSend` here is the parent's `canSend && !modalPending`, so it
+              goes false for two different reasons — no live/resumable session,
+              or a prompt is waiting. Keep the copy true for both. */}
+          <Tooltip
+            align="end"
+            side="top"
+            label={
+              canSend
+                ? "Send now"
+                : "Can't send right now — run the task, or answer the pending prompt first"
+            }
+          >
+            <button
+              type="button"
+              className={BACKLOG_ICON_BTN}
+              disabled={!canSend || busy}
+              onClick={onSend}
+              aria-label="Send now"
+            >
+              <Send className="size-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip align="end" side="top" label="Delete">
+            <button
+              type="button"
+              className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+              disabled={busy}
+              onClick={onDelete}
+              aria-label="Delete"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </Tooltip>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Read-only tab strip for switching the log between the task's own (Main)
+ * agent stream and each background/sub agent it has spawned. Shown only while
+ * background agents are active (see `showSubagentTabs`). The Main tab is always
+ * first and visually emphasised — it's the one stream you can actually talk to;
+ * the background tabs are watch-only, and the running ones sort directly after
+ * Main (see `sortSubagentTabs`). A running agent shows a pulsing green dot,
+ * a finished one a check.
+ */
+function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean; onSelect: (id: string) => void }) {
+  // Background shells always carry agentType "shell", which reads as a
+  // redundant label right next to the Terminal glyph below when there's no
+  // description to pair it with — prefer a more descriptive fallback for
+  // that row kind.
+  const label = s.parentKind === "bg_session" ? "background shell" : (s.agentType ?? "agent");
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      data-testid="subagent-tab"
+      data-subagent-id={s.id}
+      onClick={() => onSelect(s.id)}
+      title={s.description ?? label}
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] transition-colors",
+        selected
+          ? "bg-accent text-accent-foreground ring-1 ring-border"
+          : "text-muted-foreground hover:bg-muted/40",
+      )}
+    >
+      {/* Nested agents (spawned by another subagent, not the main agent) get a
+          depth marker so the hierarchy is legible in a flat strip. */}
+      {s.spawnDepth > 1 && <CornerDownRight className="size-3 shrink-0 text-muted-foreground/60" />}
+      {s.status === "running" ? (
+        <span className="relative inline-flex size-2 shrink-0">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/60 opacity-75" />
+          <span className="relative inline-flex size-2 rounded-full bg-success" />
+        </span>
+      ) : (
+        <Check className="size-3 shrink-0 text-muted-foreground" />
+      )}
+      {/* Background-shell subagents (parentKind "bg_session", agentType "shell")
+          get a terminal glyph so they read as distinct from the generic
+          Task-tool subagents in a mixed strip. Keyed on parentKind — the
+          actual discriminator for "is this a bg shell" — rather than
+          agentType, which is just the literal string bg shells happen to
+          carry. A Claude Code Monitor (parentKind "monitor") gets its own
+          radar glyph for the same reason — its label already reads "monitor"
+          via the `agentType ?? "agent"` fallback above, but the icon still
+          needs to read as distinct from a plain Task-tool subagent tab. */}
+      {s.parentKind === "bg_session" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
+      {s.parentKind === "monitor" && <Radar className="size-3 shrink-0 text-muted-foreground" />}
+      <span className="max-w-[10rem] truncate">{label}</span>
+      {s.description && (
+        <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
+      )}
+    </button>
+  );
+}
+
+function SubagentTabs({
+  subagents,
+  active,
+  onSelect,
+}: {
+  subagents: Subagent[];
+  active: string;
+  onSelect: (id: string) => void;
+}) {
+  // Running agents sort first, right after Main, so what's live is always the
+  // closest thing to hand (see `sortSubagentTabs`). Then collapse a large
+  // fan-out behind a "+N" pill; expanding wraps the strip onto multiple rows
+  // rather than forcing a long horizontal scroll. A running or currently-active
+  // tab is never hidden (see `splitTabsForOverflow`).
+  const [expanded, setExpanded] = useState(false);
+  // No useMemo: the 2s poll rebuilds `subagents` into a fresh array every tick,
+  // so memoising on it would never hit. The partition is O(n) on a handful.
+  const sorted = sortSubagentTabs(subagents);
+  const { visible, overflow } = splitTabsForOverflow(sorted, active);
+  const shown = expanded ? sorted : visible;
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Agent streams"
+      className={cn(
+        "flex shrink-0 items-center gap-1 border-b border-border/60 bg-card/40 px-2 py-1.5",
+        expanded ? "flex-wrap" : "overflow-x-auto",
+      )}
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === "main"}
+        onClick={() => onSelect("main")}
+        className={cn(
+          "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors",
+          // Main is always emphasised (primary accent) so it reads as the
+          // controllable stream even when a background tab is selected.
+          active === "main"
+            ? "bg-primary/15 text-primary ring-1 ring-primary/40"
+            : "text-primary/80 hover:bg-primary/10",
+        )}
+      >
+        <Bot className="size-3" />
+        Main
+      </button>
+      {shown.map((s) => (
+        <SubagentTab key={s.id} s={s} selected={active === s.id} onSelect={onSelect} />
+      ))}
+      {overflow.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="shrink-0 rounded-md px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted/40"
+          title={expanded ? "Collapse background-agent tabs" : `Show ${overflow.length} more background agent${overflow.length === 1 ? "" : "s"}`}
+        >
+          {expanded ? "Show less" : `+${overflow.length}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Read-only summary of the task's run history. The panel below shows a
+ * unified, merged stream of every run's events, so the list here doesn't
+ * gate the view — it's purely informational. Collapsed: one summary row
+ * for the latest run (status, ordinal, time, duration). Expanded: every
+ * prior run in reverse-chronological order.
+ */
+/** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for a run's merged
+ *  usage payload (fx, or cursor's per-turn `result.usage`), rendered beside
+ *  the duration/exit chips on a run-summary row. Falls back to a compact `↑in ↓out` per-turn form when
+ *  only `turn` is known, and renders nothing at all when neither half is
+ *  known (see `fxUsageChipText`). `title` carries the exact numbers —
+ *  including any per-turn breakdown — on hover; the visible text is the
+ *  abbreviated form. */
+function UsageChip({ usage }: { usage: FxUsagePayload }) {
+  const text = fxUsageChipText(usage);
+  if (text === null) return null;
+  return (
+    <span className="text-muted-foreground" title={fxUsageTitle(usage)} data-testid="fx-usage-chip">
+      {text}
+    </span>
+  );
+}
+
+/** Small muted chip naming the provider fx routed a turn through
+ *  (`gateway`/`codex`/`grok`), rendered beside {@link UsageChip} on a run's
+ *  summary row. Text is the bare value fx reported — no relabeling, so an
+ *  unreleased provider id still renders sensibly. */
+function ProviderChip({ provider }: { provider: string }) {
+  return (
+    <span
+      className="inline-block max-w-[10rem] truncate align-bottom text-muted-foreground"
+      title="fx provider"
+      data-testid="fx-provider-chip"
+    >
+      {provider}
+    </span>
+  );
+}
+
+/** Small muted chip naming the fx session title (`session_info_update`),
+ *  rendered beside {@link ProviderChip} on a run's summary row. Text is the
+ *  bare title fx reported — the driver already filters out fx's own
+ *  "Untitled session" placeholder before emitting the sentinel. */
+function SessionTitleChip({ title }: { title: string }) {
+  return (
+    <span
+      className="inline-block max-w-[14rem] truncate align-bottom text-muted-foreground"
+      title="fx session title"
+      data-testid="fx-session-title-chip"
+    >
+      {title}
+    </span>
+  );
+}
+
+function RunsList({
+  runs,
+  runsLoaded,
+  usageByRun,
+  providerByRun,
+  titleByRun,
+}: {
+  runs: Run[];
+  /** False until the first `listRuns` for this task has answered. Until then
+   *  an empty `runs` means "not fetched yet", not "no runs" — the list renders
+   *  nothing rather than flashing "No runs yet for this task." over a task
+   *  whose runs are simply still loading. */
+  runsLoaded: boolean;
+  usageByRun?: Map<string, FxUsagePayload>;
+  providerByRun?: Map<string, string>;
+  titleByRun?: Map<string, string>;
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (runs.length === 0) {
+    if (!runsLoaded) return null;
+    return (
+      <div className="border-b border-border/60 px-3 py-2 text-xs text-muted-foreground">
+        No runs yet for this task.
+      </div>
+    );
+  }
+
+  // Resolve ordinal so the user sees #1 for the first run, growing upward.
+  const ordinalFor = (id: string) => runs.length - runs.findIndex((r) => r.id === id);
+  const latest = runs[0]!;
+  const canExpand = runs.length > 1;
+
+  return (
+    <div className="border-b border-border/60">
+      <button
+        type="button"
+        onClick={() => canExpand && setOpen((o) => !o)}
+        disabled={!canExpand}
+        className={cn(
+          "flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs",
+          canExpand && "cursor-pointer hover:bg-muted/30",
+          !canExpand && "cursor-default",
+        )}
+        aria-expanded={canExpand ? open : undefined}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <Badge variant={STATUS_VARIANT[latest.status]} className="shrink-0">
+            {latest.status}
+          </Badge>
+          {latest.origin === "continuation" && (
+            <Badge
+              variant="secondary"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+              title={CONTINUATION_BADGE_TITLE}
+            >
+              auto
+            </Badge>
+          )}
+          {latest.origin === "imported" && (
+            <Badge
+              variant="secondary"
+              data-testid="run-origin-imported"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+            >
+              Imported
+            </Badge>
+          )}
+          <span className="truncate">
+            Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
+          </span>
+          {canExpand && (
+            <span className="shrink-0 text-[10px] text-muted-foreground">
+              {open ? `${runs.length} runs` : `+${runs.length - 1} earlier`}
+            </span>
+          )}
+        </span>
+        <span className="flex shrink-0 items-center gap-2 font-mono text-[10px] text-muted-foreground">
+          <span>{formatDuration(latest)}</span>
+          {latest.exitCode !== null && latest.exitCode !== 0 && (
+            <span className="text-destructive">exit {latest.exitCode}</span>
+          )}
+          {usageByRun?.get(latest.id) && <UsageChip usage={usageByRun.get(latest.id)!} />}
+          {providerByRun?.get(latest.id) && <ProviderChip provider={providerByRun.get(latest.id)!} />}
+          {titleByRun?.get(latest.id) && <SessionTitleChip title={titleByRun.get(latest.id)!} />}
+          {canExpand && (
+            <span className="text-muted-foreground">{open ? "▲" : "▼"}</span>
+          )}
+        </span>
+      </button>
+      {open && canExpand && (
+        <ul className="border-t border-border/40 bg-card/50" aria-label="Run history">
+          {runs.slice(1).map((r) => (
+            <li
+              key={r.id}
+              className="flex items-center justify-between gap-2 border-b border-border/30 px-3 py-1.5 text-xs last:border-b-0"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <Badge variant={STATUS_VARIANT[r.status]} className="shrink-0">
+                  {r.status}
+                </Badge>
+                {r.origin === "continuation" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                    title={CONTINUATION_BADGE_TITLE}
+                  >
+                    auto
+                  </Badge>
+                )}
+                {r.origin === "imported" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                  >
+                    Imported
+                  </Badge>
+                )}
+                <span className="truncate text-muted-foreground">
+                  #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
+                </span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
+                <span>
+                  {formatDuration(r)}
+                  {r.exitCode !== null && r.exitCode !== 0 && (
+                    <span className="ml-1 text-destructive">exit {r.exitCode}</span>
+                  )}
+                </span>
+                {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
+                {providerByRun?.get(r.id) && <ProviderChip provider={providerByRun.get(r.id)!} />}
+                {titleByRun?.get(r.id) && <SessionTitleChip title={titleByRun.get(r.id)!} />}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Collapsible terminal section. Mounts {@link TerminalView} for the lifetime of
+ * the panel so background tabs keep streaming even while collapsed; the PTYs
+ * themselves live on the bun side and survive the panel closing entirely.
+ * Defaults open when the task already has terminals (`openTerminalCount`).
+ */
+function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
+  const count = task.openTerminalCount;
+  // Seed open from the count at mount, then let the user own the toggle —
+  // binding `open` to the polled count would re-expand the section whenever
+  // the count changes (e.g. closing one of two terminals). `RunPanelBody`
+  // itself is NOT remounted on a task switch, but this section is keyed on
+  // `task.id` at its call site above, so it (and the `TerminalView` it
+  // mounts) gets a fresh instance per task — that's what re-seeds this open/
+  // closed state and closes the previous task's terminal sockets instead of
+  // carrying them over.
+  const [open, setOpen] = useState(count > 0);
+  // Defer mounting `TerminalView` (and its `listTerminals` fetch) until the
+  // stream-first gate opens — same non-essential-fetch deferral as the
+  // git-status/PR-mergeability effects in `RunPanelBody` (see plan
+  // §3.4(c)): without this, a terminal list request competes with the SSE
+  // subscription for the webview's shared per-host connection budget in the
+  // task-switch burst. Seeded false and re-resolved on every mount because
+  // this component is keyed on `task.id` at its call site, so each task gets
+  // its own fresh `ready` gate.
+  const [ready, setReady] = useState(false);
+  // `awaitReady` (RunPanelBody's `awaitStreamReady`) is a plain function
+  // recreated every parent render, not a stable `useCallback` — captured in
+  // a ref (same pattern as `onCloseRef` above) so this effect doesn't tear
+  // down and re-run on every RunPanelBody re-render (e.g. the 2s kanban
+  // poll). This component is keyed on `task.id` at its call site, so it
+  // mounts fresh — and re-awaits — once per task regardless.
+  const awaitReadyRef = useRef(awaitReady);
+  awaitReadyRef.current = awaitReady;
+  useEffect(() => {
+    let cancelled = false;
+    // Pass this section's own task id: the gate is task-keyed because this
+    // mount effect runs BEFORE RunPanelBody's reset effect on a task switch,
+    // so a bare "is the stream ready" boolean would still be the previous
+    // task's answer here.
+    const forTaskId = task.id;
+    void awaitReadyRef.current(forTaskId).then(() => {
+      if (!cancelled) setReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [task.id]);
+  return (
+    <details
+      data-testid="terminals-section"
+      className="border-b border-border/60"
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+    >
+      <summary className="cursor-pointer px-3 py-2 text-muted-foreground">
+        <span className="text-[10px] uppercase tracking-wide">
+          Terminal{count > 0 && <span className="font-mono normal-case"> ({count})</span>}
+        </span>
+      </summary>
+      <div className="h-80 border-t border-border/60">
+        {ready && <TerminalView taskId={task.id} archived={task.archivedAt != null} />}
+      </div>
+    </details>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Run log renderers — one component per RunEvent.stream kind.
+ *
+ * Codex (and any unstructured agent) sends raw stdout/stderr chunks; claude
+ * sends typed events parsed out of its JSONL transcript. We dispatch on
+ * `stream` and pick a renderer:
+ *   stdout/stderr/status  — flat text (no styling for stdout, red for
+ *                           stderr, divider for status)
+ *   assistant             — markdown-ish text block
+ *   thinking              — collapsed-by-default muted card
+ *   tool_use              — call card with per-tool input formatter
+ *   tool_result           — result card, paired to its tool_use by id
+ *
+ * Adjacent same-stream text events (stdout, assistant) are visually merged
+ * by the surrounding spacing; we don't pre-coalesce in state because
+ * dedup + replay invariants are easier when each event stays atomic.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+type RunIndicatorMode = "off" | "active";
+
+function RunEventList({
+  events,
+  stickyUserMessages,
+  interactions = [],
+  onInteractionResolved,
+  runStatus,
+  indicatorMode = "off",
+  holdSummary = null,
+  recoveryNotice = null,
+  pausedRecovery = null,
+  taskId,
+  plans = [],
+  onOpenPlan,
+  agentKind,
+  onAskAnswerWithheld,
+  pathRoots,
+}: {
+  events: RunEvent[];
+  /** True groups turns and pins each user message for its own response. */
+  stickyUserMessages: boolean;
+  interactions?: PendingInteraction[];
+  onInteractionResolved?: (id: string) => void;
+  runStatus?: Run["status"] | null;
+  indicatorMode?: RunIndicatorMode;
+  /** Non-null when the Main stream's turn has resolved but the task is still
+   *  held in `running` by background work (a Monitor, a bg shell, a workflow,
+   *  or a subagent) — rendered as a `HoldingIndicator` instead of the regular
+   *  `RunningIndicator`, mutually exclusive with it. Computed by the caller
+   *  (`holdSummary` in `RunPanelBody`) since it needs `task.column` and
+   *  `runs`, neither of which this component has. */
+  holdSummary?: string | null;
+  /** fx's own live retry-progress line (`liveRecoveryNotice` in
+   *  `RunPanelBody`, e.g. "⚠ Rate limited · HTTP 429 · … · retrying request
+   *  in 8s · attempt 5/10"), rendered as a `RecoveryNotice` directly under
+   *  `RunningIndicator`/`HoldingIndicator` at the bottom of the transcript —
+   *  the same "what's happening right now, in place" slot the heartbeat
+   *  occupies, not a transcript row, because it's ephemeral progress that
+   *  keeps rewriting itself in place as fx retries. `null` whenever there's
+   *  nothing live to show (see the caller's doc comment for the full gate).
+   *  The persisted explanation of what actually happened (paused/recovered)
+   *  lives in the transcript itself, written once by the driver — this prop
+   *  is a separate, purely-derived, disappearing-on-its-own affordance. */
+  recoveryNotice?: string | null;
+  /** fx paused a response and the checkpoint is still resumable — rendered
+   *  as a `PausedRecoveryNotice` + Resume button in the
+   *  same bottom slot, mutually exclusive with `recoveryNotice` (see the
+   *  caller's `pausedRecovery` doc comment for the full gate, including why
+   *  it's archived- and subagent-tab-gated). `text` is the driver's own
+   *  persisted paused summary line (`fxRecoverySummaryLine`) reused for the
+   *  live affordance's label; `busy` disables the button while a resume request is
+   *  in flight; `onResume` is the click handler. `null` when there's nothing
+   *  to resume. */
+  pausedRecovery?: ComponentProps<typeof PausedRecoveryNotice> | null;
+  /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
+   *  relative attachment ref can resolve against the task's worktree/workdir
+   *  when the user clicks it. */
+  taskId?: string;
+  /** The task's own filesystem roots (`worktreePath`, `workdir`) — used by
+   *  `UserMessageBlock` for DISPLAY-ONLY folding of expanded absolute `@`
+   *  paths back to the mention form the user typed. Never consulted for
+   *  chips/previews, which need the real absolute paths. Also consulted by
+   *  `MdImage` (via `MdImageScopeContext`, provided below) to resolve a
+   *  relative markdown image `src` against the task's roots. */
+  pathRoots?: readonly (string | null | undefined)[];
+  /** Plans detected on this task (`task.plans`) — Cursor's
+   *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
+   *  for every other agent. Matched against each `tool_use` event's parsed id
+   *  via `planByToolCallId` below to swap in a `PlanCard` for the matched
+   *  event; also consulted directly by `TmuxPromptCard` (via
+   *  `latestPlanMarkdown` below) to render the full plan markdown above
+   *  claude's plan-approval buttons. */
+  plans?: TaskPlan[];
+  /** Opens the plan modal for the given plan id — wired to `RunPanelBody`'s
+   *  `planDialogId` state exactly like `onInteractionResolved` is wired to
+   *  `dismissInteraction`. */
+  onOpenPlan?: (planId: string) => void;
+  /** This task's agent kind — gates `latestPlanMarkdown`'s fallback scan
+   *  below to claude-code only (the only agent whose `TmuxPromptCard` ever
+   *  needs it; cursor/codex/gemini tasks would otherwise pay the same
+   *  per-tool_use JSON-parse cost for a value nothing consumes). */
+  agentKind?: AgentKind;
+  /** Forwarded to `AskQuestionsCard` — fires when a free-text ask-card answer
+   *  came back `{ ok: false, withheld: true, savedToBacklog: true, reason }`
+   *  (some OTHER blocking modal was up when the answer tried to land as a
+   *  follow-up turn), so the caller can toast the outcome and refresh the
+   *  backlog tray exactly like the composer's own withheld branch. */
+  onAskAnswerWithheld?: (reason: string) => void;
+}) {
+  // Index tool_results by their tool_use_id so the tool-use card can show
+  // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
+  // stdout strings (persisted before the structured-event refactor) into the
+  // same shape live events use. Without this, replayed history from older
+  // runs renders as ugly prefixed text while only the in-flight events get
+  // proper cards.
+  const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
+
+  // Formatted handoff usage (`docs/plans/formatted-handoff.md` D21): for an
+  // assistant event holding a real `<handoff>` block, whether the runner
+  // advanced on it ("used"), passed it over ("not-used"), or hasn't decided
+  // yet (`null`). `handoffUsage` depends on the event only through its run
+  // and whether it holds that run's LAST real block, so it reduces to two
+  // values per run — computed here, then folded into a primitive signature
+  // so the `blocks` memo below (and every memoized `AssistantBlock`) only
+  // re-derives when a usage actually changes, not on every run poll or
+  // pipeline refetch that hands the context fresh objects. A run with no
+  // real block in view gets no entry (its events render no card, so usage
+  // is moot). Empty, and free, whenever the handoff view is disabled: a
+  // non-step task, a subagent tab, a delta-streaming harness.
+  const handoffView = useHandoffView();
+  const lastHandoffEventByRun = useMemo(
+    () => (handoffView.enabled ? indexLastHandoffEventByRun(normalised) : null),
+    [handoffView.enabled, normalised],
+  );
+  const handoffUsageKey = useMemo(() => {
+    if (lastHandoffEventByRun === null) return "";
+    const parts: string[] = [];
+    for (const [runId, lastIndex] of lastHandoffEventByRun) {
+      const base = {
+        record: handoffView.record,
+        eventRunId: runId,
+        runSettled: handoffView.settledRunIds.has(runId),
+      };
+      const last = handoffUsage({ ...base, isLastBlockOfRun: true });
+      const other = handoffUsage({ ...base, isLastBlockOfRun: false });
+      if (last === null && other === null) continue;
+      // Run ids are UUIDs — never contain the `|`/`\t` separators.
+      parts.push(`${runId}|${lastIndex}|${last ?? ""}|${other ?? ""}`);
+    }
+    return parts.join("\t");
+  }, [lastHandoffEventByRun, handoffView.record, handoffView.settledRunIds]);
+  const handoffUsageByRun = useMemo(() => {
+    type Usage = "used" | "not-used" | null;
+    const out = new Map<string, { lastIndex: number; last: Usage; other: Usage }>();
+    if (handoffUsageKey === "") return out;
+    for (const entry of handoffUsageKey.split("\t")) {
+      const [runId, lastIndex, last, other] = entry.split("|");
+      out.set(runId!, {
+        lastIndex: Number(lastIndex),
+        last: (last || null) as Usage,
+        other: (other || null) as Usage,
+      });
+    }
+    return out;
+  }, [handoffUsageKey]);
+
+  // Full markdown for the plan `TmuxPromptCard`'s plan branch is about to
+  // act on — the source of truth is the task's latest PENDING claude plan
+  // (mirrors what `resolveClaudePlan` server-side is about to resolve),
+  // falling back to scanning `normalised` for the latest `ExitPlanMode`
+  // tool_use when no matching plan record has landed yet (a brief race: the
+  // tmux scraper can catch the modal before the orchestrator's chunk handler
+  // has processed the `tool_use` chunk that creates the plan row).
+  const latestPlanMarkdown = useMemo(() => {
+    for (let i = plans.length - 1; i >= 0; i--) {
+      const p = plans[i]!;
+      if (p.status === "pending") return p.editedContent ?? p.content;
+    }
+    // The fallback below JSON-`safeParse`s every `tool_use` event in the
+    // display window (up to `EVENTS_WINDOW_MAX`, ~3000) — only worth paying
+    // for when the result could actually be consumed: claude-code is the
+    // only agent kind with an `ExitPlanMode` signature, and the value is
+    // only ever read by a claude plan-approval `TmuxPromptCard`, so skip
+    // the scan entirely unless one is actually pending right now.
+    if (agentKind !== "claude-code") return null;
+    const hasPendingPlanPrompt = interactions.some(
+      (i) => i.kind === "tmux_prompt" && CLAUDE_PLAN_PROMPT_RE.test(i.paneText),
+    );
+    if (!hasPendingPlanPrompt) return null;
+    for (let i = normalised.length - 1; i >= 0; i--) {
+      const e = normalised[i]!;
+      if (e.stream !== "tool_use") continue;
+      const parsed = safeParse<ParsedToolUse>(e.data);
+      if (parsed?.name === "ExitPlanMode" && isRecord(parsed.input) && typeof parsed.input.plan === "string") {
+        return parsed.input.plan;
+      }
+    }
+    return null;
+  }, [plans, normalised, agentKind, interactions]);
+
+  // Finding 4 (per-card plan markdown): in a multi-plan session, several
+  // `tmux_prompt` interactions can be pending at once but at most one is
+  // ever the live plan-approval modal — pick the most recent plan-signature
+  // one by `createdAt` so a historical/non-plan prompt never inherits the
+  // newest plan's markdown via the shared `latestPlanMarkdown` above.
+  const latestPlanPromptId = useMemo(() => {
+    let latest: PendingInteraction | null = null;
+    for (const it of interactions) {
+      if (it.kind !== "tmux_prompt" || !CLAUDE_PLAN_PROMPT_RE.test(it.paneText)) continue;
+      if (!latest || it.createdAt > latest.createdAt) latest = it;
+    }
+    return latest?.id ?? null;
+  }, [interactions]);
+
+  // Index tool_results by their tool_use_id so the tool-use card can show
+  // the result inline beneath it. Falls back to a standalone tool-result
+  // card when no matching tool_use was seen (legacy `[result]` strings have
+  // no id and always render orphan).
+  const resultByToolId = useMemo(() => {
+    const map = new Map<string, ParsedToolResult>();
+    for (const e of normalised) {
+      if (e.stream !== "tool_result") continue;
+      const parsed = safeParse<ParsedToolResult>(e.data);
+      if (parsed?.toolUseId) map.set(parsed.toolUseId, parsed);
+    }
+    return map;
+  }, [normalised]);
+
+  // Index plans by their raw (possibly-`\n`-containing) toolCallId so the
+  // `tool_use` case below can do an O(1) lookup instead of a per-render scan
+  // over `plans` — same perf rationale as `resultByToolId` above; this map
+  // is one of the `blocks` memo's deps, not recomputed inside its loop.
+  //
+  // Keyed on a content signature (`plansKey`), not `plans` itself: the
+  // `plans` state mirror in `RunPanelBody` gets a fresh array identity on
+  // every genuine task-object change (each 2s poll), even when no plan on
+  // this task actually changed. `PlanCard` (the only consumer of this map)
+  // only renders `id`/`name`/`toolCallId`/`status` — `toolCallId` never
+  // changes for a given plan record and `name` is fixed at creation, so
+  // `id:status` is the only content that can invalidate what gets rendered.
+  // Without this, `blocks` (a dep-of-`planByToolCallId` memo) recomputed
+  // — and re-parsed every markdown block in a long conversation — on every
+  // poll tick regardless of whether a plan changed.
+  const plansKey = plans.map((p) => `${p.id}:${p.status}`).join("|");
+  const planByToolCallId = useMemo(() => {
+    const map = new Map<string, TaskPlan>();
+    for (const p of plans) map.set(p.toolCallId, p);
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on `plansKey` (id+status), not `plans` — see comment above.
+  }, [plansKey]);
+
+  // Interleave events and interaction cards by timestamp. Interactions
+  // already carry a `createdAt`; pair each with the first event-index
+  // whose ts is >= createdAt so it lands next to the agent activity that
+  // prompted it. Anything still unmatched after the last event spills
+  // out below as "since the run finished" — usually means a question
+  // fired right at end_turn.
+  const sortedInteractions = useMemo(
+    () => [...interactions].sort((a, b) => a.createdAt - b.createdAt),
+    [interactions],
+  );
+  const interactionByIndex = useMemo(() => {
+    const slots = new Map<number, PendingInteraction[]>();
+    let idx = 0;
+    for (const it of sortedInteractions) {
+      while (idx < normalised.length && (normalised[idx]?.ts ?? 0) <= it.createdAt) idx++;
+      const bucket = slots.get(idx) ?? [];
+      bucket.push(it);
+      slots.set(idx, bucket);
+    }
+    return slots;
+  }, [normalised, sortedInteractions]);
+
+  // Render either turn-grouped sections with a sticky user-message header or
+  // one flat, normally scrolling block list. Settings defaults to the former
+  // because keeping the last sent message visible is useful while
+  // multitasking; users who prefer a standard chat list select the latter.
+  //
+  // Memoized over the parsed inputs: this rebuilds the rendered element tree
+  // only when the events / interactions / tool-result map actually change.
+  // A bare `setRuns` poll re-render (every 2s) hits the cache, so React gets
+  // the identical element references and bails out of the whole subtree —
+  // without this, the O(n) loop + every block's markdown re-parsed on each
+  // poll is what made long conversations lag. `renderEvent`/`renderInteraction`
+  // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
+  // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
+  const blocks = useMemo(() => {
+    // A revised Cursor tool_use (same id, grown rawInput) replaces the
+    // partial. Both rows can be in the live list; history keeps one.
+    const supersededToolUses = supersededToolUseIndexes(normalised);
+    // A Cursor ask block stays open only while its card is still pending.
+    // The card also picks the waiting line. A missing card is not a live wait.
+    const cursorAskByToolId = new Map<string, { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" }>();
+    for (const bucket of interactionByIndex.values()) {
+      for (const item of bucket) {
+        if (item.kind === "ask_questions" && item.source === "cursor" && item.toolCallId) {
+          cursorAskByToolId.set(item.toolCallId, { delivery: item.delivery, followupCause: item.followupCause });
+        }
+      }
+    }
+    // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
+    // to and imperatively highlights (`logRef.current?.querySelector('[data-
+    // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
+    // is `i` from the loop below — the position of this event within
+    // `normalised` (and so within `events`/`displayedEvents`), which is
+    // exactly the id scheme `event-search.ts` uses. The wrapper carries the
+    // key so the memoized block components underneath keep their
+    // identity/props untouched. Only STATIC classes belong here — the
+    // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
+    // by a render-time class, so this memo doesn't need `activeMatchId` as a
+    // dep (re-deriving the whole block tree on every match navigation was
+    // the point being fixed). `extraClassName` is used only by sticky mode:
+    // the wrapper, as the direct flex child, is the element that must pin.
+    // Returns `null` (no wrapper at all) when `node` is nullish, so an event
+    // with nothing to render (e.g. an unparseable orphan tool_result — see
+    // the `tool_result` case below) doesn't still leave a phantom empty div
+    // consuming a `gap-4` slot in the section's flex column.
+    const wrap = (
+      key: string,
+      evid: number,
+      node: React.ReactNode,
+      extraClassName?: string,
+    ): React.ReactNode => {
+      if (node === null || node === undefined) return null;
+      return (
+        <div key={key} data-evid={evid} className={extraClassName}>
+          {node}
+        </div>
+      );
+    };
+    const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
+      switch (e.stream) {
+        case "user":
+          return [
+            wrap(
+              key,
+              evid,
+              <UserMessageBlock text={e.data} taskId={taskId} pathRoots={pathRoots} />,
+              stickyUserMessages ? "sticky top-0 z-10" : undefined,
+            ),
+          ];
+        case "assistant": {
+          // A primitive (`"used" | "not-used" | null`), so `AssistantBlock`'s
+          // `memo` holds across renders.
+          const runUsage = handoffUsageByRun.get(e.runId);
+          const usage = runUsage ? (evid === runUsage.lastIndex ? runUsage.last : runUsage.other) : null;
+          return [wrap(key, evid, <AssistantBlock text={e.data} usage={usage} />)];
+        }
+        case "thinking":
+          return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
+        case "compaction_summary":
+          return [wrap(key, evid, <CompactionSummaryBlock text={e.data} />)];
+        case "tool_use": {
+          if (supersededToolUses.has(evid)) return [];
+          const parsed = safeParse<ParsedToolUse>(e.data);
+          if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
+          // A detected Cursor plan replaces the generic tool-call card
+          // entirely — this is the "finished after planning" moment the
+          // user needs to act on, so it gets the same prominence
+          // AskUserQuestion/ExitPlanMode get in `ToolUseBlock`, but as its
+          // own dedicated card + modal rather than an expand-to-read block.
+          const plan = planByToolCallId.get(parsed.id);
+          if (plan) {
+            return [wrap(key, evid, <PlanCard plan={plan} onOpen={() => onOpenPlan?.(plan.id)} />)];
+          }
+          const result = resultByToolId.get(parsed.id);
+          if (parseSentFilesToolUse(parsed.name, parsed.input)) {
+            return [wrap(key, evid, <SentFilesCard call={parsed} result={result} taskId={taskId} />)];
+          }
+          const cursorWait = parsed.name === "askQuestionToolCall" ? cursorAskByToolId.get(parsed.id) : undefined;
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} cursorWait={cursorWait} />)];
+        }
+        case "tool_result": {
+          const parsed = safeParse<ParsedToolResult>(e.data);
+          // Unparseable JSON — `ToolResultBlock` would render nothing for it
+          // anyway (its `!result` guard), so skip the wrapper entirely rather
+          // than emitting an empty `data-evid` div.
+          if (!parsed) return [];
+          if (parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
+          return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
+        }
+        case "status":
+          // Suppress claude's synthetic "[Image: source: <path>]" breadcrumb
+          // — it's a separate (isMeta) transcript entry for the attachment
+          // itself, not a status worth showing, and the image is now
+          // rendered as a proper thumbnail chip under the user bubble
+          // instead. Uses the lax matcher (not the strict `imageSourceMetaPath`)
+          // so historical rows persisted before this event type existed —
+          // truncated at the old 140-char status cap, possibly missing the
+          // trailing `]` or ending in an ellipsis — are filtered too, on
+          // replay as well as live.
+          if (isImageSourceMetaBreadcrumb(e.data)) return [];
+          // Suppress UI-internal status sentinels — `PERMISSION_MODE_STATUS_
+          // PREFIX` (used to feed a chip pinned below the transcript; that
+          // chip is gone, but the suppression is NOT dead code — claude
+          // emits one of these at every turn start and every mid-turn
+          // Shift+Tab, so dropping this guard would spam a divider into the
+          // scrollback for each one), `FX_USAGE_STATUS_PREFIX` (feeds the
+          // run-row usage chip — `RunsList`'s `UsageChip`, derived in the
+          // parent from the raw `events` state — not the transcript; fx's
+          // `usage_update` cadence is unspecified ("MAY"), so leaving this
+          // unsuppressed would spam a divider into the scrollback on every
+          // update), `FX_PROVIDER_STATUS_PREFIX` (same story, one per turn —
+          // feeds `RunsList`'s `ProviderChip` via `providerByRunId`), and
+          // `FX_SESSION_TITLE_STATUS_PREFIX` (same story again — feeds
+          // `RunsList`'s `SessionTitleChip` via `titleByRunId`, one per turn
+          // at most since the driver already dedupes repeats and the
+          // "Untitled session" placeholder). Single shared predicate so a
+          // new sentinel can't leak into one surface while another
+          // suppresses it.
+          if (isInternalStatusSentinel(e.data)) return [];
+          return [wrap(key, evid, <StatusDivider text={e.data} />)];
+        case "stderr":
+          return [wrap(key, evid, <ErrorBlock text={e.data} />)];
+        case "stdout":
+        case "interaction":
+        default:
+          if (e.stream === "interaction") return [];
+          return [wrap(key, evid, <RawText text={e.data} />)];
+      }
+    };
+    const renderInteraction = (it: PendingInteraction) => {
+      const onResolved = onInteractionResolved ?? (() => {});
+      switch (it.kind) {
+        case "ask_questions":
+          return (
+            <AskQuestionsCard
+              key={`int-${it.id}`}
+              req={it}
+              onResolved={onResolved}
+              onWithheld={onAskAnswerWithheld}
+            />
+          );
+        case "tmux_prompt":
+          return (
+            <TmuxPromptCard
+              key={`int-${it.id}`}
+              req={it}
+              onResolved={onResolved}
+              planMarkdown={it.id === latestPlanPromptId ? latestPlanMarkdown : null}
+            />
+          );
+        case "fx_permission":
+          return <FxPermissionCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+      }
+    };
+
+    if (stickyUserMessages) {
+      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
+      // Preamble events before the first user message share an initial
+      // headerless section. Each subsequent user message starts a new turn;
+      // its sticky lifetime naturally ends at that section's boundary.
+      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
+        key: "",
+        header: null,
+        body: [],
+      };
+      for (let i = 0; i < normalised.length; i++) {
+        const e = normalised[i]!;
+        const key = `${e.ts}-${i}`;
+        const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+        if (e.stream === "user") {
+          if (current.header !== null || current.body.length > 0) sections.push(current);
+          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+        } else {
+          if (current.key === "") current.key = key;
+          current.body.push(...before, ...renderEvent(e, key, i));
+        }
+      }
+      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
+      if (current.header !== null || current.body.length > 0) sections.push(current);
+      return sections.map((section, index) => (
+        <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
+          {section.header}
+          {section.body}
+        </section>
+      ));
+    }
+
+    const out: React.ReactNode[] = [];
+    for (let i = 0; i < normalised.length; i++) {
+      const e = normalised[i]!;
+      const key = `${e.ts}-${i}`;
+      const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+      if (e.stream === "user") {
+        // Order quirk preserved from the old section grouping: an
+        // interaction slotted AT a user message's index renders after the
+        // message (it used to land in the new section's body, below the
+        // section's header).
+        out.push(...renderEvent(e, key, i), ...before);
+      } else {
+        out.push(...before, ...renderEvent(e, key, i));
+      }
+    }
+    // Interactions that fired after the last event ("since the run
+    // finished") spill out at the bottom.
+    out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
+    return out;
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages, handoffUsageByRun]);
+
+  // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
+  // segments, the plan-approval preview) to this task's id + roots without
+  // threading props through each intermediate component. See
+  // `MdImageScopeContext`'s doc comment in `MdImage.tsx`. `allowLocal: true`
+  // — this is the user's own agent transcript, a trusted source, unlike
+  // `GitHubDialog`'s scope-less (`allowLocal: false`) default.
+  const mdImageScope = useMemo<MdImageScope>(
+    () => ({ taskId, roots: pathRoots ?? EMPTY_MD_IMAGE_SCOPE.roots, allowLocal: true }),
+    [taskId, pathRoots],
+  );
+
+  return (
+    <MdImageScopeContext.Provider value={mdImageScope}>
+      <div className="flex flex-col gap-4">
+        {blocks}
+        {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+        {holdSummary && <HoldingIndicator text={holdSummary} />}
+        {recoveryNotice && <RecoveryNotice text={recoveryNotice} />}
+        {pausedRecovery && <PausedRecoveryNotice {...pausedRecovery} />}
+      </div>
+    </MdImageScopeContext.Provider>
+  );
+}
+
+/**
+ * Pinned-at-bottom heartbeat shown while the agent is mid-turn. Hidden
+ * when an interaction card is up — the card is the right affordance for
+ * "waiting on you" and the spinner would compete with it. Follow-ups sent
+ * while the agent is working fold into the active run, so there's no separate
+ * "queued" state to surface — it's simply working or not.
+ */
+function RunningIndicator() {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+      <span className="relative inline-flex size-2">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/60 opacity-75" />
+        <span className="relative inline-flex size-2 rounded-full bg-success" />
+      </span>
+      <span>Agent is working…</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom explainer for the "held in running" state: the turn itself
+ * has resolved but the card stays in `running` because background work (a
+ * Monitor, a bg shell, a workflow, or a subagent) hasn't settled yet — see
+ * `holdSummary` above for the gating. Deliberately mutually exclusive with
+ * `RunningIndicator` (only one of the two is ever rendered) and visually
+ * quieter — a steady dot rather than `RunningIndicator`'s pulsing one, since
+ * nothing is happening on the Main stream right now; the activity is
+ * elsewhere, in the background tabs this line points at.
+ */
+function HoldingIndicator({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+      <span className="inline-flex size-2 shrink-0 rounded-full bg-info" />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom, in-place progress line for an fx model call that's
+ * mid-retry (`liveRecoveryNotice` in `RunPanelBody`, derived from the newest
+ * `fx-recovery:` sentinel on the currently-`running` run). Lives right below
+ * `RunningIndicator` — same reasoning as `HoldingIndicator`: this is "what's
+ * happening under the transcript right now", not conversation content, so it
+ * doesn't get a transcript row. It rewrites itself in place as new sentinels
+ * arrive (the caller's memo recomputes on `events`) rather than accumulating
+ * one row per retry attempt. The persisted "recovery paused …" / "✓
+ * recovered …" lines that explain the outcome AFTER the fact live in the
+ * transcript itself — written once by the driver at the terminal transition,
+ * never derived here — so this component only ever shows the transient
+ * in-progress state, never the aftermath. `title` carries the identical text
+ * (there's no separate "long form" to fall back to); the visible line itself
+ * is clamped to one row via `truncate` so a long fx message (which can run to
+ * a full sentence with an embedded Gateway URL) doesn't wrap and push the
+ * composer down — hovering it reveals the full line. The visible content
+ * goes through `renderLinkified` so an embedded `https://…` Gateway URL
+ * renders as a clickable link; `title` stays the plain `text` string (a
+ * link inside a native tooltip wouldn't be clickable anyway).
+ */
+function RecoveryNotice({ text }: { text: string }) {
+  return (
+    <div
+      data-testid="fx-recovery-notice"
+      title={text}
+      className="truncate rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning"
+    >
+      {renderLinkified(text)}
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom notice for a PAUSED fx recovery checkpoint (when fx
+ * pauses a response it keeps the turn resumable until something continues
+ * it) plus the Resume affordance — same bottom slot as
+ * `RecoveryNotice`, mutually exclusive with it (`pausedRecovery` in
+ * `RunPanelBody` only ever computes non-null once the run has settled
+ * `failed`, at which point no run is `running` any more so `recoveryNotice`
+ * is already `null`). Unlike `RecoveryNotice` this one is NOT purely
+ * ephemeral progress — it stays up until the user either resumes or sends a
+ * new message (which the driver's own `cleared` sentinel will reflect,
+ * collapsing this notice on the next render) — but it's still layered on top
+ * of, not a replacement for, the driver's own persisted paused summary
+ * line (`fxRecoverySummaryLine`) reused here as `text` — rendered through
+ * `renderLinkified` so an embedded Gateway URL is clickable, same as
+ * `RecoveryNotice`. Clicking Resume calls `RunPanelBody`'s
+ * `handleResumeFxRecovery`, which posts to `POST /tasks/:id/fx-resume` and
+ * continues the SAME paused model turn — no new user-authored message is
+ * sent.
+ *
+ * `autoResume`/`stopped`/`onCancelAuto`/`cancelBusy` are the
+ * `Task.fxRecovery`-derived auto-resume state layered on top of that same
+ * checkpoint (`docs/plans/fx-recovery-follow-ups.md` §3.5): when
+ * `autoResume` is set, a second line renders the live `useCountdown`
+ * countdown plus a Cancel button that calls `RunPanelBody`'s
+ * `handleCancelFxAutoResume` (`DELETE /tasks/:id/fx-auto-resume`); when
+ * instead `stopped` is set (no timer currently pending, and a reason is on
+ * record for why), a plain reason line explains it. Neither prop is
+ * required — a caller with no auto-resume schedule at all (e.g. before T2's
+ * engine has run) renders just the base notice + Resume button, identical
+ * to before this field existed.
+ */
+function PausedRecoveryNotice({
+  text,
+  busy,
+  onResume,
+  unsupportedHint,
+  autoResume,
+  stopped,
+  onCancelAuto,
+  cancelBusy,
+}: {
+  text: string;
+  busy: boolean;
+  /** Absent when the installed fx can't resume; `unsupportedHint` shows instead. */
+  onResume?: () => void;
+  unsupportedHint?: string;
+  autoResume?: TaskFxRecovery["autoResume"];
+  stopped?: TaskFxRecovery["autoResumeStopped"];
+  onCancelAuto?: () => void;
+  cancelBusy?: boolean;
+}) {
+  const countdown = useCountdown(autoResume?.at ?? null);
+  return (
+    <div
+      data-testid="fx-recovery-paused"
+      className="flex flex-col gap-1.5 rounded-md border border-danger/30 bg-danger/10 px-2 py-1.5 text-[11px] text-danger"
+    >
+      <div className="flex items-start gap-2">
+        <span className="min-w-0 flex-1">{renderLinkified(text)}</span>
+        {onResume && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            data-testid="fx-recovery-resume"
+            disabled={busy}
+            onClick={onResume}
+            className="h-6 shrink-0 px-2 text-[11px]"
+          >
+            Resume
+          </Button>
+        )}
+      </div>
+      {unsupportedHint && (
+        <span data-testid="fx-recovery-unsupported" className="text-danger/80">
+          {unsupportedHint}
+        </span>
+      )}
+      {autoResume && (
+        <div className="flex items-center gap-2">
+          <span data-testid="fx-recovery-countdown" className="min-w-0 flex-1">
+            {`Auto-resume in ${countdown} (${autoResume.attempt}/${autoResume.max})`}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            data-testid="fx-recovery-cancel-auto"
+            disabled={cancelBusy}
+            onClick={onCancelAuto}
+            className="h-6 shrink-0 px-2 text-[11px] text-danger hover:text-danger"
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+      {stopped && (
+        <span className="text-danger/80">
+          {stopped === "exhausted"
+            ? `Auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts.`
+            : stopped === "cancelled"
+              ? "Auto-resume cancelled."
+              : stopped === "failed"
+                ? "Auto-resume could not start — resume manually."
+                : "Auto-resume disabled in Settings."}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Map an old `stdout` event with one of the pre-refactor prefixes
+ * (`[tool: Name] {...}`, `[thinking] ...`, `[result] ...`) into the
+ * structured shape live events now use. Anything that doesn't match is
+ * returned unchanged. Pure; safe to memoise.
+ *
+ * The legacy mapper truncated tool input to 500 chars with a `…`
+ * ellipsis, so JSON.parse on those rows fails. We try `repairTruncatedJson`
+ * to recover whatever's parseable — at least the early fields like
+ * AskUserQuestion's first question + leading options come back as a real
+ * object so the per-tool renderer can show *something* useful.
+ */
+function normalizeLegacyEvent(e: RunEvent): RunEvent {
+  // Old user-message events were emitted as `status` with a "you: " prefix.
+  // Hoist them onto the dedicated "user" stream so they render as bubbles.
+  if (e.stream === "status" && e.data.startsWith("you: ")) {
+    return { ...e, stream: "user", data: e.data.slice("you: ".length) };
+  }
+  // Events tagged with a subagentId (background shells, Task subagents, …)
+  // postdate the structured-event refactor entirely — subagent tagging didn't
+  // exist when the legacy `[tool: X] `/`[thinking] `/`[result] ` stdout mapper
+  // was retired, so no legacy row can carry one. Raw background-shell stdout
+  // can legitimately *start* with one of those bracket prefixes (e.g. a test
+  // run emitting `[result] 3 tests failed`), which would otherwise get
+  // misparsed into a bogus structured tool-result card. Bail out before the
+  // prefix matching below.
+  if (e.subagentId) return e;
+  if (e.stream !== "stdout" || !e.data) return e;
+  const toolMatch = e.data.match(/^\[tool: ([^\]]+)\]\s*([\s\S]*)$/);
+  if (toolMatch) {
+    const rawInput = toolMatch[2] ?? "";
+    let input: unknown;
+    try {
+      input = JSON.parse(rawInput);
+    } catch {
+      const repaired = repairTruncatedJson(rawInput);
+      input = repaired ?? rawInput;
+    }
+    return {
+      ...e,
+      stream: "tool_use",
+      data: JSON.stringify({ id: "", name: toolMatch[1], input }),
+    };
+  }
+  const thinkingMatch = e.data.match(/^\[thinking\]\s*([\s\S]*)$/);
+  if (thinkingMatch) {
+    return { ...e, stream: "thinking", data: thinkingMatch[1]! };
+  }
+  const resultMatch = e.data.match(/^\[result\]\s*([\s\S]*)$/);
+  if (resultMatch) {
+    return {
+      ...e,
+      stream: "tool_result",
+      data: JSON.stringify({ toolUseId: "", content: resultMatch[1] }),
+    };
+  }
+  return e;
+}
+
+/**
+ * Best-effort repair for legacy 500-char-truncated tool-input JSON. Walks
+ * the string tracking quote and bracket/brace state, then closes whatever's
+ * still open. Returns the parsed object on success, or null if the repair
+ * doesn't yield valid JSON (some truncations are unrecoverable — e.g. cut
+ * inside a number literal or a `\u` escape).
+ *
+ * The intent is "salvage the early fields the user can act on" — perfect
+ * recovery is impossible since the tail bytes are gone.
+ */
+function repairTruncatedJson(input: string): unknown | null {
+  let clean = input.replace(/…\s*$/u, "").replace(/\s+$/u, "");
+  if (!clean) return null;
+  let inString = false;
+  let escape = false;
+  const stack: string[] = [];
+  for (const ch of clean) {
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") stack.push("}");
+    else if (ch === "[") stack.push("]");
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  // If we cut mid-escape (`\` is the last char before the cut), drop it —
+  // otherwise the closer-injection will produce an invalid `\<closer>`.
+  if (escape) clean = clean.slice(0, -1);
+  let repaired = clean;
+  if (inString) repaired += '"';
+  // Trailing commas would invalidate the repair — strip before closing.
+  repaired = repaired.replace(/,\s*$/u, "");
+  while (stack.length) repaired += stack.pop()!;
+  try { return JSON.parse(repaired); } catch { return null; }
+}
+
+// `title` is additive, fx-only (`src/bun/fx-acp.ts` carries fx's own
+// `tool_call.title` alongside `name` when it differs) — every other agent
+// kind's `tool_use` JSON simply lacks the key, and `ToolUseBlock` only
+// renders it when present.
+interface ParsedToolUse { id: string; name: string; input: unknown; serverSide?: boolean; title?: string }
+interface ParsedToolResult {
+  toolUseId: string;
+  content: unknown;
+  isError?: boolean;
+  attachments?: ToolResultAttachment[];
+  /** Present only on a row the archived-history retention pass trimmed — the
+   *  FIRST key of the persisted payload (`src/shared/tool-result-trim.ts`).
+   *  `content` is then the first 4 KB of the original; the muted
+   *  `tool-result-trimmed` line under the fold header says so. */
+  retention?: ToolResultRetention;
+}
+
+/**
+ * Drop the tool events the transcript never shows (D19): every
+ * `tool_use`/`tool_result` stamped `internal: true` (`isHiddenToolEvent`),
+ * plus any `tool_result` answering a hidden `tool_use` even when the result
+ * itself carries no stamp — otherwise it would render as an orphan result
+ * card for a call the user never sees. Persisted rows are untouched; this is
+ * display-only. Returns `events` itself when nothing is hidden, so the
+ * common case allocates nothing.
+ */
+function dropHiddenToolEvents(events: RunEvent[]): RunEvent[] {
+  let hiddenIds: Set<string> | null = null;
+  let anyHidden = false;
+  for (const e of events) {
+    if (!isHiddenToolEvent(e.stream, e.data)) continue;
+    anyHidden = true;
+    if (e.stream === "tool_use") {
+      const id = safeParse<{ id?: unknown }>(e.data)?.id;
+      if (typeof id === "string" && id) (hiddenIds ??= new Set()).add(id);
+    }
+  }
+  if (!anyHidden) return events;
+  return events.filter((e) => {
+    if (isHiddenToolEvent(e.stream, e.data)) return false;
+    if (e.stream !== "tool_result" || !hiddenIds) return true;
+    const toolUseId = safeParse<{ toolUseId?: unknown }>(e.data)?.toolUseId;
+    return !(typeof toolUseId === "string" && hiddenIds.has(toolUseId));
+  });
+}
+
+function safeParse<T>(s: string): T | null {
+  try { return JSON.parse(s) as T; } catch { return null; }
+}
+
+function findScrollParent(el: HTMLElement | null): HTMLElement | null {
+  let cur: HTMLElement | null = el?.parentElement ?? null;
+  while (cur) {
+    const oy = getComputedStyle(cur).overflowY;
+    if (oy === "auto" || oy === "scroll") return cur;
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+// ReactMarkdown `components` maps (ASSISTANT_MD_COMPONENTS / USER_MD_COMPONENTS)
+// live in ./md-components.tsx — hoisted there (not just to module scope here)
+// so `PlanDialog` can share the exact same link/code-block treatment without
+// importing back from this file (that used to be a circular import: PlanDialog
+// -> RunPanel -> PlanDialog). See md-components.tsx's doc comment.
+
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoots }: { text: string; taskId?: string; pathRoots?: readonly (string | null | undefined)[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const [needsToggle, setNeedsToggle] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  // Carries the pre-toggle measurements from the click handler into the
+  // useLayoutEffect below — used to compensate the scroll container by the
+  // bubble's height delta so content below the bubble stays at the same
+  // visual position after expand/collapse.
+  const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
+  const handoffCards = useHandoffView().enabled;
+
+  // Normalize once, up front, and feed every branch below from this single
+  // string instead of the raw wire `text`: CR→LF (tmux's paste-buffer
+  // artifact — see event-dedup.ts) then `normalizeDeliveredUserText`
+  // (shared/user-message.ts) — which strips agetor's former typed lead-in
+  // line (retired; only historical events carry it)
+  // and unwraps claude CLI's `<pasted_content id="…">…</pasted_content
+  // id="…">` wrapper around a bracketed-paste follow-up (see
+  // docs/plans/pasted-content-tags.md D1/D2). Without this, a pasted send's
+  // lead-in + wrapper tags would show up verbatim in the ordinary-message
+  // fallback branch (`ordinary` below), which — unlike `parsed` — used to
+  // read straight off `text`. `parseUserMessage` re-runs the same
+  // normalization internally (a no-op here since it's already applied — see
+  // `normalizeDeliveredUserText`'s identity-on-no-match contract), so
+  // handing it already-normalized text changes nothing about its own
+  // behavior; it just means every downstream consumer (segments, path
+  // folding, "Show more" measuring, copy/quote of the bubble) sees the same
+  // clean string.
+  const normalizedText = useMemo(
+    () => normalizeDeliveredUserText(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
+  // Agetor's own automatic handoff-format reminder (see
+  // HANDOFF_REMINDER_MARKER / composeHandoffReminder in shared/pipeline.ts)
+  // is a `user` event Agetor sent, not the user's own words — a `user`
+  // message whose first line is exactly the marker (any spelling in
+  // HANDOFF_REMINDER_MARKERS — older persisted reminders keep rendering).
+  // Display-only: strip
+  // that marker line before parsing/rendering (the badge below substitutes
+  // for it) and never touch the raw persisted event.
+  const isHandoffReminder = useMemo(() => {
+    const nl = normalizedText.indexOf("\n");
+    const firstLine = nl === -1 ? normalizedText : normalizedText.slice(0, nl);
+    return isHandoffReminderMarker(firstLine);
+  }, [normalizedText]);
+  const displayText = useMemo(() => {
+    if (!isHandoffReminder) return normalizedText;
+    const nl = normalizedText.indexOf("\n");
+    const rest = nl === -1 ? "" : normalizedText.slice(nl + 1);
+    return rest.replace(/^\n+/, "");
+  }, [normalizedText, isHandoffReminder]);
+
+  // Recognize slash-command invocations (XML expansion or plain echo),
+  // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
+  // "tagged" kind) any other message carrying balanced top-level tags — a
+  // background skill launch, a shell escape, or a user's own prompt tags —
+  // so all of these render as structured UI instead of literal `<tag>` text.
+  // `null` for an ordinary message — the fallback branch below renders
+  // exactly what this component always has. Fed `displayText` (the marker
+  // line already stripped for a handoff reminder) rather than
+  // `normalizedText` directly. A handoff reminder is forced to `null`
+  // (skipping `parseUserMessage` entirely) rather than run through it: its
+  // body legitimately contains an unbalanced `<handoff>`/`</handoff>` pair
+  // (the reminder text names the tag, and the repeated contract mentions its
+  // closing form) that would otherwise be mis-detected as a top-level tag
+  // spanning most of the message — it should always render as plain
+  // markdown, never segmented.
+  const parsed = useMemo(
+    () => (isHandoffReminder ? null : parseUserMessage(displayText)),
+    [isHandoffReminder, displayText],
+  );
+
+  // For an ordinary (non-command) message, split off a trailing "Referenced
+  // files/folders:" block the same way the command branch already does, so
+  // an image-attached (or file/folder-attached) send renders its paths as
+  // chips instead of a literal bullet list in the markdown body. When
+  // there's no trailing refs block, `splitReferences` returns `args`
+  // unchanged and an empty `references` array, so this is a no-op split for
+  // the common case.
+  const ordinary = useMemo(
+    () => splitReferences(displayText),
+    [displayText],
+  );
+
+  // Strip `[Image #N]` placeholders only when the message actually carries
+  // references — a user who literally types "[Image #1]" in a plain message
+  // with no attachments keeps their text verbatim. Computed for both the
+  // command-args and ordinary-message branches below (used for the
+  // truthiness check as well as the rendered body, so an args string that's
+  // non-empty only because of a placeholder doesn't render an empty
+  // markdown block).
+  const commandArgsText =
+    parsed?.kind === "command" && parsed.command.references.length > 0
+      ? stripImagePlaceholders(parsed.command.args)
+      : (parsed?.kind === "command" ? parsed.command.args : "");
+  const ordinaryArgsText =
+    ordinary.references.length > 0
+      ? stripImagePlaceholders(ordinary.args)
+      : ordinary.args;
+
+  // Display-only: fold expanded absolute paths under the task's own roots
+  // back to the `@rel` mention the user typed (send-time expansion produced
+  // them — see CLAUDE.md §12). Applied to the rendered markdown/segment body
+  // ONLY; the references arrays keep absolute paths for chips/previews.
+  // Shortening runs BEFORE segmentation below: it never touches tag markup
+  // (tags aren't paths) and it already skips code spans itself, so the
+  // segment parser sees the folded text and both features compose. A step
+  // prompt's untrusted-handoff spans are kept verbatim: a saved-handoff
+  // placeholder carries an absolute file path that the handoff card looks
+  // its record up by, and folding it to `@rel` would break that lookup.
+  const foldPaths = useCallback(
+    (s: string) =>
+      pathRoots?.length ? mapTextOutsideHandoffSpans(s, (t) => shortenTaskPaths(t, pathRoots)) : s,
+    [pathRoots],
+  );
+  const displayCommandArgs = useMemo(() => foldPaths(commandArgsText), [foldPaths, commandArgsText]);
+  const displayOrdinaryArgs = useMemo(() => foldPaths(ordinaryArgsText), [foldPaths, ordinaryArgsText]);
+
+  // A slash command's args are an intended user message too — segment them
+  // the same general way a `tagged` message's text is segmented below, so a
+  // command invoked with e.g. `<context>…</context>` in its args also gets
+  // structured rendering instead of literal tag text. Unused (and cheap:
+  // `commandArgsText` is `""`) when `parsed.kind !== "command"`.
+  const commandSegments = useMemo(
+    () => parseMessageSegments(displayCommandArgs),
+    [displayCommandArgs],
+  );
+
+  // For the `tagged` kind: strip `[Image #N]` placeholders when the message
+  // carries references (mirroring the command/ordinary branches above), fold
+  // paths, then segment. Always re-segments from the display text — the
+  // pre-parsed `parsed.segments` can't be reused once shortening may have
+  // rewritten path strings inside them. Unused (and cheap) when
+  // `parsed.kind !== "tagged"`.
+  const taggedSegments = useMemo((): MessageSegment[] => {
+    if (!parsed || parsed.kind !== "tagged") return [];
+    const text = parsed.references.length > 0 ? stripImagePlaceholders(parsed.text) : parsed.text;
+    return parseMessageSegments(foldPaths(text));
+  }, [parsed, foldPaths]);
+
+  // Default to the collapsed ~3-line cap and measure once mounted. The cap
+  // is always rendered so short messages don't flash full-height first;
+  // the toggle button only surfaces when scrollHeight exceeds clientHeight,
+  // i.e. content actually overflows the cap. When a command has no args (no
+  // `contentRef` div rendered at all), reset rather than early-return so a
+  // stale toggle can't survive a text change that removed the capped div.
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) {
+      setNeedsToggle(false);
+      return;
+    }
+    setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
+    // Keyed on the RENDERED strings, not `text`: the display-only path
+    // shortening derives from `pathRoots` too, which changes when a task's
+    // worktree materializes — measuring `text` alone left a stale
+    // "Show more" on bubbles whose folded content no longer overflows.
+    // `handoffCards` too: on a step's prompt bubble the formatted handoff
+    // cards replace the inlined JSON, so the overflow must be re-measured
+    // whenever that rendering switches on or off.
+  }, [displayCommandArgs, displayOrdinaryArgs, taggedSegments, handoffCards]);
+
+  // After expand/collapse commits, apply the saved scroll-top compensation.
+  useLayoutEffect(() => {
+    const pending = pendingAdjustRef.current;
+    if (!pending || !bubbleRef.current) return;
+    const delta = bubbleRef.current.offsetHeight - pending.prevHeight;
+    if (delta !== 0) pending.scroller.scrollTop += delta;
+    pendingAdjustRef.current = null;
+  }, [expanded]);
+
+  const onToggle = () => {
+    const bubble = bubbleRef.current;
+    if (bubble) {
+      const scroller = findScrollParent(bubble);
+      if (scroller) {
+        pendingAdjustRef.current = { scroller, prevHeight: bubble.offsetHeight };
+      }
+    }
+    setExpanded((v) => !v);
+  };
+
+  const collapseClassName = cn(
+    "agetor-md",
+    expanded ? "max-h-[40vh] overflow-y-auto" : "max-h-[4.8rem] overflow-hidden",
+  );
+
+  return (
+    <div className="flex justify-end">
+      <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card px-3 py-1.5 text-foreground shadow-sm">
+        {isHandoffReminder && <HandoffReminderBadge />}
+        {parsed?.kind === "command-output" ? (
+          <>
+            <MachineLabel>command output</MachineLabel>
+            <div ref={contentRef} className={collapseClassName}>
+              <CommandOutputBody output={parsed.output} />
+            </div>
+          </>
+        ) : parsed?.kind === "command" ? (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div className="mb-1">
+              <span className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
+                <SquareSlash className="size-3" />
+                {parsed.command.name}
+              </span>
+            </div>
+            {commandArgsText && (
+              <div ref={contentRef} className={collapseClassName}>
+                <MessageSegments segments={commandSegments} />
+              </div>
+            )}
+            <AttachmentChips references={parsed.command.references} taskId={taskId} />
+          </>
+        ) : parsed?.kind === "tagged" ? (
+          <>
+            {hasAuthoredContent(taggedSegments) && <MachineLabel>you</MachineLabel>}
+            <div ref={contentRef} className={collapseClassName}>
+              <MessageSegments segments={taggedSegments} />
+            </div>
+            <AttachmentChips references={parsed.references} taskId={taskId} />
+          </>
+        ) : (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div ref={contentRef} className={collapseClassName}>
+              {/* The UN-shortened text plus `pathRoots`: on a step's prompt
+                  bubble the untrusted-handoff spans are split out first (a
+                  placeholder's handoff-file path must stay absolute for its
+                  record lookup), then only the text parts are folded with
+                  `shortenTaskPaths`. Otherwise it renders exactly the
+                  `ReactMarkdown` of `displayOrdinaryArgs` it always did. */}
+              <UserHandoffMarkdown text={ordinaryArgsText} pathRoots={pathRoots} />
+            </div>
+            <AttachmentChips references={ordinary.references} taskId={taskId} />
+          </>
+        )}
+        {needsToggle && (
+          <button
+            type="button"
+            onClick={onToggle}
+            className="mt-1 text-[10px] font-medium uppercase tracking-wide text-primary/70 hover:text-primary"
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+});
+
+/**
+ * One assistant message. Delegates to `AssistantHandoffMessage`, which
+ * renders exactly the `agetor-md` markdown this block always did — unless
+ * the handoff view is enabled (a pipeline step's Main stream on a
+ * message-level harness) and the message carries a real `<handoff>` block,
+ * which then renders as a card between the prose before and after it
+ * (`docs/plans/formatted-handoff.md` D3, D15). `usage` is the block's D21
+ * usage, computed by `RunEventList` as a primitive so this `memo` holds.
+ */
+const AssistantBlock = memo(function AssistantBlock({
+  text,
+  usage = null,
+}: {
+  text: string;
+  usage?: "used" | "not-used" | null;
+}) {
+  return <AssistantHandoffMessage text={text} usage={usage} />;
+});
+
+const RawText = memo(function RawText({ text, muted }: { text: string; muted?: boolean }) {
+  return (
+    <div
+      className={cn(
+        "whitespace-pre-wrap font-mono text-[11px]",
+        muted ? "text-muted-foreground" : "text-foreground",
+      )}
+    >
+      {text}
+    </div>
+  );
+});
+
+const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
+  return (
+    <div className="whitespace-pre-wrap rounded-md border border-destructive/40 bg-destructive/5 p-2 font-mono text-[11px] text-destructive">
+      {text}
+    </div>
+  );
+});
+
+// `text` stays a plain `string` prop (not the `renderLinkified` output)
+// specifically so `memo`'s default shallow comparator actually catches a
+// same-text rerender: `renderLinkified` returns a freshly allocated array
+// whenever it finds a link, so passing its result as the prop would hand
+// this component a new-identity node on every parent render and defeat the
+// memo outright. Linkifying happens INSIDE the component instead, via
+// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
+// fx recovery/auto-resume line) still renders it as a clickable
+// `ExternalLink`, and a no-URL line still renders the identical text node
+// across rerenders.
+const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+  const content = useMemo(() => renderLinkified(text), [text]);
+  return (
+    <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+      <span className="h-px flex-1 bg-border" />
+      <span>{content}</span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
+  );
+});
+
+/** Tooltip for a continuation run's "auto" badge. The trigger (background
+ *  task, a turn typed in the attached terminal, Claude continuing on its own)
+ *  isn't stored on the run row — it's named by the run's opening status line
+ *  (`CONTINUATION_STATUS_TEXT`) — so the badge stays neutral. */
+const CONTINUATION_BADGE_TITLE = "a turn Agetor didn't send — its first status line says what started it";
+
+const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const expand = useCallback(() => setOpen(true), []);
+  useExpandOnJump(rootRef, expand);
+  const preview = text.length > 120 ? text.slice(0, 120) + "…" : text;
+  return (
+    <div ref={rootRef} className="rounded-md border border-border/40 bg-muted/30 px-2 py-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1 text-left text-[10px] uppercase tracking-wide text-muted-foreground hover:text-foreground"
+      >
+        <span>{open ? "▼" : "▶"}</span>
+        <span>thinking</span>
+      </button>
+      <div className="mt-1 whitespace-pre-wrap text-[11px] italic text-muted-foreground">
+        {open ? text : preview}
+      </div>
+    </div>
+  );
+});
+
+// `<Badge>` renders a `<div>`, invalid inside the `<button>` header below
+// (button only permits phrasing content) — these two spots use a plain
+// `<span>` styled via `badgeVariants` instead.
+const SECONDARY_BADGE_CLASS = badgeVariants({ variant: "secondary" });
+
+/** Tool-call card with input rendered per-tool, plus the matched result
+ *  collapsed underneath (expand to read full output). Special-cases:
+ *  AskUserQuestion + ExitPlanMode get prominent styling because the user
+ *  *needs to act on them* — claude is blocked waiting for an answer that
+ *  agetor's UI doesn't otherwise prompt for. */
+const ToolUseBlock = memo(function ToolUseBlock({
+  call,
+  result,
+  cursorWait,
+}: {
+  call: ParsedToolUse;
+  result?: ParsedToolResult;
+  /** Pending Cursor ask for this tool id, when the card is still open. */
+  cursorWait?: { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" };
+}) {
+  const summary = formatToolInputSummary(call.name, call.input);
+  const isInteractive = call.name === "AskUserQuestion" || call.name === "askQuestionToolCall" || call.name === "ExitPlanMode";
+  const cursorAsk = call.name === "askQuestionToolCall";
+  // No card means the question was answered, skipped, or cancelled. Keep
+  // the block collapsible, and do not say Cursor is still waiting.
+  const cursorFooter = cursorAsk && !result ? cursorAskToolFooter(cursorWait) : null;
+  const [open, setOpen] = useState(false);
+  const [resultOpenSignal, setResultOpenSignal] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const expand = useCallback(() => {
+    setOpen(true);
+    setResultOpenSignal((s) => s + 1);
+  }, []);
+  useExpandOnJump(rootRef, expand);
+  // `resultOpenSignal` only means anything for the ONE `ToolResultBody` mount
+  // that follows the jump that set it — since it's conditionally mounted
+  // (only while `expanded`), a stale signal ≥1 would force-open the result
+  // fold on every future expand of this same card (collapse → re-expand)
+  // even without a fresh jump. Clearing it back to 0 on collapse makes it
+  // one-shot per jump.
+  useEffect(() => {
+    if (!open) setResultOpenSignal(0);
+  }, [open]);
+  const forcedOpen = cursorAsk ? cursorFooter !== null : isInteractive && !result;
+  const expanded = open || forcedOpen;
+  // MCP convention: `mcp__<server>__<tool>`. The server name is always the
+  // first segment after the `mcp__` prefix; everything after the next `__`
+  // is the literal tool name (which itself may contain `__`). We rebuild
+  // the tool half via `slice(1).join("__")` so deep names survive.
+  const mcpParts = call.name.startsWith("mcp__") ? call.name.slice(5).split("__") : null;
+  const Icon = toolIcon(call.name);
+  return (
+    <div
+      ref={rootRef}
+      className={cn(
+        "rounded-md border bg-card",
+        isInteractive ? "border-primary/60 ring-1 ring-primary/40" : "border-border/60",
+      )}
+    >
+      <button
+        type="button"
+        disabled={forcedOpen}
+        onClick={() => {
+          if (window.getSelection()?.toString()) return;
+          setOpen((o) => !o);
+        }}
+        aria-expanded={expanded}
+        className={cn(
+          "flex w-full select-text items-center gap-2 px-2 py-1.5 text-left text-[11px] hover:bg-muted/30",
+          expanded && "border-b border-border/40",
+        )}
+      >
+        {!forcedOpen && (
+          <span className="shrink-0 text-muted-foreground" aria-hidden>{expanded ? "▼" : "▶"}</span>
+        )}
+        <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        {mcpParts && mcpParts.length >= 2 ? (
+          <span className="flex items-center gap-1 font-mono">
+            <span className={cn(SECONDARY_BADGE_CLASS, "px-1.5 py-0 text-[10px]")}>mcp · {mcpParts[0]}</span>
+            <span className="font-medium">{mcpParts.slice(1).join("__")}</span>
+          </span>
+        ) : (
+          <span className="font-mono font-medium">{call.name}</span>
+        )}
+        {call.title && (
+          <span className="ml-2 min-w-0 truncate text-muted-foreground" data-testid="tool-use-title">{call.title}</span>
+        )}
+        {call.serverSide && (
+          <span className={cn(SECONDARY_BADGE_CLASS, "px-1 py-0 text-[9px] uppercase")}>server</span>
+        )}
+        {summary && <span className="truncate text-muted-foreground">· {summary}</span>}
+        {!expanded && result?.isError && <span className="shrink-0 text-destructive">· error</span>}
+      </button>
+      {expanded && (
+        <>
+          <ToolInputBody name={call.name} input={call.input} />
+          {result && <ToolResultBody result={result} openSignal={resultOpenSignal} />}
+        </>
+      )}
+      {forcedOpen && (
+        <div
+          className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground"
+          data-testid={cursorAsk ? "cursor-ask-waiting" : undefined}
+        >
+          {call.name === "AskUserQuestion"
+            ? "Claude is asking — answer it in the card above (it has a custom-answer field for anything not listed)."
+            : cursorAsk
+              ? cursorFooter
+              : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
+        </div>
+      )}
+    </div>
+  );
+});
+
+// `PlanStatusBadge` lives in ./PlanDialog.tsx (imported above) — same
+// three-state vocabulary (`pending` / `approved` / `superseded`) shared by
+// `PlanCard` below and the PlanDialog header, defined once so both agree.
+
+/** Highlighted card standing in for the generic `ToolUseBlock` whenever a
+ *  `tool_use` event's id matches a detected Cursor plan — replaces the
+ *  collapsed "createPlanToolCall" tool call entirely rather than nesting
+ *  inside it, since the plan IS the notable event here, not incidental tool
+ *  output. Same `border-primary/60 ring-1 ring-primary/40` prominence
+ *  `ToolUseBlock` gives AskUserQuestion/ExitPlanMode while `pending` — a
+ *  resolved plan (approved/superseded) keeps the ring so the card stays
+ *  findable when scrolling back through history, but drops the "needs you"
+ *  urgency via the badge alone. */
+const PlanCard = memo(function PlanCard({ plan, onOpen }: { plan: TaskPlan; onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-md border bg-card px-2 py-1.5 text-left text-[11px] hover:bg-muted/30",
+        plan.status === "pending" ? "border-primary/60 ring-1 ring-primary/40" : "border-border/60",
+      )}
+    >
+      <ClipboardList className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+      <span className="min-w-0 flex-1 truncate font-medium">{plan.name ?? "Implementation plan"}</span>
+      <PlanStatusBadge status={plan.status} />
+      <span className="shrink-0 text-muted-foreground">View plan →</span>
+    </button>
+  );
+});
+
+const ToolResultBlock = memo(function ToolResultBlock({ result }: { result: ParsedToolResult | null }) {
+  if (!result) return null;
+  return (
+    <div className="rounded-md border border-border/40 bg-muted/20">
+      <div className="border-b border-border/30 px-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+        tool result (orphan)
+      </div>
+      <ToolResultBody result={result} />
+    </div>
+  );
+});
+
+// `ExternalLink` lives in ./md-components.tsx (imported above) — shared by
+// the markdown link renderer there and the two direct uses in this file.
+
+/** Tiny labeled-row helper for tool input bodies. Keeps the markup terse. */
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-2 text-[11px]">
+      <span className="w-16 shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 flex-1 break-words">{children}</span>
+    </div>
+  );
+}
+
+/**
+ * Long-content body with a per-card "Show more / Show less" toggle. Used
+ * for any tool field that can be arbitrarily long — plan bodies, file
+ * contents, edit diffs, subagent prompts, etc. Defaults to a ~12-line
+ * preview, expandable to full content. The `className` prop controls the
+ * code-block tint per use site (red for diff `-`, green for `+`, neutral).
+ */
+function ExpandableBlock({
+  text,
+  prefix,
+  className,
+  previewLimit = 600,
+}: {
+  text: string;
+  prefix?: string;
+  className?: string;
+  previewLimit?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const full = (prefix ?? "") + text;
+  const isLong = full.length > previewLimit;
+  return (
+    <div className="mt-1">
+      <pre
+        className={cn(
+          "overflow-auto whitespace-pre-wrap break-words rounded p-1.5 font-mono text-[10px]",
+          className ?? "bg-muted/40",
+          // Collapsed view caps at ~12 lines via max-height so a
+          // monstrous file content doesn't dominate the panel.
+          !open && "max-h-48",
+        )}
+      >
+        {open || !isLong ? full : full.slice(0, previewLimit) + "…"}
+      </pre>
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="mt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        >
+          {open ? "Show less" : `Show more (${full.length.toLocaleString()} chars)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ToolInputBody({ name, input }: { name: string; input: unknown }) {
+  // Per-tool pretty rendering. Anything not specifically handled falls
+  // through to a collapsed JSON block at the bottom.
+  if (name === "Bash" && isRecord(input) && typeof input.command === "string") {
+    return (
+      <div className="px-2 py-1.5">
+        <pre className="overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-1.5 font-mono text-[11px]">
+          <span className="select-none text-muted-foreground">$ </span>{input.command}
+        </pre>
+        {typeof input.description === "string" && input.description && (
+          <div className="pt-1 text-[10px] text-muted-foreground">{input.description}</div>
+        )}
+        {input.run_in_background === true && (
+          <Badge variant="secondary" className="mt-1 px-1.5 py-0 text-[9px] uppercase">background</Badge>
+        )}
+      </div>
+    );
+  }
+  if ((name === "Read" || name === "Glob" || name === "LS") && isRecord(input)) {
+    const target = (input.file_path ?? input.path ?? input.pattern) as string | undefined;
+    const offset = input.offset, limit = input.limit;
+    return target ? (
+      <div className="px-2 py-1.5 font-mono text-[11px]">
+        <span className="break-all">{target}</span>
+        {(typeof offset === "number" || typeof limit === "number") && (
+          <span className="ml-2 text-[10px] text-muted-foreground">
+            {typeof offset === "number" ? `from line ${offset}` : ""}
+            {typeof limit === "number" ? ` · ${limit} lines` : ""}
+          </span>
+        )}
+      </div>
+    ) : <RawJsonBody input={input} />;
+  }
+  if ((name === "Write" || name === "Edit" || name === "NotebookEdit") && isRecord(input) && typeof input.file_path === "string") {
+    return (
+      <div className="px-2 py-1.5">
+        <div className="mb-1 break-all font-mono text-[11px]">{input.file_path}</div>
+        {typeof input.old_string === "string" && (
+          <ExpandableBlock
+            text={input.old_string}
+            prefix="- "
+            className="bg-destructive/10 text-destructive"
+          />
+        )}
+        {typeof input.new_string === "string" && (
+          <ExpandableBlock
+            text={input.new_string}
+            prefix="+ "
+            className="bg-success/10 text-success"
+          />
+        )}
+        {typeof input.content === "string" && (
+          <ExpandableBlock text={input.content} />
+        )}
+        {input.replace_all === true && (
+          <Badge variant="secondary" className="mt-1 px-1.5 py-0 text-[9px] uppercase">replace all</Badge>
+        )}
+      </div>
+    );
+  }
+  if (name === "Grep" && isRecord(input)) {
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        <Field label="pattern">
+          <code className="rounded bg-muted/40 px-1 font-mono">{String(input.pattern ?? "")}</code>
+        </Field>
+        {typeof input.path === "string" && <Field label="in"><span className="font-mono">{input.path}</span></Field>}
+        {typeof input.glob === "string" && <Field label="glob"><span className="font-mono">{input.glob}</span></Field>}
+        {typeof input.type === "string" && <Field label="type"><span className="font-mono">{input.type}</span></Field>}
+        {typeof input.output_mode === "string" && <Field label="mode"><span className="font-mono">{input.output_mode}</span></Field>}
+      </div>
+    );
+  }
+  if ((name === "Agent" || name === "Task") && isRecord(input)) {
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        {typeof input.subagent_type === "string" && (
+          <Field label="subagent">
+            <Badge variant="secondary" className="px-1.5 py-0 font-mono text-[10px]">{input.subagent_type}</Badge>
+          </Field>
+        )}
+        {typeof input.description === "string" && (
+          <Field label="task"><span className="text-foreground">{input.description}</span></Field>
+        )}
+        {typeof input.prompt === "string" && (
+          <ExpandableBlock text={input.prompt} previewLimit={400} />
+        )}
+      </div>
+    );
+  }
+  if (name === "TodoWrite" && isRecord(input) && Array.isArray(input.todos)) {
+    return (
+      <ul className="space-y-0.5 px-2 py-1.5 text-[11px]">
+        {(input.todos as Array<Record<string, unknown>>).map((t, i) => (
+          <li key={i} className="flex items-start gap-2">
+            <span className="shrink-0 text-muted-foreground">
+              {t.status === "completed" ? "✓" : t.status === "in_progress" ? "→" : "○"}
+            </span>
+            <span className={cn(t.status === "completed" && "line-through text-muted-foreground")}>
+              {String(t.content ?? "")}
+            </span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  if (name === "askQuestionToolCall") {
+    const ask = cursorAskFromToolUse({ name, input });
+    if (ask) {
+      return (
+        <div className="px-2 py-1.5 text-[11px]" data-testid="cursor-ask-tool-body">
+          {ask.title ? <div className="mb-1 font-medium">{ask.title}</div> : null}
+          {ask.questions.map((q, i) => (
+            <div key={q.id || i} className={cn(i > 0 && "mt-2 border-t border-border/30 pt-2")}>
+              <div className="font-medium">{q.text}</div>
+              <ul className="mt-1 space-y-0.5">
+                {q.options.map((o, oi) => (
+                  <li key={`${o.id}:${oi}`} className="text-muted-foreground">
+                    · <span className="font-medium text-foreground">{cursorAskOptionChoiceLabel(o, q.options)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      );
+    }
+  }
+  if (name === "AskUserQuestion" && isRecord(input) && Array.isArray(input.questions)) {
+    return (
+      <div className="px-2 py-1.5 text-[11px]">
+        {(input.questions as Array<Record<string, unknown>>).map((q, i) => (
+          <div key={i} className={cn(i > 0 && "mt-2 border-t border-border/30 pt-2")}>
+            <div className="font-medium">{String(q.question ?? "")}</div>
+            {Array.isArray(q.options) && (
+              <ul className="mt-1 space-y-0.5">
+                {(q.options as Array<Record<string, unknown>>).map((o, j) => (
+                  <li key={j} className="text-muted-foreground">
+                    · <span className="font-medium text-foreground">{String(o.label ?? "")}</span>
+                    {typeof o.description === "string" && <> — {o.description}</>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (name === "ExitPlanMode" && isRecord(input) && typeof input.plan === "string") {
+    return (
+      <div className="px-2 py-1.5">
+        <ExpandableBlock text={input.plan} previewLimit={600} />
+      </div>
+    );
+  }
+  // Claude-code's deferred-tool discovery — surfaces the *next* tool claude
+  // wants to call. Useful breadcrumb for understanding why a particular tool
+  // suddenly appeared mid-session.
+  if (name === "ToolSearch" && isRecord(input)) {
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        <Field label="query">
+          <code className="rounded bg-muted/40 px-1 font-mono">{String(input.query ?? "")}</code>
+        </Field>
+        {typeof input.max_results === "number" && (
+          <Field label="max"><span className="font-mono">{input.max_results}</span></Field>
+        )}
+      </div>
+    );
+  }
+  if (name === "WebFetch" && isRecord(input)) {
+    // Whitelist http/https before rendering as a clickable anchor.
+    // Without this, a `javascript:`-scheme URL would execute in the
+    // webview's CSP context on click — narrow but real XSS vector since
+    // claude is steered by the user's prompt.
+    const rawUrl = typeof input.url === "string" ? input.url : null;
+    const safeUrl = rawUrl && /^https?:\/\//i.test(rawUrl) ? rawUrl : null;
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        {rawUrl && (
+          <Field label="url">
+            {safeUrl ? (
+              <ExternalLink className="font-mono" href={safeUrl}>{safeUrl}</ExternalLink>
+            ) : (
+              <span className="font-mono text-muted-foreground" title="non-http(s) URL — rendered as plain text for safety">{rawUrl}</span>
+            )}
+          </Field>
+        )}
+        {typeof input.prompt === "string" && (
+          <Field label="prompt"><ExpandableBlock text={input.prompt} previewLimit={240} /></Field>
+        )}
+      </div>
+    );
+  }
+  if (name === "WebSearch" && isRecord(input)) {
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        <Field label="query">
+          <code className="rounded bg-muted/40 px-1 font-mono">{String(input.query ?? "")}</code>
+        </Field>
+        {Array.isArray(input.allowed_domains) && input.allowed_domains.length > 0 && (
+          <Field label="allow">
+            <span className="flex flex-wrap gap-1">
+              {(input.allowed_domains as unknown[]).map((d, i) => (
+                <Badge key={i} variant="outline" className="px-1.5 py-0 font-mono text-[10px]">{String(d)}</Badge>
+              ))}
+            </span>
+          </Field>
+        )}
+        {Array.isArray(input.blocked_domains) && input.blocked_domains.length > 0 && (
+          <Field label="block">
+            <span className="flex flex-wrap gap-1">
+              {(input.blocked_domains as unknown[]).map((d, i) => (
+                <Badge key={i} variant="destructive" className="px-1.5 py-0 font-mono text-[10px]">{String(d)}</Badge>
+              ))}
+            </span>
+          </Field>
+        )}
+      </div>
+    );
+  }
+  if (name === "SlashCommand" && isRecord(input) && typeof input.command === "string") {
+    return (
+      <pre className="overflow-auto whitespace-pre-wrap rounded bg-muted/40 px-2 py-1.5 font-mono text-[11px]">
+        {input.command}
+      </pre>
+    );
+  }
+  if (name === "Skill" && isRecord(input)) {
+    return (
+      <div className="space-y-1 px-2 py-1.5">
+        {typeof input.skill === "string" && (
+          <Field label="skill">
+            <Badge variant="secondary" className="px-1.5 py-0 font-mono text-[10px]">{input.skill}</Badge>
+          </Field>
+        )}
+        {typeof input.args === "string" && input.args && (
+          <Field label="args"><span className="whitespace-pre-wrap">{truncateString(input.args, 240)}</span></Field>
+        )}
+      </div>
+    );
+  }
+  if ((name === "BashOutput" || name === "KillShell") && isRecord(input) && typeof input.shell_id === "string") {
+    return (
+      <div className="px-2 py-1.5 font-mono text-[11px]">shell {input.shell_id}</div>
+    );
+  }
+  return <RawJsonBody input={input} />;
+}
+
+function RawJsonBody({ input }: { input: unknown }) {
+  // Strings come through when legacy truncated tool-input JSON couldn't be
+  // repaired; render them raw rather than re-JSON-stringifying (which would
+  // wrap the whole thing in quotes and escape every inner `"` — exactly
+  // what the user saw).
+  const body = typeof input === "string"
+    ? input
+    : JSON.stringify(input, null, 2);
+  return (
+    <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words px-2 py-1.5 font-mono text-[10px] text-muted-foreground">
+      {body}
+    </pre>
+  );
+}
+
+function ToolResultBody({ result, openSignal = 0 }: { result: ParsedToolResult; openSignal?: number }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const expand = useCallback(() => setOpen(true), []);
+  useExpandOnJump(rootRef, expand);
+  // `openSignal` covers the mount-order gap the document-level listener above
+  // can't: when a jump expands a collapsed `ToolUseBlock`, this component
+  // doesn't exist yet to catch the bubbling `EXPAND_EVENT`, so `ToolUseBlock`
+  // also bumps this counter (in its own jump-expand callback) and hands it
+  // down as a prop — safe for the memo'd tree since it originates from
+  // `ToolUseBlock`'s own local state, not from the `blocks` memo. A mount
+  // with `openSignal > 0` opens the fold immediately; incrementing (rather
+  // than a boolean) means a repeat jump to the same block re-opens it even
+  // if the user had since collapsed it manually.
+  useEffect(() => {
+    if (openSignal) setOpen(true);
+  }, [openSignal]);
+  const text = stringifyResult(result.content);
+  const isLong = text.length > 280;
+  const preview = isLong ? text.slice(0, 280) + "…" : text;
+  return (
+    <div ref={rootRef} className={cn("border-t border-border/40", result.isError && "bg-destructive/10")}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1 px-2 py-1 text-left text-[10px] uppercase tracking-wide text-muted-foreground hover:text-foreground"
+      >
+        <span>{open ? "▼" : "▶"}</span>
+        <span>{result.isError ? "error result" : "result"}</span>
+      </button>
+      {result.retention?.trimmed === true && (
+        <div className="px-2 pb-1 text-[10px] text-muted-foreground" data-testid="tool-result-trimmed">
+          {retentionTrimNote(result.retention)}
+        </div>
+      )}
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap px-2 pb-1.5 font-mono text-[11px]">
+        {open || !isLong ? text : preview}
+      </pre>
+    </div>
+  );
+}
+
+function stringifyResult(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    // claude returns content as an array of blocks ({type:"text",text:"…"})
+    // for tools that return rich output (eg the Agent tool's report).
+    return content
+      .map((b) => (isRecord(b) && typeof b.text === "string" ? b.text : JSON.stringify(b)))
+      .join("\n");
+  }
+  return content === undefined ? "" : JSON.stringify(content, null, 2);
+}
+
+function truncateString(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Lucide icon for a tool name. Picks something semantically close —
+ * Bash → Terminal, Read → FileText, Write → FilePlus, … — and falls
+ * back to a generic Wrench for tools we don't have a specific icon for
+ * yet. Used by ToolUseBlock's header.
+ */
+function toolIcon(name: string): ComponentType<{ className?: string; "aria-hidden"?: boolean }> {
+  switch (name) {
+    case "Bash":
+    case "BashOutput":
+    case "KillShell":
+      return Terminal;
+    case "Read":
+    case "NotebookRead":
+      return FileText;
+    case "Write":
+      return FilePlus;
+    case "Edit":
+    case "NotebookEdit":
+      return FilePenLine;
+    case "LS":
+      return Folder;
+    case "Glob":
+    case "Grep":
+    case "ToolSearch":
+      return Search;
+    case "Agent":
+    case "Task":
+      return Bot;
+    case "TodoWrite":
+      return ListTodo;
+    case "AskUserQuestion":
+      return HelpCircle;
+    case "ExitPlanMode":
+    case "createPlanToolCall":
+    case "copilot_plan":
+      return ClipboardList;
+    case "WebFetch":
+    case "WebSearch":
+      return Globe;
+    case "SlashCommand":
+      return Slash;
+    case "Skill":
+      return Sparkles;
+    case "SendUserFile":
+      return Paperclip;
+    default:
+      // MCP tools get their own icon so the user can spot "this is a
+      // third-party server's tool" at a glance.
+      if (name.startsWith("mcp__")) return Plug;
+      return Wrench;
+  }
+}
+
+/** One-line summary of a tool call's input, shown next to the tool name in
+ *  the card header so a collapsed log is still scannable. */
+function formatToolInputSummary(name: string, input: unknown): string {
+  if (!isRecord(input)) return "";
+  if (name === "Bash" && typeof input.command === "string") return truncateString(input.command, 80);
+  if ((name === "Read" || name === "Glob" || name === "LS") && (typeof input.file_path === "string" || typeof input.path === "string" || typeof input.pattern === "string")) {
+    return String(input.file_path ?? input.path ?? input.pattern);
+  }
+  if ((name === "Write" || name === "Edit" || name === "NotebookEdit") && typeof input.file_path === "string") return input.file_path;
+  if (name === "Grep" && typeof input.pattern === "string") return String(input.pattern);
+  if ((name === "Agent" || name === "Task") && typeof input.description === "string") return input.description;
+  if (name === "AskUserQuestion" && Array.isArray(input.questions) && input.questions.length > 0) {
+    const q0 = input.questions[0] as Record<string, unknown>;
+    return typeof q0?.question === "string" ? truncateString(q0.question, 80) : `${input.questions.length} question(s)`;
+  }
+  if (name === "ExitPlanMode" || name === "createPlanToolCall" || name === "copilot_plan") return "plan ready for approval";
+  if (name === "TodoWrite" && Array.isArray(input.todos)) {
+    const todos = input.todos as Array<Record<string, unknown>>;
+    const done = todos.filter((t) => t.status === "completed").length;
+    return `${done}/${todos.length} done`;
+  }
+  if (name === "ToolSearch" && typeof input.query === "string") return truncateString(input.query, 80);
+  if (name === "WebFetch" && typeof input.url === "string") return truncateString(input.url, 80);
+  if (name === "WebSearch" && typeof input.query === "string") return truncateString(input.query, 80);
+  if (name === "SlashCommand" && typeof input.command === "string") return truncateString(input.command, 80);
+  if (name === "Skill" && typeof input.skill === "string") return String(input.skill);
+  if ((name === "BashOutput" || name === "KillShell") && typeof input.shell_id === "string") return String(input.shell_id);
+  // SentFilesCard renders the real card whenever `parseSentFilesToolUse`
+  // accepts the input; this only backstops the orphan/unknown-shape case
+  // where the card declines (see the tool_use case in RunEventList).
+  if (name === "SendUserFile" && Array.isArray(input.files)) return `${input.files.length} file(s)`;
+  // MCP tools: the header already shows `mcp · server / tool` via a Badge
+  // pair, so we leave the summary empty to avoid double-labeling.
+  return "";
+}
+
+/**
+ * Compact summary of the task's saved configuration. Behavioural fields
+ * (agent / mode / model / effort) become inline selects whenever the task is
+ * idle — running / blocked tasks render the same values as plain text with a
+ * "stop the run to edit" hint, mirroring how the workdir lock works in the
+ * EditTaskDialog. Project / isolation / branch / base are always read-only
+ * here — those touch worktree setup that isn't safe to mutate on the fly.
+ */
+function TaskDetails({
+  task,
+  agents,
+  harnesses,
+  agentProfileDisplay,
+  agentProfileForCard,
+  onOpenSettingsAgents,
+  agentModels,
+  harnessModels,
+  onRefreshModels,
+  homeDir,
+  onTaskFieldsChanged,
+  liveBranch,
+  tmuxSession,
+  hasRun,
+}: {
+  task: Task;
+  agents: AgentStatus[];
+  harnesses: Harness[];
+  /** Resolved agent-profile chip data for this task (`null` when the task
+   *  was never bound to a profile) — see `RunPanelBody`'s own computation,
+   *  reused here so the lock/hint/Detach affordances below and the header
+   *  chip never disagree on the profile's name / deleted state. */
+  agentProfileDisplay: TaskProfileDisplay | null;
+  /** The richer live-or-snapshot object `AgentProfileCard` itself renders
+   *  from (model/effort/mode/instructions/skills) — same object the header
+   *  chip uses (`RunPanelBody`'s `agentProfileForCard`), reused here for the
+   *  Agent row's chip so the two never disagree. `null` alongside
+   *  `agentProfileDisplay` when the task was never bound to a profile. */
+  agentProfileForCard: AgentProfile | AgentProfileSnapshot | null;
+  /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
+  onOpenSettingsAgents: (profileId?: string) => void;
+  agentModels: AgentModelMap;
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  onRefreshModels: (harnessId?: string) => Promise<void>;
+  homeDir: string;
+  /** Optimistically merges partial task fields into the parent's `tasks`
+   *  state — used by Detach below so the unlock is visible immediately
+   *  instead of waiting for the next 2s poll. */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** Branch the worktree has checked out right now (the panel's 5 s
+   *  git-status poll), `null` when unknown/detached. When it differs from
+   *  `task.branch` the Branch row splits into "Checked out" + "Task branch". */
+  liveBranch: string | null;
+  /** Tmux session name from the latest run (claude-code only). `null` when
+   *  no run has spawned a session yet — the Tmux row hides itself in that
+   *  case rather than presenting an Attach button that's guaranteed to 404. */
+  tmuxSession: string | null;
+  /** Whether this task has ever run — see the call site's doc comment
+   *  (`RunPanelBody`) for how this is derived. Threaded through to
+   *  `AgentProfileDetailsDialog`'s status line only. */
+  hasRun: boolean;
+}) {
+  // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
+  // in flight for this task's harness — mirrors NewTaskForm's affordance.
+  const [refreshingModels, setRefreshingModels] = useState(false);
+  // A task bound to an agent profile (plan D5) locks the four dropdowns
+  // (+ speed, cursor max) regardless of run state — only Detach unlocks them.
+  // `runningLock` alone (the pre-existing rule) still gates the Detach
+  // button itself, so a bound task can't be detached mid-run.
+  const runningLock = task.column === "running" || task.column === "blocked";
+  const profileLock = task.agentProfileId != null;
+  const editable = !runningLock && !profileLock;
+  const [detaching, setDetaching] = useState(false);
+  // Agent-details modal (plan D2), opened by clicking the chip in the Agent
+  // row below. Closed defensively if the task becomes unbound while open —
+  // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
+  // a still-open dialog would otherwise render a suddenly-empty snapshot.
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  useEffect(() => {
+    if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
+  }, [profileDialogOpen, profileLock]);
+  const detachProfile = async () => {
+    setDetaching(true);
+    try {
+      const updated = await api.detachTaskAgentProfile(task.id);
+      // Merge the returned task's cleared `agentProfileId`/`agentProfile`
+      // back optimistically — don't wait for the parent's 2s task poll
+      // (`App.tsx`) to unlock the dropdowns. Only these two fields, never
+      // the whole snapshot (would revert a concurrent optimistic patch).
+      onTaskFieldsChanged?.(task.id, {
+        agentProfileId: updated.agentProfileId,
+        agentProfile: updated.agentProfile,
+      });
+    } catch (e) {
+      toast.error("Couldn't detach agent", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDetaching(false);
+    }
+  };
+  const kind = harnessKindOf(task.agent, harnesses);
+  // `harnessKindOf` falls back to claude-code while the harness list doesn't
+  // hold the task's harness yet (still loading, or a harness added since the
+  // last poll). The effort/speed/max-mode cascades below must not PATCH the
+  // task under that guessed kind — on a loaded run that cleared an fx task's
+  // stored speed tier the moment the panel opened.
+  const harnessKnown = harnesses.some((h) => h.id === task.agent);
+  const selectedStatus = agents.find((a) => a.harnessId === task.agent);
+
+  const save = async (patch: Partial<Task>) => {
+    try {
+      await api.updateTask(task.id, patch);
+    } catch {
+      // Swallow — the parent's poll picks the row back up on the next 2s tick
+      // and the dropdown reverts on its own. We could surface this through
+      // the global error toast, but for now keeping it quiet matches the
+      // optimistic-UI pattern the rest of the panel uses.
+    }
+  };
+
+  // Memoized so the merge (curated ∪ discovered, rule 1–7) only re-runs when
+  // one of its actual inputs changes, not on every streamed-event render.
+  // Declared before the effort memos below because they read from it —
+  // per rule 8/rule 7, effort discovery must go through the same
+  // logged-out-distrusting merge the Model picker uses, not the raw
+  // discovered list.
+  const modelOptions = useMemo(
+    () => mergedModels(
+      kind,
+      task.agent,
+      agentModels,
+      harnessModels,
+      task.model ?? DEFAULT_MODEL[kind],
+      selectedStatus?.loggedIn ?? null,
+    ),
+    [kind, task.agent, agentModels, harnessModels, task.model, selectedStatus?.loggedIn],
+  );
+
+  // Effort is per (agent, model) — e.g. xhigh isn't valid for Sonnet 4.6,
+  // and Haiku 4.5 doesn't accept the effort param at all. When the user picks
+  // a model that no longer supports the saved effort, drop it back to the
+  // kind's default effort (if supported) or null when the model is the
+  // Haiku-style "no effort" case. Same pattern as the new-task form.
+  //
+  // The CLI's own discovered per-model efforts (when reported) win over the
+  // curated table for what the picker OFFERS — see `supportedEfforts`'s
+  // third argument. But the cascade below deliberately checks the wider
+  // `retainableEfforts` union (discovered ∪ curated), not just what's
+  // offered right now: a discovery refresh that happens to omit an id (e.g.
+  // `none`, which Codex's own `model/list` never lists even though the API
+  // accepts it) must not silently PATCH away an effort the user already
+  // chose. Only an effort neither source supports triggers the fallback.
+  //
+  // Reads from `modelOptions` (the merged rows), not the raw
+  // `harnessModels`/`agentModels` maps — `mergeModelOptions` already applies
+  // rule 7 (a logged-out harness's discovered catalog is untrustworthy), and
+  // this is the single source that distrust must flow through.
+  const discoveredEffortsForTask = useMemo(
+    () => discoveredEffortsFor(modelOptions, task.model),
+    [modelOptions, task.model],
+  );
+  const supportedEffortsForModel = useMemo(
+    () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
+    [kind, task.model, discoveredEffortsForTask],
+  );
+  const allowedEfforts = useMemo(
+    () => new Set(supportedEffortsForModel.map((o) => o.id)),
+    [supportedEffortsForModel],
+  );
+  // `task.effort` rides along so OpenCode keeps a stored variant while its
+  // model's variants are still unknown (see `retainableEfforts`).
+  const retainable = useMemo(
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask, task.effort),
+    [kind, task.model, discoveredEffortsForTask, task.effort],
+  );
+  // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
+  // retained (kept valid by the cascade above) without being one the picker
+  // would otherwise offer — e.g. a discovery refresh that omits `none`.
+  // Built in `EFFORT_OPTIONS` order (highest→lowest) rather than appended
+  // last, so a retained `ultra` still sorts above `Low` instead of trailing
+  // the whole list; the "kept as you chose it" hint names the harness the
+  // task is actually running on instead of hardcoding "Codex".
+  const effortSelectOptions = useMemo(() => {
+    const harnessLabel = harnesses.find((h) => h.id === task.agent)?.label ?? kind;
+    const known = EFFORT_OPTIONS.some((o) => o.id === task.effort);
+    const options = EFFORT_OPTIONS
+      .filter((o) => allowedEfforts.has(o.id) || (o.id === task.effort && retainable.has(o.id)))
+      .map((o) => (
+        allowedEfforts.has(o.id)
+          ? o
+          : {
+              ...o,
+              unlisted: true,
+              hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+            }
+      ));
+    // `task.effort` may be an id with no `EFFORT_OPTIONS` row at all (an
+    // unknown/future effort id) — the filter above can't represent it, so
+    // fall back to a raw row labelled by the id itself.
+    if (task.effort && !known && retainable.has(task.effort)) {
+      return [
+        ...options,
+        {
+          id: task.effort,
+          label: task.effort,
+          hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+          unlisted: true,
+        },
+      ];
+    }
+    return options;
+  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
+  const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
+  const opencodeLock = opencodeServerLock(harnesses.find((h) => h.id === task.agent));
+  // Speed tiers for the task's model: cursor's come from the curated
+  // fast-variant table, fx's only from discovery (the merged row's
+  // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
+  const speedOptions = useMemo(() => {
+    const option = modelOptions.find((o) => o.id === (task.model ?? DEFAULT_MODEL[kind]));
+    return supportedSpeeds(kind, task.model, task.effort, option);
+  }, [kind, task.model, task.effort, modelOptions]);
+  useEffect(() => {
+    // A profile-bound task's effort is owned by the profile, not this
+    // cascade — mutating it here would PATCH a field the profile lock is
+    // supposed to keep the user's hands off (see the `profileLock`/`editable`
+    // rule above).
+    if (task.agentProfileId != null) return;
+    if (!harnessKnown) return;
+    if (task.effort && retainable.has(task.effort)) return;
+    if (supportedEffortsForModel.length === 0) {
+      if (task.effort !== null) void save({ effort: null });
+      return;
+    }
+    const fallback = allowedEfforts.has(DEFAULT_EFFORT[kind])
+      ? DEFAULT_EFFORT[kind]
+      : supportedEffortsForModel[0]!.id;
+    if (task.effort !== fallback) void save({ effort: fallback });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId, harnessKnown]);
+  useEffect(() => {
+    // Same profile-lock guard as the effort cascade above — `speed`/`maxMode`
+    // are also profile-owned fields once bound.
+    if (task.agentProfileId != null) return;
+    // fx is never cleared here: its tiers come from discovery alone, which
+    // may not be ready yet (or omit flags a moment), so a stored tier the
+    // model doesn't list stays and renders as the picker's "(not offered)"
+    // segment — the driver posts a breadcrumb and runs without it. Only a
+    // user model change resets it (`onModelChange`).
+    if (kind === "fx" || !harnessKnown) return;
+    if (task.speed !== "off" && !speedOptions.includes(task.speed)) void save({ speed: "off" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, speedOptions, task.speed, task.agentProfileId, harnessKnown]);
+  useEffect(() => {
+    if (task.agentProfileId != null) return;
+    if (!harnessKnown) return;
+    if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maxModeAvailable, task.maxMode, task.agentProfileId, harnessKnown]);
+
+  const onAgentChange = (nextId: string) => {
+    if (nextId === task.agent) return;
+    // Switching harness wipes the current mode / model / effort context —
+    // those ids belong to the old harness's kind option set. Reset to the
+    // new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and let
+    // the user re-pick if they want something specific. Sent as one PATCH
+    // so the server-side reconcile only fires once.
+    const nextKind = harnessKindOf(nextId, harnesses);
+    const nextMode = defaultModeFor(nextKind);
+    const nextModel = DEFAULT_MODEL[nextKind];
+    // Same merged-rows source `modelOptions` reads from (rule 7's
+    // logged-out distrust), but for the harness being switched TO rather
+    // than the task's current one.
+    const nextLoggedIn = agents.find((a) => a.harnessId === nextId)?.loggedIn ?? null;
+    const nextModelRows = mergedModels(nextKind, nextId, agentModels, harnessModels, nextModel, nextLoggedIn);
+    const nextEfforts = supportedEfforts(
+      nextKind,
+      nextModel,
+      discoveredEffortsFor(nextModelRows, nextModel),
+    );
+    const nextEffort = nextEfforts.length === 0
+      ? null
+      : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
+        ? DEFAULT_EFFORT[nextKind]
+        : nextEfforts[0]!.id;
+    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, speed: "off", maxMode: false });
+  };
+
+  const onModelChange = (model: string) => {
+    // fx speed reset rule (plan §3.1): drop a stored tier to `off` only on a
+    // user model change, and only when the new model's tiers are actually
+    // known — the model is in this harness's discovered catalog and that
+    // catalog is trusted (rule 7: not a logged-out harness) — and exclude
+    // it. Cursor's own clear runs in the effect above.
+    if (kind === "fx" && task.speed !== "off" && selectedStatus?.loggedIn !== false) {
+      const discovered = harnessModels[task.agent] ?? agentModels[kind] ?? [];
+      const option = modelOptions.find((o) => o.id === model);
+      if (discovered.some((m) => m.id === model) && !supportedSpeeds(kind, model, task.effort, option).includes(task.speed)) {
+        void save({ model, speed: "off" });
+        return;
+      }
+    }
+    void save({ model });
+  };
+
+  const modeOptions = supportedModes(kind, task.model);
+  // A stored `task.mode === null` resolves at spawn/display time via the
+  // single shared `defaultModeFor(kind)` (`AGENT_OPTIONS[kind].modes[0]?.id
+  // ?? "auto"`, `shared/types.ts`) — every driver's `buildCommand` now
+  // resolves a null mode the same way, so this dropdown's fallback and the
+  // actual spawn default can't drift apart. For every kind except fx this is
+  // `"auto"`, because `modes[0]` IS `"auto"`. fx is the one exception: 0.0.8
+  // reordered `AGENT_OPTIONS.fx.modes` to put `yolo` ("Full access") first —
+  // per the owner's explicit call in `docs/plans/fx-recovery-follow-ups.md`
+  // §3.6, a null-mode fx row now spawns (and this dropdown shows) "Full
+  // access", not "auto", superseding the earlier no-silent-escalation rule.
+  //
+  // `defaultModeFor(kind)` is a kind-wide default and doesn't know about
+  // per-model mode denials (`MODEL_MODE_DENY`) — `modeOptions` above already
+  // filtered those out. Every deny list is empty today, so this guard is
+  // latent, but the <Select> below must never be handed a value with no
+  // matching <option>, so fall back to the first still-offered mode (or, in
+  // the pathological all-denied case, a hardcoded safe default) rather than
+  // trusting the kind-wide default blindly.
+  const preferred = defaultModeFor(kind);
+  const nullModeFallback = modeOptions.some((m) => m.id === preferred)
+    ? preferred
+    : (modeOptions[0]?.id ?? "bypass");
+  // Hint-line name fallback (finding F1-1): prefer the resolved display's
+  // name, then the raw frozen snapshot's own name, and only fall back to
+  // "an unknown agent" copy when neither yields anything — never interpolate
+  // an empty quoted name into the sentence.
+  const agentProfileHintName = agentProfileDisplay?.name || task.agentProfile?.name || null;
+  // Action-cluster gate (finding F1-1): a task can be locked
+  // (`task.agentProfileId != null`) with no readable snapshot AND no
+  // matching live profile — malformed snapshot JSON, or a retired harness
+  // kind — in which case `agentProfileForCard` is null even though the row
+  // is very much bound to *something*. Gating on `profileLock` in addition
+  // to `agentProfileDisplay` (which is itself already non-null whenever
+  // `profileLock` is true — see `resolveTaskProfileDisplay`) keeps the
+  // Detach/Manage affordances reachable in that case instead of stranding
+  // the user behind a "None" row they can't escape.
+  const showAgentProfileActions = profileLock || agentProfileDisplay != null;
+
+  return (
+    <>
+      <details className="border-b border-border/60 px-3 py-2 text-xs">
+        <summary className="cursor-pointer text-muted-foreground">
+          <span className="text-[10px] uppercase tracking-wide">Task details</span>
+        </summary>
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
+            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+          </div>
+
+          {!editable && (
+            <p
+              className="text-[10px] italic text-muted-foreground"
+              data-testid={profileLock ? "task-agent-profile-hint" : undefined}
+            >
+              {profileLock
+                ? (agentProfileHintName
+                  ? `Bound to agent "${agentProfileHintName}" — detach to edit.`
+                  : "Bound to an unknown agent — detach to edit.")
+                : "Stop the run to change agent / mode / model / effort."}
+            </p>
+          )}
+
+          <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-muted-foreground">Agent</dt>
+            <dd className="min-w-0">
+              {showAgentProfileActions ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  {agentProfileForCard ? (
+                    <button
+                      type="button"
+                      data-testid="task-agent-profile-open"
+                      aria-haspopup="dialog"
+                      aria-expanded={profileDialogOpen}
+                      aria-label="View agent details"
+                      onClick={() => setProfileDialogOpen(true)}
+                      className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
+                    >
+                      <AgentProfileCard
+                        variant="chip"
+                        profile={agentProfileForCard}
+                        harnesses={harnesses}
+                        deleted={agentProfileDisplay?.deleted ?? true}
+                      />
+                    </button>
+                  ) : (
+                    <span data-testid="task-agent-profile-unknown" className="text-warning">
+                      Unknown agent
+                    </span>
+                  )}
+                  {/* A step task's profile is frozen — the parent pipeline
+                      snapshotted it at run start (D8/D9,
+                      docs/plans/pipelines.md), and there's no live task for
+                      the user to re-edit afterward, so Detach is hidden
+                      rather than offered and disabled. */}
+                  {!task.pipelineParentId && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 px-2 text-[10px]"
+                      data-testid="task-agent-profile-detach"
+                      disabled={runningLock || detaching}
+                      onClick={() => void detachProfile()}
+                    >
+                      Detach
+                    </Button>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="task-agent-profile-manage"
+                    onClick={() => onOpenSettingsAgents()}
+                    className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    Manage agents…
+                  </button>
+                </div>
+              ) : (
+                <span data-testid="task-agent-profile-none" className="text-muted-foreground">
+                  None
+                </span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Harness</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <AgentSelect
+                  value={task.agent}
+                  harnesses={harnesses}
+                  agents={agents}
+                  onChange={onAgentChange}
+                />
+              ) : (
+                <span className="inline-flex items-center gap-1">
+                  <AgentIcon kind={kind} className="size-3" /> {task.agent}
+                </span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Mode</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.mode ?? nullModeFallback}
+                  options={modeOptions}
+                  onChange={(mode) => void save({ mode })}
+                />
+              ) : (
+                <span>{task.mode ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="flex items-center gap-1 text-muted-foreground">
+              Model
+              {editable && (
+                <Tooltip label="Refresh model list">
+                  <button
+                    type="button"
+                    aria-label="Refresh model list"
+                    data-testid="refresh-models-details"
+                    disabled={refreshingModels}
+                    className={cn(
+                      "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                      refreshingModels && "animate-spin",
+                    )}
+                    onClick={async () => {
+                      setRefreshingModels(true);
+                      try {
+                        await onRefreshModels(task.agent);
+                      } catch {
+                        // The SSE / ready-retry paths also refetch.
+                      } finally {
+                        setRefreshingModels(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="size-3" />
+                  </button>
+                </Tooltip>
+              )}
+            </dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.model ?? DEFAULT_MODEL[kind]}
+                  options={modelOptions}
+                  onChange={onModelChange}
+                />
+              ) : (
+                <span>{task.model ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Effort</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.effort ?? ""}
+                  options={effortSelectOptions}
+                  onChange={(effort) => void save({ effort })}
+                  disabled={supportedEffortsForModel.length === 0}
+                  placeholder="n/a"
+                />
+              ) : (
+                <span>{task.effort ?? "—"}</span>
+              )}
+            </dd>
+
+            {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
+              <>
+                <dt className="text-muted-foreground">Max Mode</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.maxMode}
+                      onCheckedChange={(maxMode) => void save({ maxMode })}
+                      disabled={!maxModeAvailable}
+                      aria-label="Use Cursor Max Mode context"
+                    />
+                  ) : (
+                    <span>{task.maxMode ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            {(speedOptions.length > 1 || task.speed !== "off") && (
+              <>
+                <dt className="text-muted-foreground">Speed</dt>
+                <dd className="min-w-0">
+                  <SpeedPicker
+                    testId="task-speed"
+                    options={speedOptions}
+                    value={task.speed}
+                    onChange={(speed) => void save({ speed })}
+                    disabled={!editable}
+                  />
+                </dd>
+              </>
+            )}
+
+            {/* OpenCode server mode (D-4): shown on v2 or an unknown version
+                only (v1 has no shared service). Locked like the effort
+                select — by a running turn or a bound profile — and, for a
+                harness with its own home, forced to Standalone with the
+                picker's own note. The server reads it per turn, so a change
+                lands on the next one. */}
+            {showOpencodeServerPicker(kind, selectedStatus?.version) && (
+              <>
+                <dt className="text-muted-foreground">Server</dt>
+                <dd className="min-w-0">
+                  <OpencodeServerPicker
+                    testId="task-opencode-server"
+                    value={opencodeLock ? "standalone" : task.opencodeServer}
+                    onChange={(opencodeServer) => void save({ opencodeServer })}
+                    locked={opencodeLock}
+                    disabled={!editable}
+                  />
+                  <p className="mt-0.5 text-[10px] text-muted-foreground">Applies on the next turn.</p>
+                </dd>
+              </>
+            )}
+
+            <dt className="text-muted-foreground">Project</dt>
+            <dd className="min-w-0 truncate font-mono" title={task.workdir}>
+              {abbreviateHome(task.workdir, homeDir)}
+            </dd>
+
+            <dt className="text-muted-foreground">Isolation</dt>
+            <dd className="min-w-0">{task.isolation}</dd>
+
+            {task.branch && (() => {
+              const drift = driftOf(task.branch, liveBranch);
+              if (!drift.drifted) {
+                return (
+                  <>
+                    <dt className="text-muted-foreground">Branch</dt>
+                    <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
+                  </>
+                );
+              }
+              return (
+                <>
+                  <dt className="text-muted-foreground">Checked out</dt>
+                  <dd
+                    data-testid="task-details-checkout-branch"
+                    className={cn(
+                      "min-w-0 truncate font-mono",
+                      task.branchSource === "existing" ? "text-warning" : undefined,
+                    )}
+                    title={task.branchSource === "existing" ? "Commits here won't land on the pull request" : undefined}
+                  >
+                    {drift.live}
+                  </dd>
+                  <dt className="text-muted-foreground">Task branch</dt>
+                  <dd data-testid="task-details-task-branch" className="min-w-0 truncate font-mono">{task.branch}</dd>
+                </>
+              );
+            })()}
+            {task.baseRef && (
+              <>
+                <dt className="text-muted-foreground">Base</dt>
+                <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
+              </>
+            )}
+            {kind === "claude-code" && tmuxSession && (
+              <>
+                <dt className="text-muted-foreground">Tmux</dt>
+                <dd className="flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono" title={tmuxSession}>
+                    {tmuxSession}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 shrink-0 px-2 text-[11px]"
+                    onClick={() => {
+                      void api.openTmux(task.id).catch((err: unknown) => {
+                        const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
+                        toast.error(msg);
+                      });
+                    }}
+                    title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                  >
+                    <Terminal className="mr-1 size-3" /> Attach
+                  </Button>
+                </dd>
+              </>
+            )}
+            {task.references.length > 0 && (
+              <>
+                <dt className="text-muted-foreground self-start">Files</dt>
+                <dd className="min-w-0">
+                  <details open>
+                    <summary className="cursor-pointer text-muted-foreground">
+                      <span className="font-mono">({task.references.length})</span>{" "}
+                      files / folders
+                    </summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {task.references.map((r) => {
+                        const Icon = iconForRef(r);
+                        return (
+                          <li
+                            key={r.path}
+                            title={r.path}
+                            className="flex items-center gap-1"
+                          >
+                            <Icon className="size-3 shrink-0 opacity-70" />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void api
+                                  .openPath({ path: r.path, taskId: task.id })
+                                  .catch(() => {})
+                              }
+                              className="truncate font-mono text-left hover:underline"
+                            >
+                              {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </details>
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+      </details>
+      <AgentProfileDetailsDialog
+        open={profileDialogOpen}
+        onClose={() => setProfileDialogOpen(false)}
+        task={task}
+        display={agentProfileDisplay}
+        deleted={agentProfileDisplay?.deleted ?? false}
+        hasRun={hasRun}
+        harnesses={harnesses}
+        onOpenSettingsAgents={onOpenSettingsAgents}
+      />
+    </>
+  );
+}
+
+/** Merge curated AGENT_OPTIONS models with this harness's CLI-discovered
+ *  catalog via the shared `mergeModelOptions` helper (same rules NewTaskForm
+ *  uses — plan `fx-model-catalog-refresh.md` §3 D3) so the inline editor
+ *  surfaces every model the user can pick. Prefers the per-harness catalog
+ *  (keyed by `harnessId`, e.g. `task.agent`) over the kind-level map, which
+ *  only exists as a fallback for an older daemon predating
+ *  `GET /agent-models/harnesses`. */
+function mergedModels(
+  kind: AgentKind,
+  harnessId: string,
+  agentModels: AgentModelMap,
+  harnessModels: Record<string, { id: string; label?: string }[]>,
+  selected: string | null,
+  loggedIn: boolean | null,
+) {
+  const discovered = (harnessModels[harnessId] ?? agentModels[kind] ?? [])
+    .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
+  return mergeModelOptions({
+    curated: AGENT_OPTIONS[kind].models,
+    discovered,
+    selected,
+    scoped: CATALOG_SCOPED_KINDS.has(kind),
+    loggedIn,
+  });
+}
+
+function CompactSelect({
+  value,
+  options,
+  onChange,
+  disabled,
+  placeholder,
+}: {
+  value: string;
+  // `hint`/`unlisted` are optional so plain `{id,label}` rows (every other
+  // call site — Mode, Effort) keep compiling unchanged; only the Model row's
+  // `mergedModels()` result actually populates them. Mirrors NewTaskForm's
+  // `<option title={m.unlisted ? m.hint : undefined}>` so a stale
+  // `task.model` no longer in this account's catalog still surfaces its
+  // "not in this account's model catalog" explanation on hover here too.
+  options: readonly { id: string; label: string; hint?: string; unlisted?: boolean }[];
+  onChange: (next: string) => void;
+  disabled?: boolean;
+  placeholder?: string;
+}) {
+  return (
+    <Select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-6 text-[11px]"
+      disabled={disabled}
+    >
+      {options.length === 0 && placeholder ? (
+        <option value="">{placeholder}</option>
+      ) : (
+        options.map((o) => (
+          <option key={o.id} value={o.id} title={o.unlisted ? o.hint : undefined}>{o.label}</option>
+        ))
+      )}
+    </Select>
+  );
+}
+
+function AgentSelect({
+  value,
+  harnesses,
+  agents,
+  onChange,
+}: {
+  /** Current harness id stored on the task. */
+  value: string;
+  harnesses: Harness[];
+  agents: AgentStatus[];
+  onChange: (next: string) => void;
+}) {
+  return (
+    <Select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-6 text-[11px]"
+    >
+      {harnesses.map((h) => {
+        const status = agents.find((a) => a.harnessId === h.id);
+        const available = status?.available ?? true;
+        const loggedOut = available && status?.loggedIn === false;
+        const suffix = !available ? " (unavailable)" : loggedOut ? " (not logged in)" : "";
+        return (
+          <option key={h.id} value={h.id}>
+            {h.label}{suffix}
+          </option>
+        );
+      })}
+    </Select>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Interaction cards: tool-call approvals + clarifying questions
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** One-line summary for the tool's primary input — Bash → command,
+ *  Edit/Write/Read → file_path, others → JSON-stringified, truncated. */
+function summarizeToolInput(toolName: string, input: unknown): string {
+  if (input && typeof input === "object") {
+    const o = input as Record<string, unknown>;
+    if (toolName === "Bash" && typeof o.command === "string") return o.command;
+    if (typeof o.file_path === "string") return o.file_path;
+    if (typeof o.path === "string") return o.path;
+  }
+  const s = typeof input === "string" ? input : JSON.stringify(input);
+  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+/**
+ * Card for claude's built-in AskUserQuestion (scraper-sourced from the tmux
+ * pane). One claude tool call can carry multiple sub-questions; we render
+ * each with its own radio/checkbox group + free-text "Custom answer"
+ * field. A single Send button at the bottom commits all of them.
+ *
+ * The wire format includes rich `options` with descriptions, and the answer
+ * round-trip goes through `/ask-questions/:id/answer` — the server plans the
+ * keystrokes from the user's picks and drives them into the native modal.
+ */
+function AskQuestionsCard({
+  req,
+  onResolved,
+  onWithheld,
+}: {
+  req: Extract<PendingInteraction, { kind: "ask_questions" }>;
+  onResolved: (id: string) => void;
+  /** Fires when the free-text answer path came back withheld-and-saved (see
+   *  `RunEventList`'s `onAskAnswerWithheld` doc). Undefined for the
+   *  drive-a-numbered-modal path, which can't withhold. */
+  onWithheld?: (reason: string) => void;
+}) {
+  // One entry per question. selected = picked option labels; custom = optional free-text.
+  const [answers, setAnswers] = useState<Array<{ selected: string[]; custom: string }>>(
+    () => req.questions.map(() => ({ selected: [], custom: "" })),
+  );
+  const [submitting, setSubmitting] = useState(false);
+  // Two-phase flow mirroring claude's native modal: answer every question,
+  // then a review screen ("✔ Submit" tab) before the final submit.
+  const [phase, setPhase] = useState<"answer" | "review">("answer");
+
+  const togglePick = (qi: number, label: string, multi: boolean) => {
+    setAnswers((cur) =>
+      cur.map((a, i) => {
+        if (i !== qi) return a;
+        if (multi) {
+          return a.selected.includes(label)
+            ? { ...a, selected: a.selected.filter((s) => s !== label) }
+            : { ...a, selected: [...a.selected, label] };
+        }
+        return { ...a, selected: [label] };
+      }),
+    );
+  };
+
+  const setCustom = (qi: number, value: string) =>
+    setAnswers((cur) => cur.map((a, i) => (i === qi ? { ...a, custom: value } : a)));
+
+  const cursor = req.source === "cursor";
+  /** Cursor cannot deliver typed text. A selected option is the answer;
+   *  leftover custom text must not hide that pick, replace it, or count
+   *  as an answer by itself. */
+  const cursorIgnoresCustom = cursor && CURSOR_ASK_FREEFORM === "unsupported";
+
+  // Every question needs a real answer before Review or submit. Claude
+  // accepts the custom field. Cursor with unsupported freeform does not
+  // accept typed text alone, or typed text added to a multi-select.
+  const canSubmit = cursor
+    ? cursorAskCanAdvance(req.questions, answers)
+    : answers.every((a) => a.selected.length > 0 || a.custom.trim().length > 0);
+
+  const submit = async () => {
+    if (!canSubmit || submitting) return;
+    setSubmitting(true);
+    try {
+      const res = await api.answerAskQuestions(req.id, {
+        answers: answers.map((a, qi) => {
+          const multi = req.questions[qi]?.multiSelect === true;
+          const custom = cursor
+            ? cursorAskWireCustom(multi, a.custom)
+            : (a.custom.trim() || undefined);
+          if (!cursor) return { selected: a.selected, custom };
+          const picks = cursorAskPicksFromValues(req.questions[qi]?.options ?? [], a.selected);
+          return { ...picks, custom };
+        }),
+      });
+      // The server resolves the card regardless of outcome (see its own
+      // doc), so keeping it up wouldn't let the user retry: on the drive
+      // path no Escape is sent, and a modal that is still open is simply
+      // re-collected by the pane scraper as a fresh card. A withheld-and-saved
+      // outcome (some OTHER blocking modal came up while delivering the
+      // follow-up turn) is purely informational — surface it exactly like the
+      // composer's own withheld branch (toast + backlog refresh); any other
+      // failed delivery gets its own toast so the vanished card isn't silent.
+      if (res.withheld && res.savedToBacklog) {
+        onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
+      } else if (!res.ok) {
+        // The server's own `reason` is the most specific explanation; the
+        // copy below is the fallback when it sent none. `delivery` says what
+        // was attempted: absent means NOTHING was (the card was already
+        // resolved), so that is neutral feedback, not an error — and no
+        // fresh card is coming. The fresh-card copy is reserved for a failed
+        // drive, which can leave the modal open for the scraper to
+        // re-collect.
+        const reason = res.reason?.trim();
+        if (res.delivery === undefined) {
+          toast(reason || "This question was already resolved");
+        } else {
+          const who = cursor ? "Cursor" : "Claude";
+          toast.error(
+            reason
+              || (res.delivery === "message"
+                ? `Answer didn't reach ${who} — answer it in the terminal or resend from the composer`
+                : `Answer didn't reach ${who} — a fresh card will appear; answer it there or in the terminal`),
+          );
+        }
+      }
+      onResolved(req.id);
+    } catch (e) {
+      // 409: another request (a double submit, the CLI, the TUI) holds the
+      // route's in-flight claim and is answering this card right now. Nothing
+      // was sent on our behalf, so this is neutral feedback, and the card
+      // goes away — the request that owns it resolves it on the server.
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      // Cursor rejects a custom-only answer while that input is unsupported.
+      // The card stays up so an option can still be picked.
+      if (e instanceof ApiError && e.status === 400 && req.source === "cursor") {
+        toast.error(e.message || "Cursor cannot accept a custom answer — pick an option");
+        return;
+      }
+      throw e;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const skip = async () => {
+    if (submitting || req.source !== "cursor") return;
+    setSubmitting(true);
+    try {
+      const res = await api.skipAskQuestions(req.id);
+      if (!res.ok) toast.error("Skip didn't reach Cursor");
+      onResolved(req.id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      if (e instanceof ApiError && e.status === 400) {
+        toast.error(e.message || "Could not skip");
+        return;
+      }
+      throw e;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const heading = phase === "review"
+    ? "Review your answers"
+    : cursor
+      ? cursorAskCardHeading(req.delivery, req.followupCause)
+      : "Claude is asking";
+
+  const displayPick = (qi: number, key: string): string => {
+    const options = req.questions[qi]?.options ?? [];
+    const opt = cursor
+      ? options.find((option) => option.id === key)
+      : options.find((option) => option.label === key);
+    if (!opt) return key;
+    return cursor ? cursorAskOptionChoiceLabel(opt, options) : opt.label;
+  };
+
+  /** One-line summary of the user's answer to question `qi` (picked labels +
+   *  any custom text), for the review screen. Mirrors the native "→ a, b".
+   *  A single-select question's custom text REPLACES the pick (the drive and
+   *  the follow-up message both send custom only); multi-select adds it.
+   *  Cursor with unsupported freeform is the exception: a selected option
+   *  stays visible, and custom text is shown only when it is the whole answer.
+   *  Cursor picks are option ids; the summary shows the label. */
+  const answerSummary = (qi: number): string => {
+    const a = answers[qi] ?? { selected: [], custom: "" };
+    const custom = a.custom.trim();
+    const keys = !req.questions[qi]?.multiSelect && custom && !cursorIgnoresCustom ? [] : [...a.selected];
+    const pieces = keys.map((key) => displayPick(qi, key));
+    if (custom && !(cursorIgnoresCustom && a.selected.length > 0)) pieces.push(custom);
+    return pieces.length ? pieces.join(", ") : "(no answer)";
+  };
+
+  return (
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40" data-testid="ask-questions-card">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary" data-testid="ask-questions-title">
+          <HelpCircle className="size-3.5" aria-hidden />
+          {heading}
+        </span>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {phase === "review"
+            ? "before submitting"
+            : req.questions.length === 1 ? "1 question" : `${req.questions.length} questions`}
+        </span>
+      </div>
+      {req.title ? (
+        <div className="mb-2 text-[13px] font-medium" data-testid="ask-questions-args-title">
+          {req.title}
+        </div>
+      ) : null}
+
+      {phase === "review" ? (
+        <>
+          <div className="space-y-2">
+            {req.questions.map((q, qi) => (
+              <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
+                <div className="whitespace-pre-wrap text-[12px] font-medium">{q.question}</div>
+                <div className="mt-0.5 text-[12px] text-primary">→ {answerSummary(qi)}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
+                ← Back
+              </Button>
+              {cursor && (
+                <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                  Skip
+                </Button>
+              )}
+            </div>
+            <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
+              {submitting ? "Submitting…" : "Submit answers"}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="space-y-3">
+            {req.questions.map((q, qi) => (
+              <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
+                <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
+                <div className="space-y-1">
+                  {q.options.map((opt, oi) => {
+                    const value = cursor ? cursorAskOptionValue(opt) : opt.label;
+                    const picked = answers[qi]?.selected.includes(value) ?? false;
+                    const shown = cursor ? cursorAskOptionChoiceLabel(opt, q.options) : opt.label;
+                    return (
+                      <label
+                        key={`${value}:${oi}`}
+                        className={cn(
+                          "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
+                          picked && "border-primary/40 bg-primary/10",
+                        )}
+                      >
+                        <input
+                          type={q.multiSelect ? "checkbox" : "radio"}
+                          name={`q-${req.id}-${qi}`}
+                          checked={picked}
+                          onChange={() => togglePick(qi, value, Boolean(q.multiSelect))}
+                          className="mt-0.5"
+                        />
+                        <span className="text-[12px]">
+                          <span className="font-medium">{shown}</span>
+                          {opt.description && (
+                            <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
+                          )}
+                          {opt.preview && (
+                            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[10px] leading-snug text-muted-foreground">{opt.preview}</pre>
+                          )}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <Textarea
+                  value={answers[qi]?.custom ?? ""}
+                  onChange={(e) => setCustom(qi, e.target.value)}
+                  placeholder={
+                    cursorIgnoresCustom
+                      ? "Custom answer — Cursor can't accept typed text; pick an option"
+                      : q.multiSelect
+                        ? "Custom answer — added to the selection"
+                        : "Custom answer — replaces the selection"
+                  }
+                  rows={2}
+                  className="mt-2 text-[12px]"
+                />
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center justify-between">
+            {cursor ? (
+              <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                Skip
+              </Button>
+            ) : <span />}
+            <Button onClick={() => setPhase("review")} disabled={!canSubmit || submitting} size="sm">
+              Review answers →
+            </Button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Card for a REPL modal the tmux pane scraper caught — typically a
+ * plan-mode safety dialog, `/login`, model picker, or any prompt the
+ * PreToolUse hook system never sees. Clicking a choice ships the
+ * literal key (e.g. `"1"`) back to the server, which `tmux send-keys`-es
+ * it into the pane so claude reads it as the user's keypress.
+ *
+ * The card's appearance is intentionally pane-like (monospace, dark
+ * background) so the user recognises that they're looking at what's
+ * actually on the tmux screen, not an agetor-synthesised question.
+ */
+// claude's TUI keyboard-shortcut footers and working-spinner status line —
+// meaningless when answering through agetor's buttons, and they bury the
+// actual prompt. Stripped from the scraped pane before display via
+// `cleanPromptPane` (see `@/lib/prompt-noise` for the pattern list and the
+// rationale for each). Display-only; the parsed choices are unaffected.
+
+function TmuxPromptCard({
+  req,
+  onResolved,
+  planMarkdown = null,
+}: {
+  req: Extract<PendingInteraction, { kind: "tmux_prompt" }>;
+  onResolved: (id: string) => void;
+  /** Full markdown for the plan this modal is asking about to proceed with
+   *  — `RunEventList`'s `latestPlanMarkdown` (task's latest pending claude
+   *  plan, or the latest `ExitPlanMode` tool_use as a fallback). `null` for
+   *  every non-plan `TmuxPromptCard` (the `isPlan` branch below is the only
+   *  consumer) and, defensively, for a plan modal with no resolvable content
+   *  (shouldn't happen in practice — `ExitPlanMode` always carries `input.
+   *  plan` — but the card degrades to today's buttons-only behaviour rather
+   *  than rendering an empty block). */
+  planMarkdown?: string | null;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Only used by the unparsable-fallback branch below, but declared here
+  // (unconditionally) to satisfy the rules of hooks — this component has
+  // early returns above where these would otherwise live.
+  const [openError, setOpenError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  const send = async (key: string) => {
+    if (submitting) return;
+    setSubmitting(key);
+    setError(null);
+    try {
+      // Only clear the card once the server has handled it. Resolving
+      // optimistically (the old behaviour) made a failed keystroke briefly
+      // hide the card, then the scraper re-detected the still-present modal
+      // and re-registered it — the "flicker that stays" the user saw.
+      //
+      // `{ ok: false }` (HTTP 200) means the prompt was already resolved
+      // server-side (scraper auto-cancel, double-click) — the card should
+      // just go away, not show an error. Genuine delivery failures come
+      // back as 410/500 and throw, landing in the catch below.
+      await api.answerTmuxPrompt(req.id, key === "__reject__" ? { reject: true } : { key });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send choice.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+  // ExitPlanMode's native approval modal is a numbered prompt the scraper
+  // catches like any other, but it deserves a first-class card (not the raw
+  // pane dump) — same polish as the AskUserQuestion card. Detect it by its
+  // signature and render labelled buttons plus the plan markdown itself
+  // (`planMarkdown`, below) — the plan's `tool_use` event renders as a
+  // `PlanCard` summary button now (see `RunEventList`'s `blocks` memo),
+  // not an inline expanded body, so this card is the only place the full
+  // text is shown at decision time.
+  const isPlan = CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
+  if (isPlan) {
+    const planLabel = (label: string): string => {
+      const l = label.toLowerCase();
+      if (/auto/.test(l)) return "Approve — auto-accept edits";
+      if (/manual/.test(l)) return "Approve — review each edit";
+      if (/tell claude/.test(l)) return "Tell Claude what to change";
+      if (/^no\b|refine|keep planning/.test(l)) return "Keep planning (don't proceed)";
+      return label;
+    };
+    return (
+      <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+        <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+          <ClipboardList className="size-3.5" aria-hidden /> Claude’s plan is ready
+        </div>
+        <p className="mb-3 text-[12px] text-muted-foreground">
+          Claude finished a plan{planMarkdown ? "" : " (shown above)"} and is ready to execute. How should it proceed?
+        </p>
+        {planMarkdown && (
+          <div className="agetor-md mb-3 max-h-64 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 text-foreground">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={ASSISTANT_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
+              {planMarkdown}
+            </ReactMarkdown>
+          </div>
+        )}
+        <div className="flex flex-col gap-1.5">
+          {req.choices
+            // Only the two "Yes, …" approvals are genuine one-click actions.
+            // Claude's own "No, refine with Ultraplan…" jumps to the web and
+            // "Tell Claude what to change" opens an inline TUI field a button
+            // can't fill — so we offer our own Reject (below) instead, which
+            // Esc's the modal and lets the user redirect via the message box.
+            .filter((c) => /^yes\b/i.test(c.label.trim()))
+            .map((c) => (
+              <Button
+                key={c.key}
+                onClick={() => void send(c.key)}
+                size="sm"
+                variant="secondary"
+                disabled={submitting !== null}
+                className="justify-start"
+              >
+                {submitting === c.key ? "Sending…" : planLabel(c.label)}
+              </Button>
+            ))}
+          <Button
+            onClick={() => void send("__reject__")}
+            size="sm"
+            variant="outline"
+            disabled={submitting !== null}
+            className="justify-start"
+          >
+            {submitting === "__reject__" ? "Dismissing…" : "Reject — don’t approve"}
+          </Button>
+        </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Rejecting dismisses the plan; then describe your changes in the message box below.
+        </p>
+        {error && <p className="mt-2 text-[11px] text-destructive">{error}</p>}
+      </div>
+    );
+  }
+
+  // Footer-gated / stuck-turn fallback: the scraper saw *something* claude
+  // is blocked on but couldn't parse it into choices. There's nothing to
+  // click — the only correct action is handing the user off to the real
+  // terminal, where the existing `__external__` sweep notices the prompt
+  // was answered and clears this card on its own.
+  if (req.unparsable === true) {
+    const openInTerminal = async () => {
+      if (opening) return;
+      setOpening(true);
+      setOpenError(null);
+      try {
+        await api.openTmux(req.taskId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Could not attach to tmux session";
+        setOpenError(msg);
+      } finally {
+        setOpening(false);
+      }
+    };
+    return (
+      <div className="rounded-md border border-warning/60 bg-card p-3 ring-1 ring-warning/40">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-warning">
+            <Terminal className="size-3.5" aria-hidden /> Claude is asking something Agetor can’t read
+          </span>
+        </div>
+        <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+          {cleanPromptPane(req.paneText)}
+        </pre>
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <Button
+            onClick={() => void openInTerminal()}
+            size="sm"
+            variant="secondary"
+            disabled={opening}
+          >
+            <Terminal className="mr-1 size-3.5" aria-hidden />
+            {opening ? "Opening…" : "Open in Terminal"}
+          </Button>
+        </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Answering the prompt in the terminal resolves this card automatically.
+        </p>
+        {openError && (
+          <p className="mt-2 text-right text-[11px] text-destructive">{openError}</p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-warning/60 bg-card p-3 ring-1 ring-warning/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-warning">
+          <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
+        </span>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        {cleanPromptPane(req.paneText)}
+      </pre>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {req.choices.map((c) => {
+          // Visual hint only: dim out the "negative" choice so it doesn't
+          // sit at equal weight with the primary one. Anchor the regex
+          // so labels like "Notify me" or "Nominate" don't accidentally
+          // get styled as a destructive action.
+          const isNegative = c.key.toLowerCase() === "n"
+            || /^(no|reject|cancel|deny|abort|quit)\b/i.test(c.label.trim());
+          return (
+            <Button
+              key={c.key}
+              onClick={() => void send(c.key)}
+              size="sm"
+              variant={isNegative ? "outline" : "secondary"}
+              disabled={submitting !== null}
+            >
+              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+            </Button>
+          );
+        })}
+      </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Card for fx's ACP `session/request_permission` — the ACP-native analog
+ * of `TmuxPromptCard` above, but a real in-process RPC awaiter rather than
+ * a scraped tmux pane: resolving the interaction (via `answerFxPermission`)
+ * directly unblocks fx's turn, so there's no keystroke leg and no
+ * "already resolved" scraper race to guard against beyond the ordinary
+ * network-failure retry.
+ *
+ * Shares `AskQuestionsCard`'s card shell (border-primary/ring-primary — a
+ * permission gate is closer in weight to a question than a paused-pane
+ * warning). Option buttons render fx's own `name`s verbatim: fx documents
+ * session-scoped approvals ("Allow for this session") beyond ACP's four
+ * canonical `PermissionOptionKind`s, so hardcoding a fixed label set would
+ * misrender those.
+ */
+// Sentinel `submitting` key for the unconditional Dismiss button — distinct
+// from any real `optionId` fx could offer, so the two paths' "Sending…"/
+// "Dismissing…" labels stay independently addressable.
+const FX_DISMISS_SUBMIT_KEY = "__fx_dismiss__";
+
+function FxPermissionCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "fx_permission" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // `{ ok: false }` (HTTP 200) means the request was already resolved
+  // server-side — a sibling `answer`/`cancel` call won the race — so the
+  // card should just go away, not show an error. Mirrors `TmuxPromptCard.
+  // send`'s rationale exactly: neither handler branches on the response
+  // body's `ok` value, since a non-throwing call means the server has
+  // already settled this interaction one way or another; only a genuine
+  // delivery failure (410/500, thrown by `api.*`) falls into the catch
+  // below and surfaces an error.
+  const choose = async (optionId: string) => {
+    if (submitting) return;
+    setSubmitting(optionId);
+    setError(null);
+    try {
+      await api.answerFxPermission(req.id, { optionId });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send the answer.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  // Unconditional deny path, independent of whatever options fx offered —
+  // answers the request `cancelled`.
+  const dismiss = async () => {
+    if (submitting) return;
+    setSubmitting(FX_DISMISS_SUBMIT_KEY);
+    setError(null);
+    try {
+      await api.answerFxPermission(req.id, { cancel: true });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to dismiss.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const title = req.toolCall.title || req.toolCall.kind || "tool call";
+
+  return (
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+          <ShieldAlert className="size-3.5" aria-hidden /> Fx is requesting permission
+        </span>
+        {/* The agetor mode (`auto`/`ask`) that caused this to surface as a
+         *  card — `yolo` auto-allows and never reaches here, so an auto-mode
+         *  user seeing this badge knows fx's own LLM review escalated the
+         *  call rather than agetor's mode gating it. */}
+        <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground">
+          {req.mode}
+        </Badge>
+      </div>
+      <div className="rounded-md border border-border/40 bg-muted/20 p-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-medium">
+          <span className="truncate">{title}</span>
+          {req.toolCall.kind && (
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground">
+              {req.toolCall.kind}
+            </Badge>
+          )}
+        </div>
+        {req.toolCall.rawInput !== undefined && (
+          <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[10px] leading-snug text-muted-foreground">
+            {typeof req.toolCall.rawInput === "string"
+              ? req.toolCall.rawInput
+              : JSON.stringify(req.toolCall.rawInput, null, 2)}
+          </pre>
+        )}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {/* Defensive only — the driver guards against fx sending a request
+         *  with zero options — but if it ever happens, Dismiss is the only
+         *  affordance the card offers. */}
+        {req.options.length === 0 && (
+          <p className="mr-auto text-[11px] text-muted-foreground">fx offered no options</p>
+        )}
+        {req.options.map((opt) => {
+          const isReject = opt.kind?.startsWith("reject") ?? false;
+          return (
+            <Button
+              key={opt.optionId}
+              onClick={() => void choose(opt.optionId)}
+              size="sm"
+              variant={isReject ? "outline" : "default"}
+              disabled={submitting !== null}
+            >
+              {submitting === opt.optionId ? "Sending…" : opt.name}
+            </Button>
+          );
+        })}
+        <Button
+          onClick={() => void dismiss()}
+          size="sm"
+          variant="outline"
+          disabled={submitting !== null}
+        >
+          {submitting === FX_DISMISS_SUBMIT_KEY ? "Dismissing…" : "Dismiss (reject)"}
+        </Button>
+      </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
+    </div>
+  );
+}

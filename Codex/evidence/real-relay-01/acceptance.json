@@ -1,0 +1,14 @@
+{
+  "execution": "real",
+  "faultInjected": true,
+  "initialTestExit": 1,
+  "finalTestExit": 0,
+  "stdout": "5 acceptance cases passed\n",
+  "stderr": "",
+  "developerSession": "01a19ad1-2021-7f92-9454-108378e8ace6",
+  "reviewerSession": "01a19ad1-36b6-7ab1-9d83-e3ae84bd1909",
+  "independentSessions": true,
+  "reviewerRanTests": true,
+  "testsExecutedBy": "coordinator-and-reviewer",
+  "repairUsedResume": true
+}

@@ -1,0 +1,3 @@
+tsc --noEmit: exit 0
+tsc --noEmit -p tsconfig.hub.json: exit 0
+git diff --check: exit 0

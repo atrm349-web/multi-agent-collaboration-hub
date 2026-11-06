@@ -1,0 +1,53 @@
+{
+  "downloadReproduction": {
+    "originalSha256": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+    "downloadSha256": "c3a4ad9c0f3106622e2e2075778e36d6a33b8bd1ef979fcd29aeacb6e6d28518",
+    "bytesPreserved": false
+  },
+  "checkedAt": "2026-11-03T01:01:38.612Z",
+  "hashes": {
+    "apps/web/public/index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "apps/web/public/app.js": "60612e4e148ff138ff9451263f22965c5daa1360a15bb78b21303ff5b6e9e2f1",
+    "apps/web/public/styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe",
+    "Antigravity/frontend-deliveries/F02/app.live-native.js": "57ae412748763aecc81b4ffabe99cd362a141c9d429e55056934b1d16ad09122",
+    "Antigravity/frontend-deliveries/F02/index.live-native.html": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523"
+  },
+  "manifestMatches": true,
+  "mismatches": [],
+  "bridgeSourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "60612e4e148ff138ff9451263f22965c5daa1360a15bb78b21303ff5b6e9e2f1",
+    "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+  },
+  "nativeAppMatches": true,
+  "nativeHtmlMatches": true,
+  "reproductions": {
+    "lostTransitiveDependency": {
+      "input": "A -> B(analysis) -> C",
+      "actual": [
+        {
+          "id": "A",
+          "stage": "implementation",
+          "code": "A",
+          "dependsOn": []
+        },
+        {
+          "id": "C",
+          "stage": "implementation",
+          "code": "C",
+          "dependsOn": []
+        }
+      ],
+      "expectedCDependsOn": [
+        "A"
+      ]
+    },
+    "rawJsonArtifactDataLoss": {
+      "input": {
+        "data": "payload",
+        "metadata": "must survive"
+      },
+      "actual": "payload"
+    }
+  }
+}

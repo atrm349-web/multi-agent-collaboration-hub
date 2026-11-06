@@ -1,0 +1,33 @@
+{
+  "task": "F-03",
+  "owner": "Antigravity",
+  "contractVersion": "0.2",
+  "updatedAt": "2026-11-02T12:03:06.368Z",
+  "alignedWithCodexDeliveries": [
+    "B-01",
+    "B-02",
+    "B03-1",
+    "B03-2"
+  ],
+  "verification": {
+    "httpContractSuitesPassed": 7,
+    "realChromeBrowserChecksPassed": 6,
+    "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "executionMode": "mock",
+    "liveExecutionAvailable": false
+  },
+  "files": {
+    "packages/shared/src/types.ts": "bbff12d05c1f88b6ddf3f6e249e36ba3e1bdbe625da0d88705e9cfd6f70bce65",
+    "packages/shared/src/types.v0.2.ts": "a6b0fc147ff22e7508abc79631b3d3f6c4d29bcbe7c49d1378b3a7ce21a6fd42",
+    "apps/web/server.mjs": "4f6d847c28bed1e0181b43dca19faa9d95633066f1b2c8dae59387da6ee8c066",
+    "apps/web/public/app.js": "11fd3df56b7996b76ebb3483056f6b2d1a7514395892f7220cc0cf47139eba99",
+    "apps/web/public/index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "apps/web/public/styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe",
+    "tests/verify-contract-v0.2.mjs": "1aa144e688607a6de9387fdb856dd093243ed3ad7ee5afe615e4d76e097c41ab",
+    "tests/verify-browser-v0.2.mjs": "3ae872e211df483e358c78fa99c9b0e34565959ec65bf6442f209cd0abc61a60",
+    "Antigravity/alignment-ack-v0.2.md": "a07eb3f9bd65f777ead5ea59cc5f080d7c495ee8734df0c5a810d5ae8e0c5e72",
+    "Antigravity/evidence/contract-v0.2-api.log": "4d4a2b416358aa0efa015e67dfa40d605fbb16f021d90490ad29c1c567486972",
+    "Antigravity/evidence/browser-v0.2-chrome.log": "648db10f6f831181ade6e1d22e1a1a85261e8b442cd566f6cf448e9180b415dd",
+    "Antigravity/evidence/browser-v0.2-verification.md": "37cba03ff68bf927f9875c0e9b97a7f66b8b5c662dad8b7b53776ed61afb8c69"
+  }
+}

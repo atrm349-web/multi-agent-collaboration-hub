@@ -1,0 +1,447 @@
+import { test, expect } from "bun:test";
+import {
+  canonicalInstructions,
+  formatAgentProfileListRow,
+  formatAgentProfileShow,
+  opencodeServerText,
+  parseAgentProfileFlags,
+  profileHarnessContext,
+  taskCountText,
+} from "./agent-profile.ts";
+import type { AgentProfile, Harness } from "../../shared/types.ts";
+
+/**
+ * `cmdAgentProfile` itself obtains its client via `getClient(flags)` (like
+ * `cmdAdd` does — see `add.test.ts`'s header comment) and reads real files
+ * for `--instructions-file`, so it isn't exercised here. This suite covers
+ * the pure, I/O-free flag parser `parseAgentProfileFlags` — the file read
+ * for `--instructions-file` happens later, in `resolveInstructions`, so this
+ * only asserts the parsed path (or `-` for stdin) comes through untouched.
+ */
+
+// ── individual flags ─────────────────────────────────────────────────────
+
+test("parseAgentProfileFlags: --name", () => {
+  const f = parseAgentProfileFlags(["--name", "My Agent"]);
+  expect(f.name).toBe("My Agent");
+});
+
+test("parseAgentProfileFlags: --harness", () => {
+  const f = parseAgentProfileFlags(["--harness", "codex"]);
+  expect(f.harness).toBe("codex");
+});
+
+test("parseAgentProfileFlags: --model", () => {
+  const f = parseAgentProfileFlags(["--model", "gpt-6-astra"]);
+  expect(f.model).toBe("gpt-6-astra");
+});
+
+test("parseAgentProfileFlags: --effort", () => {
+  const f = parseAgentProfileFlags(["--effort", "high"]);
+  expect(f.effort).toBe("high");
+});
+
+test("parseAgentProfileFlags: --mode", () => {
+  const f = parseAgentProfileFlags(["--mode", "ask"]);
+  expect(f.mode).toBe("ask");
+});
+
+test("parseAgentProfileFlags: --speed takes each tier", () => {
+  expect(parseAgentProfileFlags(["--speed", "off"]).speed).toBe("off");
+  expect(parseAgentProfileFlags(["--speed", "fast"]).speed).toBe("fast");
+  expect(parseAgentProfileFlags(["--speed", "ultrafast"]).speed).toBe("ultrafast");
+});
+
+test("parseAgentProfileFlags: an unknown --speed tier is a usage error naming the tiers", () => {
+  expect(() => parseAgentProfileFlags(["--speed", "warp"])).toThrow(
+    "'--speed' must be one of off, fast, ultrafast (got 'warp')",
+  );
+});
+
+test("parseAgentProfileFlags: --speed with no value is refused", () => {
+  expect(() => parseAgentProfileFlags(["--speed"])).toThrow("'--speed' needs a value");
+});
+
+test("parseAgentProfileFlags: --fast is --speed fast", () => {
+  const f = parseAgentProfileFlags(["--fast"]);
+  expect(f.speed).toBe("fast");
+});
+
+test("parseAgentProfileFlags: --no-fast is --speed off", () => {
+  const f = parseAgentProfileFlags(["--no-fast"]);
+  expect(f.speed).toBe("off");
+});
+
+test("parseAgentProfileFlags: --fast then --no-fast — last one wins", () => {
+  const f = parseAgentProfileFlags(["--fast", "--no-fast"]);
+  expect(f.speed).toBe("off");
+});
+
+test("parseAgentProfileFlags: --no-fast then --fast — last one wins", () => {
+  const f = parseAgentProfileFlags(["--no-fast", "--fast"]);
+  expect(f.speed).toBe("fast");
+});
+
+test("parseAgentProfileFlags: --speed and --fast/--no-fast mixed — the later flag wins", () => {
+  expect(parseAgentProfileFlags(["--speed", "ultrafast", "--fast"]).speed).toBe("fast");
+  expect(parseAgentProfileFlags(["--fast", "--speed", "ultrafast"]).speed).toBe("ultrafast");
+  expect(parseAgentProfileFlags(["--speed", "ultrafast", "--no-fast"]).speed).toBe("off");
+});
+
+test("parseAgentProfileFlags: --max-mode sets maxMode true", () => {
+  const f = parseAgentProfileFlags(["--max-mode"]);
+  expect(f.maxMode).toBe(true);
+});
+
+test("parseAgentProfileFlags: --no-max-mode sets maxMode false", () => {
+  const f = parseAgentProfileFlags(["--no-max-mode"]);
+  expect(f.maxMode).toBe(false);
+});
+
+test("parseAgentProfileFlags: no speed flag nor --max-mode/--no-max-mode leaves them undefined", () => {
+  const f = parseAgentProfileFlags([]);
+  expect(f.speed).toBeUndefined();
+  expect(f.maxMode).toBeUndefined();
+});
+
+test("parseAgentProfileFlags: --instructions sets instructions verbatim, does not touch instructionsFile", () => {
+  const f = parseAgentProfileFlags(["--instructions", "Always run tests first."]);
+  expect(f.instructions).toBe("Always run tests first.");
+  expect(f.instructionsFile).toBeUndefined();
+});
+
+test("parseAgentProfileFlags: --instructions-file <path> stores the path verbatim — no file read here", () => {
+  const f = parseAgentProfileFlags(["--instructions-file", "/tmp/does-not-exist-instructions.md"]);
+  expect(f.instructionsFile).toBe("/tmp/does-not-exist-instructions.md");
+  expect(f.instructions).toBeUndefined();
+});
+
+test("parseAgentProfileFlags: --instructions-file - (stdin marker) is accepted as a bare dash", () => {
+  const f = parseAgentProfileFlags(["--instructions-file", "-"]);
+  expect(f.instructionsFile).toBe("-");
+});
+
+test("parseAgentProfileFlags: --instructions-file requires allowDash — a following flag is not swallowed as its value", () => {
+  expect(() => parseAgentProfileFlags(["--instructions-file", "--name", "X"])).toThrow(
+    /needs a value/,
+  );
+});
+
+test("parseAgentProfileFlags: --skill is repeatable and preserves order (raw, unnormalized)", () => {
+  const f = parseAgentProfileFlags(["--skill", "code-review", "--skill", "/deploy", "--skill", "code-review"]);
+  // The parser itself does no dedup/normalization — that's `normalizeSkillList`
+  // in agent-profile.ts, which isn't exported, so raw tokens (including a
+  // literal duplicate and a leading "/") pass straight through here.
+  expect(f.skills).toEqual(["code-review", "/deploy", "code-review"]);
+});
+
+test("parseAgentProfileFlags: no --skill flags leaves skills as an empty array (not undefined)", () => {
+  const f = parseAgentProfileFlags([]);
+  expect(f.skills).toEqual([]);
+});
+
+test("parseAgentProfileFlags: --clear-skills sets clearSkills true", () => {
+  const f = parseAgentProfileFlags(["--clear-skills"]);
+  expect(f.clearSkills).toBe(true);
+});
+
+test("parseAgentProfileFlags: no --clear-skills leaves clearSkills undefined", () => {
+  const f = parseAgentProfileFlags([]);
+  expect(f.clearSkills).toBeUndefined();
+});
+
+// ── missing values / malformed flags ─────────────────────────────────────
+
+test("parseAgentProfileFlags: a value flag with nothing after it throws 'needs a value'", () => {
+  expect(() => parseAgentProfileFlags(["--name"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--harness"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--model"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--effort"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--mode"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--instructions"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--instructions-file"])).toThrow(/needs a value/);
+  expect(() => parseAgentProfileFlags(["--skill"])).toThrow(/needs a value/);
+});
+
+test("parseAgentProfileFlags: a value flag followed by another flag doesn't swallow it as the value", () => {
+  expect(() => parseAgentProfileFlags(["--name", "--harness"])).toThrow(/needs a value/);
+});
+
+// ── unknown flags: ignored, per house convention (parseAdd's `default: break`) ──
+
+test("parseAgentProfileFlags: an unrecognized flag is silently ignored, not thrown on", () => {
+  const f = parseAgentProfileFlags(["--bogus"]);
+  expect(f).toEqual({ skills: [] });
+});
+
+test("parseAgentProfileFlags: an unrecognized flag's would-be value is also ignored (not consumed as a value, not mistaken for a later flag's value)", () => {
+  const f = parseAgentProfileFlags(["--bogus", "something", "--name", "Real Name"]);
+  expect(f.name).toBe("Real Name");
+  expect(f).toEqual({ skills: [], name: "Real Name" });
+});
+
+// ── everything together ──────────────────────────────────────────────────
+
+test("parseAgentProfileFlags: every flag combined parses into one flags object", () => {
+  const f = parseAgentProfileFlags([
+    "--name",
+    "Reviewer",
+    "--harness",
+    "codex",
+    "--model",
+    "gpt-6-astra",
+    "--effort",
+    "high",
+    "--mode",
+    "auto",
+    "--fast",
+    "--max-mode",
+    "--instructions",
+    "Be thorough.",
+    "--skill",
+    "code-review",
+    "--skill",
+    "security-review",
+    "--clear-skills",
+  ]);
+  expect(f).toEqual({
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    speed: "fast",
+    maxMode: true,
+    instructions: "Be thorough.",
+    skills: ["code-review", "security-review"],
+    clearSkills: true,
+  });
+});
+
+test("parseAgentProfileFlags: --instructions-file wins the slot over --instructions when both are passed (last-write-wins on their own fields, not mutually exclusive at parse time)", () => {
+  const f = parseAgentProfileFlags(["--instructions", "inline text", "--instructions-file", "/tmp/x.md"]);
+  // The parser sets both fields independently; precedence between them is
+  // `resolveInstructions`'s job (not exported, not covered here) — this just
+  // proves the parser doesn't clear one when the other is given.
+  expect(f.instructions).toBe("inline text");
+  expect(f.instructionsFile).toBe("/tmp/x.md");
+});
+
+// ── canonicalInstructions ────────────────────────────────────────────────
+//
+// `resolveInstructions` itself isn't exported (it does real file/stdin I/O),
+// but the trimming it applies to both `--instructions-file` delivery
+// channels (a real path and the `-` stdin marker) is factored into this
+// pure helper so it's covered without touching the filesystem.
+
+test("canonicalInstructions: trims leading and trailing whitespace", () => {
+  expect(canonicalInstructions("  Always run tests first.  ")).toBe("Always run tests first.");
+});
+
+test("canonicalInstructions: trims surrounding newlines (e.g. a file read via readFileSync)", () => {
+  expect(canonicalInstructions("Be thorough.\n")).toBe("Be thorough.");
+  expect(canonicalInstructions("\n\nBe thorough.\n\n")).toBe("Be thorough.");
+});
+
+test("canonicalInstructions: preserves internal whitespace/newlines", () => {
+  expect(canonicalInstructions("  Line one.\nLine two.  ")).toBe("Line one.\nLine two.");
+});
+
+test("canonicalInstructions: whitespace-only input canonicalizes to an empty string", () => {
+  expect(canonicalInstructions("   \n\t  ")).toBe("");
+});
+
+test("canonicalInstructions: already-trimmed text is unchanged", () => {
+  expect(canonicalInstructions("Be thorough.")).toBe("Be thorough.");
+});
+
+// ── taskCountText / formatAgentProfileListRow (docs/plans/agent-profiles.md
+// "used by N tasks" counter, follow-up) ─────────────────────────────────
+
+test("taskCountText: singular for 1", () => {
+  expect(taskCountText(1)).toBe("1 task");
+});
+
+test("taskCountText: plural for 0 and N>1", () => {
+  expect(taskCountText(0)).toBe("0 tasks");
+  expect(taskCountText(3)).toBe("3 tasks");
+});
+
+function fakeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "p1",
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    speed: "off",
+    maxMode: false,
+    opencodeServer: "shared",
+    instructions: "Be thorough and check for regressions carefully across the whole diff.",
+    skills: ["code-review", "security-review"],
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+test("formatAgentProfileListRow: places the tasks column after skills, before instructions", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: 5 }));
+  // name, harness, model, effort, mode, skills, tasks, instructions
+  expect(row).toHaveLength(8);
+  expect(row[5]).toBe("2"); // skills.length
+  expect(row[6]).toBe("5"); // taskCount
+});
+
+test("formatAgentProfileListRow: undefined taskCount (older server payload) renders as 0", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: undefined }));
+  expect(row[6]).toBe("0");
+});
+
+test("formatAgentProfileListRow: name/harness/model/effort/mode come through verbatim", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ taskCount: 0 }));
+  expect(row[0]).toBe("Reviewer");
+  expect(row[1]).toBe("codex");
+  expect(row[2]).toBe("gpt-6-astra");
+  expect(row[3]).toBe("high");
+  expect(row[4]).toBe("auto");
+});
+
+test("formatAgentProfileListRow: null effort/mode render as '-'", () => {
+  const row = formatAgentProfileListRow(fakeProfile({ effort: null, mode: null, taskCount: 0 }));
+  expect(row[3]).toBe("-");
+  expect(row[4]).toBe("-");
+});
+
+test("formatAgentProfileListRow: names and instructions print with control characters escaped", () => {
+  const row = formatAgentProfileListRow({
+    id: "p1",
+    name: "Rev\u001b[31miewer",
+    harness: "claude-code",
+    model: "opus\u009b",
+    effort: null,
+    mode: null,
+    speed: "off",
+    maxMode: false,
+    opencodeServer: "shared",
+    instructions: "do\u001b]52;c;x\u0007 it",
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  expect(row.join(" ")).not.toMatch(/[\u001b\u009b\u0007]/);
+  expect(row[0]).toContain("Rev\\u001b[31miewer");
+});
+
+test("formatAgentProfileListRow: instructions cut never leaves half an emoji, and joiners print as text", () => {
+  const base = {
+    id: "p1",
+    name: "Reviewer",
+    harness: "claude-code",
+    model: "opus",
+    effort: null,
+    mode: null,
+    speed: "off" as const,
+    maxMode: false,
+    opencodeServer: "shared" as const,
+    skills: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  // 58 ASCII chars then an emoji: a UTF-16 slice at 59 would keep only its
+  // high surrogate, which escapes to a literal `\ud83d`.
+  const emoji = formatAgentProfileListRow({ ...base, instructions: `${"a".repeat(58)}😀 and more text` });
+  expect(emoji[7]).not.toContain("\\ud83d");
+  expect(emoji[7]).toContain("…");
+  // Persian ZWNJ and Hindi ZWJ are allowed between letters in multi-line text.
+  const scripts = formatAgentProfileListRow({ ...base, instructions: "می‌خواهم क्‍ष\n  next line" });
+  expect(scripts[7]).not.toContain("\\u200c");
+  expect(scripts[7]).not.toContain("\\u200d");
+  expect(scripts[7]).toContain("next line");
+});
+
+// ── formatAgentProfileShow (`agetor profile show`) ───────────────────────
+
+test("formatAgentProfileShow: prints the speed tier, not a fast yes/no", () => {
+  const lines = formatAgentProfileShow(fakeProfile({ speed: "fast", taskCount: 1 }));
+  const speedLine = lines.find((l) => l.includes("speed:"));
+  expect(speedLine).toBe("  speed: fast   max mode: no");
+  expect(lines.join("\n")).not.toContain("fast: ");
+});
+
+test("formatAgentProfileShow: off and ultrafast print as their tier", () => {
+  expect(formatAgentProfileShow(fakeProfile({ speed: "off" })).join("\n")).toContain("speed: off");
+  expect(formatAgentProfileShow(fakeProfile({ speed: "ultrafast", maxMode: true })).join("\n")).toContain(
+    "speed: ultrafast   max mode: yes",
+  );
+});
+
+test("formatAgentProfileShow: header, fields, used-by and instructions lines", () => {
+  const lines = formatAgentProfileShow(fakeProfile({ taskCount: 2, instructions: "Line one.\nLine two.\n" }));
+  expect(lines[0]).toBe("Reviewer  p1");
+  expect(lines[1]).toBe("  harness: codex   model: gpt-6-astra   effort: high   mode: auto");
+  expect(lines).toContain("  skills: /code-review, /security-review");
+  expect(lines).toContain("  used by: 2 tasks");
+  expect(lines.slice(-3)).toEqual(["  instructions:", "    Line one.", "    Line two."]);
+});
+
+// ── --opencode-server ────────────────────────────────────────────────────
+
+test("parseAgentProfileFlags: --opencode-server takes shared and standalone", () => {
+  expect(parseAgentProfileFlags(["--opencode-server", "shared"]).opencodeServer).toBe("shared");
+  expect(parseAgentProfileFlags(["--opencode-server", "standalone"]).opencodeServer).toBe("standalone");
+  expect(parseAgentProfileFlags(["--name", "x"]).opencodeServer).toBeUndefined();
+});
+
+test("parseAgentProfileFlags: a bad --opencode-server is a usage error naming the modes", () => {
+  expect(() => parseAgentProfileFlags(["--opencode-server", "private"])).toThrow(
+    "'--opencode-server' must be one of shared, standalone (got 'private')",
+  );
+  expect(() => parseAgentProfileFlags(["--opencode-server"])).toThrow("'--opencode-server' needs a value");
+});
+
+function harnessRow(over: Partial<Harness> = {}): Harness {
+  return {
+    id: "opencode",
+    kind: "opencode",
+    label: "OpenCode",
+    isBuiltin: true,
+    home: null,
+    bin: null,
+    env: {},
+    enabled: true,
+    ...over,
+  };
+}
+
+test("formatAgentProfileShow: an OpenCode profile prints its server option; other kinds don't", () => {
+  const oc = fakeProfile({ harness: "opencode", model: "opencode-default", opencodeServer: "standalone" });
+  expect(formatAgentProfileShow(oc, { kind: "opencode" })).toContain("  opencode server: standalone");
+  const shared = formatAgentProfileShow(fakeProfile({ harness: "opencode" }), { kind: "opencode" });
+  expect(shared).toContain("  opencode server: shared");
+  expect(formatAgentProfileShow(fakeProfile(), { kind: "codex" }).join("\n")).not.toContain("opencode server");
+  // No harness context (older call site) prints no line.
+  expect(formatAgentProfileShow(oc).join("\n")).not.toContain("opencode server");
+});
+
+test("opencodeServerText: notes a harness home (forced standalone) and OpenCode 1 (unused)", () => {
+  expect(opencodeServerText("shared", { home: null, version: "opencode v2.1.3" })).toBe("shared");
+  expect(opencodeServerText("standalone", { home: "/h" })).toBe("standalone");
+  expect(opencodeServerText("shared", { home: "/h", version: "2.1.3" })).toBe(
+    "shared (runs standalone: the harness has its own home)",
+  );
+  expect(opencodeServerText("shared", { version: "1.19.4" })).toBe("shared (not used by OpenCode 1)");
+  // An unknown version counts as OpenCode 2.
+  expect(opencodeServerText("standalone", { version: null })).toBe("standalone");
+});
+
+test("profileHarnessContext: the harness row first, else a built-in kind id, else unknown", () => {
+  const info = {
+    harnesses: [harnessRow({ id: "oc-work", isBuiltin: false, home: "/Users/me/oc-work" })],
+    statuses: [{ harnessId: "oc-work", version: "opencode v2.1.3" }] as never,
+  };
+  expect(profileHarnessContext("oc-work", info)).toEqual({ kind: "opencode", home: "/Users/me/oc-work", version: "opencode v2.1.3" });
+  expect(profileHarnessContext("opencode", null)).toEqual({ kind: "opencode" });
+  expect(profileHarnessContext("gone-harness", info)).toEqual({ kind: null });
+});

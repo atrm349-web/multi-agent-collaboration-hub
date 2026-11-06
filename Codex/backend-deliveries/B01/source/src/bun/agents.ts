@@ -1,0 +1,4052 @@
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import { effectiveOpencodeServer, opencodeMajor, opencodeModelArgs } from "../shared/opencode.ts";
+import { compactionStatusLine } from "../shared/compaction.ts";
+import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
+import { HANDOFF_TAG } from "../shared/pipeline.ts";
+import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
+import { attachSubagentWatcher, settleSubagentById, type SubagentWatcherHandle } from "./claude-subagents.ts";
+import {
+  CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  openContinuationRun,
+  spawnClaudeViaTmux,
+  toClaudeModeString,
+  type ChunkHandler,
+  type SpawnedAgent,
+} from "./claude-tmux.ts";
+import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import { createCursorMapCtx, flushCursorThinking, mapCursorEvent } from "./cursor-tmux.ts";
+import { FAKE_CURSOR_ASK_PROMPT_MARKER, spawnCursorViaAcp, spawnFakeCursorAsk } from "./cursor-acp.ts";
+import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
+import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
+import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
+import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
+import {
+  createOpencodeLineProcessor,
+  spawnOpencodeViaTmux,
+  type OpencodeLaunchOptions,
+  type OpencodeSubagentNotice,
+} from "./opencode-tmux.ts";
+import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
+import { copilotHome } from "./copilot-home.ts";
+import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
+import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
+import { answerFxPermission, registerFxPermission } from "./interactions.ts";
+import { gitWritableRoots } from "./worktree.ts";
+
+export type { SpawnedAgent };
+
+export interface AgentCommand {
+  cmd: string[];
+  env?: Record<string, string>;
+  /**
+   * Set only by the claude-code branch of `buildCommand`, when the prompt is
+   * too large to ride in `tmux new-session`'s argv (see
+   * `CLAUDE_PROMPT_ARGV_MAX_BYTES`). `spawnAgent` forwards this to
+   * `spawnClaudeViaTmux` as `ClaudeLaunchOptions.deferredPrompt`, which
+   * delivers it post-launch via the same load-buffer/paste-buffer machinery
+   * live-session follow-ups use, gated on the composer being idle. Always
+   * undefined for codex — its prompt already rides on stdin, never argv, so
+   * it has no size-driven argv problem.
+   */
+  deferredPrompt?: string;
+  /**
+   * Set only by the opencode branch of `buildCommand`, and only when the turn
+   * resumes a session (`opts.resumeSessionId`): the same argv without
+   * `-s <id>`, plus `--title=<t>` when a title was given. `spawnAgent` forwards
+   * it to `spawnOpencodeViaTmux` as `OpencodeLaunchOptions.freshArgv`, which
+   * relaunches with it once when a v1 resume fails with "Session not found"
+   * before any line carried a session id (D-9, spike A5). Undefined for every
+   * other kind.
+   */
+  freshArgv?: string[];
+  /**
+   * Set only by the cursor branch. The composed model id (`cursorModelArg`)
+   * sent as `session/set_config_option`, not as an argv `--model` flag.
+   * ACP does not read `--model`.
+   */
+  cursorModel?: string;
+  /**
+   * Set only by the copilot branch of `buildCommand`: the classic-PAT
+   * variables (`GH_TOKEN` / `GITHUB_TOKEN`) the launch shell must drop when
+   * the pane's real env holds a `ghp_` classic token — Copilot CLI rejects
+   * those — minus any the harness env map sets itself. Forwarded to
+   * `spawnCopilotViaTmux` as `stripClassicTokens`.
+   */
+  stripClassicTokens?: string[];
+}
+
+/**
+ * Prompts up to this size stay embedded in the claude-code launch argv
+ * (today's behavior, byte-identical). Above it, `buildCommand` omits the
+ * prompt from argv entirely and returns it as `AgentCommand.deferredPrompt`
+ * instead, so `spawnAgent` can route it through `spawnClaudeViaTmux`'s
+ * post-launch paste path.
+ *
+ * Why: tmux serializes the WHOLE client command — `new-session` flags, every
+ * `-e KEY=VAL` env pair, and the trailing argv — as a single message over its
+ * control socket, and tmux 3.6a rejects anything past its ~16KB imsg cap with
+ * a literal `command too long` (empirically measured: 14KB ok, 16KB fails).
+ * Budgeting 4KB to the prompt alone leaves generous headroom in that same
+ * message for the env block and flags, which ride alongside it regardless of
+ * prompt size.
+ */
+export const CLAUDE_PROMPT_ARGV_MAX_BYTES = 4096;
+
+/**
+ * Same tmux-imsg-cap constraint as {@link CLAUDE_PROMPT_ARGV_MAX_BYTES}
+ * (gemini is also hosted in a detached tmux session — see gemini-tmux.ts),
+ * but gemini has no deferred-paste fallback: unlike claude's persistent REPL,
+ * gemini's tmux session is one-shot (dies at end of turn), so there's no
+ * live composer to paste an oversized prompt into after launch the way
+ * `deferredPrompt` does for claude. `buildCommand` throws above this budget
+ * instead of silently mis-delivering a truncated prompt.
+ *
+ * Gemini's `--help` notes `-p`'s value is "Appended to input on stdin (if
+ * any)", which suggests a stdin-based large-prompt path might exist (mirror
+ * codex's stdin delivery, avoiding the argv cap entirely) — but this was
+ * unverified as of this cap's introduction (the live API was returning 503s
+ * during the spike that would have confirmed it). Follow up and remove this
+ * cap in favor of stdin delivery once confirmed; until then, fail loudly
+ * rather than guess at unverified CLI behavior.
+ *
+ * Lives in `src/shared/prompt-limits.ts` (the webview/CLI need it too, to
+ * pre-check an issue-task prompt before ever calling createTask) and is
+ * re-exported here so existing importers of `./agents.ts` keep resolving.
+ */
+export { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
+
+export interface AgentRunOptions {
+  /** Friendly mode id; see AGENT_OPTIONS in shared/types.ts. */
+  mode?: string | null;
+  /** Friendly model id; see AGENT_OPTIONS in shared/types.ts. */
+  model?: string | null;
+  /** Friendly reasoning-effort id (codex: minimal|low|medium|high). */
+  effort?: string | null;
+  /**
+   * Speed tier (`off | fast | ultrafast`). Cursor folds `fast` into the
+   * model id; fx applies it as an ACP session option. Other kinds ignore it.
+   */
+  speed?: Speed | null;
+  /** Cursor Max Mode / large-context toggle. Currently consumed by cursor only. */
+  maxMode?: boolean | null;
+  /**
+   * Existing session id to resume a prior conversation on a follow-up turn.
+   * For claude-code: the JSONL session uuid, resumed via `claude --resume
+   * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
+   * For fx: fx's own ACP session id (DISCOVERED from `session/new`'s
+   * response on the first turn, not pre-generated — see `onSessionId` on
+   * `SpawnAgentArgs`), resumed via the ACP `session/resume` request (falling
+   * back to `session/load` on a resume error — see fx-acp.ts). Either way
+   * the new prompt attaches to the full prior conversation instead of
+   * starting fresh.
+   */
+  resumeSessionId?: string | null;
+  /**
+   * For claude-code: pre-generated UUID passed via `--session-id <uuid>` so
+   * claude writes its JSONL transcript to a path we know in advance. With
+   * this set we can `fs.watch` the exact filename instead of racing an
+   * mtime-based directory poll, and the run row's `claude_session_id` is
+   * known synchronously at spawn (no `onSessionId` round-trip). Mutually
+   * exclusive with `resumeSessionId` — claude rejects both together.
+   * Ignored by codex.
+   */
+  sessionId?: string | null;
+  /** External Git metadata writes cannot be granted by the cwd sandbox.
+   *  Auto mode refuses these runs; a coordinator must own Git changes. */
+  codexExternalGitDirs?: string[];
+  /**
+   * The run row id, threaded into `buildCommand` ONLY for fx: fx's argv
+   * embeds a deterministic `--log-file <dataDir>/fx-logs/<runId>.log` path
+   * (fx owns and writes that log itself — see fx-acp.ts's header — this just
+   * gives it somewhere to open). Every other kind ignores this field; codex
+   * and cursor instead take a `runId` directly as a `spawnAgent`/tmux-driver
+   * argument for the same per-turn log/prompt-file purpose, since their
+   * per-kind command-building functions (`buildCodexCommand`) already have a
+   * dedicated seam for cwd/run-scoped values. fx's is simpler (no fs calls
+   * needed to resolve it) so it rides directly in `AgentRunOptions` instead
+   * of getting its own `buildFxCommand` wrapper.
+   */
+  runId?: string | null;
+  /**
+   * fx-only: continue a response fx paused after exhausting its provider
+   * retries (see `FX_RECOVERY_STATUS_PREFIX` in shared/types.ts) instead of
+   * sending a new prompt. Requires `resumeSessionId` — there is no paused
+   * checkpoint to continue on a fresh session. When set, the driver sends
+   * the ACP `session/prompt` call with an empty `prompt: []` and
+   * `_meta.fx.continueRecovery: true`; the prompt text passed to
+   * `spawnAgent`/`buildCommand` is ignored for this turn. Every other agent
+   * kind ignores this field entirely.
+   */
+  continueRecovery?: boolean;
+  /**
+   * opencode-only: the harness CLI's probed `--version` output (D-2). Picks
+   * the OpenCode line via `opencodeMajor` — v1 takes `--variant` and has no
+   * `--standalone`, v2 carries the variant in `-m provider/model#v`. A
+   * missing or unparseable version reads as v2. Every other kind ignores it.
+   */
+  cliVersion?: string | null;
+  /**
+   * opencode-only: the task's stored server mode (`task.opencodeServer`,
+   * D-4). Resolved through `effectiveOpencodeServer` — a harness with a
+   * home always runs Standalone, v1 has no server flag at all. `null`/absent
+   * reads as `"shared"`. Every other kind ignores it.
+   */
+  opencodeServer?: OpencodeServerMode | null;
+  /**
+   * opencode-only: the task title, passed as `--title` (cut to 100 code
+   * points) on a fresh session only — OpenCode ignores `--title` when `-s`
+   * resumes an existing session (spike A10/Q15). Every other kind ignores it.
+   */
+  title?: string | null;
+}
+
+// Map friendly model ids to the exact strings the claude-code CLI expects.
+// Unknown ids are passed through verbatim (so a user can type a model the
+// curated list doesn't know about yet). Codex accepts the friendly ids as-is
+// so it doesn't need a translation table.
+const CLAUDE_MODEL_FLAG: Record<string, string> = {
+  "mythos-5.1": "claude-mythos-5-1",
+  "fable-5.1": "claude-fable-5-1",
+  "mythos-5": "claude-mythos-5",
+  "fable-5": "claude-fable-5",
+  "opus-5.5": "claude-opus-5-5",
+  "opus-5": "claude-opus-5",
+  "opus-4.8": "claude-opus-4-8",
+  "opus-4.7": "claude-opus-4-7",
+  "opus-4.6": "claude-opus-4-6",
+  "sonnet-5.5": "claude-sonnet-5-5",
+  "sonnet-5": "claude-sonnet-5",
+  "sonnet-4.6": "claude-sonnet-4-6",
+  "haiku-5.5": "claude-haiku-5-5",
+  "haiku-4.5": "claude-haiku-4-5",
+};
+
+/**
+ * Map a friendly claude-code model id (from AGENT_OPTIONS) to the exact
+ * string the CLI / `/model` slash command wants. Unknown ids fall through
+ * verbatim so a future curated entry "just works" until the table catches
+ * up. Exported because the orchestrator needs the same translation when
+ * issuing `/model <id>` to a live session.
+ */
+export function toClaudeModelArg(id: string): string {
+  return CLAUDE_MODEL_FLAG[id] ?? id;
+}
+
+/**
+ * Inverse of `toClaudeModelArg`/`CLAUDE_MODEL_FLAG`: given a `/model <arg>`
+ * argument as claude itself would echo it back (or as agetor's own dropdown
+ * mirror sent it — see `reconcileTaskSession`), resolve it to the agetor
+ * model id whose flag matches exactly. Falls back to the arg itself when it
+ * already looks like a raw claude model id (`claude-…`), so a future
+ * curated id "just works" before `CLAUDE_MODEL_FLAG` catches up.
+ *
+ * Deliberately does NOT resolve claude's own aliases (`sonnet`, `opus`,
+ * `default`, …) — those map many-to-one onto a model family and can't be
+ * inverted losslessly from the arg alone. Callers that need to resolve an
+ * alias must fall back to the `<local-command-stdout>` display name instead
+ * (see `claudeModelIdFromDisplayName` in `claude-local-setting.ts`).
+ */
+export function claudeModelIdFromArg(arg: string): string | null {
+  for (const [id, flag] of Object.entries(CLAUDE_MODEL_FLAG)) {
+    if (flag === arg) return id;
+  }
+  return /^claude-/.test(arg) ? arg : null;
+}
+
+/**
+ * Map an agetor claude-code model id to the model-FAMILY label the 2.1.246
+ * `/model` picker's UI actually offers as a selectable row (`Opus`, `Sonnet`,
+ * `Fable`, `Haiku`) — smoke-tested on claude 2.1.246
+ * (docs/plans/model-effort-local-command-turns.md §10, owner decision 2).
+ * The picker is coarser than `CLAUDE_MODEL_FLAG`: it offers one row per
+ * family, always resolving to that family's CURRENT release, not every
+ * versioned id agetor tracks. An id whose family row would therefore land on
+ * a DIFFERENT specific version than the one just requested — `opus-4.8`,
+ * `opus-4.7`, `opus-4.6`, `sonnet-4.6`, `sonnet-5` (all superseded within their family by
+ * a newer pinned id) — is deliberately mapped to `null` rather than the
+ * nearest family, so the live-session mirror is skipped instead of silently
+ * switching the session to a different version than the task row now holds.
+ * Fable follows the same current-release convention as Opus: `fable-5.1`
+ * owns the "Fable" row since the installed claude CLI (2.1.257) ships the
+ * `claude-fable-5-1` model id, so the now-superseded `fable-5` maps to `null`
+ * (next-run-only, same as any other superseded pinned id). Opus follows the
+ * same rule again: `opus-5.5` now owns the "Opus" row because claude 2.1.280
+ * ships `claude-opus-5-5` as its default Opus model (CHANGELOG "now the
+ * default Opus model"; the binary's alias table maps `opus` →
+ * `claude-opus-5-5` and the picker rows read "Opus 5.5 - best for everyday,
+ * complex tasks" / "Opus 5 - previous Opus version"), so `opus-5` joins
+ * `opus-4.8`, `opus-4.7`, `opus-4.6`, `sonnet-4.6` and `fable-5` in the null
+ * (next-run-only) bucket. Sonnet follows the same current-release rule:
+ * `sonnet-5.5` owns the "Sonnet" row because claude 2.1.284 ships
+ * `claude-sonnet-5-5` as its default Sonnet model (CHANGELOG "now the default
+ * Sonnet model on the Anthropic API"; the binary's alias table maps `sonnet` →
+ * `claude-sonnet-5-5` and the picker's previous-version row reads "Sonnet 5 -
+ * previous Sonnet version"), so `sonnet-5` joins the null (next-run-only)
+ * bucket too. Haiku follows the same current-release rule: Claude CLI 2.1.293
+ * maps the alias `haiku` to `claude-haiku-5-5` (constant HAIKU_ID), so
+ * `haiku-5.5` owns the "Haiku" row and the superseded `haiku-4.5` joins the
+ * null bucket alongside `opus-5`, `sonnet-5` and `fable-5`. `mythos-5` and `mythos-5.1` both have no picker row
+ * at all — claude's picker has no Mythos row of any kind. An unknown/future
+ * raw id also returns `null` rather than guess. Sole caller:
+ * `reconcileTaskSession`'s model mirror (`orchestrator.ts`), which feeds the
+ * result to `mirrorModelViaPicker` (`claude-tmux.ts`).
+ */
+export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable" | "Haiku" | null {
+  switch (id) {
+    case "opus-5.5":
+      return "Opus";
+    case "sonnet-5.5":
+      return "Sonnet";
+    case "fable-5.1":
+      return "Fable";
+    case "haiku-5.5":
+      return "Haiku";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Effort → `CLAUDE_CODE_EFFORT_LEVEL` env var on the spawned process. Same
+ * lever the `/effort` slash command uses internally, so it works on every
+ * claude model rather than relying on per-model API support. Unknown ids are
+ * dropped rather than passed through — better than letting a typo silently
+ * become a no-op or surface as a CLI error mid-run.
+ *
+ * Keep this in sync with `MODEL_EFFORT_SUPPORT['claude-code'][<model>]` in
+ * `shared/types.ts` — the latter drives the picker, this drives the env-var
+ * emit. Both list the same five ids today; if you extend one, extend the
+ * other.
+ */
+const CLAUDE_EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * True when the named model is one we know doesn't accept any effort flag
+ * (Haiku 4.5 today). For these models, `null`/missing effort is allowed and
+ * `buildCommand` emits no env var / `-c` flag. Every other model must carry
+ * an explicit effort id; `buildCommand` throws otherwise.
+ */
+function modelDeclinesEffort(kind: AgentKind, model: string): boolean {
+  const support = MODEL_EFFORT_SUPPORT[kind][model];
+  return Array.isArray(support) && support.length === 0;
+}
+
+/**
+ * Resolve the binary path for a harness. Per-harness `bin` wins (set by the
+ * user when adding an alias). Falls back to the corresponding process env
+ * override for back-compat with `AGETOR_CLAUDE_BIN` / `AGETOR_CODEX_BIN`,
+ * then to the kind's default name resolved against the current PATH.
+ *
+ * The PATH lookup goes through `Bun.which` with an explicit `{ PATH }` to
+ * dodge Bun's startup PATH cache (see agent-status.ts). Without this, codex
+ * (which is spawned via `Bun.spawn` directly, not through tmux) would fail
+ * to launch from a packaged .app even though `claude` finds it during
+ * `agent-status.checkHarness()`.
+ */
+export function resolveBin(harness: Harness): string {
+  if (harness.bin) return harness.bin;
+  let fallback: string;
+  let override: string | undefined;
+  switch (harness.kind) {
+    case "claude-code":
+      fallback = "claude";
+      override = process.env.AGETOR_CLAUDE_BIN;
+      break;
+    case "codex":
+      fallback = "codex";
+      override = process.env.AGETOR_CODEX_BIN;
+      break;
+    case "cursor":
+      fallback = "cursor-agent";
+      override = process.env.AGETOR_CURSOR_BIN;
+      break;
+    case "gemini":
+      fallback = "gemini";
+      override = process.env.AGETOR_GEMINI_BIN;
+      break;
+    case "fx":
+      fallback = "fx";
+      override = process.env.AGETOR_FX_BIN;
+      break;
+    case "antigravity":
+      fallback = "agy";
+      override = process.env.AGETOR_ANTIGRAVITY_BIN;
+      break;
+    case "opencode":
+      fallback = "opencode";
+      override = process.env.AGETOR_OPENCODE_BIN;
+      break;
+    case "copilot":
+      fallback = "copilot";
+      override = process.env.AGETOR_COPILOT_BIN;
+      break;
+    default:
+      // A retired kind (`grok`/`kimi` rows can still sit in a database).
+      // `checkHarness` resolves a bin for every row, so this must not throw;
+      // `buildCommand`/`spawnAgent` are what refuse to launch it.
+      fallback = String(harness.kind satisfies never);
+      break;
+  }
+  if (override) return override;
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+const warnedUnknownKinds = new Set<string>();
+
+function warnUnknownHarnessKind(kind: string): void {
+  if (warnedUnknownKinds.has(kind)) return;
+  warnedUnknownKinds.add(kind);
+  console.warn(`[agetor] harness kind "${kind}" is not supported by this build; no home env var is set for it`);
+}
+
+/**
+ * Build the env block the harness contributes to a spawn: home-derived
+ * vars (HOME + the CLI-specific config-dir) layered under the harness's
+ * own `env` map. The caller (buildCommand / agent-status) merges this with
+ * kind/effort env on top.
+ */
+export function harnessEnv(harness: Harness): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (harness.home) {
+    // claude-code uses CLAUDE_CONFIG_DIR (which it treats as the `.claude/`
+    // equivalent — config, sessions, projects, and `.claude.json` all live
+    // directly under it). We deliberately do NOT override HOME: on macOS,
+    // claude's keychain reads ("Claude Code-credentials" via Security.framework)
+    // resolve `$HOME/Library/Keychains/login.keychain-db` against the live
+    // HOME, so re-homing the spawn lands on a non-existent keychain and the
+    // CLI reports "Not logged in" even when a valid token is present.
+    //
+    // Codex goes through its own CODEX_HOME override and doesn't touch the
+    // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
+    // actually controls its login & history, so we set both as a belt-and-
+    // braces measure.
+    //
+    // Cursor has no documented dedicated config-dir env var, so isolating an
+    // additional account means a true HOME override (like codex's HOME half,
+    // but with no CODEX_HOME-equivalent to also set — cursor-agent reads its
+    // login/config straight out of $HOME).
+    if (harness.kind === "claude-code") {
+      env.CLAUDE_CONFIG_DIR = harness.home;
+    } else if (harness.kind === "codex") {
+      env.HOME = harness.home;
+      env.CODEX_HOME = path.join(harness.home, ".codex");
+    } else if (harness.kind === "cursor") {
+      env.HOME = harness.home;
+    } else if (harness.kind === "fx") {
+      // fx has no dedicated config-dir env var (verified against binary
+      // v0.0.4 — no FX_HOME or FX_CONFIG_DIR in its strings); its state
+      // lives hardcoded at `~/.fx/*`, so isolating an additional account's
+      // login/config means a true HOME override, same approach as cursor's
+      // branch above. Re-verified 0.0.10 — all 60 FX_* env vars identical
+      // across 0.0.8/0.0.9/0.0.10, still no FX_HOME (`profile_paths.zig
+      // root_dir_name = ".fx"`, hardcoded).
+      env.HOME = harness.home;
+    } else if (harness.kind === "antigravity") {
+      env.HOME = harness.home;
+    } else if (harness.kind === "opencode") {
+      // OpenCode follows the XDG base-dir spec for its config, data (auth +
+      // `opencode.db`), state (the Shared service's `service.json`) and
+      // cache, falling back to `$HOME/.config` etc. only when the XDG var is
+      // unset — so an inherited XDG_* from agetor's own env would otherwise
+      // leak the first account's state into an additional one (GD10). Pin
+      // all four under the home, plus HOME itself for anything that reads
+      // it directly. Spike A12: any invocation, `--version` included,
+      // creates dirs under these.
+      env.HOME = harness.home;
+      env.XDG_CONFIG_HOME = path.join(harness.home, ".config");
+      env.XDG_DATA_HOME = path.join(harness.home, ".local", "share");
+      env.XDG_STATE_HOME = path.join(harness.home, ".local", "state");
+      env.XDG_CACHE_HOME = path.join(harness.home, ".cache");
+    } else if (harness.kind === "copilot") {
+      // Copilot CLI keeps config, login state, session state and skills under
+      // $COPILOT_HOME (default ~/.copilot), a dedicated home-override env var,
+      // so an additional account needs no HOME override.
+      env.COPILOT_HOME = harness.home;
+    } else if (harness.kind === "gemini") {
+      // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
+      // in the bundled CLI source — `homedir()` returns
+      // `process.env.GEMINI_CLI_HOME || os.homedir()`, and every gemini state
+      // dir hangs off that), so unlike codex there's no need to also touch
+      // the real HOME.
+      env.GEMINI_CLI_HOME = harness.home;
+    } else {
+      // Compile-time exhaustiveness: a new AgentKind must get a branch above.
+      // At runtime an unknown kind (a retired `grok`/`kimi` row) contributes
+      // no home var and warns once — it must NOT throw, because
+      // `checkHarness` calls this for every harness row and a throw would
+      // break `GET /harnesses`.
+      warnUnknownHarnessKind(harness.kind satisfies never);
+    }
+  }
+  // User-provided env wins over the home-derived defaults.
+  for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
+  // Copilot: resolve the home the same way every spawn does (`copilotHome`
+  // expands a leading `~` and trims), so the login terminal and
+  // `agetor harness shell` write the login where runs will read it. Only when
+  // the harness names a home — a home-less harness keeps the user's own default.
+  if (harness.kind === "copilot" && (nonBlankString(harness.home) || nonBlankString(harness.env?.COPILOT_HOME))) {
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+  }
+  return env;
+}
+
+function nonBlankString(v: string | null | undefined): boolean {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+/**
+ * A POSIX-valid environment variable name: a letter or underscore followed
+ * by letters, digits, or underscores. Used to gate what the harness `env`
+ * map may contain, both at write time (the harness POST/PATCH routes) and at
+ * shell-emit time (`buildHarnessTerminalCommand` below). Anything outside
+ * this set can't be a real `NAME=…` assignment and — left unquoted — would
+ * let a crafted key (`X; rm -rf ~`) break out of the generated command.
+ */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function isValidEnvKey(key: string): boolean {
+  return ENV_KEY_RE.test(key);
+}
+
+/**
+ * Build the command that launches a harness's agent in a new Terminal window.
+ * The agent is started directly with its config applied as an inline env-var
+ * prefix, so the user lands straight in the REPL (e.g. to run `/login`)
+ * instead of a bare shell:
+ *
+ *   - default Claude Code      → `claude`
+ *   - a config-dir alias       → `CLAUDE_CONFIG_DIR=… claude`
+ *   - a codex alias            → `HOME=… CODEX_HOME=… codex`
+ *
+ * Pure and deterministic — no spawning — so the escaping is unit-testable in
+ * isolation (see agents.test.ts). The caller wraps the result with
+ * `toTerminalAppleScript` and hands it to `osascript`.
+ *
+ * Every interpolated value is POSIX single-quoted (`sq`), which neutralizes
+ * `$`, backtick, spaces, and backslashes; the lone special case is `'`
+ * itself, closed-escaped-reopened. Env *keys* are filtered through
+ * `isValidEnvKey` rather than quoted — a non-identifier key can't be a valid
+ * assignment anyway, and skipping it closes the injection vector even for
+ * legacy DB rows written before the route-level validation existed.
+ */
+export function buildHarnessTerminalCommand(harness: Harness): string {
+  const bin = resolveBin(harness);
+  const launch = path.basename(bin);
+  const env = harnessEnv(harness);
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+  // Inline `VAR=val … cmd` prefix: the agent launches with its config applied,
+  // but the user's shell isn't permanently re-homed.
+  const prefix: string[] = [];
+  // Only an explicit `bin` override needs a PATH tweak so the bare agent name
+  // resolves to it. The default and config-dir-only aliases already find the
+  // agent on the inherited PATH, which keeps the command as clean as `claude`
+  // / `CLAUDE_CONFIG_DIR=… claude` rather than dragging in an absolute path.
+  if (harness.bin && path.isAbsolute(harness.bin)) {
+    prefix.push(`PATH=${sq(path.dirname(harness.bin))}:$PATH`);
+  }
+  for (const [k, v] of Object.entries(env)) {
+    if (!isValidEnvKey(k)) continue;
+    prefix.push(`${k}=${sq(v)}`);
+  }
+  return [...prefix, launch].join(" ");
+}
+
+/**
+ * Wrap a shell command in the AppleScript that opens it in a new Terminal.app
+ * window and brings Terminal to the front. `do script` runs the command in a
+ * fresh interactive shell (so the agent's REPL is fully interactive) and
+ * leaves the window open when it exits. Backslash and double-quote are
+ * escaped for the AppleScript double-quoted string literal.
+ */
+export function toTerminalAppleScript(shellCmd: string): string {
+  const asEscape = (s: string) => s.replace(/(["\\])/g, "\\$1");
+  return (
+    `tell application "Terminal" to do script "${asEscape(shellCmd)}"\n` +
+    `activate application "Terminal"`
+  );
+}
+
+/** `--title` budget for an OpenCode session name (D-3): the task title, cut
+ *  on a code-point boundary so a surrogate pair is never split. */
+export const OPENCODE_TITLE_MAX_CHARS = 100;
+
+/** The `--title` value for a task title, or `null` when there is none. */
+function opencodeTitleArg(title: string | null | undefined): string | null {
+  const trimmed = title?.trim() ?? "";
+  if (trimmed === "") return null;
+  return Array.from(trimmed).slice(0, OPENCODE_TITLE_MAX_CHARS).join("").trimEnd();
+}
+
+/**
+ * Build the launch argv for a harness. For claude-code this is the
+ * interactive REPL — no `--print`. The driver (tmux) drops these args after
+ * `tmux new-session ... -- <argv>`. For codex this is `codex exec ...`,
+ * still one-shot.
+ *
+ * Env handling: extra args for built-ins still come from
+ * `AGETOR_CLAUDE_ARGS` / `AGETOR_CODEX_ARGS` (back-compat). Per-harness
+ * `env` + `home` ride in the returned `env` block; the caller is
+ * responsible for merging it onto `process.env` (codex) or `tmux -e` (claude).
+ *
+ * For claude-code, `prompt` is ignored — the prompt is delivered as keystrokes
+ * via tmux, not as an argv element. For codex the prompt is the final argv.
+ */
+export function buildCommand(
+  harness: Harness,
+  prompt: string,
+  opts: AgentRunOptions = {},
+): AgentCommand {
+  const bin = resolveBin(harness);
+  const env: Record<string, string> = harnessEnv(harness);
+
+  if (harness.kind === "claude-code") {
+    // Turn off Claude Code's prompt suggestions. Spike (claude 2.1.296): the
+    // var suppresses both the post-turn suggestion AND the startup
+    // `Try "…"` sample, which otherwise render as dim text on the `❯` row of
+    // the tmux pane (the scraper then has to tell that placeholder apart
+    // from a real draft). The env var wins over the user's own
+    // `promptSuggestionEnabled` setting. `??=` keeps a harness whose own env
+    // map sets the var (e.g. to "true") in charge of its own launches.
+    // Both the fresh and the `resumeSessionId` launches pass through here.
+    env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION ??= "false";
+    const extra = (process.env.AGETOR_CLAUDE_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    // Interactive launch — no --print. Model, permission-mode, session-id,
+    // and resume flags all work identically in interactive mode; they set
+    // the initial state of the session.
+    const args: string[] = [bin];
+
+    if (!opts.model) {
+      throw new Error("model is required for claude-code");
+    }
+    args.push("--model", toClaudeModelArg(opts.model));
+
+    // Pre-generated session id → claude writes its JSONL at a path we know
+    // in advance (`~/.claude/projects/<encoded>/<sessionId>.jsonl`).
+    // Mutually exclusive with --resume per claude's CLI contract — we only
+    // emit one or the other.
+    if (opts.resumeSessionId) {
+      args.push("--resume", opts.resumeSessionId);
+    } else if (opts.sessionId) {
+      args.push("--session-id", opts.sessionId);
+    }
+
+    // Permission mode. Null → "auto" for back-compat.
+    //
+    // Most agetor mode ids translate 1:1 to claude's `--permission-mode`
+    // values via `toClaudeModeString` (which canonicalizes `bypass` →
+    // `bypassPermissions` and `ask` → `default`). Two cases bypass the
+    // straight translation:
+    //
+    //   - `bypass` → emit `--dangerously-skip-permissions` instead of the
+    //     `--permission-mode bypassPermissions` form. Both are valid, but
+    //     the legacy flag is what users see in claude's own docs — keep
+    //     parity with that.
+    //
+    //   - `ask` → emit nothing; claude lands in its built-in `default`
+    //     mode, which is exactly the "ask before each action" posture we
+    //     want for this id. Setting `--permission-mode default`
+    //     explicitly works too, but omitting it matches the prior
+    //     behavior so the launch transcript is unchanged.
+    //
+    // agetor installs no PreToolUse hook and no MCP server, so the mode
+    // only drives these launch flags — claude's own permission engine and
+    // its TUI prompts (surfaced through the tmux pane scraper) handle every
+    // tool call. claude's TUI prompts are invisible in detached tmux, so
+    // agetor's scraper-driven UI cards are the user's window into per-call
+    // decisions.
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode === "bypass") {
+      args.push("--dangerously-skip-permissions");
+    } else {
+      // `ask` must be EXPLICIT: omitting the flag inherits the user-level
+      // `defaultMode` (e.g. `auto` in ~/.claude/settings.json), silently
+      // running the task in a looser mode than the one stored on it.
+      args.push("--permission-mode", toClaudeModeString(mode));
+    }
+
+    args.push(...extra);
+
+    // Initial prompt as the final argv element — claude's documented form is
+    // `claude "query"` to start an interactive session with that prompt
+    // already submitted. Prefix it with the `--` option terminator so a
+    // prompt that STARTS WITH `-` (e.g. a markdown checklist item
+    // "- [ ] do the thing", or any "--flag-like" instruction) is treated as a
+    // positional and not misparsed by claude's CLI as an unknown option.
+    // Without `--`, claude errors `unknown option '<prompt>'` and exits
+    // before writing any JSONL — which the tmux driver only observes as a
+    // dead session + empty pane + 30s boot timeout (the run just fails with
+    // no visible cause). `--` is a no-op for prompts that don't lead with a
+    // dash.
+    //
+    // Above CLAUDE_PROMPT_ARGV_MAX_BYTES, embedding the prompt here blows
+    // tmux's client-command cap and `tmux new-session` fails outright with
+    // `command too long` before claude ever starts — worse than the
+    // unknown-option case above, since there's no session at all to inspect.
+    // Skip the argv entirely and hand the raw prompt back as
+    // `deferredPrompt`; `spawnAgent` forwards it to `spawnClaudeViaTmux`,
+    // which pastes it in once claude's composer is up.
+    let deferredPrompt: string | undefined;
+    if (prompt) {
+      if (Buffer.byteLength(prompt, "utf8") > CLAUDE_PROMPT_ARGV_MAX_BYTES) {
+        deferredPrompt = prompt;
+      } else {
+        args.push("--", prompt);
+      }
+    }
+
+    // Effort is required unless the chosen model doesn't accept the flag
+    // (Haiku 4.5 today). Unknown effort ids are dropped rather than passed
+    // through — better than letting a typo silently become a no-op or
+    // surface as a CLI error mid-run.
+    if (opts.effort) {
+      if (CLAUDE_EFFORT_VALUES.has(opts.effort)) {
+        env.CLAUDE_CODE_EFFORT_LEVEL = opts.effort;
+      }
+    } else if (!modelDeclinesEffort("claude-code", opts.model)) {
+      throw new Error(`effort is required for claude-code model ${opts.model}`);
+    }
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined, deferredPrompt };
+  }
+
+  if (harness.kind === "cursor") {
+    // cursor-agent acp. The prompt, model, plan/ask mode, and session resume
+    // are JSON-RPC params (`session/prompt`, `session/set_config_option`,
+    // `session/set_mode`, `session/load`). Argv is `acp`, plus `--force` when
+    // the mode is auto — that flag is the one ACP launch option this CLI
+    // build reads. `--sandbox`, `--trust`, `--mode`, `--model`, `--resume`,
+    // and `-p` are not.
+    const extra = (process.env.AGETOR_CURSOR_ARGS ?? "").split(/\s+/).filter(Boolean);
+    if (!opts.model) {
+      throw new Error("model is required for cursor");
+    }
+    const cursorModel = cursorModelArg(opts.model, opts.effort ?? null, opts.speed === "fast", opts.maxMode === true);
+    const args: string[] = [bin, "acp"];
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode === "auto") args.push("--force");
+    args.push(...extra);
+    return { cmd: args, env: Object.keys(env).length ? env : undefined, cursorModel };
+  }
+
+  if (harness.kind === "gemini") {
+    const extra = (process.env.AGETOR_GEMINI_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const args: string[] = [bin];
+
+    if (!opts.model) {
+      throw new Error("model is required for gemini");
+    }
+    args.push("-m", opts.model);
+
+    // Structured streaming: `--output-format stream-json` emits NDJSON
+    // events on stdout (tailed by the driver, same shape claude/codex use).
+    args.push("--output-format", "stream-json");
+
+    // Session flow mirrors claude's pre-generated-uuid pattern (see
+    // AgentRunOptions.sessionId doc): agetor self-issues the uuid via
+    // `--session-id` on the first turn; every follow-up passes the SAME
+    // uuid back via `--resume` — verified empirically (`--resume <uuid> -p
+    // "..."` correctly recalled context established under `--session-id
+    // <uuid>` on a prior turn). Mutually exclusive, like claude.
+    if (opts.resumeSessionId) {
+      args.push("--resume", opts.resumeSessionId);
+    } else if (opts.sessionId) {
+      args.push("--session-id", opts.sessionId);
+    }
+
+    // Approval posture. `auto` → `--yolo` (verified: auto-approves every
+    // tool call). `ask` → `--approval-mode plan` (verified real read-only
+    // mode — closer to claude's native `plan` than codex's read-only-sandbox
+    // stand-in, since gemini has no sandbox at all). `--skip-trust` is
+    // mandatory for BOTH: gemini's headless mode refuses to run tool calls
+    // in an untrusted directory (exit 55) even under `--yolo` — verified —
+    // and every agetor task runs in a fresh worktree path that's inherently
+    // untrusted on first run.
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode === "auto") {
+      args.push("--yolo");
+    } else {
+      args.push("--approval-mode", "plan");
+    }
+    args.push("--skip-trust");
+
+    args.push(...extra);
+
+    // Gemini has no per-invocation effort/thinking-budget flag at all
+    // (verified via `gemini --help`) — unlike claude/codex this isn't
+    // model-specific, so `opts.effort` is intentionally ignored here rather
+    // than routed through `modelDeclinesEffort` (which would throw for any
+    // gemini model id absent from `MODEL_EFFORT_SUPPORT.gemini`, e.g. a
+    // user-typed future model — see `DEFAULT_EFFORT.gemini` comment in
+    // shared/types.ts).
+
+    // Prompt rides in argv (`-p <prompt>`) — no confirmed stdin-only
+    // delivery path exists yet (see GEMINI_PROMPT_ARGV_MAX_BYTES). Gemini's
+    // one-shot tmux launch has no deferred-paste fallback the way claude's
+    // persistent REPL does, so fail loudly above the safe budget instead of
+    // silently mis-delivering a truncated prompt.
+    if (!prompt) {
+      throw new Error("prompt is required for gemini");
+    }
+    if (Buffer.byteLength(prompt, "utf8") > GEMINI_PROMPT_ARGV_MAX_BYTES) {
+      throw new Error(
+        `prompt exceeds ${GEMINI_PROMPT_ARGV_MAX_BYTES} bytes — gemini's one-shot tmux launch has no `
+          + `deferred-paste fallback for an oversized prompt (see GEMINI_PROMPT_ARGV_MAX_BYTES)`,
+      );
+    }
+    args.push("-p", prompt);
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "antigravity") {
+    const extra = (process.env.AGETOR_ANTIGRAVITY_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const args: string[] = [bin, "--output-format", "stream-json"];
+
+    if (!opts.model) {
+      throw new Error("model is required for antigravity");
+    }
+    args.push("--model", opts.model);
+
+    // Effort is encoded in the model id suffix (`gemini-3.8-flash-high`,
+    // `gemini-4-argon-low`, …) and every `MODEL_EFFORT_SUPPORT.antigravity`
+    // set is empty, so `opts.effort` is deliberately ignored here — like the
+    // gemini branch, NOT routed through `modelDeclinesEffort`, so a
+    // user-typed or discovered id still launches. Owner decision D6/D7
+    // (docs/plans/add-gemini-4-argon-grill.md); migration 065 cleared the
+    // efforts older rows had saved.
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode === "auto") {
+      args.push("--dangerously-skip-permissions");
+    } else if (mode === "plan") {
+      args.push("--mode", "plan");
+    } else if (mode === "ask") {
+      args.push("--mode", "accept-edits");
+    }
+
+    if (opts.resumeSessionId) {
+      args.push("--conversation", opts.resumeSessionId);
+    }
+
+    args.push(...extra);
+
+    // End with -p so the shell wrapper in spawnAntigravityViaTmux delivers the prompt via $(cat <promptfile>)
+    args.push("-p");
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, no tmux involved at all (see
+    // that file's header). The prompt is NOT an argv element: it rides over
+    // the `session/prompt` JSON-RPC call the driver issues after the
+    // handshake, so unlike claude/gemini there's no tmux-imsg-cap-style
+    // argv-size budget to enforce here. `fx acp` flags re-verified 0.0.9 and
+    // 0.0.10 (binary probe 2026-09-14): still exactly `--model` and
+    // `--log-file` (source: cli_surface.zig parseAcpArgs, byte-identical
+    // across 0.0.7/0.0.8/0.0.9/0.0.10).
+    const extra = (process.env.AGETOR_FX_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for fx");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for fx (used to build the --log-file path)");
+    }
+
+    // fx owns and writes its own `--log-file` for its own troubleshooting —
+    // agetor never reads it (fx-acp.ts's `ensureLogDirForArgv` only makes
+    // sure the parent dir exists so `fx acp` doesn't fail to open it). This
+    // is the seam `FxLaunchOptions.argv` documents: buildCommand emits the
+    // full argv, `--log-file` already filled in; the driver appends nothing.
+    const logFile = path.join(dataDir, "fx-logs", `${opts.runId}.log`);
+
+    const args: string[] = [bin, "acp", "--model", opts.model, "--log-file", logFile, ...extra];
+
+    // Permission posture rides as an env var, not an argv flag — mirrors the
+    // FX_PERMISSION_MODE contract FxLaunchOptions.env documents. `auto` and
+    // `ask` map straight through since fx's own mode ids already match
+    // agetor's; any other (future/unknown) mode id passes through verbatim,
+    // same convention as every other kind's unknown-model/mode passthrough
+    // in this file. A stored `null` mode resolves to `defaultModeFor("fx")`
+    // = `"yolo"` ("Full access"), not `"auto"` — fx is the one kind whose
+    // house-convention null default escalates past `modes[0]` of every other
+    // kind's "auto", because fx's own `auto` blocks on an interactive
+    // permission card whenever its hard-wired reviewer is unreachable (see
+    // `defaultModeFor`'s doc comment in shared/types.ts and the fx harness
+    // section of CLAUDE.md).
+    // fx 0.0.8 also accepts `full-access` as a UI/CLI-wording alias of
+    // `yolo` (`--full-access` flag, `/permissions full-access`) — it parses
+    // to the identical `.yolo` enum value (config_runtime.zig
+    // parsePermissionMode; fx's README: "saved settings and JSON output
+    // retain `yolo`"), so agetor keeps sending the canonical `yolo` id here
+    // (and `auto`/`ask` for the other two modes) rather than the new alias.
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    env.FX_PERMISSION_MODE = mode;
+
+    // Effort is NOT an argv/env knob for fx — there's no CLI-level flag and
+    // never has been. Since fx 0.0.9 it rides over ACP instead:
+    // fx-acp.ts's `applyFxEffort` sends `session/set_config_option
+    // {configId:"effort", value}` after `session/new`/`resume`/`load`, driven
+    // by `FxLaunchOptions.effort` (threaded through from `opts.effort` at the
+    // `spawnFxViaAcp` call site below `buildCommand`). So `buildCommand`
+    // still emits nothing for `opts.effort` here — a 0.0.8-or-earlier binary
+    // silently ignores the ACP call and just keeps its own default.
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "opencode") {
+    // opencode — hosted in tmux via opencode-tmux.ts, one-shot `opencode run`
+    // per turn (D-1/D-3, spike A10). The prompt is NOT an argv element: a
+    // positional prompt gets wrapped in literal quotes by OpenCode, so the
+    // driver feeds the prompt file on stdin (`"$@" < '<prompt>'`) and no user
+    // text touches argv or the shell wrapper — which also means there is no
+    // argv-size cap to enforce here.
+    const major = opencodeMajor(opts.cliVersion);
+    const server = effectiveOpencodeServer({
+      mode: opts.opencodeServer ?? "shared",
+      harnessHome: harness.home,
+      major,
+    });
+    env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+    const extra = (process.env.AGETOR_OPENCODE_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const title = opencodeTitleArg(opts.title);
+
+    const assemble = (resumeId: string | null): string[] => {
+      const args: string[] = [bin, "run", "--format", "json", "--thinking"];
+      // `-m` (and the variant: v2 `-m id#v`, v1 `-m id --variant v`) is
+      // omitted entirely for the "OpenCode default" sentinel, and the effort
+      // is dropped for `auto` — `opencodeModelArgs` owns both rules, since
+      // every spawn passes the stored `task.effort` straight through (D-6).
+      args.push(...opencodeModelArgs({ model: opts.model ?? null, effort: opts.effort ?? null, major }));
+      // `auto` (and the null default) runs OpenCode's Build agent with every
+      // permission ask approved; `plan` selects OpenCode's own Plan agent
+      // (no file edits; shell commands still run, permission asks are
+      // rejected). An unknown mode id gets no flag (house passthrough).
+      const mode = opts.mode ?? defaultModeFor(harness.kind);
+      if (mode === "auto") {
+        args.push("--auto");
+      } else if (mode === "plan") {
+        args.push("--agent", "plan");
+      }
+      if (resumeId) {
+        args.push("-s", resumeId);
+      } else if (title) {
+        // Only on a fresh session: OpenCode keeps the original title when
+        // `-s` resumes one (spike Q15). One `--title=<t>` argv item, never
+        // `--title <t>`: v2's parser reads a dash-leading VALUE as a flag
+        // (`-v2 migration` printed the version and the turn did nothing), and
+        // both majors parse the `=` form (v1 is yargs).
+        args.push(`--title=${title}`);
+      }
+      // v2 only (v1 rejects unknown flags): run without the shared background
+      // service. A harness with a home always lands here (spike A14 — the
+      // service's fixed port isn't isolated by HOME/XDG).
+      if (major === 2 && server === "standalone") {
+        args.push("--standalone");
+      }
+      args.push(...extra);
+      return args;
+    };
+
+    const resumeId = opts.resumeSessionId ?? null;
+    return {
+      cmd: assemble(resumeId),
+      env,
+      ...(resumeId ? { freshArgv: assemble(null) } : {}),
+    };
+  }
+
+  if (harness.kind === "copilot") {
+    // GitHub Copilot CLI — hosted in a per-task tmux session via
+    // copilot-tmux.ts. One-shot per turn like codex (prompt on stdin, so no
+    // argv-size cap), with a self-issued `--session-id` like gemini: the
+    // caller passes the prior id as `resumeSessionId` on a follow-up, else a
+    // fresh uuid as `sessionId`; Copilot resumes by seeing the same id.
+    const extra = (process.env.AGETOR_COPILOT_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for copilot");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for copilot (used to build the --usage-output-file path)");
+    }
+    const sessionId = opts.resumeSessionId ?? opts.sessionId;
+    if (!sessionId) {
+      throw new Error("sessionId or resumeSessionId is required for copilot");
+    }
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    const args: string[] = [
+      bin,
+      "--output-format", "json",
+      "--no-color",
+      "--no-ask-user",
+      "--session-id", sessionId,
+      "--model", opts.model,
+    ];
+    // `auto` ("Model default") and null both mean: let Copilot choose.
+    if (opts.effort && opts.effort !== "auto") {
+      args.push("--reasoning-effort", opts.effort);
+    }
+    // `--mode` is always passed (never inherited from the saved session), so
+    // a task switched Plan -> Auto stops planning on the very next turn.
+    args.push("--mode", mode === "plan" ? "plan" : "interactive");
+    if (mode === "auto") {
+      args.push("--allow-all");
+    }
+    args.push("--usage-output-file", copilotUsagePath(opts.runId));
+    args.push(...extra);
+
+    // The long-lived tmux server's env may belong to another process, and the
+    // plan-file reader must look where Copilot writes: always pin the home.
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    // Allow-all rides the env too (Auto only); a value the harness env map
+    // sets wins in every mode. In every other mode the driver additionally
+    // unsets an ambient export (`shouldUnsetAllowAll`), which only holds while
+    // the key is absent here.
+    if (mode === "auto" && !("COPILOT_ALLOW_ALL" in env)) {
+      env.COPILOT_ALLOW_ALL = "true";
+    }
+    const harnessSetsEnv = harness.env ?? {};
+    const stripClassicTokens = ["GH_TOKEN", "GITHUB_TOKEN"].filter((k) => !(k in harnessSetsEnv));
+
+    return { cmd: args, env, stripClassicTokens };
+  }
+
+  if (harness.kind === "codex") {
+    // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
+    // element: it's delivered on stdin (the trailing `-`), so the driver can
+    // pipe a prompt file in and no user text touches the shell wrapper.
+    if (process.env.AGETOR_CODEX_ARGS?.trim()) {
+      throw new Error("PERMISSION_DENIED: AGETOR_CODEX_ARGS is disabled; arbitrary flags can override the sandbox");
+    }
+
+    const args: string[] = [bin, "exec"];
+
+    if (!opts.model) {
+      throw new Error("model is required for codex");
+    }
+    args.push("--model", opts.model);
+
+    if (opts.effort) {
+      args.push("-c", `model_reasoning_effort=${opts.effort}`);
+    } else if (!modelDeclinesEffort("codex", opts.model)) {
+      throw new Error(`effort is required for codex model ${opts.model}`);
+    }
+
+    args.push("--json", "--color", "never", "--skip-git-repo-check",
+      "--ignore-user-config", "-c", "features.apps=false",
+      "-c", "approval_policy=never",
+      "-c", "sandbox_workspace_write.writable_roots=[]",
+      "-c", "sandbox_workspace_write.network_access=false",
+      "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+      "-c", "sandbox_workspace_write.exclude_slash_tmp=true");
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    if (mode !== "auto" && mode !== "ask") {
+      throw new Error("UNSUPPORTED_CAPABILITY: Codex supports only auto or ask mode");
+    }
+    if (mode === "auto" && opts.codexExternalGitDirs?.length) {
+      throw new Error("PERMISSION_DENIED: external Git metadata writes require a coordinator; use read-only review instead");
+    }
+    args.push("--sandbox", mode === "auto" ? "workspace-write" : "read-only");
+    if (opts.resumeSessionId && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(opts.resumeSessionId)) {
+      throw new Error("INVALID_INPUT: resumeSessionId must be an explicit session identifier");
+    }
+
+    // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
+    // rejects `--json`/`--color` placed after it). codex loads the prior
+    // conversation from its own rollout via `thread_id`, so the new prompt is
+    // just the user's next line.
+    if (opts.resumeSessionId) {
+      args.push("resume", opts.resumeSessionId);
+    }
+    // Read the prompt from stdin — `-` is codex's stdin sentinel.
+    args.push("-");
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  // Exhaustive: a new AgentKind must get its own branch above rather than
+  // silently falling through to another kind's argv (KB 785913e5).
+  const _never: never = harness.kind;
+  throw new Error(`unknown harness kind: ${String(_never)}`);
+}
+
+/** Resolve external Git metadata before applying the same launch policy to
+ *  fresh and resumed Codex runs. Worktree isolation is not a permission grant. */
+export async function buildCodexCommand(
+  harness: Harness,
+  prompt: string,
+  opts: AgentRunOptions,
+  cwd: string,
+): Promise<AgentCommand> {
+  return buildCommand(harness, prompt, {
+    ...opts,
+    codexExternalGitDirs: await gitWritableRoots(cwd),
+  });
+}
+
+/**
+ * The server mode an OpenCode turn runs in for this harness + task + CLI
+ * version (D-4): a thin wrapper over `effectiveOpencodeServer` +
+ * `opencodeMajor`, so the orchestrator (breadcrumb, reattach) and
+ * `spawnAgent` resolve it identically. `null` on v1 (no server flag).
+ */
+export function opencodeEffectiveServerFor(
+  harness: Harness,
+  task: { opencodeServer?: OpencodeServerMode | null },
+  cliVersion: string | null,
+): OpencodeServerMode | null {
+  return effectiveOpencodeServer({
+    mode: task.opencodeServer ?? "shared",
+    harnessHome: harness.home,
+    major: opencodeMajor(cliVersion),
+  });
+}
+
+/**
+ * The subagent hooks an OpenCode turn's driver runs (D-11), exported so the
+ * orchestrator's reattach path wires exactly what `spawnAgent` wires:
+ *  - `onSubagent` registers a `subagents` row (`parentKind:
+ *    "opencode_subagent"`, status `running`) when a `subagent` (v2) / `task`
+ *    (v1) tool result names a child session;
+ *  - `beforeSettle` — awaited by the driver before `done` resolves — exports
+ *    every running/orphaned child of the task and fills or orphans its tab,
+ *    so no row stays `running` past settle (which would park the task in the
+ *    background-agent hold). Best effort: a failed refresh is logged and
+ *    never blocks the turn from settling.
+ * The export runs with the same env a turn gets (`harnessEnv` plus
+ * `OPENCODE_DISABLE_AUTOUPDATE`) and the turn's server mode.
+ */
+export function opencodeDriverHooks(a: {
+  taskId: string;
+  runId: string;
+  harness: Harness;
+  cwd: string;
+  major: 1 | 2;
+  standalone: boolean;
+}): { onSubagent: (n: OpencodeSubagentNotice) => void; beforeSettle: OpencodeLaunchOptions["beforeSettle"] } {
+  const { taskId, runId, harness, cwd, major, standalone } = a;
+  return {
+    onSubagent: (notice) => {
+      try {
+        registerOpencodeSubagent({ taskId, runId, notice });
+      } catch (err) {
+        console.warn(`[agetor] opencode: couldn't register subagent ${notice.childSessionId} for task ${taskId}:`, err);
+      }
+    },
+    beforeSettle: async () => {
+      const env = harnessEnv(harness);
+      env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+      try {
+        await refreshOpencodeSubagents({ taskId, bin: resolveBin(harness), env, cwd, major, standalone, final: true });
+      } catch (err) {
+        console.warn(`[agetor] opencode: subagent refresh failed for task ${taskId}:`, err);
+      }
+    },
+  };
+}
+
+/**
+ * Optional test hook: when `AGETOR_CLAUDE_DRIVER=fake` the claude branch
+ * returns an in-process SpawnedAgent that emits canned events on a tick
+ * rather than touching tmux. Keeps orchestrator integration tests fast and
+ * isolated from a real CLI.
+ */
+type FakeDriverInstance = SpawnedAgent & {
+  _record: string[];
+  /** The speed tier the spawn's run options carried (recorded by the fake
+   *  fx branch, so orchestrator tests can see `task.speed` reach the spawn). */
+  _speed?: Speed | null;
+};
+const fakeDrivers = new Map<string, FakeDriverInstance>();
+export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined {
+  return fakeDrivers.get(taskId);
+}
+
+/**
+ * Alternate trigger for the `AGETOR_FAKE_CLAUDE_TODOS` scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var.
+ * Env-var scenario selection is fixed for the whole process — every task the
+ * fake driver spawns for gets the same behavior — which is fine for unit
+ * tests (`beforeAll` sets the var per file) but doesn't compose with the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`), which spawns one
+ * `headless.ts` per worker with a fixed env block shared by every test/task
+ * in that worker. A spec can't get its own env var into that already-running
+ * process, but it CAN put anything it wants in `task.prompt` at task-create
+ * time — so this marker is the e2e-reachable equivalent of the env gate,
+ * exported so `e2e/todo-progress.spec.ts` can reference the exact string
+ * instead of duplicating it.
+ */
+export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
+
+/**
+ * Prompt-marker trigger for the pipeline-handoff fake-driver scenario (see
+ * `makeFakeAgent` below and `docs/plans/pipelines.md` §3/T3) — same
+ * rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}: `pipeline-runner.ts`
+ * composes each step's prompt server-side (`composeStepPrompt`), so a test
+ * drives this scenario by putting the marker in a step's `instructions`
+ * field, never via a process-wide env var. An optional `:<token>` suffix
+ * selects the outcome — `done` (or no suffix) ⇒ a valid terminal handoff,
+ * `missing` ⇒ no `<handoff>` tag at all, `invalid` ⇒ a `<handoff>` tag whose
+ * body isn't valid JSON, anything else ⇒ that literal token as the
+ * handoff's `next` field (picking a named outgoing step). The **last**
+ * occurrence in the prompt wins (`lastFakeHandoffSuffix` below) — the
+ * overall goal text can carry a default suffix that a step's own
+ * instructions override. This "last occurrence wins" rule is resolved
+ * against whichever prompt actually carries the marker — see the two-turn
+ * suffixes below for what happens when the CURRENT turn's prompt carries no
+ * marker at all.
+ *
+ * Formatted-handoff suffixes (docs/plans/formatted-handoff.md T3): `rich` /
+ * `rich-blocked` write `agetor-handoff/notes.md` and `report.txt` into the
+ * turn's cwd and emit the canonical rich handoff (all eight artifact shapes,
+ * two open questions, `status` `done` / `blocked`); `mention` quotes
+ * `<handoff>` and a `{schemaVersion, …}` shape in inline code in prose ahead
+ * of a valid terminal block (the legacy parser misreads it, the code-aware
+ * one does not); `fenced` wraps a valid block entirely in a code fence (not a
+ * real handoff to a code-aware reader). `fenced-then-<token>` is the
+ * two-turn form. A bare `rich`/`mention`/`fenced` is therefore no longer
+ * usable as a literal `next` — name such a step differently.
+ *
+ * Two-turn suffixes: `missing-then-done` and `invalid-then-done` behave like
+ * `missing`/`invalid` on the task's FIRST fake-driver turn and like `done`
+ * (a valid terminal handoff) on every turn after that; more generally
+ * `missing-then-<token>` / `invalid-then-<token>` behave like `missing`/
+ * `invalid` on turn 1 and like plain `<token>` (a `next`-field pick, or
+ * `done`) on turn 2+. These exist because the pipeline runner sends ONE
+ * automatic reminder — an ordinary follow-up `sendInput` turn on the step
+ * task — when a step's reply lacked a valid `<handoff>`; that reminder text
+ * never carries this marker itself. `continue-then-done` is turn 1 only: the
+ * reply has no `<handoff>`, then a real continuation run (the same factory
+ * a stray JSONL line uses) is opened and that run writes a terminal
+ * handoff. The continuation is scheduled as a microtask after this turn's
+ * `done` resolves, so the first run's settle still runs and sees the newer
+ * run already `running`. Later turns ignore the suffix's continuation
+ * behavior and emit an ordinary terminal handoff.
+ *
+ * `continue-overlap` is turn 1 only as well, and reproduces two overlapping
+ * continuations: run A writes text with no `<handoff>` and resolves; a
+ * microtask later a notification-continuation B is adopted and writes a
+ * valid terminal handoff but stays open; a user-continuation C is then
+ * opened, displaces B as the task's current run and writes
+ * "Picking this back up." with no handoff. B resolves after
+ * {@link FAKE_OVERLAP_B_MS}, C after {@link FAKE_OVERLAP_C_MS}, so B always
+ * ends first and the step's FINAL run (C) carries no handoff while an
+ * earlier continuation (B) does. Later turns emit an ordinary terminal
+ * handoff, like `continue-then-done`. A per-task turn counter
+ * (`fakeHandoffTurnCounts` below) tracks which turn a given taskId is on,
+ * and when the CURRENT turn's `prompt` carries no marker at all (true for
+ * that reminder, and for any other marker-less follow-up), the driver falls
+ * back to the marker in the task's own stored `prompt` (its original,
+ * turn-1 text — via `tasks.get`) so the scenario still resolves the same way
+ * across the whole conversation, not just its first turn.
+ */
+export const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a
+ *  pattern without escaping — mirrors {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}'s
+ *  own suffix regex below. */
+const FAKE_CLAUDE_HANDOFF_SUFFIX_RE = new RegExp(`${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}(?::([\\w-]+))?`, "g");
+
+/**
+ * Companion to {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}: when a pipeline
+ * step's prompt ALSO carries this marker, the fake handoff turn first
+ * "spawns" one subagent — a `subagents` row inserted directly, exactly like
+ * the Monitor scenario does (this fake driver writes no session JSONL for
+ * `claude-subagents.ts` to discover it from) — keeps it `running` for
+ * `:<ms>` (default {@link FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS}), settles it
+ * `completed`, and only THEN emits the handoff and resolves the turn (the
+ * orchestrator's `subagents.hasRunning` hold would otherwise keep the step
+ * `running` past the turn). The optional `[<description>]` sets the row's
+ * `description` — the run view attributes a live subagent to a configured
+ * persona by name (`matchSubagentToProfile`), so a test names the persona
+ * there: `__agetor_fake_claude_subagent__:4500[Helper One: review tests]`.
+ * Exported for `e2e/pipelines-run.spec.ts`, which keeps a literal copy.
+ */
+export const FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_claude_subagent__";
+export const FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS = 1500;
+const FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS = 50;
+const FAKE_CLAUDE_SUBAGENT_RE = new RegExp(
+  `${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}(?::(\\d+))?(?:\\[([^\\]\\n]+)\\])?`,
+);
+/** Parse the LAST subagent marker in `prompt` (a step's own instructions win
+ *  over the goal text, same rule as `lastFakeHandoffSuffix`). */
+function parseFakeSubagentMarker(prompt: string): { runMs: number; description: string } | null {
+  const idx = prompt.lastIndexOf(FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER);
+  if (idx === -1) return null;
+  const m = FAKE_CLAUDE_SUBAGENT_RE.exec(prompt.slice(idx));
+  const parsed = m?.[1] ? Number(m[1]) : NaN;
+  const runMs = Number.isFinite(parsed) ? Math.max(FAKE_CLAUDE_SUBAGENT_MIN_RUN_MS, parsed) : FAKE_CLAUDE_SUBAGENT_DEFAULT_RUN_MS;
+  const description = m?.[2]?.trim() || "Fake subagent";
+  return { runMs, description };
+}
+/**
+ * Test hook: a fake claude turn that attaches the REAL subagent watcher
+ * (`attachSubagentWatcher`, timer mode) over real on-disk subagent
+ * transcripts, instead of faking subagent rows/events by hand the way
+ * {@link FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER} does. Exists for the structural
+ * non-blocking-restore e2e (TT8) and the watcher-drift integration test
+ * (TT2) of `docs/plans/non-blocking-session-restore.md`: a `--resume`-style
+ * follow-up turn re-attaches a watcher over a task with dozens of large
+ * transcripts, and the spec asserts (a) the rest of the app (other task
+ * panels, the pipeline run view, `/health`) stays responsive while that
+ * cooperative seed + first pass runs, and (b) the re-attach dedupes against
+ * the persisted `run_events` (zero new subagent events/rows). The TIMING
+ * claim (max event-loop gap) lives in the drift integration test, not here.
+ *
+ * Optional suffix `:<files>x<kb>` (default 20 files x 64 KB; files clamped
+ * 1..500, kb 1..8192): `__agetor_fake_claude_real_watcher__:60x512`. The LAST
+ * occurrence in the prompt wins. A follow-up turn carries no marker of its
+ * own, so the marker is also honoured from the task's stored (turn-1)
+ * prompt (see `resolveFakeRealWatcherSpec`).
+ *
+ * On-disk layout (under the task's cwd, i.e. a test's temp workdir; the
+ * session id is `fake-<taskId>`, stable across turns):
+ *
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>.jsonl            (main; empty)
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>/subagents/agent-<id>.jsonl
+ *   <cwd>/agetor-fake-claude/<taskId>/<sessionId>/subagents/agent-<id>.meta.json
+ *
+ * which is exactly the layout `attachSubagentWatcher` derives from the main
+ * JSONL path. Turn 1 (main JSONL not on disk yet) writes the files and
+ * inserts one `completed` `subagents` row per file, then attaches the real
+ * watcher and awaits `handle.settled` (seed + first full pass) BEFORE the
+ * turn resolves, so the first pass's events are persisted deterministically
+ * when the run settles. Every later turn only re-attaches (a genuine
+ * rehydrate + offset-0 replay that must dedupe to zero new events). After
+ * each turn resolves — and on `kill()` — the watcher is detached so the next
+ * turn's attach is a real rehydrate rather than a no-op on a live watcher.
+ */
+export const FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER = "__agetor_fake_claude_real_watcher__";
+export const FAKE_CLAUDE_REAL_WATCHER_DEFAULT_FILES = 20;
+export const FAKE_CLAUDE_REAL_WATCHER_DEFAULT_KB = 64;
+const FAKE_CLAUDE_REAL_WATCHER_MAX_FILES = 500;
+const FAKE_CLAUDE_REAL_WATCHER_MAX_KB = 8192;
+const FAKE_CLAUDE_REAL_WATCHER_RE = new RegExp(
+  `${FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER}(?::(\\d+)x(\\d+))?`,
+);
+interface FakeRealWatcherSpec { files: number; kb: number }
+function parseFakeRealWatcherMarker(prompt: string): FakeRealWatcherSpec | null {
+  const idx = prompt.lastIndexOf(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER);
+  if (idx === -1) return null;
+  const m = FAKE_CLAUDE_REAL_WATCHER_RE.exec(prompt.slice(idx));
+  const files = m?.[1] ? Number(m[1]) : NaN;
+  const kb = m?.[2] ? Number(m[2]) : NaN;
+  return {
+    files: Number.isFinite(files)
+      ? Math.min(FAKE_CLAUDE_REAL_WATCHER_MAX_FILES, Math.max(1, files))
+      : FAKE_CLAUDE_REAL_WATCHER_DEFAULT_FILES,
+    kb: Number.isFinite(kb)
+      ? Math.min(FAKE_CLAUDE_REAL_WATCHER_MAX_KB, Math.max(1, kb))
+      : FAKE_CLAUDE_REAL_WATCHER_DEFAULT_KB,
+  };
+}
+/** The CURRENT turn's prompt when it carries the marker, else the task's own
+ *  stored (turn-1) prompt when THAT does — the same fallback
+ *  `resolveFakeHandoffPromptSource` uses, for the marker-less follow-up turn. */
+function resolveFakeRealWatcherSpec(taskId: string, prompt: string): FakeRealWatcherSpec | null {
+  if (prompt.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER)) return parseFakeRealWatcherMarker(prompt);
+  const stored = tasks.get(taskId)?.prompt;
+  return stored && stored.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER) ? parseFakeRealWatcherMarker(stored) : null;
+}
+/** Filesystem-safe form of a task id (a uuid in practice) — the paths below
+ *  are `path.join`ed from it, so nothing but `[A-Za-z0-9_-]` may reach them. */
+function fakeRealWatcherSafeId(taskId: string): string {
+  return taskId.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+/** Paths of the fake session for `taskId` under `cwd` (see the marker doc). */
+function fakeRealWatcherPaths(cwd: string, taskId: string) {
+  const safe = fakeRealWatcherSafeId(taskId);
+  const sessionId = `fake-${safe}`;
+  const baseDir = path.join(cwd, "agetor-fake-claude", safe);
+  return {
+    safe,
+    sessionId,
+    jsonlPath: path.join(baseDir, `${sessionId}.jsonl`),
+    subagentsDir: path.join(baseDir, sessionId, "subagents"),
+  };
+}
+/** Write `files` claude-shaped sidechain transcripts of ~`kb` KB each and
+ *  insert one `completed` `subagents` row per file (`parentKind: "subagent"`,
+ *  `sourcePath` = the transcript, `runId` = the turn's run) — everything the
+ *  watcher's rehydrate seed needs to pick the rows up. Line shape mirrors
+ *  claude's sidechain lines: `isSidechain: true`, `agentId`, an `assistant`
+ *  message with one text block, a unique `uuid` per line (the dedup key), a
+ *  timestamp; the final line carries `stop_reason: "end_turn"`. */
+async function writeFakeRealWatcherFixture(
+  taskId: string,
+  runId: string | null,
+  spec: FakeRealWatcherSpec,
+  paths: ReturnType<typeof fakeRealWatcherPaths>,
+): Promise<void> {
+  mkdirSync(paths.subagentsDir, { recursive: true });
+  writeFileSync(paths.jsonlPath, "");
+  // ~1 KB of text per line so `kb` KB is `kb` lines-ish and each file has
+  // many distinct dedup keys.
+  const filler = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(17).slice(0, 900);
+  const targetBytes = spec.kb * 1024;
+  const now = Date.now();
+  for (let i = 0; i < spec.files; i++) {
+    const agentId = `fakerw-${paths.safe.slice(0, 12)}-${i}`;
+    const sourcePath = path.join(paths.subagentsDir, `agent-${agentId}.jsonl`);
+    const toolUseId = `toolu_${agentId}`;
+    const out: string[] = [];
+    let bytes = 0;
+    let n = 0;
+    let parentUuid: string | null = null;
+    while (bytes < targetBytes) {
+      const uuid = crypto.randomUUID();
+      const last = bytes + 1100 >= targetBytes;
+      const line = JSON.stringify({
+        parentUuid,
+        isSidechain: true,
+        userType: "external",
+        sessionId: paths.sessionId,
+        agentId,
+        type: "assistant",
+        message: {
+          id: `msg_${agentId}_${n}`,
+          type: "message",
+          role: "assistant",
+          model: "claude-fake",
+          content: [{ type: "text", text: `[${agentId} #${n}] ${filler}` }],
+          stop_reason: last ? "end_turn" : null,
+        },
+        uuid,
+        timestamp: new Date(now - (spec.files - i) * 1000 + n).toISOString(),
+      });
+      out.push(line);
+      bytes += line.length + 1;
+      parentUuid = uuid;
+      n++;
+    }
+    await Bun.write(sourcePath, out.join("\n") + "\n");
+    await Bun.write(
+      path.join(paths.subagentsDir, `agent-${agentId}.meta.json`),
+      JSON.stringify({ agentType: "general-purpose", description: `Fake real-watcher subagent ${i}`, toolUseId, spawnDepth: 1 }),
+    );
+    subagentsDb.insertIfAbsent({
+      id: agentId,
+      taskId,
+      runId,
+      parentKind: "subagent",
+      agentType: "general-purpose",
+      description: `Fake real-watcher subagent ${i}`,
+      spawnDepth: 1,
+      sourcePath,
+      toolUseId,
+      status: "completed",
+      startedAt: now - 1000,
+      endedAt: now,
+    });
+  }
+}
+
+/** Find the LAST occurrence of {@link FAKE_CLAUDE_HANDOFF_PROMPT_MARKER} in
+ *  `prompt` and return its optional `:<token>` suffix (letters/digits/-/_ ;
+ *  stops at whitespace/`:`), or `null` when the marker carries no suffix
+ *  (bare `done` behavior) or isn't present at all. */
+function lastFakeHandoffSuffix(prompt: string): string | null {
+  FAKE_CLAUDE_HANDOFF_SUFFIX_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((match = FAKE_CLAUDE_HANDOFF_SUFFIX_RE.exec(prompt)) !== null) {
+    last = match;
+    if (match[0].length === 0) FAKE_CLAUDE_HANDOFF_SUFFIX_RE.lastIndex++;
+  }
+  return last ? (last[1] ?? null) : null;
+}
+
+/**
+ * Resolve which prompt text the handoff scenario should read its marker
+ * from for this spawn: the CURRENT turn's `prompt` when it carries the
+ * marker itself (the normal case — the first turn of a step, or any
+ * marker-carrying follow-up a test sends directly), else the task's own
+ * stored (turn-1) `prompt` when THAT carries the marker (the pipeline
+ * runner's automatic "no handoff found" reminder, and any other
+ * marker-less follow-up) — via a direct `tasks.get` import, safe because
+ * `db.ts` has no import of `agents.ts` in its own chain (no cycle). Returns
+ * `null` when neither carries the marker at all, i.e. this isn't a handoff
+ * scenario.
+ */
+function resolveFakeHandoffPromptSource(taskId: string, prompt: string): string | null {
+  if (prompt.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return prompt;
+  const stored = tasks.get(taskId)?.prompt;
+  if (stored && stored.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return stored;
+  return null;
+}
+
+/**
+ * Per-task turn counter for the handoff scenario only, bumped once per fake
+ * spawn that actually enters the handoff branch below (see
+ * `resolveFakeHandoffPromptSource`) — this is what lets `missing-then-done`
+ * / `invalid-then-done` (and `missing-then-<token>` / `invalid-then-<token>`)
+ * distinguish a task's first turn from every turn after it. Never cleared on
+ * `kill()` (a cancelled turn still counts as having happened — the counter
+ * isn't a "successful turns" count), and never explicitly cleared on task
+ * delete either (not observable from here); instead capped at
+ * `FAKE_HANDOFF_TURN_MAP_CAP` entries with FIFO eviction of the
+ * oldest-inserted taskId so a long-running test process can't leak memory
+ * across many short-lived fake tasks.
+ */
+const fakeHandoffTurnCounts = new Map<string, number>();
+const FAKE_HANDOFF_TURN_MAP_CAP = 1000;
+function bumpFakeHandoffTurn(taskId: string): number {
+  const isNewKey = !fakeHandoffTurnCounts.has(taskId);
+  const next = (fakeHandoffTurnCounts.get(taskId) ?? 0) + 1;
+  if (isNewKey && fakeHandoffTurnCounts.size >= FAKE_HANDOFF_TURN_MAP_CAP) {
+    const oldestKey = fakeHandoffTurnCounts.keys().next().value;
+    if (oldestKey !== undefined) fakeHandoffTurnCounts.delete(oldestKey);
+  }
+  fakeHandoffTurnCounts.set(taskId, next);
+  return next;
+}
+
+/**
+ * Two-turn suffix regex: `(missing|invalid|fenced)-then-<token>` where `<token>` is
+ * itself a valid ordinary suffix (letters/digits/-/_). Matches
+ * `missing-then-done`, `invalid-then-done`, and `missing-then-<StepName>`
+ * alike — `<token>` is used verbatim, same as a plain suffix would be.
+ */
+const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid|fenced)-then-(.+)$/;
+/**
+ * Resolve the raw suffix (from `lastFakeHandoffSuffix`) plus the current
+ * turn number into the EFFECTIVE suffix `makeFakeAgent`'s handoff branch
+ * should act on: an ordinary suffix (or no suffix) is turn-invariant and
+ * passes through unchanged; a two-turn suffix resolves to the "then"
+ * behavior — `missing`/`invalid` — on turn 1, and to the token after
+ * `-then-` on every later turn.
+ */
+function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): string | null {
+  if (!rawSuffix) return rawSuffix;
+  const match = FAKE_HANDOFF_TWO_TURN_RE.exec(rawSuffix);
+  if (!match) return rawSuffix;
+  const firstTurnBehavior: string = match[1] ?? rawSuffix;
+  const laterToken: string = match[2] ?? rawSuffix;
+  return turn <= 1 ? firstTurnBehavior : laterToken;
+}
+
+/** The canonical rich handoff's `artifacts` list (docs/plans/formatted-handoff.md
+ *  §4, "Canonical rich handoff"): eight entries covering every artifact shape
+ *  the card and modal render — a relative path, an absolute path, a URL, a path
+ *  with a note, a path with a line number, a path that is never written, a
+ *  knowledge-entry reference and free text. Entry 2 is absolute under `cwd`;
+ *  `rich` writes entries 1 and 2 to disk (entry 6 is deliberately never
+ *  written). Exported for `agents-fake-handoff.test.ts` and kept in step with
+ *  `e2e/formatted-handoff.spec.ts`, which copies it literally. */
+export function fakeRichHandoffArtifacts(cwd: string): string[] {
+  return [
+    "agetor-handoff/notes.md",
+    path.join(cwd, "agetor-handoff", "report.txt"),
+    "https://example.invalid/pr/1",
+    "agetor-handoff/notes.md (the plan)",
+    "agetor-handoff/notes.md:12",
+    "agetor-handoff/missing.md",
+    "jubarteai:00000000-0000-4000-8000-000000000000 (note)",
+    "commit 1234abc on feature/example",
+  ];
+}
+
+/** `rich` / `rich-blocked`: write the two files entries 1 and 2 of
+ *  {@link fakeRichHandoffArtifacts} point at, and return the turn's assistant
+ *  text — prose, then the canonical rich handoff block. */
+function fakeRichHandoffText(cwd: string, status: "done" | "blocked"): string {
+  const dir = path.join(cwd, "agetor-handoff");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "notes.md"), "# Handoff notes\n\nSynthetic notes for the rich handoff fixture.\n");
+  writeFileSync(path.join(dir, "report.txt"), "Synthetic report for the rich handoff fixture.\n");
+  const handoff = {
+    schemaVersion: 1,
+    purpose: "e2e rich purpose",
+    summary: "**Rich** handoff with `code` and a list:\n- one\n- two\n- three\n- four\n- five",
+    reason: "e2e rich reason uniquetoken-reason",
+    next: null as string | null,
+    artifacts: fakeRichHandoffArtifacts(cwd),
+    openQuestions: ["First e2e question?", "Second e2e question?"],
+    status,
+  };
+  return `Here is the rich handoff.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`;
+}
+
+/** Terminal handoff the `continue-then-done` continuation writes. `next`
+ *  is null so a step with one outgoing edge still takes it, and a step
+ *  with none is finished. */
+function fakeTerminalHandoffText(summary: string): string {
+  const handoff = {
+    schemaVersion: 1,
+    purpose: "fake purpose",
+    summary,
+    reason: "fake reason",
+    next: null as string | null,
+    artifacts: [] as string[],
+    openQuestions: [] as string[],
+    status: "done" as const,
+  };
+  return `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`;
+}
+
+/**
+ * `continue-overlap`: how long after both continuations are open the first
+ * one (B, the notification-continuation carrying the handoff) resolves. Kept
+ * well under {@link FAKE_OVERLAP_C_MS} so B always ends before C, and long
+ * enough that C's open (a synchronous run-row insert) lands while B is still
+ * `running`.
+ */
+export const FAKE_OVERLAP_B_MS = 400;
+/**
+ * `continue-overlap`: how long after both continuations are open the second
+ * one (C, the user-continuation that displaces B and carries no handoff)
+ * resolves. It is the step's last run to settle, which is what the pipeline
+ * runner's look-back has to cope with.
+ */
+export const FAKE_OVERLAP_C_MS = 1200;
+
+/**
+ * Adopt a continuation run and write a terminal handoff onto it. Called
+ * from a microtask queued AFTER the current turn's `done` promise is
+ * resolved, so that turn's settle is already queued and still sees this
+ * newer run as `running` when it classifies. The continuation's own
+ * `done` is resolved from a further microtask so it cannot settle before
+ * that classification. A null factory (no orchestrator wired) is a no-op:
+ * the turn that just finished simply has no handoff.
+ */
+function adoptFakeHandoffContinuation(taskId: string): void {
+  const hooks = openContinuationRun(taskId);
+  if (!hooks) return;
+  let resolveCont!: (code: number) => void;
+  const contDone = new Promise<number>((res) => { resolveCont = res; });
+  let settled = false;
+  const finish = (code: number) => {
+    if (settled) return;
+    settled = true;
+    resolveCont(code);
+  };
+  hooks.onAdopted({
+    kill: () => finish(0),
+    writeInput: () => true,
+    done: contDone,
+  });
+  hooks.onChunk("assistant", fakeTerminalHandoffText("continued after background task"));
+  queueMicrotask(() => {
+    hooks.onChunk("status", "turn complete");
+    finish(0);
+  });
+}
+
+/**
+ * `continue-overlap` driver: adopt continuation B (trigger `"notification"`)
+ * and write a terminal handoff onto it without resolving, then adopt
+ * continuation C (trigger `"user"`) which displaces B as the task's current
+ * run and writes a handoff-less message. B resolves after
+ * {@link FAKE_OVERLAP_B_MS}, C after {@link FAKE_OVERLAP_C_MS}. Called from a
+ * microtask queued AFTER the first run's `done` is resolved, like
+ * {@link adoptFakeHandoffContinuation}. A null factory (no orchestrator
+ * wired) is a no-op for the continuation it would have opened.
+ */
+function adoptFakeOverlappingContinuations(taskId: string): void {
+  const open = (
+    trigger: "notification" | "user",
+    text: string,
+    resolveAfterMs: number,
+  ): void => {
+    const hooks = openContinuationRun(taskId, trigger);
+    if (!hooks) return;
+    let resolveCont!: (code: number) => void;
+    const contDone = new Promise<number>((res) => { resolveCont = res; });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveCont(code);
+    };
+    hooks.onAdopted({
+      kill: () => finish(0),
+      writeInput: () => true,
+      done: contDone,
+    });
+    hooks.onChunk("assistant", text);
+    timer = setTimeout(() => {
+      hooks.onChunk("status", "turn complete");
+      finish(0);
+    }, resolveAfterMs);
+  };
+  // B first, C second: C's run-row insert flips `task.runId` to C while B is
+  // still running.
+  open("notification", fakeTerminalHandoffText("continued after background task (overlap)"), FAKE_OVERLAP_B_MS);
+  open("user", "Picking this back up.", FAKE_OVERLAP_C_MS);
+}
+
+/**
+ * Prompt-marker trigger for the `SendUserFile` fake-driver scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
+ * same rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above — the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`) spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process, but CAN put anything it wants in `task.prompt` at
+ * task-create time. Exported so `e2e/sent-files.spec.ts` can reference the
+ * exact string instead of duplicating it (that spec can't `import` from
+ * `src/bun/*`, so it keeps a **literal copy** of this string).
+ */
+export const FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER = "__agetor_fake_claude_sent_files__";
+
+/** * Prompt-marker trigger for the `fx_permission` card scenario (see
+ * `makeFakeAgent` below), same rationale as `FAKE_CLAUDE_TODOS_PROMPT_MARKER`
+ * above: the e2e suite's worker-scoped backend fixture spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process — but it CAN put anything it wants in
+ * `task.prompt` at task-create time. Exported so an fx-permission e2e spec
+ * can reference the exact string instead of duplicating it.
+ */
+export const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
+/**
+ * Prompt-marker trigger for the fx model-response-recovery scenario (see
+ * `makeFakeAgent` below and `docs/plans/fix-fx-harness-rate-limit.md` §3) —
+ * same rationale as {@link FAKE_FX_PERMISSION_PROMPT_MARKER}: puts the "storm"
+ * variant (a run of retry sentinels ending in `paused`) on the wire for an
+ * e2e spec that can't set a per-test env var against the worker-shared
+ * `headless.ts` backend. `AGETOR_FAKE_FX_RECOVERY=1` is the process-wide
+ * equivalent for unit/driver tests that don't need per-task scoping. Neither
+ * trigger matters when the launch itself carries
+ * `AgentRunOptions.continueRecovery: true` — that always selects the
+ * "continue" variant (a `recovered` sentinel followed by an ordinary turn)
+ * regardless of what the prompt says, since a continue turn's prompt text is
+ * ignored entirely (see `AgentRunOptions.continueRecovery`'s doc comment).
+ */
+export const FAKE_FX_RECOVERY_PROMPT_MARKER = "__agetor_fake_fx_recovery__";
+/**
+ * Prompt-marker trigger for the fx model-response-recovery **repause**
+ * scenario (`docs/plans/fx-recovery-follow-ups.md` §3.6/T3) — makes a
+ * `continueRecovery` launch storm and pause again instead of recovering, so
+ * the auto-resume cap (`FX_AUTO_RESUME_MAX`) is exercisable in tests without
+ * waiting out three real chained pauses. Also included in the top-level
+ * trigger for the recovery scenario branch below, so a task created with
+ * ONLY this marker (no {@link FAKE_FX_RECOVERY_PROMPT_MARKER}) still storms
+ * on its very first (non-continue) launch, not just on later continues.
+ *
+ * `AGETOR_FAKE_FX_REPAUSE=1` is the process-wide equivalent, same rationale
+ * as {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s `AGETOR_FAKE_FX_RECOVERY=1`.
+ * The env var is the ONLY way to trigger a repause on a `continueRecovery`
+ * launch: the orchestrator always sends an EMPTY prompt on a continue turn
+ * (see `AgentRunOptions.continueRecovery`'s doc comment), so
+ * `prompt.includes(...)` can never see this marker on that turn — only a
+ * fresh (non-continue) launch can carry it in the prompt. Precedence: this
+ * marker/env wins over the plain recovery marker/env whenever both are
+ * present on a `continueRecovery` launch — {@link FAKE_FX_RECOVERY_PROMPT_MARKER}
+ * alone still recovers on continue exactly as before.
+ */
+export const FAKE_FX_REPAUSE_PROMPT_MARKER = "__agetor_fake_fx_repause__";
+/**
+ * Prompt-marker trigger that appends a fake upgrade URL to every `active`/
+ * `paused` recovery message the fake fx driver emits (never `recovered`),
+ * so e2e specs can exercise link rendering/click-through in a recovery
+ * notice or transcript status line without a real Gateway URL
+ * (`docs/plans/fx-recovery-follow-ups.md` §3.6/T3). `AGETOR_FAKE_FX_RECOVERY_URL=1`
+ * is the process-wide equivalent, same rationale as
+ * {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s env twin — and, like
+ * {@link FAKE_FX_REPAUSE_PROMPT_MARKER}, the env var is the only way to turn
+ * this on for a `continueRecovery` launch, since that turn's prompt is
+ * always empty. Off (neither marker nor env present) leaves every message
+ * byte-identical to before this constant existed.
+ */
+export const FAKE_FX_RECOVERY_URL_PROMPT_MARKER = "__agetor_fake_fx_recovery_url__";
+/**
+ * Prompt-marker trigger for the fx effort-"isn't offered" breadcrumb scenario
+ * (see the generic fake-fx turn in `makeFakeAgent` below and
+ * `docs/plans/fx-0.0.10-compat.md` §3/§3.7/T4) — mirrors fx-acp.ts's real
+ * `applyFxEffort`, which emits a status breadcrumb when the session's
+ * `configOptions[{id:"effort"}]` entry (fx ≥0.0.9) reports the task's
+ * requested effort isn't in the model's offered set. The real driver only
+ * knows the *actual* offered list from fx's own wire response, but the fake
+ * has no live fx to ask, so it reports a fixed offered list
+ * (`auto, low, high, max`) instead — good enough for an e2e spec asserting
+ * the breadcrumb shape without a real fx. `AGETOR_FAKE_FX_EFFORT_UNOFFERED=1`
+ * is the process-wide equivalent, same rationale as
+ * {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s `AGETOR_FAKE_FX_RECOVERY=1`. The
+ * real driver's success path is silent (no breadcrumb when the effort IS
+ * offered), so the fake emits nothing unless this marker/env is present.
+ */
+export const FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_effort_unoffered__";
+/**
+ * Prompt-marker trigger for fx 0.0.11+'s terminal `failed` recovery state
+ * (docs/plans/fx-0.0.14-and-cursor-updates.md §3.6/§5): two `active` retry
+ * updates, then a `failed` one — fx stopped retrying and kept no resumable
+ * checkpoint — then the turn ends `refused` and the run fails. Each update is
+ * a canned `session_info_update` fed through the real `mapFxUpdate`, so the
+ * sentinels and the `failed` summary line are exactly what the real driver
+ * would persist. `AGETOR_FAKE_FX_RECOVERY_FAILED=1` is the process-wide
+ * equivalent, same rationale as {@link FAKE_FX_RECOVERY_PROMPT_MARKER}'s env
+ * twin. Ignored on a `continueRecovery` launch (a failed turn has nothing to
+ * continue).
+ */
+export const FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER = "__agetor_fake_fx_recovery_failed__";
+/**
+ * Prompt-marker trigger for fx-acp.ts's speed "isn't offered" breadcrumb
+ * (`applyFxSpeed`, plan §3.2): the generic fake fx turn emits
+ * `fxSpeedNotOfferedLine(<task speed>, <model>)` for a `fast`/`ultrafast`
+ * task and nothing for `off` — the fake has no session `configOptions` to
+ * consult, so it treats the tier as never offered. Marker only (no env twin).
+ */
+export const FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER = "__agetor_fake_fx_speed_unoffered__";
+/**
+ * Prompt-marker trigger for fx 0.0.14's tool-call identity metadata and
+ * structured notices (plan §3.2, §3.6): an internal `capability_search` call
+ * (`_meta.fx.toolCall.internal: true`) and its result, an MCP call
+ * (`_meta.fx.toolCall.mcp: {server: "e2e-mcp", tool: "lookup"}`) and its
+ * result, and a `warning` `notice` titled "e2e notice" — all canned
+ * `session/update`s fed through the real `mapFxUpdate` — then an ordinary
+ * assistant reply and a successful turn. Marker only (no env twin).
+ */
+export const FAKE_FX_TOOL_META_PROMPT_MARKER = "__agetor_fake_fx_tool_meta__";
+/**
+ * Prompt-marker trigger for fx 0.0.14 mid-turn steering (plan §3.2 "D17/D18,
+ * steering", §5): `__agetor_fake_fx_steer__:absorbed` or `:dropped`. The fake
+ * turn holds for `AGETOR_FAKE_FX_STEER_HOLD_MS` (default
+ * {@link FAKE_FX_STEER_DEFAULT_HOLD_MS}) and the agent exposes `steer()`,
+ * which accepts every line while the turn is in flight. At settle, `absorbed`
+ * acknowledges each steered line with an assistant line; `dropped` hands each
+ * one to `onSteerDropped` and emits `FX_STEER_DROPPED_STATUS` when it was
+ * re-queued, both before
+ * `done` resolves — the order the real driver guarantees; a kill of a
+ * `:dropped` turn reports its pending steers dropped too (no status line). Read from the
+ * current turn's prompt, else the task's stored prompt (a steered or
+ * re-queued follow-up never carries the marker itself). Without the marker
+ * the fake agent has no `steer` at all. Marker only (no env twin); e2e specs
+ * keep a literal copy.
+ */
+export const FAKE_FX_STEER_PROMPT_MARKER = "__agetor_fake_fx_steer__";
+const FAKE_FX_STEER_SUFFIX_RE = new RegExp(`${FAKE_FX_STEER_PROMPT_MARKER}:(absorbed|dropped)`);
+const FAKE_FX_STEER_DEFAULT_HOLD_MS = 4000;
+
+/** The steer scenario this spawn runs, from the current prompt or (for a
+ *  marker-less follow-up) the task's stored prompt; `null` when neither
+ *  carries a well-formed `:absorbed`/`:dropped` marker. */
+function resolveFakeFxSteerMode(taskId: string, prompt: string): "absorbed" | "dropped" | null {
+  const own = FAKE_FX_STEER_SUFFIX_RE.exec(prompt);
+  if (own) return own[1] as "absorbed" | "dropped";
+  const stored = tasks.get(taskId)?.prompt;
+  const fromStored = stored ? FAKE_FX_STEER_SUFFIX_RE.exec(stored) : null;
+  return fromStored ? (fromStored[1] as "absorbed" | "dropped") : null;
+}
+
+/** How long the steer scenario's turn holds: `AGETOR_FAKE_FX_STEER_HOLD_MS`
+ *  when it is a finite number ≥ 0, else 4000 ms. */
+function fakeFxSteerHoldMs(): number {
+  const raw = process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  const parsed = raw === undefined || raw === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : FAKE_FX_STEER_DEFAULT_HOLD_MS;
+}
+/**
+ * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
+ * "Claude Code Monitor" scenario (see
+ * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
+ * in `running` by a live monitor, released when it ends" flow through
+ * `orchestrator.ts`'s DB-derived hold predicate (`subagents.hasRunning`)
+ * without a real Claude CLI. The real driver discovers a monitor's two-line
+ * launch (`tool_use` name `"Monitor"` + its `tool_result` stub, both tailed
+ * from the session JSONL by `claude-subagents.ts`'s
+ * `scanLineForMonitorLaunch`/`scanLineForMonitorStub`) and its terminal event
+ * the same way — but this fake driver emits chunks only, writes no JSONL, and
+ * attaches no `claude-subagents.ts` watcher, so the scenario below inserts
+ * and later settles the `subagents` row itself, directly, matching the shape
+ * the real scan would produce.
+ *
+ * Optional `:<ms>` suffix sets how long the monitor stays "running" before it
+ * settles — e.g. `__agetor_fake_claude_monitor__:1500` settles 1.5s after
+ * arming. Defaults to {@link FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS} (4000);
+ * clamped to a floor of {@link FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS} (50) so a
+ * caller can't race the settle ahead of the +12ms turn-resolution chunk.
+ *
+ * Exported (like the TODOS marker) so `e2e/monitor-hold.spec.ts` can drive
+ * this scenario from a task's prompt — the e2e worker-shared backend fixture
+ * (`e2e/fixtures.ts`) can't set per-test env vars, only per-test prompt text.
+ * Per that same constraint, e2e specs can't `import` from `src/bun/*` and
+ * must keep a **literal copy** of this exact string.
+ */
+export const FAKE_CLAUDE_MONITOR_PROMPT_MARKER = "__agetor_fake_claude_monitor__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a pattern
+ *  without escaping. */
+const FAKE_CLAUDE_MONITOR_SETTLE_MS_RE = new RegExp(`${FAKE_CLAUDE_MONITOR_PROMPT_MARKER}:(\\d+)`);
+const FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS = 4000;
+const FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS = 50;
+
+/**
+ * Emits the fx ≥0.0.8 usage + session-title sentinels the fake fx driver
+ * pairs with every completed turn, mirroring the real driver's
+ * `usage_update` sentinel, the `session/prompt.usage` → `{turn}` sentinel,
+ * and the `session_info_update` title sentinel (fx-acp.ts) — see the shared
+ * spec (`Fake fx driver per turn`) in docs/plans/fx-0.0.8-compat.md §3.
+ * Called just before the "turn complete" status + `resolveDone` in every fx
+ * fake-turn branch below. No `lineUuid` is passed, matching every other
+ * status chunk this fake driver already emits (e.g. the provider sentinel
+ * below) — per-line dedup only matters for a real, tailed/replayed JSONL
+ * stream, not this in-process fake.
+ */
+function emitFakeFxUsageAndTitle(onChunk: ChunkHandler): void {
+  onChunk("status", `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ used: 1234, size: 128000 })}`);
+  onChunk(
+    "status",
+    `${FX_USAGE_STATUS_PREFIX}${JSON.stringify({ turn: { inputTokens: 42, outputTokens: 7 } })}`,
+  );
+  onChunk("status", `${FX_SESSION_TITLE_STATUS_PREFIX}Fake fx session`);
+}
+
+/**
+ * When the fake fx storm ({@link emitFakeFxRecoveryStorm}) pauses: 1500 ms,
+ * or `AGETOR_FAKE_FX_RECOVERY_PAUSE_MS` (≥ 900, so all three attempts land
+ * first). The e2e fixture widens it — the live notice exists only between the
+ * first attempt and the pause, and a loaded machine can spend 1.5 s just
+ * delivering the first attempt to an open panel.
+ */
+function fakeFxRecoveryPauseMs(): number {
+  const raw = Number(process.env.AGETOR_FAKE_FX_RECOVERY_PAUSE_MS);
+  return Number.isFinite(raw) && raw >= 900 ? raw : 1500;
+}
+
+/**
+ * Emits the fake fx driver's 3-attempt rate-limit storm → terminal `paused`
+ * sequence: three `FX_RECOVERY_STATUS_PREFIX` sentinel `status` chunks
+ * (attempt 1/3, 2/3 with `delaySeconds: 1`, 3/3, at +5/+400/+800ms), then at
+ * +1500ms (`fakeFxRecoveryPauseMs`) a terminal `paused` sentinel, its persisted `fxRecoverySummaryLine`
+ * status line, the plain `fx turn ended: refused (…)` status line, and
+ * `resolveDone(1)`. Factored out so a fresh (non-continue) storm launch and a
+ * `continueRecovery` launch under {@link FAKE_FX_REPAUSE_PROMPT_MARKER}
+ * (which re-storms instead of recovering, so the auto-resume cap is
+ * testable) share byte-identical timing and text — see the recovery scenario
+ * branch below for both call sites.
+ *
+ * `urlSuffix` is spliced onto every `active`/`paused` message (never
+ * `recovered`, which this function never emits) when
+ * {@link FAKE_FX_RECOVERY_URL_PROMPT_MARKER}/`AGETOR_FAKE_FX_RECOVERY_URL=1`
+ * is on; pass `""` (the default off-state) for a byte-identical no-op splice.
+ */
+function emitFakeFxRecoveryStorm(
+  onChunk: ChunkHandler,
+  after: (ms: number, fn: () => void) => void,
+  resolveDone: (code: number) => void,
+  urlSuffix: string,
+): void {
+  after(5, () => {
+    const attempt1: FxRecoveryPayload = {
+      state: "active",
+      kind: "auto_retry",
+      cause: "rate_limited",
+      action: "retrying_request",
+      attempt: 1,
+      attemptLimit: 3,
+      durable: true,
+      message: `⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 1/3${urlSuffix}`,
+    };
+    onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt1)}`);
+  });
+  after(400, () => {
+    const attempt2: FxRecoveryPayload = {
+      state: "active",
+      kind: "auto_retry",
+      cause: "rate_limited",
+      action: "retrying_request",
+      attempt: 2,
+      attemptLimit: 3,
+      delaySeconds: 1,
+      durable: true,
+      message: `⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request in 1s · attempt 2/3${urlSuffix}`,
+    };
+    onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt2)}`);
+  });
+  after(800, () => {
+    const attempt3: FxRecoveryPayload = {
+      state: "active",
+      kind: "auto_retry",
+      cause: "rate_limited",
+      action: "retrying_request",
+      attempt: 3,
+      attemptLimit: 3,
+      durable: true,
+      message: `⚠ Rate limited · HTTP 429 · fake gateway limit · retrying request · attempt 3/3${urlSuffix}`,
+    };
+    onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(attempt3)}`);
+  });
+  after(fakeFxRecoveryPauseMs(), () => {
+    const paused: FxRecoveryPayload = {
+      state: "paused",
+      kind: "terminal_provider_error",
+      cause: "rate_limited",
+      action: "paused",
+      requiredAction: "continue_later",
+      attempt: 3,
+      attemptLimit: 3,
+      durable: true,
+      message: `⚠ Rate limited · HTTP 429 · fake gateway limit · recovery paused after 3/3 attempts${urlSuffix}`,
+    };
+    onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(paused)}`);
+    const summary = fxRecoverySummaryLine(paused);
+    if (summary) onChunk("status", summary);
+    onChunk("status", "fx turn ended: refused (response paused after 3/3 attempts — resumable)");
+    resolveDone(1);
+  });
+}
+
+/** A fresh `mapFxUpdate` context for one fake fx turn — one ctx per turn,
+ *  shared by every canned update in it, exactly as the real driver threads
+ *  its per-run state through `dispatchSessionUpdate`. */
+function fakeFxUpdateCtx(runId: string): FxUpdateCtx {
+  let seq = 0;
+  return { runId, nextSeq: () => seq++ };
+}
+
+/** Feed one canned fx `session/update` through the real `mapFxUpdate` and
+ *  forward whatever it maps to, line_uuids included. */
+function emitFakeFxUpdate(onChunk: ChunkHandler, ctx: FxUpdateCtx, update: Record<string, unknown>): void {
+  for (const chunk of mapFxUpdate(update, ctx)) onChunk(chunk.stream, chunk.data, chunk.lineUuid);
+}
+
+/** A `session_info_update` carrying fx's `_meta.fx.modelResponseRecovery`. */
+function fakeFxRecoveryUpdate(recovery: Record<string, unknown>): Record<string, unknown> {
+  return { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: recovery } } };
+}
+
+/**
+ * The {@link FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER} scenario: two `active`
+ * retry attempts (+5/+200 ms, the second with `delaySeconds`), then at +400 ms
+ * a terminal `failed` update — fx 0.0.11+ sends `failed` for a
+ * `terminal_provider_error` it doesn't pause on, so there is no checkpoint
+ * and nothing to resume — then the same `fx turn ended: refused` line the
+ * real driver's stopReason switch writes (`fxRefusedStatusLine`, which only
+ * adds "resumable" for a resumable pause) and `resolveDone(1)`.
+ */
+function emitFakeFxRecoveryFailed(
+  onChunk: ChunkHandler,
+  after: (ms: number, fn: () => void) => void,
+  resolveDone: (code: number) => void,
+  ctx: FxUpdateCtx,
+): void {
+  const base = { kind: "auto_retry", cause: "provider_unavailable", action: "retrying_request", attemptLimit: 3, durable: true };
+  after(5, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      ...base,
+      state: "active",
+      attempt: 1,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · retrying request · attempt 1/3",
+    }));
+  });
+  after(200, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      ...base,
+      state: "active",
+      attempt: 2,
+      delaySeconds: 1,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · retrying request in 1s · attempt 2/3",
+    }));
+  });
+  after(400, () => {
+    emitFakeFxUpdate(onChunk, ctx, fakeFxRecoveryUpdate({
+      state: "failed",
+      kind: "terminal_provider_error",
+      cause: "provider_unavailable",
+      attempt: 3,
+      attemptLimit: 3,
+      durable: true,
+      message: "⚠ Provider unavailable · HTTP 503 · fake gateway outage · request failed after 3/3 attempts",
+    }));
+    onChunk("status", fxRefusedStatusLine("refused", ctx.lastRecovery));
+    resolveDone(1);
+  });
+}
+
+/**
+ * The {@link FAKE_FX_TOOL_META_PROMPT_MARKER} scenario: fx 0.0.14's
+ * `_meta.fx.toolCall` identity on two tool calls — an internal discovery
+ * step a host may hide, and an MCP call carrying its server/tool — plus a
+ * structured `notice`, all through the real `mapFxUpdate`, then an ordinary
+ * assistant reply and a successful turn (usage/title sentinels, "turn
+ * complete", `resolveDone(0)`).
+ */
+function emitFakeFxToolMetaTurn(
+  onChunk: ChunkHandler,
+  after: (ms: number, fn: () => void) => void,
+  resolveDone: (code: number) => void,
+  ctx: FxUpdateCtx,
+): void {
+  after(5, () => {
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call",
+      toolCallId: "fake-fx-internal-1",
+      name: "capability_search",
+      title: "Search capabilities",
+      kind: "search",
+      status: "pending",
+      rawInput: { query: "lookup" },
+      _meta: { fx: { toolCall: { internal: true } } },
+    });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "fake-fx-internal-1",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "1 capability: e2e-mcp · lookup" } }],
+    });
+  });
+  after(10, () => {
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call",
+      toolCallId: "fake-fx-mcp-1",
+      name: "lookup",
+      title: "Look up a key",
+      kind: "other",
+      status: "pending",
+      rawInput: { key: "alpha" },
+      _meta: { fx: { toolCall: { internal: false, mcp: { server: "e2e-mcp", tool: "lookup" } } } },
+    });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "fake-fx-mcp-1",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "alpha = 42" } }],
+    });
+  });
+  after(15, () => {
+    emitFakeFxUpdate(onChunk, ctx, { sessionUpdate: "notice", severity: "warning", title: "e2e notice" });
+    emitFakeFxUpdate(onChunk, ctx, {
+      sessionUpdate: "agent_message_chunk",
+      messageId: "fake-fx-msg-1",
+      content: { type: "text", text: "Looked it up: alpha is 42." },
+    });
+  });
+  after(20, () => {
+    emitFakeFxUsageAndTitle(onChunk);
+    onChunk("status", "turn complete");
+    resolveDone(0);
+  });
+}
+
+/**
+ * Prompt-marker trigger for the markdown-image fake-driver scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var,
+ * same rationale as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above — the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`) spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process, but CAN put anything it wants in `task.prompt` at
+ * task-create time. Exported so `e2e/markdown-images.spec.ts` can reference
+ * the exact string instead of duplicating it (that spec can't `import` from
+ * `src/bun/*`, so it keeps a **literal copy** of this string). See
+ * `docs/plans/markdown-image-rendering.md` (D10, T3).
+ */
+export const FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__";
+
+/**
+ * Test hook for the Claude Code context-compaction rendering work
+ * (`docs/plans/claude-code-placeholder.md`): makes the fake claude driver emit
+ * the sequence the real JSONL mapper produces for a compaction — a `status`
+ * line from the `compact_boundary` event, the `compaction_summary` stream
+ * carrying the (synthetic) summary markdown, the "Compacted while idle…"
+ * notice as a second `status` line, then one short assistant reply and the
+ * usual turn-complete. Same prompt-marker trick as
+ * {@link FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER} above, for the same reason: the
+ * e2e suite's worker-shared backend fixture can't set a per-test env var, but
+ * a spec can put anything it wants in `task.prompt`. Exported so unit tests
+ * can reference the exact string; `e2e/compaction-summary.spec.ts` can't
+ * `import` from `src/bun/*` and keeps a **literal copy** of it.
+ */
+export const FAKE_CLAUDE_COMPACTION_PROMPT_MARKER = "__agetor_fake_claude_compaction__";
+
+/** First line of the synthetic compaction summary — mirrors the opening line
+ *  of Claude Code's real summary. Exported for tests. */
+export const FAKE_CLAUDE_COMPACTION_SUMMARY_FIRST_LINE =
+  "This session is being continued from a previous conversation that ran out of context.";
+
+/** Notice Claude Code writes ~280 ms after a compaction that happened while
+ *  the session was idle. Exported for tests. */
+export const FAKE_CLAUDE_COMPACTION_NOTICE = "Compacted while idle, before the prompt cache expired";
+
+/** Synthetic multi-paragraph markdown summary (~2 KB) — invented text only. */
+const FAKE_CLAUDE_COMPACTION_SUMMARY = [
+  FAKE_CLAUDE_COMPACTION_SUMMARY_FIRST_LINE,
+  "The summary below covers the earlier part of the conversation.",
+  "",
+  "## Analysis",
+  "",
+  "The user asked for a small command-line tool that renders a table of widgets from a JSON file. The first half of the session was spent agreeing on the file format (an array of objects with `name`, `count` and `tags` keys), the column order, and how long cell values should be truncated. Several approaches to column-width calculation were compared; fixed-width columns were rejected in favour of measuring the longest cell per column, capped at 40 characters.",
+  "",
+  "The renderer was written as a pure function that takes parsed rows and returns an array of lines, so it can be tested without touching the terminal. Edge cases covered so far: an empty array, a row with a missing key, a cell containing a newline, and a value wider than the cap.",
+  "",
+  "## Files and code sections",
+  "",
+  "- `src/render.ts` - the pure `renderTable(rows, opts)` function and its helper `padCell`.",
+  "- `src/cli.ts` - argument parsing (`--file`, `--max-width`, `--no-header`) and the entry point.",
+  "- `src/render.test.ts` - eight unit tests covering the cases listed above.",
+  "",
+  "## Errors and fixes",
+  "",
+  "- Truncation initially counted UTF-16 code units, which split emoji in the middle; it now iterates by code point.",
+  "- The `--max-width` flag was parsed as a string and compared lexically; it is now converted with `Number` and validated.",
+  "",
+  "## Pending tasks",
+  "",
+  "- Add a `--sort <column>` option.",
+  "- Document the JSON format in the README.",
+  "",
+  "## Current work",
+  "",
+  "Immediately before this summary the assistant was wiring the `--sort` option into the argument parser and had just written a failing test for sorting by the `count` column in descending order.",
+  "",
+  "## Next step",
+  "",
+  "Make the failing sort test pass, then run the whole suite and report the result.",
+].join("\n");
+
+/**
+ * Test hook for the "anchored first-load window" work
+ * (`docs/plans/first-load-reaches-last-user-message.md`): makes the fake
+ * claude driver emit more `assistant` chunks in one turn than
+ * `EVENTS_REPLAY_LIMIT` (800, `src/shared/types.ts`), so an e2e spec can
+ * produce a task whose prompt echo would land outside the SSE replay's
+ * un-anchored newest-N window and prove the anchor pulls it back in on first
+ * open, without a real claude CLI. Same prompt-marker trick as
+ * {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER} above, for the same reason: the
+ * e2e suite's worker-shared backend fixture can't set a per-test env var, but
+ * a spec can put anything it wants in `task.prompt`.
+ *
+ * Optional `:<count>` suffix overrides how many `assistant` chunks are
+ * emitted — e.g. `__agetor_fake_claude_long_reply__:1200` — parsed the same
+ * way {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}'s `:<ms>` suffix is (see
+ * `FAKE_CLAUDE_MONITOR_SETTLE_MS_RE` above). Defaults to
+ * {@link FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT} (900 — deliberately above
+ * `EVENTS_REPLAY_LIMIT`'s 800 so, pre-fix, the prompt echo falls outside the
+ * replay window) and is clamped to `[1, FAKE_CLAUDE_LONG_REPLY_MAX_COUNT]`
+ * (5000) so a malformed or malicious suffix can't spin up an unbounded loop.
+ *
+ * Exported (like the TODOS/MONITOR/MD_IMAGE markers) so
+ * `e2e/load-earlier-anchor.spec.ts` can drive this scenario from a task's
+ * prompt; per that same fixture constraint, the e2e spec can't `import` from
+ * `src/bun/*` and must keep a **literal copy** of this exact string.
+ */
+export const FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER = "__agetor_fake_claude_long_reply__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a pattern
+ *  without escaping — mirrors `FAKE_CLAUDE_MONITOR_SETTLE_MS_RE` above. */
+const FAKE_CLAUDE_LONG_REPLY_COUNT_RE = new RegExp(`${FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}:(\\d+)`);
+const FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT = 900;
+const FAKE_CLAUDE_LONG_REPLY_MAX_COUNT = 5000;
+
+/**
+ * Prompt-marker trigger for the "driver rejects `done`" scenario
+ * (docs/plans/event-stream-forward-resume.md, D4): the fake claude agent
+ * rejects its `done` promise with `new Error("fake done rejection")` shortly
+ * after the prompt echo, so `attachDoneHandler`'s `.catch` branch — the
+ * spawn-rejection settle path that persists a `stderr` line
+ * (`Error: fake done rejection`) — can be exercised end to end without a real
+ * driver crash. Like the sibling `FAKE_CLAUDE_*` markers it rides in
+ * `task.prompt` because the e2e suite's worker-shared backend can't set a
+ * per-test env var; specs can't `import` from `src/bun/*` and must keep a
+ * literal copy of this exact string.
+ *
+ * Only turn 1 (a fresh spawn) runs this scenario — same convention as every
+ * other canned scenario in this driver.
+ */
+export const FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER = "__agetor_fake_claude_done_reject__";
+
+/**
+ * A real, valid 1×1 transparent PNG (not just arbitrary bytes with a `.png`
+ * extension) — small, but enough for `/files/preview` and an `<img>` tile to
+ * actually decode and render it. Module-scope so both the sent-files and the
+ * markdown-image fake-driver scenarios below can share one copy instead of
+ * each inlining the same base64 literal.
+ */
+const FAKE_PNG_1X1_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+function makeFakeAgent(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  fakeOpts: {
+    runId?: string;
+    mode?: string;
+    kind?: AgentKind;
+    cwd?: string;
+    continueRecovery?: boolean;
+    effort?: string | null;
+    model?: string;
+    speed?: Speed | null;
+    onSteerDropped?: (text: string) => boolean;
+  } = {},
+): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  let rejectDone!: (err: Error) => void;
+  const done = new Promise<number>((res, rej) => { resolveDone = res; rejectDone = rej; });
+  // Every setTimeout this fake schedules is tracked here so `kill()` can
+  // clear them all — otherwise a chunk fires after the run/task row it
+  // targets has been deleted (e.g. a test that deletes a task immediately
+  // after starting it), and `runs.appendEvent` throws an unhandled
+  // `SQLITE_CONSTRAINT_FOREIGNKEY` against the cascade-deleted row.
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+  // Set only by the AGETOR_FAKE_FX_PERMISSION scenario below — `kill()`
+  // needs it to settle a still-open card the same way `dropFxSession` →
+  // `settleFx` does in the real driver (see interactions.ts's "Settlement
+  // single-source-of-truth"), so Stop/delete during the fake card doesn't
+  // leave a phantom registry entry.
+  let fxPermissionCardId: string | undefined;
+  // Set by `kill()` before it settles `done` itself. The fx-permission
+  // scenario's `answer.then` callback below checks this so it never emits
+  // chunks or re-resolves `done` after `kill()` has already torn everything
+  // down (a still-pending `answer` promise can resolve asynchronously after
+  // `kill()` returns, since `answerFxPermission` there just settles the
+  // registry entry — it doesn't synchronously flush this driver's `.then`).
+  let killed = false;
+  // Set only by the FAKE_CLAUDE_REAL_WATCHER scenario: the real watcher this
+  // turn attached, so `kill()` (Stop/delete) can detach it.
+  let realWatcherHandle: SubagentWatcherHandle | undefined;
+  // Set only by the FAKE_FX_STEER scenario: the agent's `steer()`. Left
+  // undefined otherwise, so the returned agent carries no `steer` key at all.
+  let steer: ((line: string) => boolean) | undefined;
+  // Set alongside `steer`: what `kill()` does with steers the turn hadn't
+  // settled yet (the `:dropped` variant reports them dropped). Returns true
+  // when it took over resolving `done`.
+  let settleSteersOnKill: (() => boolean) | undefined;
+  // Test hook: simulate a claude code API error mid-turn so orchestrator
+  // tests can exercise the api-error → `blocked` column flip without having
+  // to plumb a real synthetic-message JSONL through the driver. Mirrors what
+  // claude-tmux.ts emits on an `isApiErrorMessage` line: the user-facing
+  // text on the assistant stream + the sentinel api-error status chunk that
+  // makeChunkHandler pattern-matches on. Resolves the turn with code 0
+  // because that's what popEndOfTurn does — the orchestrator distinguishes
+  // it from a real success via the handle.apiError flag, not exit code.
+  if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR === "1") {
+    // Emit the chunks promptly (this is what flips the column to `blocked`
+    // in the live path), but allow an optional resolve delay so
+    // cancellation-precedence tests have a window to fire `cancelRun`
+    // between the column flip and the done resolution. Without the delay
+    // both events would land within the same tick and there'd be nowhere
+    // to insert the cancel.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    after(5, () => {
+      onChunk("assistant", "API Error: 529 Overloaded. This is a server-side issue, usually temporary.");
+      onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 529 — turn aborted; blocked for manual retry`);
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED === "1") {
+    // Test hook: simulate the tmux session dying mid-turn. Mirrors what the
+    // real drivers emit from their death watch — the `SESSION_DIED_STATUS_PREFIX`
+    // sentinel status chunk that makeChunkHandler pattern-matches to flip the
+    // column to `blocked`, then resolves the turn with code 0 (the handle
+    // `sessionDied` flag, not the exit code, drives the failed/blocked outcome).
+    // Optional resolve delay lets cancellation-precedence tests fire cancelRun
+    // between the column flip and the done resolution.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    after(5, () => {
+      onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (process.env.AGETOR_FAKE_CLAUDE_UNKNOWN_COMMAND === "1") {
+    // Test hook: simulate claude's TUI rejecting the message as an unknown
+    // slash command. Mirrors what `signalUnknownCommand` (claude-tmux.ts)
+    // emits from the pane scraper — the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+    // sentinel status chunk that makeChunkHandler pattern-matches to flip the
+    // column to `blocked`, then resolves the turn with code 0 (the handle
+    // `unknownCommand` flag, not the exit code, drives the failed/blocked
+    // outcome). Optional resolve delay lets cancellation-precedence tests
+    // fire cancelRun between the column flip and the done resolution.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    after(5, () => {
+      onChunk(
+        "status",
+        `${CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX}/fake-command — claude treated the message as a `
+          + `slash command; it was not delivered. Edit the message so it doesn't start with "/" and resend.`,
+      );
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (resolveFakeRealWatcherSpec(taskId, prompt) !== null) {
+    // Test hook: attach the REAL subagent watcher over real on-disk
+    // transcripts — see FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER's doc comment
+    // for the layout, the turn-1-vs-later split and why it exists. Checked
+    // ahead of the handoff scenario (and every marker below) so it wins when
+    // a prompt carries more than one marker.
+    const realWatcherSpec = resolveFakeRealWatcherSpec(taskId, prompt) as FakeRealWatcherSpec;
+    const rwPaths = fakeRealWatcherPaths(fakeOpts.cwd ?? process.cwd(), taskId);
+    after(5, () => {
+      void (async () => {
+        try {
+          onChunk("status", "fake: attaching real subagent watcher");
+          // Turn 1 == the fake session's main JSONL doesn't exist yet. Stateless
+          // (survives a process restart) and needs no per-task counter.
+          if (!existsSync(rwPaths.jsonlPath)) {
+            const rowRunId = fakeOpts.runId ?? tasks.get(taskId)?.runId ?? null;
+            await writeFakeRealWatcherFixture(taskId, rowRunId, realWatcherSpec, rwPaths);
+          }
+          if (killed) return;
+          realWatcherHandle = attachSubagentWatcher({
+            taskId,
+            jsonlPath: rwPaths.jsonlPath,
+            runId: fakeOpts.runId,
+          });
+          // `settled` (seed + first full pass), not just `ready`: the first
+          // pass is what persists turn 1's subagent events, so awaiting it
+          // makes "the run settled" imply "the events are in run_events".
+          await realWatcherHandle.settled;
+          if (killed) return;
+          onChunk("assistant", `Real subagent watcher attached over ${realWatcherSpec.files} transcript(s).`);
+          onChunk("status", "turn complete");
+          resolveDone(0);
+          // Detach AFTER the turn resolved so the next turn's attach is a
+          // genuine rehydrate + first-pass replay, not a live watcher.
+          realWatcherHandle.detach();
+          realWatcherHandle = undefined;
+        } catch (e) {
+          realWatcherHandle?.detach();
+          realWatcherHandle = undefined;
+          if (killed) return;
+          onChunk("status", `fake real-watcher turn failed: ${(e as Error).message}`);
+          resolveDone(1);
+        }
+      })();
+    });
+  } else if (resolveFakeHandoffPromptSource(taskId, prompt) !== null) {
+    // Test hook: simulate a pipeline step's turn ending with a `<handoff>`
+    // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
+    // `parseHandoff`) so `pipeline-runner.test.ts` can drive the runner's
+    // settle/resolve/join logic end to end without a real claude CLI.
+    // Checked after the api-error/session-died/unknown-command branches
+    // above (this fake driver has no reason to special-case pipeline
+    // handoffs ahead of those three — they're mutually exclusive env-var
+    // toggles, this is a prompt-marker), but before every OTHER marker
+    // branch further down, so it wins if a test prompt somehow carries more
+    // than one marker. The marker is read from the CURRENT turn's `prompt`
+    // when it carries one, else from the task's own stored (turn-1) prompt
+    // (`resolveFakeHandoffPromptSource`) — this is what lets a pipeline's
+    // automatic "no handoff found" reminder turn (a plain follow-up
+    // `sendInput` line with no marker of its own) still resolve against the
+    // scenario the step's ORIGINAL prompt selected. `lastFakeHandoffSuffix`
+    // then finds the LAST occurrence of the marker in THAT source prompt (a
+    // step's own instructions can override a default the overall goal text
+    // carries) and extracts its optional `:<token>` suffix — `done` (or no
+    // suffix) emits a valid terminal handoff, `missing` emits prose with no
+    // `<handoff>` tag at all, `invalid` emits a `<handoff>` tag whose body
+    // isn't valid JSON, `missing-then-<token>` / `invalid-then-<token>`
+    // behave like `missing`/`invalid` on this task's first fake-driver turn
+    // and like plain `<token>` (e.g. `done`, or a named outgoing step) on
+    // every turn after that — `bumpFakeHandoffTurn`/
+    // `resolveFakeHandoffTurnSuffix` resolve the two-turn form against a
+    // per-task turn counter — and any other plain token is used verbatim as
+    // the handoff's `next` field (a `"choose"`-transition step picking a
+    // named outgoing step). `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` (same env
+    // var the api-error/session-died/unknown-command branches above already
+    // read) widens the window between "assistant text landed" and "turn
+    // resolved" — lets a test (`cancelRun`/`cancelPipelineRun` mid-step)
+    // reliably fire a Stop while the step is still genuinely `running`.
+    // Defaults to 30ms, same as this branch's original fixed delay.
+    const handoffPromptSource = resolveFakeHandoffPromptSource(taskId, prompt) as string;
+    const turn = bumpFakeHandoffTurn(taskId);
+    const suffix = resolveFakeHandoffTurnSuffix(lastFakeHandoffSuffix(handoffPromptSource), turn);
+    // A `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in the same source prompt (turn
+    // 1 only — a real agent spawns its helpers while doing the work, not on
+    // a reminder round-trip) adds a "spawned a subagent" phase ahead of the
+    // handoff: the row runs for `runMs`, then settles, and the handoff +
+    // resolve are pushed out past that settle so the orchestrator's
+    // subagent hold never outlives the turn.
+    const subagentSpec = turn <= 1 ? parseFakeSubagentMarker(handoffPromptSource) : null;
+    const baseResolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
+    const resolveDelayMs = subagentSpec ? Math.max(baseResolveDelayMs, subagentSpec.runMs + 60) : baseResolveDelayMs;
+    after(5, () => onChunk("status", "fake: working"));
+    if (subagentSpec) {
+      // Keyed on the RUN (same reasoning as the Monitor scenario's id):
+      // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would
+      // collide with a previous run's already-completed row on a re-run.
+      const subagentId = `fake-subagent-${fakeOpts.runId ?? taskId}`;
+      after(8, () => {
+        onChunk(
+          "tool_use",
+          JSON.stringify({
+            id: "fake-subagent-1",
+            name: "Agent",
+            input: { subagent_type: "general-purpose", description: subagentSpec.description, prompt: "do the delegated part" },
+            serverSide: false,
+          }),
+          "fake-subagent-1-tu",
+        );
+        subagentsDb.insertIfAbsent({
+          id: subagentId,
+          taskId,
+          runId: fakeOpts.runId ?? null,
+          parentKind: "subagent",
+          agentType: "general-purpose",
+          description: subagentSpec.description,
+          spawnDepth: 1,
+          sourcePath: "",
+          toolUseId: "fake-subagent-1",
+          status: "running",
+          startedAt: Date.now(),
+          endedAt: null,
+        });
+        record.push(`subagent:spawned:${subagentId}`);
+      });
+      after(8 + subagentSpec.runMs, () => {
+        settleSubagentById(subagentId, "completed", "receipt");
+        onChunk(
+          "tool_result",
+          JSON.stringify({ toolUseId: "fake-subagent-1", content: "delegated part done", isError: false }),
+          "fake-subagent-1-tr",
+        );
+        record.push(`subagent:settled:${subagentId}`);
+      });
+    }
+    after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
+      if (
+        suffix === "missing"
+        || ((suffix === "continue-then-done" || suffix === "continue-overlap") && turn <= 1)
+      ) {
+        onChunk("assistant", "I finished the work but forgot the handoff.");
+      } else if (suffix === "invalid") {
+        onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
+      } else if (suffix === "continue-then-done" || suffix === "continue-overlap") {
+        onChunk("assistant", fakeTerminalHandoffText(`fake summary for ${suffix}`));
+      } else if (suffix === "rich" || suffix === "rich-blocked") {
+        onChunk("assistant", fakeRichHandoffText(fakeOpts.cwd ?? process.cwd(), suffix === "rich" ? "done" : "blocked"));
+      } else if (suffix === "mention") {
+        // The `{schemaVersion, …}` in the prose is load-bearing: the legacy
+        // balanced-object fallback would otherwise rescue the JSON from the
+        // quoted tag's span and the bug would not reproduce.
+        onChunk(
+          "assistant",
+          `I checked the \`<${HANDOFF_TAG}>\` contract and its \`{schemaVersion, …}\` shape before finishing.\n${fakeTerminalHandoffText("fake summary for mention").replace(/^Done\.\n/, "")}`,
+        );
+      } else if (suffix === "fenced") {
+        // A well-formed block wrapped entirely in a code fence: a code-aware
+        // reader treats it as quoted text, not a handoff.
+        onChunk("assistant", `Done.\n\`\`\`\n${fakeTerminalHandoffText("fake summary for fenced").replace(/^Done\.\n/, "")}\n\`\`\``);
+      } else {
+        const next = suffix && suffix !== "done" ? suffix : null;
+        const handoff = {
+          schemaVersion: 1,
+          purpose: "fake purpose",
+          summary: `fake summary for ${suffix ?? "step"}`,
+          reason: "fake reason",
+          next,
+          artifacts: [] as string[],
+          openQuestions: [] as string[],
+          status: "done" as const,
+        };
+        onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
+      }
+    });
+    after(resolveDelayMs, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+      // After `done` is resolved, its settle is queued. This microtask
+      // runs before that settle, so the continuation is already the
+      // current run when the missing handoff is classified.
+      if (suffix === "continue-then-done" && turn <= 1) {
+        queueMicrotask(() => adoptFakeHandoffContinuation(taskId));
+      } else if (suffix === "continue-overlap" && turn <= 1) {
+        queueMicrotask(() => adoptFakeOverlappingContinuations(taskId));
+      }
+    });
+  } else if (
+    process.env.AGETOR_FAKE_CLAUDE_TODOS === "1"
+    || prompt.includes(FAKE_CLAUDE_TODOS_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate a Task-tools (`TaskCreate`/`TaskUpdate`) session so
+    // orchestrator/RunPanel/board-badge tests can drive the todo tracker
+    // (src/shared/todo-progress.ts) end to end without a real claude CLI.
+    // Chunk shapes match exactly what claude-tmux.ts's real mapper produces:
+    // a `tool_use` chunk's `data` is `{id, name, input, serverSide}`, and its
+    // matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError}` — `deriveTodoProgress` joins the two on `toolUseId ===
+    // TaskCreate's id` to resolve the "Task #N created successfully: …" task
+    // number (see that module's header comment). Two creates + one update to
+    // `in_progress` on the first task is enough to exercise every code path
+    // the derivation covers (multi-item accumulation, result-text task-number
+    // resolution, status mutation) while still landing on a stable, easily
+    // asserted end state: 2 tasks, 0 done, task #1 in progress.
+    //
+    // Only turn 1 (a fresh spawn, never a `--resume`) runs this scenario —
+    // real claude only *creates* tasks once per plan; a follow-up turn on
+    // the same session reuses the default echo behavior below, same as every
+    // other canned scenario in this driver.
+    after(5, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-create-1",
+          name: "TaskCreate",
+          input: { subject: "Phase 1 — Investigate", description: "Look into the root cause.", activeForm: "Investigating" },
+          serverSide: false,
+        }),
+        "fake-todo-create-1-tu",
+      );
+    });
+    after(8, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-todo-create-1",
+          content: "Task #1 created successfully: Phase 1 — Investigate",
+          isError: false,
+        }),
+        "fake-todo-create-1-tr",
+      );
+    });
+    after(11, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-create-2",
+          name: "TaskCreate",
+          input: { subject: "Phase 2 — Implement", description: "Ship the fix.", activeForm: "Implementing" },
+          serverSide: false,
+        }),
+        "fake-todo-create-2-tu",
+      );
+    });
+    after(14, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-todo-create-2",
+          content: "Task #2 created successfully: Phase 2 — Implement",
+          isError: false,
+        }),
+        "fake-todo-create-2-tr",
+      );
+    });
+    after(17, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-update-1",
+          name: "TaskUpdate",
+          input: { taskId: "1", status: "in_progress" },
+          serverSide: false,
+        }),
+        "fake-todo-update-1-tu",
+      );
+    });
+    after(20, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({ toolUseId: "fake-todo-update-1", content: "Task #1 updated", isError: false }),
+        "fake-todo-update-1-tr",
+      );
+    });
+    after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
+    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
+    // Test hook: simulate arming a Claude Code `Monitor` and later ending it
+    // — see FAKE_CLAUDE_MONITOR_PROMPT_MARKER's doc comment above for why
+    // this scenario inserts/settles the `subagents` row itself instead of
+    // relying on claude-subagents.ts's JSONL-tailing discovery. Chunk shapes
+    // match exactly what claude-tmux.ts's real mapper produces for a Monitor
+    // launch: a `tool_use` chunk's `data` is `{id, name, input, serverSide}`,
+    // its matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError}` with `content` echoing the real "Monitor started (task <id>,
+    // timeout <ms>ms)…" stub text `scanLineForMonitorStub` parses `taskId`
+    // out of.
+    //
+    // Only turn 1 (a fresh spawn, never a `--resume`) runs this scenario,
+    // same convention as every other canned scenario in this driver.
+    const settleMsMatch = prompt.match(FAKE_CLAUDE_MONITOR_SETTLE_MS_RE);
+    const parsedSettleMs = settleMsMatch ? Number(settleMsMatch[1]) : NaN;
+    const settleMs = Number.isFinite(parsedSettleMs)
+      ? Math.max(FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS, parsedSettleMs)
+      : FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS;
+    // Keyed on the RUN, not the task: `subagentsDb.insertIfAbsent` is
+    // INSERT OR IGNORE, so a task-keyed id would collide with the already-
+    // `completed` row from a previous run (an e2e retry, Stop→Start, a re-run
+    // of the marker prompt) and silently degrade to a plain fake turn with no
+    // hold. Same reasoning as `fakePlanCallCounter` in the cursor fake.
+    const monitorId = `fake-monitor-${fakeOpts.runId ?? taskId}`;
+    after(5, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-monitor-1",
+          name: "Monitor",
+          input: { command: "tail -f build.log", description: "Fake monitor", timeout_ms: 60000, persistent: false },
+          serverSide: false,
+        }),
+        "fake-monitor-1-tu",
+      );
+    });
+    after(8, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-monitor-1",
+          content: `Monitor started (task ${monitorId}, timeout 60000ms). You will be notified on each event.`,
+          isError: false,
+        }),
+        "fake-monitor-1-tr",
+      );
+      // The real discovery path (claude-subagents.ts) would insert this row
+      // off the same two lines just emitted above; this fake driver writes
+      // no JSONL for that watcher to tail, so it inserts directly.
+      subagentsDb.insertIfAbsent({
+        id: monitorId,
+        taskId,
+        runId: fakeOpts.runId ?? null,
+        parentKind: "monitor",
+        agentType: "monitor",
+        description: "Fake monitor",
+        spawnDepth: 1,
+        sourcePath: "",
+        toolUseId: "fake-monitor-1",
+        status: "running",
+        startedAt: Date.now(),
+        endedAt: null,
+      });
+      record.push(`monitor:armed:${monitorId}`);
+    });
+    after(12, () => {
+      onChunk("assistant", "Armed a monitor; waiting for events.");
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+    after(settleMs, () => {
+      // Mirrors the live path's receipt settle
+      // (`setBackgroundTaskSettledHandler` → `settleSubagentById(id,
+      // "completed", "receipt")`) that fires when a `<task-notification>`
+      // carries the monitor's terminal event — this is what flips
+      // `subagents.hasRunning(taskId)` false and releases the orchestrator's
+      // hold, moving the card from `running` to `review`.
+      settleSubagentById(monitorId, "completed", "receipt");
+      record.push(`monitor:settled:${monitorId}`);
+    });
+  } else if (
+    fakeOpts.kind === "fx"
+    && fakeOpts.continueRecovery !== true
+    && (
+      process.env.AGETOR_FAKE_FX_RECOVERY_FAILED === "1"
+      || prompt.includes(FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER)
+    )
+  ) {
+    // Test hook: fx 0.0.11+'s terminal `failed` recovery state — see
+    // FAKE_FX_RECOVERY_FAILED_PROMPT_MARKER's doc comment. Checked before the
+    // storm branch below; the two markers never overlap as substrings.
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    emitFakeFxRecoveryFailed(onChunk, after, resolveDone, fakeFxUpdateCtx(fakeOpts.runId ?? `fake-${taskId}`));
+  } else if (fakeOpts.kind === "fx" && prompt.includes(FAKE_FX_TOOL_META_PROMPT_MARKER)) {
+    // Test hook: fx 0.0.14 tool-call identity metadata + structured notice —
+    // see FAKE_FX_TOOL_META_PROMPT_MARKER's doc comment.
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    emitFakeFxToolMetaTurn(onChunk, after, resolveDone, fakeFxUpdateCtx(fakeOpts.runId ?? `fake-${taskId}`));
+  } else if (
+    fakeOpts.kind === "fx"
+    && fakeOpts.continueRecovery !== true
+    && resolveFakeFxSteerMode(taskId, prompt) !== null
+  ) {
+    // Test hook: fx 0.0.14 mid-turn steering — see FAKE_FX_STEER_PROMPT_MARKER's
+    // doc comment. The turn holds so a follow-up can arrive while it runs;
+    // `steer()` takes every line until the turn settles (or is killed). A
+    // kill (Stop, delete, archive, agent switch) of a `:dropped` turn hands
+    // every pending steer to `onSteerDropped` before `done` resolves, like the
+    // real driver's cancel and `dropFxSession` paths — a tick later, since
+    // the real drop arrives asynchronously after the kill too — but emits no
+    // status chunk, since a kill can land after a deleted run's row is gone.
+    const steerMode = resolveFakeFxSteerMode(taskId, prompt) as "absorbed" | "dropped";
+    const steered: string[] = [];
+    let steerSettled = false;
+    steer = (line) => {
+      if (steerSettled || killed) return false;
+      // Same per-message cap the real driver enforces (fx refuses > 64 KiB).
+      if (Buffer.byteLength(line, "utf8") > 64 * 1024) return false;
+      record.push(`steer:${line}`);
+      steered.push(line);
+      return true;
+    };
+    settleSteersOnKill = () => {
+      if (steerSettled) return false;
+      steerSettled = true;
+      if (steerMode !== "dropped" || steered.length === 0) return false;
+      setTimeout(() => {
+        for (const text of steered) fakeOpts.onSteerDropped?.(text);
+        resolveDone(0);
+      }, 0);
+      return true;
+    };
+    onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    after(5, () => {
+      onChunk("thinking", "fake fx reasoning");
+      onChunk("assistant", "fake fx steer turn: working…");
+    });
+    after(Math.max(fakeFxSteerHoldMs(), 6), () => {
+      steerSettled = true;
+      for (const text of steered) {
+        if (steerMode === "absorbed") {
+          onChunk("assistant", `fake fx took your steer: ${text}`);
+        } else {
+          if (fakeOpts.onSteerDropped?.(text) === true) onChunk("status", FX_STEER_DROPPED_STATUS);
+        }
+      }
+      emitFakeFxUsageAndTitle(onChunk);
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (
+    fakeOpts.kind === "fx"
+    && (
+      fakeOpts.continueRecovery === true
+      || process.env.AGETOR_FAKE_FX_RECOVERY === "1"
+      || prompt.includes(FAKE_FX_RECOVERY_PROMPT_MARKER)
+      || process.env.AGETOR_FAKE_FX_REPAUSE === "1"
+      || prompt.includes(FAKE_FX_REPAUSE_PROMPT_MARKER)
+    )
+  ) {
+    // Test hook: simulate fx's model-response-recovery channel (the
+    // `_meta.fx.modelResponseRecovery` field on a `session_info_update`
+    // notification — see `FX_RECOVERY_STATUS_PREFIX`'s doc comment in
+    // shared/types.ts) so orchestrator/RunPanel/CLI/TUI tests and
+    // `e2e/fx-recovery.spec.ts` can drive the whole 429 → paused → Resume
+    // flow without a real Gateway rate limit. Mirrors the real driver's
+    // mapping in fx-acp.ts's `session_info_update` branch: each retry
+    // attempt becomes an `FX_RECOVERY_STATUS_PREFIX` sentinel `status` chunk
+    // (`{FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(payload)}`), and the two
+    // terminal transitions (`paused`, `recovered`) additionally get a plain,
+    // persisted `status` line via `fxRecoverySummaryLine` — see
+    // docs/plans/fix-fx-harness-rate-limit.md §3 for the full spec this
+    // mirrors chunk-for-chunk.
+    //
+    // `fakeOpts.continueRecovery === true` picks the "continue" variant
+    // below UNLESS `repause` is also on, in which case it re-storms instead
+    // (see `FAKE_FX_REPAUSE_PROMPT_MARKER`'s doc comment) — a continue
+    // launch's prompt text is otherwise ignored by the real driver too (see
+    // `AgentRunOptions.continueRecovery`), so there's nothing else to
+    // inspect the prompt for on that turn. The repause and URL triggers
+    // (`FAKE_FX_REPAUSE_PROMPT_MARKER`/`AGETOR_FAKE_FX_REPAUSE`,
+    // `FAKE_FX_RECOVERY_URL_PROMPT_MARKER`/`AGETOR_FAKE_FX_RECOVERY_URL`) are
+    // read once here via `prompt`/env regardless of which condition above
+    // admitted this branch — on a `continueRecovery` launch `prompt` is
+    // always `""` (the orchestrator never resends the original text on a
+    // continue), so only the env-var forms can reach a continue turn; the
+    // prompt-marker forms only work on a fresh (non-continue) launch.
+    const repause = (
+      process.env.AGETOR_FAKE_FX_REPAUSE === "1"
+      || prompt.includes(FAKE_FX_REPAUSE_PROMPT_MARKER)
+    );
+    const urlSuffix = (
+      process.env.AGETOR_FAKE_FX_RECOVERY_URL === "1"
+      || prompt.includes(FAKE_FX_RECOVERY_URL_PROMPT_MARKER)
+    )
+      ? " · upgrade at https://example.invalid/upgrade"
+      : "";
+    if (fakeOpts.continueRecovery === true && !repause) {
+      // "continue" variant: fx resumed a paused checkpoint and the retry
+      // succeeded on the first attempt — one `recovered` sentinel, its
+      // persisted summary line, then an ordinary short turn.
+      onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+      after(5, () => {
+        const recovered: FxRecoveryPayload = {
+          state: "recovered",
+          kind: "auto_recovered",
+          attempt: 1,
+          attemptLimit: 3,
+          durable: true,
+          message: "✓ recovered · succeeded on attempt 1/3",
+        };
+        onChunk("status", `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify(recovered)}`);
+        const summary = fxRecoverySummaryLine(recovered);
+        if (summary) onChunk("status", summary);
+      });
+      after(10, () => {
+        onChunk("thinking", "fake fx reasoning");
+        onChunk("assistant", "recovered answer");
+        emitFakeFxUsageAndTitle(onChunk);
+        onChunk("status", "turn complete");
+        resolveDone(0);
+      });
+    } else {
+      // "recovery" storm variant: three retry attempts (the second carrying
+      // a `delaySeconds`, mirroring fx's real backoff reporting), then a
+      // terminal `paused` update once the fake attempt budget (3) is
+      // exhausted — fx's own real cap is 10, but a small fixed number keeps
+      // this scenario fast and deterministic. Reached both by a fresh
+      // (non-continue) launch under the plain recovery trigger, and by a
+      // `continueRecovery` launch under the repause trigger — see
+      // `emitFakeFxRecoveryStorm`'s doc comment.
+      onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+      emitFakeFxRecoveryStorm(onChunk, after, resolveDone, urlSuffix);
+    }
+  } else if (
+    process.env.AGETOR_FAKE_FX_PERMISSION === "1"
+    || prompt.includes(FAKE_FX_PERMISSION_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate fx's ACP `session/request_permission` round-trip
+    // so Playwright/e2e specs can drive the `fx_permission` card
+    // (RunPanel's FxPermissionCard) end to end without the real ACP driver.
+    // Mirrors fx-acp.ts's real handler almost exactly: register the card via
+    // `registerFxPermission` and await its `answer` promise instead of
+    // scheduling a fixed-delay end-of-turn timer — this scenario's turn only
+    // resolves once the card is answered (by the user via the HTTP route, or
+    // by `kill()` below on Stop/delete), same registry-awaiter discipline as
+    // the real driver.
+    //
+    // Mirrors the real driver's `maybeEmitProvider` (fx-acp.ts): the
+    // `configOptions` provider id rides a `FX_PROVIDER_STATUS_PREFIX` status
+    // chunk once per turn, emitted before any turn content, so the run-row
+    // provider chip is e2e-visible under this fake too.
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    after(5, () => {
+      // fx ≥0.0.8 mirror: an `agent_thought_chunk`-derived `thinking` chunk
+      // precedes the turn's assistant text — see `emitFakeFxUsageAndTitle`'s
+      // doc comment and the shared spec in docs/plans/fx-0.0.8-compat.md §3.
+      if (fakeOpts.kind === "fx") onChunk("thinking", "fake fx reasoning");
+      onChunk("assistant", "requesting permission…");
+    });
+    if (fakeOpts.mode === "yolo") {
+      // Mirror the real driver: `yolo` auto-allows client-side and answers
+      // synchronously without ever reaching `session/request_permission`'s
+      // registry round-trip, so this fake must not register a card for it
+      // either — a yolo task should never surface an `fx_permission` card.
+      after(8, () => {
+        onChunk("status", "fake fx permission auto-allowed (yolo)");
+        if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
+        onChunk("status", "turn complete");
+        resolveDone(0);
+      });
+    } else {
+      try {
+        const { id, answer } = registerFxPermission({
+          taskId,
+          runId: fakeOpts.runId ?? "fake-run",
+          toolCall: {
+            toolCallId: "fake-fx-permission-1",
+            title: "Write file",
+            kind: "edit",
+            rawInput: { path: "/tmp/example.txt" },
+          },
+          options: [
+            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+          ],
+          mode: fakeOpts.mode === "ask" ? "ask" : "auto",
+        });
+        fxPermissionCardId = id;
+        answer
+          .then((a) => {
+            // `kill()` may have already cleared the timers and settled
+            // `done` (and answered this same card `cancelled` itself)
+            // before this promise resolves — skip emitting/resolving a
+            // second time so we never double-resolve `resolveDone` or emit
+            // chunks against a run `kill()` already tore down.
+            if (killed) return;
+            onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+            if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
+            onChunk("status", "turn complete");
+            resolveDone(0);
+          })
+          .catch(() => {});
+      } catch (err) {
+        onChunk(
+          "status",
+          `fake fx permission registration failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        resolveDone(1);
+      }
+    }  } else if (prompt.includes(FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER)) {
+    // Test hook: simulate a plain markdown assistant reply carrying image
+    // references (see docs/plans/markdown-image-rendering.md, D10/T3) so
+    // RunPanel's `MdImage` `img` override can be exercised end to end
+    // without a real claude CLI. Unlike the `SendUserFile` scenario below,
+    // nothing here is a structured tool_use/tool_result — this is exactly
+    // what every harness (claude, cursor, codex, gemini, fx) actually puts
+    // on the wire: joined markdown text on the `assistant` stream (plan §2).
+    // A single `assistant` chunk carries four refs, one per path `MdImage`
+    // must handle:
+    //   - an ABSOLUTE ref to a real file → renders inline.
+    //   - a RELATIVE ref to that same real file → exercises the
+    //     worktree/workdir candidate-resolution order (plan D5): it only
+    //     resolves once a task root (worktreePath, then workdir) actually
+    //     contains `agetor-md-images/shot.png`, i.e. once `fakeOpts.cwd` is
+    //     the task's own cwd.
+    //   - an absolute ref to a file that is never written → the
+    //     `md-image-fallback` chip (missing image), not a broken-image
+    //     glyph.
+    //   - an absolute ref to a `.pdf` that is ALSO never written to disk →
+    //     the non-image `md-image-file` chip renders purely from the
+    //     extension and doesn't require the path to exist on disk.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver.
+    const mdImageCwd = fakeOpts.cwd ?? process.cwd();
+    const mdImageDir = path.join(mdImageCwd, "agetor-md-images");
+    mkdirSync(mdImageDir, { recursive: true });
+    writeFileSync(path.join(mdImageDir, "shot.png"), Buffer.from(FAKE_PNG_1X1_BASE64, "base64"));
+    after(5, () => {
+      onChunk(
+        "assistant",
+        `Here are the screenshots.\n\n![Absolute shot](${mdImageDir}/shot.png)\n\n![Relative shot](agetor-md-images/shot.png)\n\n![Missing shot](${mdImageDir}/missing.png)\n\n![The report](${mdImageDir}/report.pdf)`,
+      );
+    });
+    after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (prompt.includes(FAKE_CLAUDE_COMPACTION_PROMPT_MARKER)) {
+    // Test hook: simulate a context compaction (see
+    // FAKE_CLAUDE_COMPACTION_PROMPT_MARKER's doc comment) so the
+    // `compaction_summary` stream, its two companion status lines and their
+    // ordering can be exercised end to end without a real claude CLI. The
+    // order mirrors the real session JSONL: boundary status, summary, notice
+    // status, then the turn's own assistant reply.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver.
+    after(5, () => {
+      onChunk("status", compactionStatusLine({ preTokens: 450162, postTokens: 8613, trigger: "auto" }));
+      onChunk("compaction_summary", FAKE_CLAUDE_COMPACTION_SUMMARY);
+      onChunk("status", FAKE_CLAUDE_COMPACTION_NOTICE);
+      onChunk("assistant", "Picking up where we left off.");
+    });
+    after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (prompt.includes(FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER)) {
+    // Test hook: reject `done` (see FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER's
+    // doc comment). The orchestrator has already echoed the prompt by now;
+    // `kill()` clears this timer like every other scenario's.
+    after(5, () => { rejectDone(new Error("fake done rejection")); });
+  } else if (prompt.includes(FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER)) {
+    // Test hook: emit a reply long enough (in event count) to overflow
+    // EVENTS_REPLAY_LIMIT (800) in one turn — see
+    // FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER's doc comment above for the full
+    // rationale (docs/plans/first-load-reaches-last-user-message.md). Each
+    // `onChunk("assistant", …)` call below becomes its own persisted
+    // `run_events` row, which is the point: with the default count (900)
+    // there are more assistant rows after the prompt echo than
+    // EVENTS_REPLAY_LIMIT admits, so pre-fix the un-anchored SSE replay
+    // window drops the user's own prompt bubble on first open.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver: a follow-up turn's prompt
+    // won't carry the marker unless the caller re-includes it.
+    const countMatch = prompt.match(FAKE_CLAUDE_LONG_REPLY_COUNT_RE);
+    const parsedCount = countMatch ? Number(countMatch[1]) : NaN;
+    const longReplyCount = Number.isFinite(parsedCount)
+      ? Math.min(FAKE_CLAUDE_LONG_REPLY_MAX_COUNT, Math.max(1, parsedCount))
+      : FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT;
+    after(5, () => {
+      for (let i = 0; i < longReplyCount; i++) {
+        onChunk("assistant", `long reply chunk ${i + 1}/${longReplyCount}`);
+      }
+    });
+    after(20, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (
+    process.env.AGETOR_FAKE_CLAUDE_SENT_FILES === "1"
+    || prompt.includes(FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate a `SendUserFile` session (see
+    // docs/plans/send-files-to-user.md) so orchestrator/RunPanel/board-badge/
+    // CLI tests can drive the sent-files card, the board's paperclip badge,
+    // and the error-card path end to end without a real claude CLI. Chunk
+    // shapes match exactly what claude-tmux.ts's real mapper produces: a
+    // `tool_use` chunk's `data` is `{id, name, input, serverSide}` and its
+    // matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError, attachments?}` — `attachments` (T3, `claude-tmux.ts`) is
+    // present only on a successful result (claude's structured
+    // `toolUseResult.attachments`, sanitized via
+    // `sanitizeToolResultAttachments`); an errored result's `toolUseResult`
+    // is a bare string, so nothing is forwarded there.
+    //
+    // The scenario exercises the three states the card/badge need to cover:
+    //   1. A delivered `SendUserFile` call for two REAL files (a PNG and a
+    //      Markdown report, actually written under `<cwd>/agetor-sent/` so
+    //      the card's `/files/preview` image tile and its stat-driven file
+    //      tile have something real on disk to render) — the "2 files
+    //      delivered" card with an image tile (PNG) and a generic file tile
+    //      (Markdown), which is also what bumps `tasks.sent_files` / the
+    //      board's paperclip badge to a count of 2.
+    //   2. A second, ERRORED `SendUserFile` call pointed at the
+    //      `agetor-sent` DIRECTORY itself — mirrors the real, live-probed
+    //      claude behavior of rejecting a directory with
+    //      `<tool_use_error>Attachment "<path>" is not a regular file.
+    //      </tool_use_error>` (see `src/shared/sent-files.ts`'s header
+    //      comment) — the error card, whose lone tile renders folder-shaped
+    //      (stat-driven: the path IS a directory on disk).
+    //   3. The first tool_result's `attachments[]` gives the card real
+    //      `size`/`isImage`/`mediaType` metadata to render immediately,
+    //      without waiting on a live `/refs/resolve` stat round-trip.
+    //
+    // Only turn 1 (a fresh spawn) runs this scenario — same convention as
+    // every other canned scenario in this driver: a follow-up turn's prompt
+    // won't carry the marker unless the caller re-includes it.
+    //
+    // Deliberately the LAST marker-driven branch in this if/else chain (after
+    // TODOS, MONITOR, FX_PERMISSION, and MD_IMAGE): its trigger is `||`-gated on a bare
+    // env var (`AGETOR_FAKE_CLAUDE_SENT_FILES=1`), same convention as
+    // `AGETOR_FAKE_CLAUDE_TODOS`, and a bare env var is process-wide — it
+    // can't be scoped to one test's prompt the way a marker substring can. If
+    // this branch sat ABOVE the monitor/fx-permission branches (as it
+    // originally did), setting the env var globally would hijack *every*
+    // fake-claude turn, including ones whose prompt carries
+    // `FAKE_CLAUDE_MONITOR_PROMPT_MARKER` or `FAKE_FX_PERMISSION_PROMPT_MARKER`
+    // and clearly wants a different canned scenario. Placing it last means
+    // those more specific, prompt-marker-gated branches are checked first in
+    // the `if`/`else if` chain and win on their own merits — ordering alone
+    // makes the env-var trigger safe, no extra exclusion condition needed.
+    const sentCwd = fakeOpts.cwd ?? process.cwd();
+    const sentDir = path.join(sentCwd, "agetor-sent");
+    mkdirSync(sentDir, { recursive: true });
+    const pngPath = path.join(sentDir, "chart.png");
+    const mdPath = path.join(sentDir, "report.md");
+    const pngBuffer = Buffer.from(FAKE_PNG_1X1_BASE64, "base64");
+    const mdContent = "# Fake report\n\nDelivered by the fake claude driver.\n";
+    writeFileSync(pngPath, pngBuffer);
+    writeFileSync(mdPath, mdContent);
+
+    after(5, () => onChunk("assistant", "Sending you the files."));
+    after(8, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_1",
+          name: "SendUserFile",
+          input: {
+            files: [pngPath, mdPath],
+            caption: "Fake delivery — a chart and its report",
+            status: "normal",
+            display: "render",
+          },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-1",
+      );
+    });
+    after(11, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_1",
+          content:
+            "2 files delivered to user.\n  " + pngPath + " → file_uuid: 00000000-0000-4000-8000-000000000001\n  "
+              + mdPath + " → file_uuid: 00000000-0000-4000-8000-000000000002",
+          isError: false,
+          attachments: [
+            { path: pngPath, size: pngBuffer.length, isImage: true, mediaType: "image/png" },
+            { path: mdPath, size: Buffer.byteLength(mdContent), isImage: false, mediaType: null },
+          ],
+        }),
+        "fake-sent-files-tr-1",
+      );
+    });
+    after(14, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "toolu_fake_sent_2",
+          name: "SendUserFile",
+          input: { files: [sentDir], caption: "Trying to send the whole folder", status: "normal" },
+          serverSide: false,
+        }),
+        "fake-sent-files-tu-2",
+      );
+    });
+    after(17, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "toolu_fake_sent_2",
+          content: `<tool_use_error>Attachment "${sentDir}" is not a regular file.</tool_use_error>`,
+          isError: true,
+        }),
+        "fake-sent-files-tr-2",
+      );
+    });
+    after(20, () => onChunk("assistant", "Done."));
+    after(23, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else {
+    // Generic fallback, shared with claude's fake driver — only fx turns get
+    // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
+    // the fx-permission scenario above for the same comment in full).
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
+    // fx ≥0.0.9 mirror: `applyFxEffort` (fx-acp.ts) emits an "isn't offered"
+    // breadcrumb when the task's requested effort isn't in the model's
+    // offered set — see FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER's doc comment.
+    // Exactly once per turn, right after the provider sentinel and before the
+    // thinking chunk (mirrors the real driver's post-session/new ordering).
+    if (
+      fakeOpts.kind === "fx"
+      && (prompt.includes(FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER)
+        || process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED === "1")
+    ) {
+      onChunk(
+        "status",
+        `fx: effort ${fakeOpts.effort ?? "auto"} isn't offered for ${
+          fakeOpts.model ?? DEFAULT_MODEL.fx
+        } (offers: auto, low, high, max) — running at fx's default`,
+      );
+    }
+    // fx 0.0.14 mirror: `applyFxSpeed` (fx-acp.ts) runs right after
+    // `applyFxEffort` and breadcrumbs a Fast/Ultrafast tier the model doesn't
+    // offer — see FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER's doc comment. Silent
+    // for `off`/unset, like the real driver.
+    if (
+      fakeOpts.kind === "fx"
+      && prompt.includes(FAKE_FX_SPEED_UNOFFERED_PROMPT_MARKER)
+      && (fakeOpts.speed === "fast" || fakeOpts.speed === "ultrafast")
+    ) {
+      onChunk("status", fxSpeedNotOfferedLine(fakeOpts.speed, fakeOpts.model ?? DEFAULT_MODEL.fx));
+    }
+    after(5, () => {
+      // fx ≥0.0.8 mirror: a `thinking` chunk precedes the turn's assistant
+      // text — see `emitFakeFxUsageAndTitle`'s doc comment and the shared
+      // spec in docs/plans/fx-0.0.8-compat.md §3.
+      if (fakeOpts.kind === "fx") onChunk("thinking", "fake fx reasoning");
+      onChunk("stdout", `fake response to: ${prompt}`);
+    });
+    // Test seam: `AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS` holds a fake CODEX turn
+    // in flight for that long (default 20ms — the historical timing every
+    // other consumer relies on), so a test can deterministically queue
+    // follow-ups behind it and mutate the task (model, CLI version) before
+    // `drainCodexQueue` runs. Read at call time. `AGETOR_FAKE_CLAUDE_TURN_MS`
+    // is the claude counterpart for this generic turn: a test that folds a
+    // follow-up into the still-running turn holds it open instead of racing
+    // the 20ms timer (which a loaded machine loses). fx keeps its own timing.
+    const resolveAfterMs =
+      fakeOpts.kind === "codex"
+        ? (Number(process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS ?? 20) || 20)
+        : fakeOpts.kind === "claude-code"
+          ? (Number(process.env.AGETOR_FAKE_CLAUDE_TURN_MS ?? 20) || 20)
+          : 20;
+    after(resolveAfterMs, () => {
+      if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  }
+  const inst: FakeDriverInstance = {
+    _record: record,
+    _speed: fakeOpts.speed,
+    kill: () => {
+      record.push("kill");
+      // Set before anything else so the fx-permission scenario's still-
+      // pending `answer.then` callback (if any) sees it and skips emitting
+      // chunks / re-resolving `done` once that promise settles.
+      killed = true;
+      // Clear every pending timer so no further chunks/resolutions fire from
+      // them, but still settle `done` immediately (with the same code the
+      // timer chain would have used) so a kill never leaves a caller awaiting
+      // `done` forever. If the timers already fired, both of these are no-ops
+      // (clearTimeout on an elapsed timer, resolveDone on an already-settled
+      // promise).
+      for (const t of timers) clearTimeout(t);
+      realWatcherHandle?.detach();
+      realWatcherHandle = undefined;
+      // Mirror the real fx driver's settlement discipline: a still-open
+      // fx_permission card must be resolved on teardown, not left dangling
+      // in the registry. `answerFxPermission` is idempotent (returns false
+      // if the card was already answered/cancelled), so this is safe to call
+      // unconditionally whenever this fake spawned one.
+      if (fxPermissionCardId !== undefined) {
+        answerFxPermission(fxPermissionCardId, { cancelled: true });
+      }
+      if (settleSteersOnKill?.() !== true) resolveDone(0);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    ...(steer ? { steer } : {}),
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
+/**
+ * Test hook: when `AGETOR_FAKE_CURSOR_PLAN=1`, the cursor fake driver emits a
+ * `createPlanToolCall` tool_use/tool_result pair instead of the generic fake
+ * response, so orchestrator tests can drive `attachDoneHandler`'s cursor plan
+ * detection (`orchestrator.ts:detectCursorPlan`) end to end without a real
+ * `cursor-agent` CLI. Chunk shapes match exactly what `mapCursorEvent`
+ * produces (`cursor-tmux.ts`): the `tool_use` chunk's `data` is
+ * `{id, name, input, serverSide}` with `input` = the raw `tool_call` payload
+ * (so `input.createPlanToolCall.args.plan` round-trips the same way a real
+ * run's does), and the `tool_result` chunk is `{toolUseId, content, isError}`.
+ * The call_id deliberately embeds a newline — real Cursor call_ids do this
+ * (plan §2) — so detection/persistence code that only exercises this path in
+ * tests still gets coverage for the newline-safety requirement.
+ *
+ * `fakePlanCallCounter` makes the call_id unique per spawn (i.e. per turn):
+ * without it, a `--resume` turn issued right after approving a plan would
+ * emit the exact same call_id as the first turn, and `upsertDetectedPlan`'s
+ * dedup-by-toolCallId would treat the second plan as a no-op re-detection of
+ * the first instead of a genuinely new plan — which is exactly the
+ * supersede transition tests need to exercise.
+ */
+let fakePlanCallCounter = 0;
+function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const n = ++fakePlanCallCounter;
+  const callId = `call-fake-plan-${n}\nfc_fake_${n}`;
+  const planArgs = {
+    plan: "# Fake Plan\n\n- step one\n- step two",
+    name: "Fake Plan",
+    todos: [] as unknown[],
+    overview: "",
+    isProject: false,
+    phases: [] as unknown[],
+  };
+  after(5, () => {
+    onChunk(
+      "tool_use",
+      JSON.stringify({
+        id: callId,
+        name: "createPlanToolCall",
+        input: { createPlanToolCall: { args: planArgs } },
+        serverSide: false,
+      }),
+      `tool_call:${callId}:started`,
+    );
+  });
+  after(10, () => {
+    // `mapCursorEvent`'s `completed` branch forwards the WHOLE `tool_call`
+    // envelope as `content` (cursor-tmux.ts's `evt.tool_call ?? {}`), not
+    // just its result payload — match that shape here so a test asserting
+    // on `tool_result.content` sees exactly what a real run would produce.
+    onChunk(
+      "tool_result",
+      JSON.stringify({
+        toolUseId: callId,
+        content: { createPlanToolCall: { args: planArgs, result: { success: {}, planUri: "" } } },
+        isError: false,
+      }),
+      `tool_call:${callId}:completed`,
+    );
+  });
+  after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      for (const t of timers) clearTimeout(t);
+      resolveDone(0);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
+/**
+ * Prompt-marker trigger for the cursor stream scenario
+ * (docs/plans/fx-0.0.14-and-cursor-updates.md §3.3/§5): the fake cursor
+ * driver replays a canned NDJSON turn shaped like cursor-agent 2026.10.22's
+ * real `--output-format stream-json` output — two `thinking` blocks (deltas
+ * then `completed`), a `globToolCall` started/completed pair, an assistant
+ * message and a `result` carrying `usage` — through the real `mapCursorEvent`
+ * with one shared `CursorMapCtx`, so the coalesced thinking chunks
+ * (`cursor:thinking:<n>`) and the usage sentinel (`cursor:usage:<n>`) are
+ * exactly what a real run persists. `AGETOR_FAKE_CURSOR_STREAM=1` is the
+ * process-wide equivalent. The marker wins over `AGETOR_FAKE_CURSOR_PLAN=1`;
+ * the env twin doesn't (see `spawnAgent`'s cursor branch).
+ */
+export const FAKE_CURSOR_STREAM_PROMPT_MARKER = "__agetor_fake_cursor_stream__";
+
+/** Synthetic cursor-agent 2026.10.22 stream-json turn for
+ *  {@link FAKE_CURSOR_STREAM_PROMPT_MARKER} — the live capture's shape
+ *  (inner tool key first, then cursor's bookkeeping siblings; `result.usage`
+ *  with all four token counts) with genericized content. */
+function fakeCursorStreamEvents(sessionId: string, prompt: string): Record<string, unknown>[] {
+  const callId = "call-fake-stream-1\nfc_fake_stream_1";
+  const globArgs = { globPattern: "**/notes.txt" };
+  const toolBookkeeping = { hookAdditionalContexts: [], toolCallId: callId, startedAtMs: "1700000000000" };
+  return [
+    { type: "system", subtype: "init", apiKeySource: "login", cwd: "/fake/cwd", session_id: sessionId, model: "Auto", permissionMode: "default" },
+    { type: "user", message: { role: "user", content: [{ type: "text", text: prompt }] }, session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: "Looking for", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " the notes file", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " first.", session_id: sessionId },
+    { type: "thinking", subtype: "completed", session_id: sessionId },
+    {
+      type: "tool_call",
+      subtype: "started",
+      call_id: callId,
+      tool_call: { globToolCall: { args: globArgs }, ...toolBookkeeping },
+      session_id: sessionId,
+    },
+    {
+      type: "tool_call",
+      subtype: "completed",
+      call_id: callId,
+      tool_call: {
+        globToolCall: { args: globArgs, result: { success: { pattern: "", path: "", files: ["./notes.txt"], totalFiles: 1 } } },
+        ...toolBookkeeping,
+        completedAtMs: "1700000000050",
+      },
+      session_id: sessionId,
+    },
+    { type: "thinking", subtype: "delta", text: "Found it.", session_id: sessionId },
+    { type: "thinking", subtype: "delta", text: " Answering now.", session_id: sessionId },
+    { type: "thinking", subtype: "completed", session_id: sessionId },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "The notes file is ./notes.txt." }] }, session_id: sessionId },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "The notes file is ./notes.txt.",
+      session_id: sessionId,
+      request_id: "fake-request-1",
+      usage: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 3400, cacheWriteTokens: 0 },
+    },
+  ];
+}
+
+/** The {@link FAKE_CURSOR_STREAM_PROMPT_MARKER} fake agent: one canned event
+ *  per 3 ms through `mapCursorEvent`, lineIndex = the NDJSON line index the
+ *  real tailer would use, settling with the `result` event's exit code (no
+ *  "turn complete" line — the real cursor driver writes none). */
+function makeFakeCursorStreamAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const ctx = createCursorMapCtx();
+  let assistantTextEmitted = false;
+  const events = fakeCursorStreamEvents(`fake-cursor-session-${taskId}`, prompt);
+  events.forEach((evt, lineIndex) => {
+    after(5 + lineIndex * 3, () => {
+      const result = mapCursorEvent(evt as Parameters<typeof mapCursorEvent>[0], onChunk, lineIndex, assistantTextEmitted, ctx);
+      if (result.assistantTextEmitted) assistantTextEmitted = true;
+      if (lineIndex === events.length - 1) {
+        flushCursorThinking(ctx, onChunk);
+        resolveDone(result.done ?? 0);
+      }
+    });
+  });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      for (const t of timers) clearTimeout(t);
+      resolveDone(0);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
+/**
+ * Prompt-marker triggers for the fake opencode driver
+ * (`AGETOR_OPENCODE_DRIVER=fake`, D-18) — same rationale as
+ * {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}: the e2e backend's env is fixed per
+ * worker, the prompt is not.
+ *  - {@link FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER}: the turn also runs a v2
+ *    `subagent` tool whose result names the child session
+ *    `ses_fakechild<taskId8>`, so `onSubagent` registers its tab and the
+ *    turn-end refresh exports it through `opencode-export.ts`'s fake seam.
+ *  - {@link FAKE_OPENCODE_ERROR_PROMPT_MARKER}: the turn ends with an `error`
+ *    event and exit 1.
+ *  - {@link FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER}: on a resumed turn, the
+ *    resume "fails" — the D-9 status line is posted and the turn continues in
+ *    a NEW session (reported through `onSessionId`), like the real driver's
+ *    one-shot `freshArgv` relaunch. Ignored on a fresh turn.
+ */
+export const FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_opencode_subagent__";
+export const FAKE_OPENCODE_ERROR_PROMPT_MARKER = "__agetor_fake_opencode_error__";
+export const FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER = "__agetor_fake_opencode_resume_fail__";
+
+/** The first 8 chars of a task id, alphanumerics only, so a fake session id
+ *  built from it still matches `OPENCODE_SESSION_ID_RE`. */
+function fakeOpencodeIdPart(taskId: string): string {
+  return taskId.slice(0, 8).replace(/[^A-Za-z0-9]/g, "");
+}
+
+/** The fake child session id the subagent marker names. */
+export function fakeOpencodeChildSessionId(taskId: string): string {
+  return `ses_fakechild${fakeOpencodeIdPart(taskId)}`;
+}
+
+/** The D-9 status line a failed resume posts before the fresh session. */
+export function opencodeResumeFailedStatusLine(sessionId: string): string {
+  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
+}
+
+/** Makes every fake turn's part ids unique, so two turns of one task never
+ *  share a `line_uuid`. */
+let fakeOpencodeTurnCounter = 0;
+
+/**
+ * Synthetic v2 (2.1.3) `opencode run --format json` turn for the fake driver,
+ * shaped like the captured fixtures (`src/bun/fixtures/opencode/v2-*`):
+ * reasoning, a `shell` tool, a `todowrite`, the assistant text, and a
+ * `step_finish` (tokens + numeric USD cost) per step. The subagent marker
+ * adds a `subagent` step; the error marker ends on an `error` event instead
+ * of the text.
+ */
+function fakeOpencodeEvents(sessionId: string, taskId: string, prompt: string): Record<string, unknown>[] {
+  const turn = ++fakeOpencodeTurnCounter;
+  const tag = `${fakeOpencodeIdPart(taskId)}${turn}`;
+  let clock = 1_793_108_789_000 + turn * 10_000;
+  let seq = 0;
+  const partId = () => `prt_fake${tag}p${++seq}`;
+  const messageId = (n: number) => `msg_fake${tag}m${n}`;
+  const envelope = (type: string, body: Record<string, unknown>) => ({ type, timestamp: (clock += 5), sessionID: sessionId, ...body });
+  const stepStart = (msg: string) =>
+    envelope("step_start", { part: { id: partId(), sessionID: sessionId, messageID: msg, type: "step-start", snapshot: "fakesnapshot" } });
+  const stepFinish = (msg: string, reason: "tool-calls" | "stop", tokens: { input: number; output: number; reasoning: number; read: number }) =>
+    envelope("step_finish", {
+      part: {
+        id: partId(),
+        sessionID: sessionId,
+        messageID: msg,
+        type: "step-finish",
+        reason,
+        snapshot: "fakesnapshot",
+        cost: 0.0012,
+        tokens: { input: tokens.input, output: tokens.output, reasoning: tokens.reasoning, cache: { read: tokens.read, write: 0 } },
+      },
+    });
+  const tool = (msg: string, callId: string, name: string, input: Record<string, unknown>, output: string, metadata: Record<string, unknown>) =>
+    envelope("tool_use", {
+      part: {
+        partID: partId(),
+        sessionID: sessionId,
+        messageID: msg,
+        type: "tool",
+        id: callId,
+        tool: name,
+        state: {
+          status: "completed",
+          input,
+          output,
+          title: name,
+          metadata: { metadata, content: [{ type: "text", text: output }] },
+          time: { start: clock, end: clock + 3 },
+        },
+      },
+    });
+
+  const m1 = messageId(1);
+  const m2 = messageId(2);
+  const m3 = messageId(3);
+  const todos = [
+    { content: "inspect the project", status: "completed" },
+    { content: "answer the user", status: "pending" },
+  ];
+  const events: Record<string, unknown>[] = [
+    stepStart(m1),
+    envelope("reasoning", { part: { id: partId(), sessionID: sessionId, messageID: m1, type: "reasoning", text: "fake opencode reasoning" } }),
+    tool(m1, `call-fake-${tag}-shell`, "shell", { command: "ls" }, "a.txt\nb.txt\n", { status: "completed", truncated: false, exit: 0 }),
+    stepFinish(m1, "tool-calls", { input: 1200, output: 40, reasoning: 12, read: 0 }),
+    stepStart(m2),
+    tool(m2, `call-fake-${tag}-todo`, "todowrite", { todos }, "Todos updated: 1/2 completed, 1 pending", { todos, truncated: false }),
+    stepFinish(m2, "tool-calls", { input: 300, output: 20, reasoning: 0, read: 1100 }),
+  ];
+  if (prompt.includes(FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER)) {
+    const child = fakeOpencodeChildSessionId(taskId);
+    const ms = messageId(4);
+    events.push(
+      stepStart(ms),
+      tool(
+        ms,
+        `call-fake-${tag}-subagent`,
+        "subagent",
+        { prompt: "List the files in the current directory.", description: "Fake child task", agent: "explore" },
+        `<subagent sessionID="${child}" state="completed">\nfake child reply\n</subagent>`,
+        { sessionID: child, status: "completed", truncated: false },
+      ),
+      stepFinish(ms, "tool-calls", { input: 200, output: 15, reasoning: 0, read: 1300 }),
+    );
+  }
+  events.push(stepStart(m3));
+  if (prompt.includes(FAKE_OPENCODE_ERROR_PROMPT_MARKER)) {
+    events.push(envelope("error", { error: { type: "unknown", message: "fake opencode error" } }));
+  } else {
+    events.push(
+      envelope("text", {
+        part: { id: partId(), sessionID: sessionId, messageID: m3, type: "text", text: `fake response to: ${prompt}`, time: { start: clock, end: clock + 2 } },
+      }),
+      stepFinish(m3, "stop", { input: 150, output: 10, reasoning: 0, read: 1400 }),
+    );
+  }
+  return events;
+}
+
+/**
+ * The fake opencode agent (`AGETOR_OPENCODE_DRIVER=fake`, D-18): replays
+ * {@link fakeOpencodeEvents} one NDJSON line per 3 ms through the REAL
+ * `createOpencodeLineProcessor` (the cursor-stream precedent), so the chunks,
+ * line uuids, session-id discovery and subagent notices are exactly what a
+ * real turn produces. Settles with the processor's verdict (exit 1 after an
+ * `error` event, else 0) after awaiting `beforeSettle`, like the real driver;
+ * `kill()` settles as the SIGINT exit (130), the orchestrator's own
+ * `cancelled` flag deciding the run status.
+ */
+function makeFakeOpencodeAgent(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  fakeOpts: {
+    major: 1 | 2;
+    resumeSessionId?: string | null;
+    onSessionId?: (id: string) => void;
+    onSubagent?: (n: OpencodeSubagentNotice) => void;
+    beforeSettle?: OpencodeLaunchOptions["beforeSettle"];
+  },
+): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const resumeId = fakeOpts.resumeSessionId ?? null;
+  const resumeFails = resumeId !== null && prompt.includes(FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER);
+  const sessionId = resumeFails
+    ? `ses_fakefresh${fakeOpencodeIdPart(taskId)}${fakeOpencodeTurnCounter + 1}`
+    : resumeId ?? `ses_fake${fakeOpencodeIdPart(taskId)}`;
+  const processor = createOpencodeLineProcessor({
+    onChunk,
+    onSessionId: fakeOpts.onSessionId,
+    onSubagent: fakeOpts.onSubagent,
+    major: fakeOpts.major,
+  });
+
+  let settled = false;
+  const settle = async (code: number) => {
+    if (settled) return;
+    settled = true;
+    for (const t of timers) clearTimeout(t);
+    try {
+      await fakeOpts.beforeSettle?.({ code, sessionId: processor.result().sessionId });
+    } catch (err) {
+      console.warn(`[agetor] fake opencode: beforeSettle failed for task ${taskId}:`, err);
+    }
+    resolveDone(code);
+  };
+
+  if (resumeFails) {
+    // Same text and line uuid the real driver's fresh retry posts
+    // (opencode-tmux.ts `settle`).
+    after(2, () => onChunk("status", opencodeResumeFailedStatusLine(resumeId), "opencode:fresh-retry"));
+  }
+  const events = fakeOpencodeEvents(sessionId, taskId, prompt);
+  events.forEach((evt, lineIndex) => {
+    after(5 + lineIndex * 3, () => {
+      processor.feed(JSON.stringify(evt));
+      if (lineIndex === events.length - 1) void settle(processor.result().failed ? 1 : 0);
+    });
+  });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      void settle(130);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
+export interface SpawnAgentArgs {
+  taskId: string;
+  /** The run row this spawn belongs to. Used by the codex driver to key its
+   *  per-run log/prompt files (so each turn — and its reattach — is isolated).
+   *  Ignored by claude-code. */
+  runId: string;
+  harness: Harness;
+  prompt: string;
+  cwd: string;
+  onChunk: ChunkHandler;
+  /**
+   * Fires with the agent's session uuid. For claude-code and gemini, both of
+   * which take a self-issued `--session-id`, this fires synchronously before
+   * the CLI has even written its first event — useful for persisting the id
+   * on the run row immediately. For codex and fx it fires later, once the
+   * driver DISCOVERS the id from the process itself — codex from the
+   * `thread.started` event, fx from the ACP `session/new` response's
+   * `sessionId` (both have no pre-generation flag/mechanism). Not invoked at
+   * all pre-gemini for codex-shaped "no comparable session id" cases — every
+   * kind now has one.
+   */
+  onSessionId?: (sessionId: string) => void;
+  /**
+   * fx-only: called with the text of a mid-turn steer (`SpawnedAgent.steer`)
+   * fx didn't take before the turn ended, so the caller can send it as the
+   * next turn instead. Fires BEFORE the agent's `done` resolves; returns
+   * whether the text was queued. Forwarded to
+   * `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
+   */
+  onSteerDropped?: (text: string) => boolean;
+  /**
+   * copilot-only: the orchestrator's background-agent sink. Copilot reports
+   * subagents inline in its JSON stream; the driver feeds each one through
+   * this sink so it shows up as a subagent tab. Other kinds ignore it.
+   */
+  copilotSubagents?: CopilotSubagentSink;
+  opts?: AgentRunOptions;
+}
+
+/**
+ * The `FxLaunchOptions` `spawnAgent` hands `spawnFxViaAcp` for a real fx
+ * spawn — split out so tests can pin exactly what reaches the driver
+ * (the speed tier and the harness's profile-MCP toggle in particular)
+ * without spawning an fx child. `speed: null` means "skip speed
+ * reconciliation" in the driver; `profileMcpServers` is on unless the harness
+ * explicitly turned it off (an absent field reads as on).
+ */
+export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand): FxLaunchOptions {
+  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, onSteerDropped, opts = {} } = args;
+  return {
+    taskId,
+    runId,
+    argv: built.cmd,
+    env: built.env ?? {},
+    cwd,
+    promptText: prompt,
+    mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
+    resumeSessionId: opts.resumeSessionId ?? undefined,
+    continueRecovery: opts.continueRecovery === true,
+    effort: opts.effort ?? null,
+    speed: opts.speed ?? null,
+    profileMcpServers: harness.profileMcpServers !== false,
+    model: opts.model ?? undefined,
+    onChunk,
+    onSessionId,
+    onSteerDropped,
+  };
+}
+
+/**
+ * Start a new agent run. For claude-code this creates the per-task tmux
+ * session (or reuses one that survived a previous run). For codex this is
+ * a fresh `Bun.spawn`.
+ *
+ * Returns a unified `SpawnedAgent` so the orchestrator's bookkeeping is the
+ * same for both agents.
+ *
+ * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnGeminiViaTmux` are
+ * `Bun.spawn`-backed tmux drivers (wave 1 of
+ * docs/plans/fix-task-details-load-delay.md — no more `Bun.spawnSync` on the
+ * warm-up path), so those dispatch branches await their driver spawn.
+ * `spawnFxViaAcp` and `spawnCursorViaAcp` stay synchronous (neither uses
+ * tmux — see fx-acp.ts and cursor-acp.ts) and the fake-driver branches stay
+ * synchronous too (`makeFakeAgent` / `makeFakeCursorPlanAgent` /
+ * `spawnFakeCursorAsk`); both are still valid returns from this `async`
+ * function, just resolved immediately.
+ */
+export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
+  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
+
+  if (harness.kind === "claude-code") {
+    if (process.env.AGETOR_CLAUDE_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by;
+      // the fake's behaviour doesn't depend on the argv shape.
+      buildCommand(harness, prompt, opts);
+      // Test hook: delay the SPAWN itself — i.e. the promise `spawnAgent`
+      // returns — rather than anything the fake agent emits afterward. This
+      // is distinct from `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS` above, which
+      // delays a turn's *resolution* once the fake agent is already running;
+      // this one delays the caller (`startTask`/`sendInput`) from ever
+      // getting a `SpawnedAgent` back, reproducing a slow `spawnClaudeViaTmux`
+      // (e.g. a slow `tmux new-session`) without touching tmux at all. Exists
+      // for `docs/plans/task-details-blank-while-session-restores.md`'s
+      // bounded-spawn-await work (§3.1) and its tests. Unset/0/non-finite →
+      // no delay, byte-identical to today.
+      const spawnDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS ?? 0);
+      if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
+        await Bun.sleep(spawnDelayMs);
+      }
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: "claude-code",
+      });
+    }
+    // Pre-generate a session uuid when we're not resuming. The driver will
+    // expect claude to write its JSONL at the deterministic path derived
+    // from cwd + this uuid, replacing the previous mtime-poll race.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    onSessionId?.(sessionId);
+    return await spawnClaudeViaTmux({
+      taskId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      onChunk,
+      sessionId,
+      configDir: harness.home,
+      mode: opts.mode ?? null,
+      deferredPrompt: built.deferredPrompt,
+    });
+  }
+
+  if (harness.kind === "cursor") {
+    // cursor — one `cursor-agent acp` child per turn (cursor-acp.ts), NDJSON
+    // JSON-RPC on stdio. A restart leaves that child; an open question is
+    // rebuilt from `cursor_asks` and the next user message carries the answer.
+    if (process.env.AGETOR_CURSOR_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Test hook: hold the spawn — the promise `spawnAgent` returns — so a
+      // delete or force-archive can land after `spawnCursorTurnNow` has
+      // minted the run and before it registers the child. That is the ACP
+      // handshake window in production. Unset/0/non-finite → no delay.
+      const spawnDelayMs = Number(process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS ?? 0);
+      if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
+        await Bun.sleep(spawnDelayMs);
+      }
+      // Hand the orchestrator a session id so it persists `cursor_session_id`
+      // and can route the next turn through `session/load`.
+      onSessionId?.(`fake-cursor-session-${taskId}`);
+      // The ask marker is first: an e2e worker with the plan or stream env
+      // still set must be able to drive a question card.
+      if (prompt.includes(FAKE_CURSOR_ASK_PROMPT_MARKER)) {
+        return spawnFakeCursorAsk({ taskId, runId, prompt, onChunk });
+      }
+      if (prompt.includes(FAKE_CURSOR_STREAM_PROMPT_MARKER)) {
+        return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
+      }
+      if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
+        return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
+      }
+      if (process.env.AGETOR_FAKE_CURSOR_STREAM === "1") {
+        return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
+      }
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return spawnCursorViaAcp({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      mode: opts.mode ?? null,
+      model: built.cursorModel ?? "",
+      resumeSessionId: opts.resumeSessionId ?? undefined,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  if (harness.kind === "gemini") {
+    if (process.env.AGETOR_GEMINI_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Unlike claude's fake path (which skips onSessionId entirely — see
+      // above), gemini's real spawn always calls onSessionId synchronously,
+      // so the fake preserves that observable contract with a predictable
+      // value tests can assert on (mirrors codex's fake `thread.started`
+      // stand-in, `fake-codex-thread-${taskId}`).
+      const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
+      onSessionId?.(sessionId);      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });    }
+    // Pre-generate a session uuid when we're not resuming — mirrors claude's
+    // pattern (`--session-id` up front) rather than codex's discover-later
+    // pattern, even though the tmux HOSTING strategy below (one-shot per
+    // turn, detached session, reattach-while-in-flight) mirrors codex.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    onSessionId?.(sessionId);
+    return await spawnGeminiViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      onChunk,
+    });
+  }
+
+  if (harness.kind === "antigravity") {
+    if (process.env.AGETOR_ANTIGRAVITY_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      const sessionId = opts.resumeSessionId ?? `fake-antigravity-session-${taskId}`;
+      onSessionId?.(sessionId);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return await spawnAntigravityViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  if (harness.kind === "copilot") {
+    // Self-issued session id, like gemini: always passed as `--session-id` —
+    // the prior id when resuming, else a fresh uuid.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      runId,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    const home = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    if (process.env.AGETOR_COPILOT_DRIVER === "fake") {
+      const fakeSessionId = opts.resumeSessionId ?? `fake-copilot-session-${taskId}`;
+      onSessionId?.(fakeSessionId);
+      const script = fakeCopilotScript(prompt, { runId, sessionId: fakeSessionId, model: opts.model ?? null });
+      return playFakeCopilotTurn({
+        script,
+        runId,
+        sessionId: fakeSessionId,
+        model: opts.model ?? null,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        copilotHome: home,
+        onChunk,
+        sink: args.copilotSubagents,
+      });
+    }
+    return await spawnCopilotViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      sessionId,
+      copilotHome: home,
+      mode: opts.mode ?? defaultModeFor(harness.kind),
+      model: opts.model ?? null,
+      stripClassicTokens: built.stripClassicTokens ?? [],
+      onSubagent: args.copilotSubagents,
+      onSessionId,
+    });
+  }
+
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, a plain `Bun.spawn` child
+    // process with no tmux involved (see that file's header for why: an ACP
+    // stdio server has nothing to reattach to across an agetor restart, so a
+    // mid-turn death orphans the run by design).
+    if (process.env.AGETOR_FX_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by and
+      // exercises the same validation (missing model/runId) the real path
+      // does; the fake's behaviour doesn't depend on the argv shape.
+      buildCommand(harness, prompt, { ...opts, runId });
+      // fx's ACP session id is DISCOVERED from `session/new`'s response, not
+      // pre-generated — mirrors codex's `thread.started`-discovery timing
+      // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
+      // pre-generated-uuid pattern.
+      onSessionId?.(`fake-fx-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        kind: "fx",
+        cwd,
+        continueRecovery: opts.continueRecovery === true,
+        effort: opts.effort ?? null,
+        model: opts.model ?? undefined,
+        speed: opts.speed ?? null,
+        onSteerDropped: args.onSteerDropped,
+      });
+    }
+    const built = buildCommand(harness, prompt, { ...opts, runId });
+    return spawnFxViaAcp(buildFxLaunchOptions(args, built));
+  }
+
+  if (harness.kind === "opencode") {
+    // opencode — hosted in a per-task tmux session via opencode-tmux.ts (so a
+    // mid-turn run survives an agetor restart and is reattachable), one-shot
+    // `opencode run --format json` per turn with the prompt on stdin,
+    // streaming structured events by tailing its NDJSON log. The session id
+    // is DISCOVERED from the stream (first non-empty `sessionID`), like codex.
+    const major = opencodeMajor(opts.cliVersion);
+    const server = opencodeEffectiveServerFor(harness, { opencodeServer: opts.opencodeServer }, opts.cliVersion ?? null);
+    const hooks = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone: server === "standalone" });
+    if (process.env.AGETOR_OPENCODE_DRIVER === "fake") {
+      // Build the command anyway so the fake exercises the same argv
+      // assembly the real path does; the fake's behaviour doesn't depend on
+      // the argv shape.
+      buildCommand(harness, prompt, opts);
+      return makeFakeOpencodeAgent(taskId, prompt, onChunk, {
+        major,
+        resumeSessionId: opts.resumeSessionId ?? null,
+        onSessionId,
+        ...hooks,
+      });
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return await spawnOpencodeViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      freshArgv: built.freshArgv ?? null,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      major,
+      onChunk,
+      onSessionId,
+      ...hooks,
+    });
+  }
+
+  if (harness.kind === "codex") {
+    // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
+    // run survives an agetor restart and is reattachable), streaming structured
+    // events by tailing codex's `--json` log.
+    if (process.env.AGETOR_CODEX_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Hand the orchestrator a thread id so it persists `codex_session_id` and
+      // can route follow-ups through `codex exec resume` — mirrors what a real
+      // `thread.started` event would deliver.
+      onSessionId?.(`fake-codex-thread-${taskId}`);
+      // `kind` is what arms the fake's codex-only resolve delay
+      // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: harness.kind,
+      });
+    }
+    // Shared policy rejects unsupported Git writes without dropping the sandbox.
+    const built = await buildCodexCommand(harness, prompt, opts, cwd);
+    return await spawnCodexViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  // Exhaustive: a new AgentKind must get its own dispatch branch above
+  // rather than silently spawning another kind's driver (KB 785913e5).
+  const _never: never = harness.kind;
+  throw new Error(`unknown harness kind: ${String(_never)}`);
+}

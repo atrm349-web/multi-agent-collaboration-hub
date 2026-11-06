@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agetor</title>
+    <script>
+      // Blocking + synchronous so the `dark` class (or its absence) and
+      // `color-scheme` land on <html> before the browser paints anything —
+      // this is what prevents a flash of the wrong theme, including on the
+      // splash screen below, whose CSS is theme-conditional on this class.
+      // Must run before the splash <style> block. Duplicates (rather than
+      // imports) the parsing/resolution logic in src/mainview/lib/theme.ts
+      // (readThemeFromHash / resolveTheme) since no module can load yet.
+      // `src/bun/index.ts` resolves the persisted theme (preferences.get
+      // ("theme")) and threads it through TWO paths depending on how this
+      // page was loaded: the bundled `views://` scheme rejects URLs with a
+      // fragment, so that path injects `window.__AGETOR.theme` via a
+      // WKUserScript (`preload`) — the same preload string ALSO applies the
+      // `dark` class + `color-scheme` itself before this script ever runs,
+      // because the native wrapper's exact injection point (document-start
+      // vs document-end) isn't something this repo controls. This script is
+      // therefore a backstop, not the only line of defense: it re-derives
+      // the identical `dark` value from the identical `theme` source and
+      // re-applies it, which is a harmless no-op if the preload script
+      // already got there first. The Vite dev (`http://localhost:5173`)
+      // path has no preload step at all — there this script IS the only
+      // application, reading `&theme=<pref>` off the URL hash instead
+      // (`buildWindowHash` in index.ts). Check window.__AGETOR first, hash
+      // second, so the bundled path prefers its own value over a stale hash.
+      (function () {
+        try {
+          var injected = window.__AGETOR && window.__AGETOR.theme;
+          var pref = injected;
+          if (pref !== "dark" && pref !== "light") {
+            var hash = window.location.hash || "";
+            if (hash.charAt(0) === "#") hash = hash.slice(1);
+            var params = new URLSearchParams(hash);
+            pref = params.get("theme");
+          }
+          if (pref !== "dark" && pref !== "light") pref = "auto";
+          // "auto" with no matchMedia support is an unknown-environment
+          // case, same family as the catch below — fall back to dark for
+          // the same reason: don't guess light when we can't ask the OS.
+          var dark =
+            pref === "dark" ||
+            (pref === "auto" &&
+              (!window.matchMedia ||
+                window.matchMedia("(prefers-color-scheme: dark)").matches));
+          var root = document.documentElement;
+          if (dark) root.classList.add("dark");
+          else root.classList.remove("dark");
+          root.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {
+          // Parsing failed for some reason (malformed hash, an unexpected
+          // exception in the branches above, …) — fall back to dark rather
+          // than leaving the app unstyled. Dark, not light: every existing
+          // install predates the Light theme and has only ever rendered
+          // dark, so it's the safer guess when something has gone wrong,
+          // not "today's only theme" (Light is a real, supported option now).
+          document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = "dark";
+        }
+      })();
+      // Font size (Cmd+=/Cmd+-): same precedence + duplication rationale as
+      // the theme block above — window.__AGETOR.fontSize first (bundled
+      // views:// path, whose preload script already applied it too — a
+      // harmless idempotent re-run), then the hash `fontSize` param (Vite
+      // dev path). Order relative to the theme IIFE above doesn't matter —
+      // both only need to run before the splash <style> below. Inline-duplicates
+      // the minimal parse+clamp from clampFontSizePercent (src/shared/types.ts)
+      // since no module import is possible before first paint: the clamp bounds
+      // (100 and 170, i.e. FONT_SIZE_MIN/FONT_SIZE_MAX) and the rem baseline
+      // (16, i.e. FONT_SIZE_BASE_PX) are copied literals — keep them in sync
+      // with src/shared/types.ts if those constants ever change. Invalid/absent
+      // → 100 (FONT_SIZE_DEFAULT, the default AND minimum). At exactly 100
+      // nothing is written — the inline style stays omitted, matching the
+      // "pristine at default" contract.
+      (function () {
+        var fontSize = 100;
+        try {
+          var injectedSize = window.__AGETOR && window.__AGETOR.fontSize;
+          var rawSize = injectedSize;
+          if (typeof rawSize !== "number" && typeof rawSize !== "string") {
+            var sizeHash = window.location.hash || "";
+            if (sizeHash.charAt(0) === "#") sizeHash = sizeHash.slice(1);
+            var sizeParams = new URLSearchParams(sizeHash);
+            rawSize = sizeParams.get("fontSize");
+          }
+          var parsed = typeof rawSize === "number" ? rawSize : parseFloat(rawSize);
+          if (isFinite(parsed)) {
+            fontSize = Math.min(170, Math.max(100, Math.round(parsed)));
+          }
+          if (fontSize !== 100) {
+            document.documentElement.style.fontSize = (16 * fontSize) / 100 + "px";
+          }
+        } catch (e) {
+          // Parsing failed — leave the root at its default (unset) size
+          // rather than risk an unreadable or wildly-scaled UI.
+        }
+      })();
+    </script>
+    <style>
+      /* Inline so the splash paints at HTML-parse time — before main.tsx or
+         index.css load. The two rules below mirror the `.dark`/`:root`
+         `--background` tokens in index.css (Tailwind hasn't applied yet at
+         this point); which one is active is decided by the blocking script
+         above, which sets the `dark` class before this stylesheet is even
+         parsed. */
+      #splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: opacity 300ms ease;
+      }
+      html.dark #splash {
+        background: #09090b;
+      }
+      html:not(.dark) #splash {
+        background: #ffffff;
+      }
+      #splash img {
+        width: 128px;
+        height: 128px;
+        user-select: none;
+        -webkit-user-drag: none;
+      }
+      #splash.is-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #splash { transition: none; }
+      }
+    </style>
+  </head>
+  <body class="bg-background text-foreground antialiased">
+    <div id="splash" role="status" aria-label="Loading Agetor"><img src="./splash-logo.png" alt="" /></div>
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>

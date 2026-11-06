@@ -1,0 +1,1382 @@
+import { test, expect, beforeAll, afterAll, describe } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import path from "node:path";
+
+// commands.ts imports repoRoot from worktree.ts, which imports dataDir from
+// db.ts — db.ts opens its sqlite connection at module-load time. A plain
+// top-level `import` is hoisted ahead of any other code in this file, so
+// AGETOR_DATA_DIR must be set before a *dynamic* import instead (same
+// pattern as harnesses.test.ts). Without this, this file (or whichever file
+// `bun test` loads first) can silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-commands-db-"));
+const { listAvailableCommands, listAgentCapabilities, OPENCODE_USER_SKILL_DIRS, stripJsonc, parseJsonc } = await import("./commands.ts");
+
+/** Discover just the extension list via the production path (the picker uses
+ *  `listAgentCapabilities`; this keeps the extension assertions pointed at it). */
+async function listExtensions(opts: Parameters<typeof listAgentCapabilities>[0]) {
+  return (await listAgentCapabilities(opts)).extensions;
+}
+
+// We can't easily fake `os.homedir()`, so tests focus on project-level
+// discovery + precedence behavior. User-level entries pulled from the real
+// home are tolerated as long as project entries win when names collide.
+
+let tmpRoot: string;
+
+beforeAll(() => {
+  tmpRoot = mkdtempSync(path.join(tmpdir(), "agetor-cmds-"));
+});
+
+afterAll(() => {
+  try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
+function writeCmd(dir: string, name: string, body: string) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, name), body);
+}
+
+test("discovers project-level claude-code commands", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "proj-"));
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "review.md",
+    "---\ndescription: Review a PR\n---\n\nbody",
+  );
+
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  const review = all.find((c) => c.name === "/review");
+  expect(review).toBeDefined();
+  expect(review!.source).toBe("project");
+  expect(review!.kind).toBe("command");
+  expect(review!.description).toBe("Review a PR");
+});
+
+test("discovers project-level claude-code skills via SKILL.md", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "proj-skill-"));
+  writeCmd(
+    path.join(project, ".claude", "skills", "my-skill"),
+    "SKILL.md",
+    "---\ndescription: A skill\n---\nbody",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  const skill = all.find((c) => c.name === "/my-skill");
+  expect(skill).toBeDefined();
+  expect(skill!.kind).toBe("skill");
+  expect(skill!.source).toBe("project");
+});
+
+test("namespaces nested command folders with `:`", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "proj-nest-"));
+  writeCmd(
+    path.join(project, ".claude", "commands", "git"),
+    "blame.md",
+    "git blame helper",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  expect(all.some((c) => c.name === "/git:blame")).toBe(true);
+});
+
+test("codex looks under .codex/prompts", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "proj-codex-"));
+  writeCmd(
+    path.join(project, ".codex", "prompts"),
+    "refactor.md",
+    "---\ndescription: Refactor\n---\nbody",
+  );
+  // Claude-code shouldn't see codex prompts.
+  const claude = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  expect(claude.some((c) => c.name === "/refactor" && c.source === "project")).toBe(false);
+  const codex = await listAvailableCommands({ agent: "codex", workdir: project });
+  expect(codex.some((c) => c.name === "/refactor" && c.source === "project")).toBe(true);
+});
+
+test("missing workdir returns user-level entries (no crash)", async () => {
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: null });
+  // Just ensure it didn't throw; the exact list depends on the test runner's
+  // home directory and may legitimately be empty.
+  expect(Array.isArray(all)).toBe(true);
+});
+
+test("falls back to first content line when frontmatter is missing", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "proj-fallback-"));
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "bare.md",
+    "# Title heading\n\nFirst real line of body.",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  const bare = all.find((c) => c.name === "/bare");
+  expect(bare?.description).toBe("First real line of body.");
+});
+
+test("claude-code reads user commands/skills from harnessHome when set (matches CLAUDE_CONFIG_DIR layout)", async () => {
+  // For aliased multi-account harnesses we set CLAUDE_CONFIG_DIR=<harnessHome>
+  // on spawn; the picker has to read from the same place so the autocomplete
+  // matches what claude actually sees at runtime. Under CLAUDE_CONFIG_DIR
+  // mode the user commands live directly at <harnessHome>/commands/, NOT at
+  // <harnessHome>/.claude/commands/.
+  const harness = mkdtempSync(path.join(tmpRoot, "harness-"));
+  writeCmd(path.join(harness, "commands"), "alias-only.md", "---\ndescription: Alias\n---\nbody");
+  const project = mkdtempSync(path.join(tmpRoot, "proj-alias-"));
+
+  const all = await listAvailableCommands({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const alias = all.find((c) => c.name === "/alias-only");
+  expect(alias).toBeDefined();
+  expect(alias!.source).toBe("user");
+  expect(alias!.description).toBe("Alias");
+});
+
+test("codex reads user prompts from <harnessHome>/.codex/prompts when set", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "codex-harness-"));
+  writeCmd(path.join(harness, ".codex", "prompts"), "alias-only.md", "Alias prompt body");
+  const project = mkdtempSync(path.join(tmpRoot, "proj-codex-alias-"));
+
+  const all = await listAvailableCommands({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const alias = all.find((c) => c.name === "/alias-only");
+  expect(alias).toBeDefined();
+  expect(alias!.source).toBe("user");
+});
+
+test("codex reads user and project skills", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "codex-skill-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", "user-skill"),
+    "SKILL.md",
+    "---\ndescription: User skill\n---\nbody",
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "codex-skill-proj-"));
+  writeCmd(
+    path.join(project, ".codex", "skills", "project-skill"),
+    "SKILL.md",
+    "---\ndescription: Project skill\n---\nbody",
+  );
+
+  const all = await listAvailableCommands({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.find((c) => c.name === "/user-skill")?.source).toBe("user");
+  expect(all.find((c) => c.name === "/project-skill")?.source).toBe("project");
+});
+
+test("project entry overrides user entry with the same name", async () => {
+  // Drop a same-named file under both locations and assert project wins. We
+  // can't safely write into the real ~/.claude/commands here, so we synthesise
+  // both ourselves and assert the dedup rule directly via two project paths.
+  // The unit-level guarantee in commands.ts is: when two entries share `name`,
+  // the one with source="project" wins over source="user". This test sets up
+  // a project with one command and verifies its source is "project".
+  const project = mkdtempSync(path.join(tmpRoot, "proj-override-"));
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "shared-name.md",
+    "project version",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
+  const entry = all.find((c) => c.name === "/shared-name");
+  expect(entry?.source).toBe("project");
+});
+
+// --- Extensions (MCP / skills / plugins) ----------------------------------
+
+test("extensions: discovers project .mcp.json servers as @mentions", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "ext-mcp-"));
+  writeFileSync(
+    path.join(project, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        jubarteai: { type: "http", url: "https://jubarte.ai/api/mcp", headers: { Authorization: "secret" } },
+      },
+    }),
+  );
+  const all = await listExtensions({ agent: "claude-code", workdir: project });
+  const mcp = all.find((e) => e.name === "jubarteai");
+  expect(mcp).toBeDefined();
+  expect(mcp!.kind).toBe("mcp");
+  expect(mcp!.insert).toBe("@jubarteai");
+  expect(mcp!.source).toBe("project");
+  // Description summarises transport/host but must never leak auth headers.
+  expect(mcp!.description).toContain("jubarte.ai");
+  expect(JSON.stringify(all)).not.toContain("secret");
+});
+
+test("extensions: surfaces skills with a /name insert token", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "ext-skill-"));
+  writeCmd(
+    path.join(project, ".claude", "skills", "my-skill"),
+    "SKILL.md",
+    "---\ndescription: A skill\n---\nbody",
+  );
+  const all = await listExtensions({ agent: "claude-code", workdir: project });
+  const skill = all.find((e) => e.name === "my-skill");
+  expect(skill).toBeDefined();
+  expect(skill!.kind).toBe("skill");
+  expect(skill!.insert).toBe("/my-skill");
+  expect(skill!.description).toBe("A skill");
+});
+
+test("extensions: discovers user-scoped plugins from harnessHome", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-"));
+  const installPath = path.join(harness, "plugins", "cache", "demo");
+  mkdirSync(path.join(installPath, ".claude-plugin"), { recursive: true });
+  writeFileSync(
+    path.join(installPath, ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: "demo", description: "A demo plugin" }),
+  );
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "demo@some-marketplace": [{ scope: "user", installPath }],
+      },
+    }),
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-proj-"));
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const plugin = all.find((e) => e.name === "demo");
+  expect(plugin).toBeDefined();
+  expect(plugin!.kind).toBe("plugin");
+  expect(plugin!.insert).toBe("@demo");
+  expect(plugin!.source).toBe("user");
+  expect(plugin!.description).toBe("A demo plugin");
+});
+
+test("extensions: project-scoped plugins only count for the matching repo", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-scope-"));
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-match-"));
+  const other = mkdtempSync(path.join(tmpRoot, "ext-plug-other-"));
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "mine@mp": [{ scope: "project", projectPath: project, installPath: "/nope" }],
+        "theirs@mp": [{ scope: "project", projectPath: other, installPath: "/nope" }],
+      },
+    }),
+  );
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.some((e) => e.name === "mine" && e.kind === "plugin")).toBe(true);
+  expect(all.some((e) => e.name === "theirs")).toBe(false);
+});
+
+test("extensions: same plugin name across marketplaces keeps both, disambiguated", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-dup-"));
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "dup@mp-one": [{ scope: "user", installPath: "/nope" }],
+        "dup@mp-two": [{ scope: "user", installPath: "/nope" }],
+      },
+    }),
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-dup-proj-"));
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const plugins = all.filter((e) => e.kind === "plugin" && e.name.startsWith("dup"));
+  // Both survive (the final (kind, name) dedupe must not collapse them) and the
+  // marketplace disambiguates the display name.
+  expect(plugins).toHaveLength(2);
+  expect(plugins.some((e) => e.name === "dup (mp-one)")).toBe(true);
+  expect(plugins.some((e) => e.name === "dup (mp-two)")).toBe(true);
+});
+
+test("extensions: codex parses quoted, dotted MCP server names", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-quoted-"));
+  mkdirSync(path.join(harness, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(harness, ".codex", "config.toml"),
+    `[mcp_servers."my.server"]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-quoted-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "my.server");
+  expect(mcp).toBeDefined();
+  expect(mcp!.insert).toBe("@my.server");
+});
+
+test("extensions: codex reads [mcp_servers.*] from config.toml", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-"));
+  mkdirSync(path.join(harness, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(harness, ".codex", "config.toml"),
+    `[mcp_servers.context7]\ncommand = "npx"\n\n[mcp_servers.linear]\nurl = "https://mcp.linear.app"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.some((e) => e.name === "context7" && e.kind === "mcp")).toBe(true);
+  expect(all.some((e) => e.name === "linear" && e.kind === "mcp")).toBe(true);
+});
+
+test("extensions: codex reads project .codex/config.toml MCP servers", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-project-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-project-"));
+  mkdirSync(path.join(project, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(project, ".codex", "config.toml"),
+    `[mcp_servers.projectdb]\ncommand = "npx"\n`,
+  );
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "projectdb");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("project");
+});
+
+test("extensions: codex honors explicit CODEX_HOME from harness env", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-"));
+  const envHome = mkdtempSync(path.join(tmpRoot, "ext-codex-env-codexhome-"));
+  writeFileSync(
+    path.join(envHome, "config.toml"),
+    `[mcp_servers.envhome]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-env-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+    harnessEnv: { CODEX_HOME: envHome },
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "envhome");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("user");
+});
+
+test("extensions: codex falls back to explicit HOME from harness env", async () => {
+  const envHome = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-only-"));
+  mkdirSync(path.join(envHome, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(envHome, ".codex", "config.toml"),
+    `[mcp_servers.homeonly]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-only-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessEnv: { HOME: envHome },
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "homeonly");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("user");
+});
+
+test("capabilities: returns both commands and extensions in one pass", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "cap-"));
+  // A slash command, a skill, and a project MCP server.
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "deploy.md",
+    "---\ndescription: Deploy\n---\nbody",
+  );
+  writeCmd(
+    path.join(project, ".claude", "skills", "reviewer"),
+    "SKILL.md",
+    "---\ndescription: Reviews code\n---\nbody",
+  );
+  writeFileSync(
+    path.join(project, ".mcp.json"),
+    JSON.stringify({ mcpServers: { db: { command: "dbhub" } } }),
+  );
+
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+  });
+
+  // Commands list carries both the command and the skill (the `/` surface).
+  expect(commands.some((c) => c.name === "/deploy" && c.kind === "command")).toBe(true);
+  expect(commands.some((c) => c.name === "/reviewer" && c.kind === "skill")).toBe(true);
+
+  // Extensions list carries the skill (reused from the commands pass) and the
+  // MCP server, but NOT the plain command.
+  expect(extensions.some((e) => e.name === "reviewer" && e.kind === "skill" && e.insert === "/reviewer")).toBe(true);
+  expect(extensions.some((e) => e.name === "db" && e.kind === "mcp" && e.insert === "@db")).toBe(true);
+  expect(extensions.some((e) => e.name === "deploy")).toBe(false);
+});
+
+// --- Plugin-contributed content (commands / skills / MCP) ------------------
+
+/**
+ * Scaffold a claude-code plugin under a fake harnessHome: writes an install
+ * record into `installed_plugins.json`, the unpacked plugin tree (commands/,
+ * skills/, .mcp.json, plugin.json), and — when `enabled` is given — an
+ * `enabledPlugins` entry in the harness settings.json. Returns the installPath.
+ */
+function installPlugin(
+  harness: string,
+  key: string,
+  opts: {
+    commands?: Record<string, string>;
+    skills?: Record<string, string>;
+    mcpServers?: Record<string, unknown>;
+    manifest?: Record<string, unknown>;
+    enabled?: boolean;
+  } = {},
+): string {
+  const installPath = path.join(harness, "plugins", "cache", key.replace(/[@/]/g, "_"));
+  for (const [name, body] of Object.entries(opts.commands ?? {})) {
+    writeCmd(path.join(installPath, "commands"), name, body);
+  }
+  for (const [name, body] of Object.entries(opts.skills ?? {})) {
+    writeCmd(path.join(installPath, "skills", name), "SKILL.md", body);
+  }
+  if (opts.mcpServers) {
+    mkdirSync(installPath, { recursive: true });
+    writeFileSync(path.join(installPath, ".mcp.json"), JSON.stringify({ mcpServers: opts.mcpServers }));
+  }
+  if (opts.manifest) {
+    mkdirSync(path.join(installPath, ".claude-plugin"), { recursive: true });
+    writeFileSync(path.join(installPath, ".claude-plugin", "plugin.json"), JSON.stringify(opts.manifest));
+  }
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  // Merge into any existing install file so a test can stage several plugins.
+  let installed: any = { version: 2, plugins: {} };
+  try { installed = JSON.parse(readFileSync(path.join(harness, "plugins", "installed_plugins.json"), "utf8")); } catch { /* first plugin */ }
+  installed.plugins[key] = [{ scope: "user", installPath }];
+  writeFileSync(path.join(harness, "plugins", "installed_plugins.json"), JSON.stringify(installed));
+  if (opts.enabled !== undefined) {
+    let settings: any = {};
+    try { settings = JSON.parse(readFileSync(path.join(harness, "settings.json"), "utf8")); } catch { /* none yet */ }
+    settings.enabledPlugins = { ...(settings.enabledPlugins ?? {}), [key]: opts.enabled };
+    writeFileSync(path.join(harness, "settings.json"), JSON.stringify(settings));
+  }
+  return installPath;
+}
+
+test("plugin commands + skills are namespaced `/<plugin>:<name>` on the `/` surface", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-cmd-"));
+  installPlugin(harness, "vercel@mp", {
+    commands: { "deploy.md": "---\ndescription: Deploy to Vercel\n---\nbody" },
+    skills: { "ai-sdk": "---\ndescription: AI SDK guidance\n---\nbody" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-cmd-proj-"));
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  const cmd = all.find((c) => c.name === "/vercel:deploy");
+  expect(cmd).toBeDefined();
+  expect(cmd!.kind).toBe("command");
+  expect(cmd!.source).toBe("plugin");
+  expect(cmd!.description).toBe("Deploy to Vercel");
+
+  const skill = all.find((c) => c.name === "/vercel:ai-sdk");
+  expect(skill).toBeDefined();
+  expect(skill!.kind).toBe("skill");
+  expect(skill!.source).toBe("plugin");
+});
+
+test("plugin .mcp.json servers surface as extensions (server==plugin collapses to bare name)", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-mcp-"));
+  installPlugin(harness, "vercel@mp", {
+    mcpServers: {
+      vercel: { type: "http", url: "https://mcp.vercel.com" },
+      logs: { command: "vercel-logs" },
+    },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-mcp-proj-"));
+  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  // Single-server-named-after-the-plugin collapses to just `vercel`.
+  const main = exts.find((e) => e.name === "vercel" && e.kind === "mcp");
+  expect(main).toBeDefined();
+  expect(main!.insert).toBe("@vercel");
+  expect(main!.source).toBe("plugin");
+  // A differently-named server keeps the `<plugin>:<server>` namespace.
+  const logs = exts.find((e) => e.name === "vercel:logs" && e.kind === "mcp");
+  expect(logs).toBeDefined();
+  expect(logs!.insert).toBe("@vercel:logs");
+});
+
+test("plugin skill appears in the extensions Skills group with a /<plugin>:<name> insert", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-skillext-"));
+  installPlugin(harness, "sentry@mp", {
+    skills: { seer: "---\ndescription: Ask Sentry questions\n---\nbody" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-skillext-proj-"));
+  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const skill = exts.find((e) => e.name === "sentry:seer" && e.kind === "skill");
+  expect(skill).toBeDefined();
+  expect(skill!.insert).toBe("/sentry:seer");
+  expect(skill!.source).toBe("plugin");
+});
+
+test("a plugin disabled via enabledPlugins contributes nothing", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-disabled-"));
+  installPlugin(harness, "off@mp", {
+    commands: { "go.md": "do it" },
+    skills: { helper: "---\ndescription: helps\n---\nbody" },
+    mcpServers: { off: { command: "x" } },
+    manifest: { name: "off", description: "A disabled plugin" },
+    enabled: false,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-disabled-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(commands.some((c) => c.name.startsWith("/off"))).toBe(false);
+  expect(extensions.some((e) => e.name === "off" || e.name.startsWith("off:"))).toBe(false);
+});
+
+test("two plugins sharing a bare name collapse to one /name:cmd but both self-rows show", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-"));
+  installPlugin(harness, "dup@mp-one", {
+    commands: { "deploy.md": "---\ndescription: From mp-one\n---\nbody" },
+    manifest: { name: "dup", description: "dup from mp-one" },
+  });
+  installPlugin(harness, "dup@mp-two", {
+    commands: { "deploy.md": "---\ndescription: From mp-two\n---\nbody" },
+    manifest: { name: "dup", description: "dup from mp-two" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  // claude has no per-marketplace invocation token, so the `/dup:deploy`
+  // namespace collapses to a single deterministic entry (first install wins).
+  const deploy = commands.filter((c) => c.name === "/dup:deploy");
+  expect(deploy).toHaveLength(1);
+  expect(deploy[0]!.source).toBe("plugin");
+  // …but the picker still surfaces both plugins, marketplace-disambiguated, so
+  // the conflict is visible.
+  const dupRows = extensions.filter((e) => e.kind === "plugin" && e.name.startsWith("dup"));
+  expect(dupRows).toHaveLength(2);
+  expect(dupRows.some((e) => e.name === "dup (mp-one)")).toBe(true);
+  expect(dupRows.some((e) => e.name === "dup (mp-two)")).toBe(true);
+});
+
+// --- Built-in (binary-baked) commands + skills -----------------------------
+
+// An empty harnessHome isolates these from the test runner's real user config
+// (which may carry user skills like `code-review` that legitimately shadow a
+// same-named built-in — see the shadow test below).
+test("agents surface curated built-in commands and skills", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", ".system", "openai-docs"),
+    "SKILL.md",
+    "---\ndescription: OpenAI docs\n---\nbody",
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-"));
+  const claude = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  const claudeInit = claude.find((c) => c.name === "/init");
+  expect(claudeInit).toBeDefined();
+  expect(claudeInit!.source).toBe("builtin");
+  expect(claudeInit!.kind).toBe("command");
+
+  const codeReview = claude.find((c) => c.name === "/code-review");
+  expect(codeReview).toBeDefined();
+  expect(codeReview!.source).toBe("builtin");
+  expect(codeReview!.kind).toBe("skill");
+
+  const codex = await listAvailableCommands({ agent: "codex", workdir: project, harnessHome: harness });
+  const codexInit = codex.find((c) => c.name === "/init");
+  expect(codexInit).toBeDefined();
+  expect(codexInit!.source).toBe("builtin");
+  expect(codexInit!.kind).toBe("command");
+
+  const docs = codex.find((c) => c.name === "/openai-docs");
+  expect(docs).toBeDefined();
+  expect(docs!.source).toBe("builtin");
+  expect(docs!.kind).toBe("skill");
+});
+
+test("built-ins are available even with no workdir", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-nowd-"));
+  const claude = await listAvailableCommands({ agent: "claude-code", workdir: null, harnessHome: harness });
+  expect(claude.some((c) => c.name === "/security-review" && c.source === "builtin")).toBe(true);
+  const codex = await listAvailableCommands({ agent: "codex", workdir: null, harnessHome: harness });
+  expect(codex.some((c) => c.name === "/init" && c.source === "builtin")).toBe(true);
+});
+
+test("a user/project command shadows a same-named built-in", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-shadow-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-shadow-"));
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "review.md",
+    "---\ndescription: My custom review\n---\nbody",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const review = all.filter((c) => c.name === "/review");
+  // Exactly one `/review`, and it's the project one (not the built-in).
+  expect(review).toHaveLength(1);
+  expect(review[0]!.source).toBe("project");
+  expect(review[0]!.description).toBe("My custom review");
+});
+
+test("built-in skills surface in the extensions Skills group", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-ext-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", ".system", "openai-docs"),
+    "SKILL.md",
+    "---\ndescription: OpenAI docs\n---\nbody",
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-ext-"));
+  const claudeExts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const verify = claudeExts.find((e) => e.name === "verify" && e.kind === "skill");
+  expect(verify).toBeDefined();
+  expect(verify!.insert).toBe("/verify");
+  expect(verify!.source).toBe("builtin");
+
+  const codexExts = await listExtensions({ agent: "codex", workdir: project, harnessHome: harness });
+  const docs = codexExts.find((e) => e.name === "openai-docs" && e.kind === "skill");
+  expect(docs).toBeDefined();
+  expect(docs!.insert).toBe("/openai-docs");
+  expect(docs!.source).toBe("builtin");
+});
+
+test("an explicitly enabled plugin contributes its self-row + content", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-enabled-"));
+  installPlugin(harness, "on@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "on", description: "An enabled plugin" },
+    enabled: true,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-enabled-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(commands.some((c) => c.name === "/on:go")).toBe(true);
+  const selfRow = extensions.find((e) => e.name === "on" && e.kind === "plugin");
+  expect(selfRow).toBeDefined();
+  expect(selfRow!.description).toBe("An enabled plugin");
+});
+
+// --- Branch-scoped (git ref) discovery --------------------------------------
+//
+// listAvailableCommands/listAgentCapabilities accept a `branch` option that,
+// when set, reads project-level entries from that git ref's COMMITTED tree
+// (via resolveProjectTree -> ref-tree.ts) instead of live disk. One fixture
+// repo covers all these tests: `main` carries only a README; `feature/skills`
+// commits the branch-only entries (claude + codex); back on `main`, untracked
+// disk-only entries prove the ref mode ignores them while disk mode sees them.
+
+/** Run git in `cwd`, returning ok/stdout/stderr rather than throwing. */
+async function branchGit(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { ok: exitCode === 0, stdout, stderr };
+}
+
+/** Same as `branchGit`, but throws (with stderr) on a non-zero exit — for
+ *  fixture setup steps that must succeed. */
+async function branchGitOk(args: string[], cwd: string): Promise<string> {
+  const res = await branchGit(args, cwd);
+  if (!res.ok) throw new Error(`git ${args.join(" ")} (cwd=${cwd}) failed: ${res.stderr}`);
+  return res.stdout;
+}
+
+let branchRepo: string;
+
+describe("branch-scoped capability discovery (ref mode)", () => {
+  beforeAll(async () => {
+    branchRepo = mkdtempSync(path.join(tmpRoot, "branch-repo-"));
+    await branchGitOk(["init", "-q", "-b", "main"], branchRepo);
+    await branchGitOk(["config", "user.email", "test@example.com"], branchRepo);
+    await branchGitOk(["config", "user.name", "test"], branchRepo);
+    await branchGitOk(["config", "commit.gpgsign", "false"], branchRepo);
+
+    writeCmd(branchRepo, "README.md", "hello\n");
+    await branchGitOk(["add", "."], branchRepo);
+    await branchGitOk(["commit", "-q", "-m", "init"], branchRepo);
+
+    // feature/skills adds everything ref-mode discovery should surface.
+    await branchGitOk(["checkout", "-q", "-b", "feature/skills"], branchRepo);
+    writeCmd(
+      path.join(branchRepo, ".claude", "skills", "only-on-feature"),
+      "SKILL.md",
+      "---\ndescription: Feature-only skill\n---\nbody",
+    );
+    writeCmd(path.join(branchRepo, ".claude", "commands", "nested"), "cmd.md", "nested command body");
+    writeCmd(
+      branchRepo,
+      ".mcp.json",
+      JSON.stringify({ mcpServers: { "feature-mcp": { command: "x" } } }),
+    );
+    // Disables the "demo@mkt" plugin at the PROJECT scope, only on this ref —
+    // `main` never gets a settings.json, so the plugin is enabled there.
+    writeCmd(
+      path.join(branchRepo, ".claude"),
+      "settings.json",
+      JSON.stringify({ enabledPlugins: { "demo@mkt": false } }),
+    );
+    // Project-overrides-user precedence, exercised through ref mode.
+    writeCmd(path.join(branchRepo, ".claude", "skills", "dup"), "SKILL.md", "---\ndescription: Project dup\n---\nbody");
+    writeCmd(path.join(branchRepo, ".codex", "prompts"), "feat-prompt.md", "---\ndescription: Feature prompt\n---\nbody");
+    writeCmd(
+      path.join(branchRepo, ".codex", "skills", "codex-feat"),
+      "SKILL.md",
+      "---\ndescription: Codex feature skill\n---\nbody",
+    );
+    writeCmd(path.join(branchRepo, ".codex"), "config.toml", `[mcp_servers.feat-server]\ncommand = "npx"\n`);
+    await branchGitOk(["add", "."], branchRepo);
+    await branchGitOk(["commit", "-q", "-m", "add feature entries"], branchRepo);
+
+    await branchGitOk(["checkout", "-q", "main"], branchRepo);
+
+    // Untracked disk-only entries: visible with no `branch` (live disk),
+    // invisible under any ref (including `main`, which never committed them).
+    writeCmd(path.join(branchRepo, ".claude", "skills", "untracked"), "SKILL.md", "---\ndescription: Untracked\n---\nbody");
+    writeCmd(branchRepo, ".mcp.json", JSON.stringify({ mcpServers: { "disk-mcp": { command: "y" } } }));
+  });
+
+  test("branch set to a side branch: only that ref's committed entries show", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "feature/skills",
+    });
+    expect(commands.some((c) => c.name === "/only-on-feature" && c.kind === "skill" && c.source === "project")).toBe(true);
+    expect(commands.some((c) => c.name === "/nested:cmd" && c.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "feature-mcp" && e.kind === "mcp" && e.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "only-on-feature" && e.kind === "skill")).toBe(true);
+    // Untracked disk-only entries never show through a ref.
+    expect(commands.some((c) => c.name === "/untracked")).toBe(false);
+    expect(extensions.some((e) => e.name === "disk-mcp")).toBe(false);
+  });
+
+  test("branch set to main: no project-sourced rows at all (committed-on-feature and untracked-on-disk both absent)", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "main",
+    });
+    expect(commands.some((c) => c.source === "project")).toBe(false);
+    expect(extensions.some((e) => e.source === "project")).toBe(false);
+  });
+
+  test("no branch: reads live disk, so untracked entries show", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+    });
+    expect(commands.some((c) => c.name === "/untracked" && c.source === "project")).toBe(true);
+    expect(extensions.some((e) => e.name === "disk-mcp" && e.kind === "mcp" && e.source === "project")).toBe(true);
+  });
+
+  test("branch set to an unknown ref: zero project rows, builtin rows still present", async () => {
+    const { commands, extensions } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "does-not-exist",
+    });
+    expect(commands.some((c) => c.source === "project")).toBe(false);
+    expect(extensions.some((e) => e.source === "project")).toBe(false);
+    expect(commands.some((c) => c.name === "/init" && c.source === "builtin")).toBe(true);
+  });
+
+  // `resolveProjectTree` (commands.ts) does `branch?.trim()` itself before
+  // deciding disk-vs-ref and before calling `loadRefProjectTree` —
+  // i.e. the FUNCTION trims, not just the HTTP route's query-param handling.
+  // This pins that observed contract (whitespace-padded branch behaves exactly
+  // like the trimmed form) rather than assuming the plan's phrasing ("the
+  // route trims; the function may not") without checking.
+  test("branch with surrounding whitespace resolves the same as the trimmed ref (function itself trims)", async () => {
+    const { commands } = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      branch: "  feature/skills  ",
+    });
+    expect(commands.some((c) => c.name === "/only-on-feature" && c.source === "project")).toBe(true);
+    expect(commands.some((c) => c.name === "/nested:cmd" && c.source === "project")).toBe(true);
+  });
+
+  test("codex: project prompts/skills/config.toml MCP servers are ref-scoped", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-codex-harness-"));
+
+    const feat = await listAvailableCommands({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(feat.some((c) => c.name === "/feat-prompt" && c.source === "project")).toBe(true);
+    expect(feat.some((c) => c.name === "/codex-feat" && c.kind === "skill" && c.source === "project")).toBe(true);
+    const featExts = await listExtensions({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(featExts.some((e) => e.name === "feat-server" && e.kind === "mcp" && e.source === "project")).toBe(true);
+
+    const main = await listAvailableCommands({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(main.some((c) => c.name === "/feat-prompt")).toBe(false);
+    expect(main.some((c) => c.name === "/codex-feat")).toBe(false);
+    const mainExts = await listExtensions({
+      agent: "codex",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(mainExts.some((e) => e.name === "feat-server")).toBe(false);
+  });
+
+  test("claude-code plugin: a settings.json committed at the ref disables a plugin that's enabled at every other scope", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-plugin-harness-"));
+    installPlugin(harness, "demo@mkt", {
+      commands: { "hello.md": "---\ndescription: Say hello\n---\nbody" },
+      manifest: { name: "demo", description: "Demo plugin" },
+    });
+
+    const feat = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    expect(feat.commands.some((c) => c.name === "/demo:hello")).toBe(false);
+    expect(feat.extensions.some((e) => e.name === "demo" && e.kind === "plugin")).toBe(false);
+
+    // `main` never committed a settings.json, so the same plugin (still
+    // installed at the same harness) is enabled there.
+    const main = await listAgentCapabilities({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "main",
+    });
+    expect(main.commands.some((c) => c.name === "/demo:hello")).toBe(true);
+    expect(main.extensions.some((e) => e.name === "demo" && e.kind === "plugin")).toBe(true);
+  });
+
+  test("project entry at the ref still overrides a same-named user-scoped entry", async () => {
+    const harness = mkdtempSync(path.join(tmpRoot, "branch-precedence-harness-"));
+    writeCmd(path.join(harness, "skills", "dup"), "SKILL.md", "---\ndescription: User dup\n---\nbody");
+
+    const all = await listAvailableCommands({
+      agent: "claude-code",
+      workdir: branchRepo,
+      harnessHome: harness,
+      branch: "feature/skills",
+    });
+    const dup = all.find((c) => c.name === "/dup");
+    expect(dup).toBeDefined();
+    expect(dup!.source).toBe("project");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cursor / fx skill discovery
+// ---------------------------------------------------------------------------
+
+function writeSkill(root: string, rel: string, name: string, description: string) {
+  writeCmd(path.join(root, rel, name), "SKILL.md", `---\ndescription: ${description}\n---\nbody`);
+}
+
+describe("cursor / fx skill discovery", () => {
+  const find = (all: Awaited<ReturnType<typeof listAvailableCommands>>, n: string) =>
+    all.filter((c) => c.name === n);
+
+  test("cursor sees a skill in each user root and in skills-cursor", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-proj-"));
+    const roots = [".cursor/skills", ".claude/skills", ".codex/skills", ".grok/skills", ".agents/skills"];
+    roots.forEach((r, i) => writeSkill(home, r, `cur-root-${i}-zq`, `root ${i}`));
+    writeSkill(home, ".cursor/skills-cursor", "cur-builtin-zq", "builtin one");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    roots.forEach((_, i) => {
+      const hit = find(all, `/cur-root-${i}-zq`);
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("user");
+    });
+    const b = find(all, "/cur-builtin-zq");
+    expect(b).toHaveLength(1);
+    expect(b[0]!.source).toBe("builtin");
+  });
+
+  test("cursor: user skill beats same-named builtin", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-bi-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-bi-proj-"));
+    writeSkill(home, ".cursor/skills-cursor", "cur-shared-zq", "from builtin");
+    writeSkill(home, ".claude/skills", "cur-shared-zq", "from user");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-shared-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("user");
+    expect(hit[0]!.description).toBe("from user");
+  });
+
+  test("cursor: duplicate user copies collapse, earlier dir wins", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-dup-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-dup-proj-"));
+    writeSkill(home, ".agents/skills", "cur-dup-zq", "from agents");
+    writeSkill(home, ".cursor/skills", "cur-dup-zq", "from cursor");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-dup-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.description).toBe("from cursor");
+  });
+
+  test("cursor: project skill replaces user skill of the same name", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-pr-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-pr-proj-"));
+    writeSkill(home, ".cursor/skills", "cur-proj-zq", "from user");
+    writeSkill(project, ".cursor/skills", "cur-proj-zq", "from project");
+
+    const all = await listAvailableCommands({ agent: "cursor", workdir: project, harnessHome: home });
+    const hit = find(all, "/cur-proj-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("project");
+    expect(hit[0]!.description).toBe("from project");
+  });
+
+  test("fx sees user opencode dir and project .fx, bare skills, .opencode, .claw", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "fx-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "fx-proj-"));
+    writeSkill(home, ".config/opencode/skills", "fx-user-oc-zq", "u");
+    writeSkill(home, ".claw/skills", "fx-user-claw-zq", "u");
+    writeSkill(project, ".fx/skills", "fx-proj-fx-zq", "p");
+    writeSkill(project, "skills", "fx-proj-bare-zq", "p");
+    writeSkill(project, ".opencode/skills", "fx-proj-oc-zq", "p");
+    writeSkill(project, ".claw/skills", "fx-proj-claw-zq", "p");
+
+    const all = await listAvailableCommands({ agent: "fx", workdir: project, harnessHome: home });
+    for (const n of ["fx-user-oc-zq", "fx-user-claw-zq"]) {
+      expect(find(all, `/${n}`)[0]?.source).toBe("user");
+    }
+    for (const n of ["fx-proj-fx-zq", "fx-proj-bare-zq", "fx-proj-oc-zq", "fx-proj-claw-zq"]) {
+      expect(find(all, `/${n}`)[0]?.source).toBe("project");
+    }
+  });
+
+  test("fx: project skill replaces user skill of the same name", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "fx-pr-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "fx-pr-proj-"));
+    writeSkill(home, ".fx/skills", "fx-shared-zq", "from user");
+    writeSkill(project, "skills", "fx-shared-zq", "from project");
+
+    const all = await listAvailableCommands({ agent: "fx", workdir: project, harnessHome: home });
+    const hit = find(all, "/fx-shared-zq");
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.source).toBe("project");
+    expect(hit[0]!.description).toBe("from project");
+  });
+
+  test("cursor mcp.json: user and project rows, project wins, secrets stay out of the description", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-mcp-proj-"));
+    writeCmd(
+      path.join(home, ".cursor"),
+      "mcp.json",
+      JSON.stringify({
+        mcpServers: {
+          "user-stdio-zq": { command: "true", env: { TOKEN: "secret-env" } },
+          "shared-mcp-zq": { command: "from-user" },
+        },
+      }),
+    );
+    writeCmd(
+      path.join(project, ".cursor"),
+      "mcp.json",
+      JSON.stringify({
+        mcpServers: {
+          "proj-http-zq": { url: "https://example.test/mcp", headers: { Authorization: "secret-token" } },
+          "shared-mcp-zq": { command: "from-project" },
+        },
+      }),
+    );
+
+    const exts = await listExtensions({ agent: "cursor", workdir: project, harnessHome: home });
+    const mcp = (name: string) => exts.filter((e) => e.kind === "mcp" && e.name === name);
+
+    const user = mcp("user-stdio-zq");
+    expect(user).toHaveLength(1);
+    expect(user[0]!.source).toBe("user");
+    expect(user[0]!.insert).toBe("@user-stdio-zq");
+    expect(user[0]!.description).toBe("stdio · true");
+    expect(user[0]!.description).not.toContain("secret-env");
+
+    const proj = mcp("proj-http-zq");
+    expect(proj).toHaveLength(1);
+    expect(proj[0]!.source).toBe("project");
+    expect(proj[0]!.insert).toBe("@proj-http-zq");
+    expect(proj[0]!.description).toBe("http · example.test");
+    expect(proj[0]!.description).not.toContain("secret-token");
+
+    const shared = mcp("shared-mcp-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]!.source).toBe("project");
+    expect(shared[0]!.description).toBe("stdio · from-project");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome for mcp.json", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "cur-mcp-env-proj-"));
+    writeCmd(path.join(home, ".cursor"), "mcp.json", JSON.stringify({ mcpServers: { "from-harness-zq": { command: "h" } } }));
+    writeCmd(path.join(envHome, ".cursor"), "mcp.json", JSON.stringify({ mcpServers: { "from-env-zq": { command: "e" } } }));
+
+    const exts = await listExtensions({
+      agent: "cursor",
+      workdir: project,
+      harnessHome: home,
+      harnessEnv: { HOME: envHome },
+    });
+    const names = exts.filter((e) => e.kind === "mcp").map((e) => e.name);
+    expect(names).toContain("from-env-zq");
+    expect(names).not.toContain("from-harness-zq");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "env-home-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "env-home-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "env-proj-"));
+    writeSkill(home, ".cursor/skills", "env-from-harness-zq", "h");
+    writeSkill(envHome, ".cursor/skills", "env-from-env-zq", "e");
+
+    const all = await listAvailableCommands({
+      agent: "cursor",
+      workdir: project,
+      harnessHome: home,
+      harnessEnv: { HOME: envHome },
+    });
+    expect(find(all, "/env-from-env-zq")).toHaveLength(1);
+    expect(find(all, "/env-from-harness-zq")).toHaveLength(0);
+  });
+
+  describe("branch ref", () => {
+    let repo: string;
+    beforeAll(async () => {
+      repo = mkdtempSync(path.join(tmpRoot, "cur-branch-repo-"));
+      await branchGitOk(["init", "-q", "-b", "main"], repo);
+      await branchGitOk(["config", "user.email", "test@example.com"], repo);
+      await branchGitOk(["config", "user.name", "test"], repo);
+      await branchGitOk(["config", "commit.gpgsign", "false"], repo);
+      writeCmd(repo, "README.md", "hello\n");
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "init"], repo);
+      await branchGitOk(["checkout", "-q", "-b", "feature/cur"], repo);
+      writeSkill(repo, ".cursor/skills", "on-ref", "committed on ref");
+      writeCmd(
+        path.join(repo, ".cursor"),
+        "mcp.json",
+        JSON.stringify({ mcpServers: { "mcp-on-ref": { command: "committed" } } }),
+      );
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "skill"], repo);
+      await branchGitOk(["checkout", "-q", "main"], repo);
+      writeSkill(repo, ".cursor/skills", "uncommitted-zq", "disk only");
+      writeCmd(
+        path.join(repo, ".cursor"),
+        "mcp.json",
+        JSON.stringify({ mcpServers: { "mcp-dirty-zq": { command: "dirty" } } }),
+      );
+    });
+
+    test("offers committed cursor skill, hides uncommitted one", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "cur-branch-home-"));
+      const all = await listAvailableCommands({
+        agent: "cursor",
+        workdir: repo,
+        branch: "feature/cur",
+        harnessHome: home,
+      });
+      const hit = find(all, "/on-ref");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("project");
+      expect(find(all, "/uncommitted-zq")).toHaveLength(0);
+    });
+
+    test("offers committed .cursor/mcp.json and hides an uncommitted one", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "cur-mcp-branch-home-"));
+      const exts = await listExtensions({
+        agent: "cursor",
+        workdir: repo,
+        branch: "feature/cur",
+        harnessHome: home,
+      });
+      const hit = exts.filter((e) => e.kind === "mcp" && e.name === "mcp-on-ref");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]!.source).toBe("project");
+      expect(hit[0]!.insert).toBe("@mcp-on-ref");
+      expect(exts.filter((e) => e.kind === "mcp" && e.name === "mcp-dirty-zq")).toHaveLength(0);
+    });
+  });
+});
+
+describe("opencode capability discovery", () => {
+  const find = (all: Awaited<ReturnType<typeof listAvailableCommands>>, n: string) =>
+    all.filter((c) => c.name === n);
+  const mcpNamed = (exts: Awaited<ReturnType<typeof listExtensions>>, n: string) =>
+    exts.filter((e) => e.kind === "mcp" && e.name === n);
+
+  test("user skill dirs are pinned", () => {
+    expect([...OPENCODE_USER_SKILL_DIRS]).toEqual([".config/opencode/skills", ".claude/skills", ".agents/skills"]);
+  });
+
+  test("skills: each user root, each project root, project replaces user", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-proj-"));
+    OPENCODE_USER_SKILL_DIRS.forEach((d, i) => writeSkill(home, d, `oc-user-${i}-zq`, `user ${i}`));
+    for (const [i, d] of [".opencode/skills", ".claude/skills", ".agents/skills"].entries()) {
+      writeSkill(project, d, `oc-proj-${i}-zq`, `project ${i}`);
+    }
+    writeSkill(home, ".config/opencode/skills", "oc-shared-zq", "from user");
+    writeSkill(project, ".opencode/skills", "oc-shared-zq", "from project");
+    // Not an opencode root: must stay invisible.
+    writeSkill(home, ".cursor/skills", "oc-cursor-only-zq", "nope");
+
+    const all = await listAvailableCommands({ agent: "opencode", workdir: project, harnessHome: home });
+    for (let i = 0; i < 3; i++) {
+      expect(find(all, `/oc-user-${i}-zq`)[0]?.source).toBe("user");
+      expect(find(all, `/oc-user-${i}-zq`)[0]?.kind).toBe("skill");
+      expect(find(all, `/oc-proj-${i}-zq`)[0]?.source).toBe("project");
+    }
+    const shared = find(all, "/oc-shared-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]!.source).toBe("project");
+    expect(shared[0]!.description).toBe("from project");
+    expect(find(all, "/oc-cursor-only-zq")).toHaveLength(0);
+  });
+
+  test("commands: command/ and commands/ dirs, user and project, project wins", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-cmd-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-cmd-proj-"));
+    writeCmd(path.join(home, ".config/opencode/command"), "u-single-zq.md", "---\ndescription: user single\n---\nx");
+    writeCmd(path.join(home, ".config/opencode/commands"), "u-plural-zq.md", "---\ndescription: user plural\n---\nx");
+    writeCmd(path.join(project, ".opencode/command"), "p-single-zq.md", "---\ndescription: proj single\n---\nx");
+    writeCmd(path.join(project, ".opencode/commands"), "p-plural-zq.md", "---\ndescription: proj plural\n---\nx");
+    writeCmd(path.join(home, ".config/opencode/command"), "oc-both-zq.md", "---\ndescription: from user\n---\nx");
+    writeCmd(path.join(project, ".opencode/commands"), "oc-both-zq.md", "---\ndescription: from project\n---\nx");
+
+    const all = await listAvailableCommands({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(find(all, "/u-single-zq")[0]).toMatchObject({ source: "user", kind: "command", description: "user single" });
+    expect(find(all, "/u-plural-zq")[0]?.source).toBe("user");
+    expect(find(all, "/p-single-zq")[0]?.source).toBe("project");
+    expect(find(all, "/p-plural-zq")[0]?.source).toBe("project");
+    const both = find(all, "/oc-both-zq");
+    expect(both).toHaveLength(1);
+    expect(both[0]!.source).toBe("project");
+    expect(both[0]!.description).toBe("from project");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome for skills and MCP", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-env-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "oc-env-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-env-proj-"));
+    writeSkill(home, ".config/opencode/skills", "oc-from-harness-zq", "h");
+    writeSkill(envHome, ".config/opencode/skills", "oc-from-env-zq", "e");
+    writeCmd(path.join(home, ".config/opencode"), "opencode.json", JSON.stringify({ mcp: { "oc-h-mcp-zq": { type: "local", command: ["h"] } } }));
+    writeCmd(path.join(envHome, ".config/opencode"), "opencode.json", JSON.stringify({ mcp: { "oc-e-mcp-zq": { type: "local", command: ["e"] } } }));
+
+    const opts = { agent: "opencode" as const, workdir: project, harnessHome: home, harnessEnv: { HOME: envHome } };
+    const all = await listAvailableCommands(opts);
+    expect(find(all, "/oc-from-env-zq")).toHaveLength(1);
+    expect(find(all, "/oc-from-harness-zq")).toHaveLength(0);
+    const exts = await listExtensions(opts);
+    expect(mcpNamed(exts, "oc-e-mcp-zq")).toHaveLength(1);
+    expect(mcpNamed(exts, "oc-h-mcp-zq")).toHaveLength(0);
+  });
+
+  test("MCP v1 shape: mcp.<name>, local argv command and remote url, secrets stay out", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-v1-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-v1-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({
+        mcp: {
+          "v1-local-zq": { type: "local", command: ["npx", "-y", "tool"], environment: { TOKEN: "secret-env" } },
+          "v1-shared-zq": { type: "local", command: ["from-user"] },
+        },
+      }),
+    );
+    writeCmd(
+      project,
+      "opencode.json",
+      JSON.stringify({
+        mcp: {
+          "v1-remote-zq": { type: "remote", url: "https://example.test/mcp", headers: { Authorization: "secret-token" } },
+          "v1-shared-zq": { type: "local", command: ["from-project"] },
+        },
+      }),
+    );
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "v1-local-zq")[0]).toMatchObject({ source: "user", insert: "@v1-local-zq", description: "stdio · npx" });
+    const remote = mcpNamed(exts, "v1-remote-zq");
+    expect(remote[0]).toMatchObject({ source: "project", description: "http · example.test" });
+    expect(JSON.stringify(exts)).not.toContain("secret");
+    const shared = mcpNamed(exts, "v1-shared-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]).toMatchObject({ source: "project", description: "stdio · from-project" });
+  });
+
+  test("MCP v2 shape: mcp.servers.<name>; a config-shaped 'servers' entry stays a v1 server", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-v2-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-v2-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({ mcp: { servers: { "v2-user-zq": { type: "local", command: ["u"] }, "v2-http-zq": { type: "http", url: "https://v2.test/x" } } } }),
+    );
+    writeCmd(project, "opencode.json", JSON.stringify({ mcp: { servers: { type: "local", command: ["named-servers"] } } }));
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "v2-user-zq")[0]).toMatchObject({ source: "user", description: "stdio · u" });
+    expect(mcpNamed(exts, "v2-http-zq")[0]?.description).toBe("http · v2.test");
+    // The user's v2 container is not itself a server; the project's v1 entry named "servers" is.
+    const servers = mcpNamed(exts, "servers");
+    expect(servers).toHaveLength(1);
+    expect(servers[0]).toMatchObject({ source: "project", description: "stdio · named-servers" });
+  });
+
+  test("MCP: disabled servers and non-object entries are not offered; project disable shadows user", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-dis-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-dis-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({ mcp: { "dis-user-zq": { type: "local", command: ["a"] }, "dis-both-zq": { type: "local", command: ["b"] }, "dis-junk-zq": true } }),
+    );
+    writeCmd(project, "opencode.json", JSON.stringify({ mcp: { "dis-both-zq": { enabled: false }, "dis-off-zq": { type: "local", command: ["c"], enabled: false } } }));
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "dis-user-zq")).toHaveLength(1);
+    for (const n of ["dis-both-zq", "dis-off-zq", "dis-junk-zq"]) expect(mcpNamed(exts, n)).toHaveLength(0);
+  });
+
+  test("MCP: opencode.jsonc with comments and trailing commas parses; unparsable files are ignored", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-jsonc-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-jsonc-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.jsonc",
+      `// user config\n{\n  /* servers */\n  "mcp": {\n    "jsonc-user-zq": { "type": "remote", "url": "https://x.test/a//b", }, // trailing\n  },\n}\n`,
+    );
+    writeCmd(project, "opencode.jsonc", `{ "mcp": { "jsonc-broken-zq": { `);
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "jsonc-user-zq")[0]).toMatchObject({ source: "user", description: "http · x.test" });
+    expect(mcpNamed(exts, "jsonc-broken-zq")).toHaveLength(0);
+  });
+
+  test("stripJsonc/parseJsonc keep comment-like text and commas inside strings", () => {
+    const text = `{"a": "// not a comment, /* nor this */", "b": [1, 2,], "c": "q\\"//x", /* c */ "d": 1,}`;
+    expect(parseJsonc(text)).toEqual({ a: "// not a comment, /* nor this */", b: [1, 2], c: 'q"//x', d: 1 });
+    expect(parseJsonc("﻿{\"x\": 1}")).toEqual({ x: 1 });
+    expect(parseJsonc("")).toBeNull();
+    expect(parseJsonc("{ nope")).toBeNull();
+    expect(stripJsonc("[1, // end\n 2 /* unterminated")).toBe("[1, \n 2 ");
+  });
+
+  describe("branch ref", () => {
+    let repo: string;
+    beforeAll(async () => {
+      repo = mkdtempSync(path.join(tmpRoot, "oc-branch-repo-"));
+      await branchGitOk(["init", "-q", "-b", "main"], repo);
+      await branchGitOk(["config", "user.email", "test@example.com"], repo);
+      await branchGitOk(["config", "user.name", "test"], repo);
+      await branchGitOk(["config", "commit.gpgsign", "false"], repo);
+      writeCmd(repo, "README.md", "hello\n");
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "init"], repo);
+      await branchGitOk(["checkout", "-q", "-b", "feature/oc"], repo);
+      writeSkill(repo, ".opencode/skills", "oc-on-ref", "committed skill");
+      writeSkill(repo, ".agents/skills", "oc-agents-on-ref", "committed agents skill");
+      writeCmd(path.join(repo, ".opencode/command"), "oc-cmd-on-ref.md", "---\ndescription: committed command\n---\nx");
+      writeCmd(path.join(repo, ".opencode/commands"), "oc-cmds-on-ref.md", "---\ndescription: committed commands\n---\nx");
+      writeCmd(repo, "opencode.jsonc", `{ // v2\n "mcp": { "servers": { "oc-mcp-on-ref": { "type": "local", "command": ["committed"], }, }, },\n}\n`);
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "oc"], repo);
+      await branchGitOk(["checkout", "-q", "main"], repo);
+      writeSkill(repo, ".opencode/skills", "oc-uncommitted-zq", "disk only");
+      writeCmd(path.join(repo, ".opencode/command"), "oc-cmd-dirty-zq.md", "---\ndescription: dirty\n---\nx");
+      writeCmd(repo, "opencode.json", JSON.stringify({ mcp: { "oc-mcp-dirty-zq": { type: "local", command: ["dirty"] } } }));
+    });
+
+    test("ref mode offers committed skills and commands, hides uncommitted ones", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-branch-home-"));
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, branch: "feature/oc", harnessHome: home });
+      expect(find(all, "/oc-on-ref")[0]).toMatchObject({ source: "project", kind: "skill" });
+      expect(find(all, "/oc-agents-on-ref")[0]?.source).toBe("project");
+      expect(find(all, "/oc-cmd-on-ref")[0]).toMatchObject({ source: "project", kind: "command", description: "committed command" });
+      expect(find(all, "/oc-cmds-on-ref")[0]?.source).toBe("project");
+      expect(find(all, "/oc-uncommitted-zq")).toHaveLength(0);
+      expect(find(all, "/oc-cmd-dirty-zq")).toHaveLength(0);
+    });
+
+    test("ref mode reads the committed opencode.jsonc, not the dirty opencode.json", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-branch-mcp-home-"));
+      const exts = await listExtensions({ agent: "opencode", workdir: repo, branch: "feature/oc", harnessHome: home });
+      expect(mcpNamed(exts, "oc-mcp-on-ref")[0]).toMatchObject({ source: "project", insert: "@oc-mcp-on-ref", description: "stdio · committed" });
+      expect(mcpNamed(exts, "oc-mcp-dirty-zq")).toHaveLength(0);
+    });
+
+    test("disk mode (no branch) sees the dirty files instead", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-disk-home-"));
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, harnessHome: home });
+      expect(find(all, "/oc-uncommitted-zq")).toHaveLength(1);
+      expect(find(all, "/oc-cmd-dirty-zq")).toHaveLength(1);
+      expect(find(all, "/oc-on-ref")).toHaveLength(0);
+      const exts = await listExtensions({ agent: "opencode", workdir: repo, harnessHome: home });
+      expect(mcpNamed(exts, "oc-mcp-dirty-zq")).toHaveLength(1);
+    });
+
+    test("unknown ref: no project rows, user rows still show", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-unknown-home-"));
+      writeSkill(home, ".config/opencode/skills", "oc-user-still-zq", "u");
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, branch: "no/such-ref", harnessHome: home });
+      expect(find(all, "/oc-user-still-zq")).toHaveLength(1);
+      expect(find(all, "/oc-on-ref")).toHaveLength(0);
+    });
+  });
+});

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "delivery": "Antigravity F02-r2",
+  "checkedAt": "2026-11-03T02:24:51.709035+00:00",
+  "backendBaseCommit": "9f56aa45219df6544a7d2a62177a16ce78aa9a20",
+  "reviewStatus": "changes-requested",
+  "sourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "styles.css": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e"
+  },
+  "nativeBundleHashes": {
+    "app.live-native.js": "818fcb3ac8fb44ea103d8f293b9e64f95ca3e5de6981fa41f06f4e75060eb2ea",
+    "index.live-native.html": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317"
+  },
+  "backendHashes": {
+    "packages/core/frontend.ts": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+    "packages/core/http.ts": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
+    "packages/core/hub.ts": "c78178d24cf188f902f843519e569154aa1e039edad097ce5c68a9f4cc61b097",
+    "packages/core/quality.ts": "469f5e9bb9b27e10b199b282436e55969cb1bec03d449618cf1f21ff040e6e87",
+    "packages/core/workspace.ts": "11f34351be19f10fb28660eac7526b4f84fe998c01f79a0a0f2e47c9b87b9836",
+    "scripts/start-hub.ts": "875fed6861b13fbd73c74e2700cbdbe1d5c14b6d92be629482005835ebef8211"
+  },
+  "runtimeEnforced": false,
+  "note": "F02-r2 hashes verified; final F-02/I-01 acceptance pending remaining R3 fixes. This is a review record, not a runtime hash gate.",
+  "reviewFindings": [
+    "R3 branching duplicates criterion IDs rejected by backend",
+    "R3 terminal removed analysis loses acceptance criteria"
+  ],
+  "acceptedReworkItems": [
+    "R1 evidence boundary corrected",
+    "R2 raw byte download and hash verification",
+    "R4 JSON data preserved",
+    "R5 cancellation output drop documented"
+  ],
+  "manifestSha256": "8932364fbc3de30dbceeabcea8b261a5998757c05dcf5cb78f571b5bb9480320",
+  "sourceSnapshotNote": "styles.css and manifest were edited concurrently during review; these hashes describe the final consistent observed snapshot. Original JS findings remain applicable; latest CSS layout not independently browser-tested."
+}

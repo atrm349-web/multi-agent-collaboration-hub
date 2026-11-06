@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "delivery": "Codex F02-r3",
+  "checkedAt": "2026-11-03T07:44:18.947Z",
+  "sourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "d2d92a8bc1b3aff0df40c4d192864401a77493a78cd45171d89217e0e96b9081",
+    "styles.css": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e"
+  },
+  "nativeBundleHashes": {
+    "app.live-native.js": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
+    "index.live-native.html": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523"
+  },
+  "reviewStatus": "accepted-macos-mvp-scoped",
+  "evidence": "browser/ui-checks.json"
+}

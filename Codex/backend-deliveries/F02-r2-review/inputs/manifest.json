@@ -1,0 +1,52 @@
+{
+  "deliveryId": "F02-r2",
+  "revision": "r2",
+  "supersedes": "F02",
+  "taskIds": [
+    "F-02",
+    "I-01"
+  ],
+  "reworkItemsResolved": [
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5"
+  ],
+  "createdAt": "2026-11-03T01:16:40.520Z",
+  "bridgeCompatibility": {
+    "targetFile": "backend/agetor/packages/core/frontend.ts",
+    "testFile": "backend/agetor/src/bun/hub-frontend.test.ts",
+    "all19ReplaceExactAnchorsPreserved": true,
+    "sourceHashesFromBridge": {
+      "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+      "app.js": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+      "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+    }
+  },
+  "files": [
+    {
+      "relativePath": "apps/web/public/index.html",
+      "deliveryCopy": "Antigravity/frontend-deliveries/F02-r2/index.html",
+      "sha256": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5"
+    },
+    {
+      "relativePath": "apps/web/public/app.js",
+      "deliveryCopy": "Antigravity/frontend-deliveries/F02-r2/app.js",
+      "sha256": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463"
+    },
+    {
+      "relativePath": "apps/web/public/styles.css",
+      "deliveryCopy": "Antigravity/frontend-deliveries/F02-r2/styles.css",
+      "sha256": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+    },
+    {
+      "relativePath": "Antigravity/frontend-deliveries/F02-r2/app.live-native.js",
+      "sha256": "818fcb3ac8fb44ea103d8f293b9e64f95ca3e5de6981fa41f06f4e75060eb2ea"
+    },
+    {
+      "relativePath": "Antigravity/frontend-deliveries/F02-r2/index.live-native.html",
+      "sha256": "83e361e46fe0adceed36f79a47422604679828fdbb7b2199455140f75638b317"
+    }
+  ]
+}

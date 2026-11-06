@@ -1,0 +1,319 @@
+// Pure search-over-events logic for the task-details message stream
+// (RunPanel). Kept DOM-free (like subagent-tabs.ts / shared/user-message.ts) so
+// the matching/navigation math can be unit-tested without a DOM harness —
+// this repo has no jsdom/testing-library, so anything that touches the log's
+// actual React tree has to be validated by testing the logic it's driven by
+// instead. `findMatchingEventIds` uses each event's position in the array
+// RunPanel hands it (`displayedEvents`, in `RunEvent` order) as the match id
+// — the server doesn't guarantee a stable id across every source an event
+// can come from (live SSE vs. a JSONL rebuild splice — see `StreamEvent` in
+// RunPanel.tsx), but a positional index scoped to "whatever's currently
+// displayed" is always available, and it's exactly what the log's
+// `data-evid` DOM attribute is keyed on too.
+import { isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
+import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
+import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
+import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
+import { splitHandoffPromptSpans } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
+import { searchableHandoffText, splitHandoffMessageCached } from "./handoff-view.ts";
+import { supersededToolUseIndexes } from "../../shared/tool-use-revisions.ts";
+
+/** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
+ *  tool input truncated by an older agetor mapper) falls back to `null`
+ *  rather than blowing up the search. */
+function tryParseJson(data: string): unknown {
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+/** Render a JSON value as search-friendly text: pass strings through as-is,
+ *  stringify anything else (objects/arrays/numbers) so nested tool input/
+ *  result text is still searchable. */
+function textOf(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Search text for one event's own JSON/string payload. This is raw event
+ * data — a superset/approximation of what `RunEventList` actually renders,
+ * not a faithful re-implementation of it (no markdown formatting, no
+ * per-tool input summarizer, no truncated-JSON repair) — good enough to
+ * decide "does this event contain the query," not a guarantee that every
+ * matched substring is visible verbatim on screen. Returns `null` for
+ * streams the log never renders as their own block (`interaction`/
+ * `interaction_resolved` are consumed into interaction cards keyed by
+ * request id, not by event; `subagent` is a tab-strip lifecycle delta, not a
+ * transcript line) — those events can never match a query.
+ *
+ * `tool_use`/`tool_result` carry JSON (`{ id, name, input }` /
+ * `{ toolUseId, content }` per the `RunEvent` doc comment in shared/types.ts);
+ * `tool_use` may additionally carry fx's human-facing `title` (fx ≥0.0.8,
+ * separate from its tool id `name`), included in the searchable text
+ * alongside `name` and `input` when it's a non-empty string. Malformed JSON
+ * (legacy truncated payloads, corrupt persisted rows) falls back to the raw
+ * string rather than throwing, same as every other best-effort JSON.parse
+ * over transcript data in this codebase.
+ *
+ * A `tool_use`/`tool_result` the driver stamped `internal: true`
+ * (`isHiddenToolEvent`, shared/tool-visibility.ts — fx's own plumbing
+ * calls) is never rendered either, so it returns `null` too.
+ *
+ * `opts.handoffCards` (only passed for a pipeline step task's main stream
+ * whose harness whole-message events — `handoffCardsEnabled`) indexes what the
+ * formatted handoff card shows instead of the raw JSON: an assistant event's
+ * last real `<handoff>` block contributes its field VALUES (never keys, so
+ * `schemaVersion` doesn't match) between the surrounding prose, an invalid
+ * block its raw inner text; a user prompt's untrusted handoff spans do the
+ * same (D10, A4). Without the flag the output is exactly the raw text.
+ */
+export function searchableEventText(
+  stream: RunEventStream,
+  data: string,
+  opts?: { handoffCards?: boolean },
+): string | null {
+  if (isHiddenToolEvent(stream, data)) return null;
+  switch (stream) {
+    case "interaction":
+    case "interaction_resolved":
+    case "subagent":
+      return null;
+    case "tool_use": {
+      const parsed = tryParseJson(data) as { name?: unknown; title?: unknown; input?: unknown } | null;
+      if (!parsed || typeof parsed !== "object") return data;
+      const title = typeof parsed.title === "string" ? parsed.title : "";
+      const parts = [textOf(parsed.name), title, textOf(parsed.input)].filter((s) => s !== "");
+      return parts.length > 0 ? parts.join(" ") : data;
+    }
+    case "tool_result": {
+      const parsed = tryParseJson(data) as { content?: unknown } | null;
+      if (!parsed || typeof parsed !== "object" || !("content" in parsed)) return data;
+      return textOf(parsed.content);
+    }
+    case "status":
+      // Claude's synthetic "[Image: source: <path>]" breadcrumbs are
+      // suppressed by the log renderer (`renderEvent` in RunPanel returns no
+      // block for them — the attachment shows as a thumbnail chip on the user
+      // bubble instead), so a match here would navigate to an evid with no
+      // DOM node. Same "never rendered → never matches" rule as the streams
+      // above.
+      if (isImageSourceMetaBreadcrumb(data)) return null;
+      // fx/permission-mode/usage/provider/title sentinels are suppressed
+      // (RunPanel renders no block for them — see `isInternalStatusSentinel`),
+      // so a match here would navigate to an evid with no DOM node. Same
+      // "never rendered → never matches" rule as the breadcrumb above.
+      if (isInternalStatusSentinel(data)) return null;
+      return data;
+    case "user":
+      // Match what the bubble SHOWS, not the raw wire text: `UserMessageBlock`
+      // strips agetor's former paste lead-in (legacy events only) and unwraps claude's
+      // `<pasted_content id="…">` wrapper (docs/plans/pasted-content-tags.md),
+      // so a raw match on `pasted_content` or the lead-in phrase would jump to
+      // a bubble containing neither. Same CR→LF-then-normalize order the
+      // bubble uses; same string back when there is nothing to strip.
+      {
+        const normalized = normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
+        return opts?.handoffCards ? withHandoffSpanValues(normalized) : normalized;
+      }
+    // Claude's compaction summary renders (when expanded) as its own block —
+    // the stored text is Claude's verbatim, so match it as-is.
+    case "compaction_summary":
+      return data;
+    case "assistant": {
+      if (!opts?.handoffCards || !mayContainHandoffOpenTag(data)) return data;
+      const split = splitHandoffMessageCached(data);
+      if (split.block === null) return data;
+      // An invalid block shows its fence-stripped raw body (`InvalidHandoffCard`
+      // gets `result.raw ?? inner`), so index exactly that: a match on the
+      // fence marker itself would jump to a card with nothing to reveal.
+      const body = split.block.result.ok
+        ? searchableHandoffText(split.block.result.handoff)
+        : (split.block.result.raw ?? split.block.inner);
+      return [split.before, body, split.after].filter((p) => p.trim() !== "").join("\n");
+    }
+    case "thinking":
+    case "stderr":
+    case "stdout":
+    default:
+      return data;
+  }
+}
+
+/** A step prompt's text with each untrusted handoff span replaced by what its
+ *  card shows: the previous step's name plus the handoff's field values (a
+ *  placeholder span: the step name and file path). The same string back when
+ *  the prompt carries no span. */
+function withHandoffSpanValues(text: string): string {
+  if (!text.includes("untrusted handoff")) return text;
+  const parts = splitHandoffPromptSpans(text);
+  if (parts.length === 1 && parts[0]!.kind === "text") return text;
+  return parts
+    .map((part) => {
+      if (part.kind === "text") return part.text;
+      if (part.kind === "handoff") return `${part.fromStep}\n${searchableHandoffText(part.handoff)}`;
+      return part.filePath === null ? part.fromStep : `${part.fromStep}\n${part.filePath}`;
+    })
+    .join("\n");
+}
+
+/** Frozen empty-matches sentinel, returned (rather than a fresh `[]`)
+ *  whenever there's nothing to match — a blank/whitespace query, an empty
+ *  `events` array, or a query with zero hits — so callers get a stable
+ *  identity for "no results" instead of a new array reference every call. */
+export const NO_MATCHES: readonly number[] = Object.freeze([]);
+
+/**
+ * Ids (positions in `events`, matching the `data-evid` attribute
+ * `RunEventList` renders) of every event whose searchable text contains
+ * `query`, case-insensitively. `query` is trimmed first — an empty/
+ * whitespace query matches nothing (search is "off", not "match
+ * everything") — and an empty `events` array always matches nothing.
+ *
+ * `RunEventList` folds a `tool_result` into the `ToolUseBlock` of the
+ * `tool_use` it answers (paired by `toolUseId` ↔ `id`, matching the
+ * `ParsedToolUse`/`ParsedToolResult` shapes in RunPanel.tsx) whenever that
+ * owning call appears earlier in the stream — the standalone "orphan tool
+ * result" card only renders when no such owner exists. A search match has
+ * to land on a DOM block that's actually rendered, so this mirrors that
+ * fold: a `tool_result` with an earlier owning `tool_use` is excluded from
+ * matching at its own index, and its text is appended to the owner's
+ * searchable text instead. An orphan `tool_result` (no owner, or the only
+ * call appears later / never arrives) stays independently matchable
+ * at its own index, same as every other stream.
+ *
+ * A hidden (`internal: true`) tool event never matches (see
+ * `searchableEventText`), and neither does a `tool_result` answering a hidden
+ * `tool_use` even when the result itself carries no stamp — RunPanel drops
+ * that pair together, so the result never renders as an orphan card either.
+ *
+ * A superseded `tool_use` (an earlier partial of the same id — see
+ * `supersededToolUseIndexes`) is not rendered, so it is not a match target.
+ * The latest revision is the row with the `data-evid` node. Result text
+ * folds into that latest id. When a revision is emitted after its result,
+ * that later index is still the rendered card, so the result folds forward
+ * onto it instead of matching a result row that has no `data-evid`. A
+ * result whose only `tool_use` appears later (no earlier call of that id)
+ * stays independently matchable at its own index.
+ */
+export function findMatchingEventIds(
+  events: ReadonlyArray<{ stream: RunEventStream; data: string }>,
+  query: string,
+  opts?: { handoffCards?: boolean },
+): readonly number[] {
+  const trimmed = query.trim();
+  if (!trimmed || events.length === 0) return NO_MATCHES;
+  const needle = trimmed.toLowerCase();
+  const superseded = supersededToolUseIndexes(events);
+
+  // Pass 1: each event's own searchable text, plus a toolUseId → index map
+  // for every tool_use that published a non-empty id (legacy normalized
+  // events carry `id: ""`, which is falsy and deliberately never
+  // registered as an owner — an orphan id can't own anything).
+  const ownText: (string | null)[] = new Array(events.length);
+  const toolUseIndexById = new Map<string, number>();
+  const toolUseFirstIndexById = new Map<string, number>();
+  const hiddenToolUseIds = new Set<string>();
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i]!;
+    ownText[i] = searchableEventText(e.stream, e.data, opts);
+    if (e.stream === "tool_use") {
+      const parsed = tryParseJson(e.data) as { id?: unknown } | null;
+      const id = parsed && typeof parsed === "object" ? parsed.id : undefined;
+      if (typeof id === "string" && id) {
+        if (isHiddenToolEvent(e.stream, e.data)) hiddenToolUseIds.add(id);
+        else {
+          if (!toolUseFirstIndexById.has(id)) toolUseFirstIndexById.set(id, i);
+          toolUseIndexById.set(id, i);
+        }
+      }
+    }
+  }
+
+  // Pass 2: fold each owned tool_result's text into its owner's entry, and
+  // mark the tool_result's own index as owned so pass 3 skips it as a
+  // separate match target.
+  const foldedText = new Map<number, string[]>();
+  const owned = new Array<boolean>(events.length).fill(false);
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i]!;
+    if (e.stream !== "tool_result") continue;
+    const parsed = tryParseJson(e.data) as { toolUseId?: unknown } | null;
+    const toolUseId = parsed && typeof parsed === "object" ? parsed.toolUseId : undefined;
+    if (typeof toolUseId !== "string" || !toolUseId) continue;
+    // The answer to a hidden call is dropped along with it — never an orphan.
+    if (hiddenToolUseIds.has(toolUseId)) {
+      owned[i] = true;
+      continue;
+    }
+    const ownerIdx = toolUseIndexById.get(toolUseId);
+    const firstIdx = toolUseFirstIndexById.get(toolUseId);
+    // The rendered card is the latest visible `tool_use`. An earlier owner
+    // is the common case. A later revision of an id that already appeared
+    // is also that card: the result row itself is not rendered, so result
+    // text has to land on the revision. A result whose only call appears
+    // later stays an orphan at its own index.
+    const laterRevision = firstIdx !== undefined && firstIdx < i && ownerIdx !== undefined && ownerIdx > firstIdx;
+    if (ownerIdx === undefined || (ownerIdx >= i && !laterRevision)) continue;
+    owned[i] = true;
+    const text = ownText[i];
+    if (text) {
+      const list = foldedText.get(ownerIdx);
+      if (list) list.push(text);
+      else foldedText.set(ownerIdx, [text]);
+    }
+  }
+
+  // Pass 3: match. An owned tool_result contributes no match of its own —
+  // its text was folded into the owner above instead.
+  const out: number[] = [];
+  for (let i = 0; i < events.length; i++) {
+    if (owned[i] || superseded.has(i)) continue;
+    const extra = foldedText.get(i);
+    const text = extra ? `${ownText[i] ?? ""} ${extra.join(" ")}` : ownText[i];
+    if (!text) continue;
+    if (text.toLowerCase().includes(needle)) out.push(i);
+  }
+  return out.length > 0 ? out : NO_MATCHES;
+}
+
+/**
+ * Step the active-match *position* (an index into the `matches` array — not
+ * an event id) by one, wrapping around both ends. Pass `current = -1` for
+ * "nothing selected yet": stepping forward lands on the first match, backward
+ * lands on the last. Returns -1 when there's nothing to select.
+ */
+export function stepMatchIndex(matchCount: number, current: number, dir: 1 | -1): number {
+  if (matchCount === 0) return -1;
+  if (current < 0) return dir === 1 ? 0 : matchCount - 1;
+  return (current + dir + matchCount) % matchCount;
+}
+
+/**
+ * Recompute the active-match *position* (matching `stepMatchIndex`'s
+ * index-into-`matches` convention) after `matches` is recomputed — e.g. on
+ * every keystroke, or when the underlying event list shifts under an open
+ * search. If `prevActiveId` (the event id that was active before this
+ * recompute) is still present in the new `matches`, keep pointing at it —
+ * its position may have shifted, but the same event stays selected instead
+ * of navigation progress silently resetting on every keystroke. Otherwise
+ * default to the first match (position 0): a fresh query, or one whose
+ * previous match scrolled out of the matched set, should land on the top hit
+ * rather than nothing. Returns -1 when there are no matches at all.
+ */
+export function resolveActiveMatchIndex(matches: ReadonlyArray<number>, prevActiveId: number | null): number {
+  if (matches.length === 0) return -1;
+  if (prevActiveId !== null) {
+    const idx = matches.indexOf(prevActiveId);
+    if (idx !== -1) return idx;
+  }
+  return 0;
+}

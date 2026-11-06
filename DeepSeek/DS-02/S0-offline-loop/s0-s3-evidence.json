@@ -1,0 +1,99 @@
+{
+  "classification": "controlled: real HubService/SQLite/Git/quality gate; simulated provider; planner bypassed; testRunner replaced",
+  "scenario": "s3",
+  "taskId": "cf9290ef-a5a1-4303-b0cc-f82fd8783298",
+  "trace": [
+    {
+      "label": "first-terminal",
+      "at": "2026-11-03T11:40:29.897Z",
+      "task": {
+        "status": "failed",
+        "version": 5,
+        "progressPct": 0,
+        "error": {
+          "code": "UNSUPPORTED_TRANSITION",
+          "message": "Error: UNSUPPORTED_TRANSITION: retry budget exhausted",
+          "retryable": false
+        }
+      },
+      "steps": [
+        {
+          "code": "IMPL",
+          "status": "validating",
+          "attempt": 2,
+          "error": null
+        },
+        {
+          "code": "FINAL-REVIEW",
+          "status": "pending",
+          "attempt": 1,
+          "error": null
+        }
+      ],
+      "runs": [
+        {
+          "attempt": 1,
+          "status": "succeeded",
+          "exitCode": 0,
+          "session": "702c6534-558b-45b4-b75b-4f55d7fa41d6"
+        },
+        {
+          "attempt": 2,
+          "status": "succeeded",
+          "exitCode": 0,
+          "session": "d1e83e6d-7ca3-461e-ae6c-0cba6d24f205"
+        }
+      ],
+      "pendingApprovals": 0
+    }
+  ],
+  "status": "failed",
+  "error": {
+    "code": "UNSUPPORTED_TRANSITION",
+    "message": "Error: UNSUPPORTED_TRANSITION: retry budget exhausted",
+    "retryable": false
+  },
+  "runs": [
+    {
+      "attempt": 1,
+      "status": "succeeded",
+      "exitCode": 0,
+      "error": null
+    },
+    {
+      "attempt": 2,
+      "status": "succeeded",
+      "exitCode": 0,
+      "error": null
+    }
+  ],
+  "subtasks": [
+    {
+      "code": "IMPL",
+      "status": "validating",
+      "attempt": 2,
+      "maxAttempts": 2,
+      "error": null
+    },
+    {
+      "code": "FINAL-REVIEW",
+      "status": "pending",
+      "attempt": 1,
+      "maxAttempts": 2,
+      "error": null
+    }
+  ],
+  "validations": [
+    {
+      "criterionId": "AC-AMOUNT",
+      "status": "failed",
+      "exitCode": 1
+    },
+    {
+      "criterionId": "AC-AMOUNT",
+      "status": "failed",
+      "exitCode": 1
+    }
+  ],
+  "approvals": []
+}

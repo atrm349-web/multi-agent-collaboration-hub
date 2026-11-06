@@ -1,0 +1,1425 @@
+import { test, expect, mock, afterAll, describe } from "bun:test";
+import path from "node:path";
+import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
+import type { Flags } from "../context.ts";
+import type {
+  AgentProfile,
+  GitHubComment,
+  GitHubIssueThreadResult,
+  GitHubListItem,
+  Pipeline,
+  Task,
+} from "../../shared/types.ts";
+import { newStep } from "../../shared/pipeline.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL, cursorModelSupportsFast, supportedEfforts } from "../../shared/types.ts";
+import type { DiscoveredModel } from "../../shared/model-options.ts";
+import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
+
+/**
+ * `cmdAdd` (in add.ts) obtains its client via `getClient(flags)` from
+ * `../context.ts` and prints via `../output.ts` — neither is injectable as a
+ * parameter, so (mirroring `src/cli/answer.test.ts`'s precedent) this suite
+ * mocks both modules with `mock.module`, snapshots the real exports first so
+ * unrelated exports keep working, and dynamically imports `./add.ts` only
+ * after the mocks are registered so its internal `import "../context.ts"` /
+ * `import "../output.ts"` resolve to the mocked versions. Both mocks are
+ * restored in `afterAll` since `mock.module` mutates the shared module
+ * registry for the whole `bun test` process.
+ */
+
+import * as realContext from "../context.ts";
+import * as realOutput from "../output.ts";
+
+const realContextSnapshot = { ...realContext };
+const realOutputSnapshot = { ...realOutput };
+
+let currentClient: AgetorClient | null = null;
+
+const outputs: string[] = [];
+const jsonOutputs: unknown[] = [];
+
+mock.module("../context.ts", () => ({
+  ...realContextSnapshot,
+  getClient: async () => {
+    if (!currentClient) throw new Error("no fake client set for this test");
+    return currentClient;
+  },
+}));
+
+mock.module("../output.ts", () => ({
+  ...realOutputSnapshot,
+  // Force the non-interactive branch regardless of the runner's real tty
+  // state, matching every other agetor-launched (headless) invocation.
+  isTTY: false,
+  out: (msg = "") => {
+    outputs.push(msg);
+  },
+  printJson: (data: unknown) => {
+    jsonOutputs.push(data);
+  },
+}));
+
+afterAll(() => {
+  mock.module("../context.ts", () => realContextSnapshot);
+  mock.module("../output.ts", () => realOutputSnapshot);
+});
+
+const {
+  parseAdd,
+  cmdAdd,
+  chooseAddPath,
+  resolveInitialModel,
+  defaultNonInteractiveMode,
+  wizardSpeedChoices,
+  wizardOpencodeServerChoices,
+} = await import("./add.ts");
+
+// ── fixtures ─────────────────────────────────────────────────────────────
+
+function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
+  return {
+    kind: "issues",
+    number: 7,
+    title: "Widgets crash on startup",
+    state: "open",
+    draft: false,
+    htmlUrl: "https://github.com/acme/widgets/issues/7",
+    author: { login: "alice", avatarUrl: null, htmlUrl: null },
+    assignees: [],
+    milestone: null,
+    body: "It crashes every time.",
+    labels: [],
+    comments: 2,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-02T00:00:00Z",
+    closedAt: null,
+    mergedAt: null,
+    locked: false,
+    sourcePath: null,
+    ...overrides,
+  };
+}
+
+function makeComment(overrides: Partial<GitHubComment> = {}): GitHubComment {
+  return {
+    id: 1,
+    body: "Same here.",
+    htmlUrl: "https://github.com/acme/widgets/issues/7#issuecomment-1",
+    author: { login: "bob", avatarUrl: null, htmlUrl: null },
+    createdAt: "2026-01-01T01:00:00Z",
+    updatedAt: "2026-01-01T01:00:00Z",
+    ...overrides,
+  };
+}
+
+function makeThread(overrides: Partial<GitHubIssueThreadResult> = {}): GitHubIssueThreadResult {
+  return {
+    repo: "acme/widgets",
+    item: makeItem(),
+    comments: [makeComment(), makeComment({ id: 2, body: "Also seeing this on 2.0." })],
+    truncated: false,
+    refetchCommand: null,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` exposing only the methods `cmdAdd`'s `--issue`
+ *  path touches, with call recorders for each. Cast through `unknown`
+ *  (the same idiom `answer.test.ts` uses) since a full `AgetorClient`
+ *  implementation isn't needed for these tests. */
+function makeClient(thread: GitHubIssueThreadResult) {
+  const getIssueThreadCalls: Array<{ path: string; number: number }> = [];
+  const createTaskCalls: CreateTaskInput[] = [];
+  const startTaskCalls: string[] = [];
+  let nextTaskId = "12345678-abcd-task";
+  const client = {
+    getIssueThread: async (path: string, number: number) => {
+      getIssueThreadCalls.push({ path, number });
+      return { ok: true as const, ...thread };
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: nextTaskId, title: input.title } as unknown as Task;
+    },
+    startTask: async (id: string) => {
+      startTaskCalls.push(id);
+      return { runId: "run-1" };
+    },
+  } as unknown as AgetorClient;
+  return { client, getIssueThreadCalls, createTaskCalls, startTaskCalls, setNextTaskId: (id: string) => (nextTaskId = id) };
+}
+
+/** A minimal fake `AgetorClient` for the plain (no `--issue`) non-interactive
+ *  `cmdAdd` path — just `createTask`, with a call recorder, matching
+ *  `makeClient`'s `createTask` stub exactly but without the issue-thread
+ *  machinery those tests don't need. */
+function makePlainClient() {
+  const createTaskCalls: CreateTaskInput[] = [];
+  const client = {
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "plain-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return { client, createTaskCalls };
+}
+
+function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "profile-1",
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    speed: "off",
+    maxMode: false,
+    opencodeServer: "shared",
+    instructions: "Be thorough.",
+    skills: ["code-review"],
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` for the `--profile` non-interactive `cmdAdd` path —
+ *  `listAgentProfiles` (for `matchAgentProfileRef` resolution) plus
+ *  `createTask`, both with call recorders. */
+function makeProfileClient(profiles: AgentProfile[]) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  let listAgentProfilesCalls = 0;
+  const client = {
+    listAgentProfiles: async () => {
+      listAgentProfilesCalls++;
+      return profiles;
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "profile-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return {
+    client,
+    createTaskCalls,
+    getListAgentProfilesCalls: () => listAgentProfilesCalls,
+  };
+}
+
+function makePipeline(overrides: Partial<Pipeline> = {}): Pipeline {
+  return {
+    id: "pipe-1",
+    name: "Bug fix flow",
+    description: "",
+    graph: { steps: [newStep({ id: "s1", name: "Investigate" })], edges: [], startStepId: "s1" },
+    maxSteps: 25,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` for the `--pipeline` non-interactive `cmdAdd` path —
+ *  `listPipelines` (for `matchPipelineRef` resolution) plus `createTask`,
+ *  both with call recorders. Mirrors `makeProfileClient`. */
+function makePipelineClient(pipelines: Pipeline[]) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  let listPipelinesCalls = 0;
+  const client = {
+    listPipelines: async () => {
+      listPipelinesCalls++;
+      return pipelines;
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "pipeline-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return {
+    client,
+    createTaskCalls,
+    getListPipelinesCalls: () => listPipelinesCalls,
+  };
+}
+
+function flags(overrides: Partial<Flags> = {}): Flags {
+  return { json: false, plain: true, noDaemon: true, ...overrides };
+}
+
+function reset(): void {
+  outputs.length = 0;
+  jsonOutputs.length = 0;
+}
+
+// ── parseAdd ─────────────────────────────────────────────────────────────
+
+test("parseAdd: --issue <url> sets issue", () => {
+  const o = parseAdd(["--issue", "https://github.com/o/r/issues/7"]);
+  expect(o.issue).toBe("https://github.com/o/r/issues/7");
+});
+
+test("parseAdd: --issue combined with --title, --workdir, --start, repeated --ref", () => {
+  const o = parseAdd([
+    "--issue",
+    "https://github.com/o/r/issues/7",
+    "--title",
+    "Custom title",
+    "--workdir",
+    "/tmp/acme-widgets",
+    "--start",
+    "--ref",
+    "a",
+    "--ref",
+    "b",
+  ]);
+  expect(o.issue).toBe("https://github.com/o/r/issues/7");
+  expect(o.title).toBe("Custom title");
+  expect(o.workdir).toBe("/tmp/acme-widgets");
+  expect(o.start).toBe(true);
+  expect(o.refs).toEqual(["a", "b"]);
+});
+
+test("parseAdd: no --issue leaves issue undefined", () => {
+  const o = parseAdd(["--title", "T", "--prompt", "P"]);
+  expect(o.issue).toBeUndefined();
+});
+
+// ── cmdAdd end-to-end (stubbed client) ──────────────────────────────────
+
+test("cmdAdd: --issue --workdir --json derives title/prompt/issueUrl/issueSnapshot from the thread", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, getIssueThreadCalls, createTaskCalls, startTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(getIssueThreadCalls).toEqual([{ path: dir, number: 7 }]);
+  expect(createTaskCalls.length).toBe(1);
+  const input = createTaskCalls[0]!;
+  expect(input.title).toBe(issueTaskTitle(thread.item));
+  expect(input.prompt).toBe(buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt);
+  expect(input.issueUrl).toBe(thread.item.htmlUrl);
+  expect(input.issueSnapshot).toBe(renderIssueThreadMarkdown(thread));
+  expect(input.workdir).toBe(dir);
+  expect(startTaskCalls).toEqual([]);
+
+  expect(jsonOutputs.length).toBe(1);
+  expect((jsonOutputs[0] as { started: boolean }).started).toBe(false);
+});
+
+test("cmdAdd: --issue --workdir --start --json also starts the created task", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, createTaskCalls, startTaskCalls, setNextTaskId } = makeClient(thread);
+  setNextTaskId("started-task-id");
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir, "--start"], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  // `--start` matches the app's "Run task": created directly in "ready".
+  expect(createTaskCalls[0]!.column).toBe("ready");
+  expect(startTaskCalls).toEqual(["started-task-id"]);
+
+  expect(jsonOutputs.length).toBe(1);
+  const printed = jsonOutputs[0] as { started: boolean; task: { id: string } };
+  expect(printed.started).toBe(true);
+  expect(printed.task.id).toBe("started-task-id");
+});
+
+// L-CLI9: a `--start` whose start call fails (a pipeline step profile gone,
+// a logged-out harness, …) must not be swallowed into a bare `started: false`.
+test("cmdAdd --start: a failed start prints '! start failed: <reason>' in plain mode and still reports the created task", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  (client as unknown as { startTask: (id: string) => Promise<never> }).startTask = async () => {
+    throw new Error("pipeline graph is invalid: step \"Fix\" has no agent profile");
+  };
+  currentClient = client;
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", "/tmp/acme-widgets", "--start"], flags());
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("✓ created");
+  expect(rendered).not.toContain("▸ started");
+  expect(rendered).toContain('! start failed: pipeline graph is invalid: step "Fix" has no agent profile');
+  expect(rendered).toContain("start it: agetor start");
+});
+
+test("cmdAdd --start --json: a failed start folds 'start failed: <reason>' into warnings with started: false", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  (client as unknown as { startTask: (id: string) => Promise<never> }).startTask = async () => {
+    throw new Error("fx isn't logged in — run fx login");
+  };
+  currentClient = client;
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", "/tmp/acme-widgets", "--start"], flags({ json: true }));
+
+  const printed = jsonOutputs[0] as { started: boolean; warnings?: string[] };
+  expect(printed.started).toBe(false);
+  expect(printed.warnings).toContain("start failed: fx isn't logged in — run fx login");
+});
+
+test("cmdAdd: --issue plus explicit --title/--prompt keeps them, but still attaches issueUrl/issueSnapshot", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(
+    [
+      "--issue",
+      thread.item.htmlUrl,
+      "--workdir",
+      dir,
+      "--title",
+      "My own title",
+      "--prompt",
+      "My own prompt text",
+    ],
+    flags({ json: true }),
+  );
+
+  expect(createTaskCalls.length).toBe(1);
+  const input = createTaskCalls[0]!;
+  expect(input.title).toBe("My own title");
+  expect(input.prompt).toBe("My own prompt text");
+  expect(input.issueUrl).toBe(thread.item.htmlUrl);
+  expect(input.issueSnapshot).toBe(renderIssueThreadMarkdown(thread));
+});
+
+test("cmdAdd: --issue with an unparseable URL throws mentioning --issue, never calling getIssueThread", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, getIssueThreadCalls } = makeClient(thread);
+  currentClient = client;
+
+  await expect(
+    cmdAdd(["--issue", "not-a-valid-url", "--workdir", "/tmp/acme-widgets"], flags()),
+  ).rejects.toThrow(/--issue/);
+  expect(getIssueThreadCalls).toEqual([]);
+});
+
+test("cmdAdd: --issue whose thread points at a different repo throws, never calling createTask", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ htmlUrl: "https://github.com/someone-else/other-repo/issues/7" }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+
+  await expect(
+    cmdAdd(
+      ["--issue", "https://github.com/acme/widgets/issues/7", "--workdir", "/tmp/acme-widgets"],
+      flags(),
+    ),
+  ).rejects.toThrow(/different repository/);
+  expect(createTaskCalls).toEqual([]);
+});
+
+test("cmdAdd: no --issue, no --title, non-TTY throws an error that mentions --issue as an option", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  currentClient = client;
+
+  await expect(cmdAdd([], flags())).rejects.toThrow(/--issue/);
+});
+
+test("cmdAdd: a relative --workdir is resolved before getIssueThread and createTask both see it", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, getIssueThreadCalls, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const rel = "../rel";
+  const resolved = path.resolve(rel);
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", rel], flags({ json: true }));
+
+  expect(getIssueThreadCalls).toEqual([{ path: resolved, number: 7 }]);
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.workdir).toBe(resolved);
+});
+
+test("cmdAdd: --issue is accepted case-insensitively against the thread's htmlUrl (sameIssueUrl, not exact normalizeIssueUrl equality)", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ htmlUrl: "https://github.com/owner/repo/issues/7" }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+
+  await cmdAdd(
+    ["--issue", "https://github.com/Owner/Repo/issues/7", "--workdir", "/tmp/acme-widgets"],
+    flags({ json: true }),
+  );
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.issueUrl).toBe(thread.item.htmlUrl);
+});
+
+test("cmdAdd: --issue whose thread has commentsError prints a terminal warning (non-JSON) and still creates a prompt mentioning 'not fetched'", async () => {
+  reset();
+  const commentsError =
+    "GitLab requires a token to read this (401) — add a token for gitlab.com in Settings → Git host tokens";
+  const thread = makeThread({ commentsError });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: false }));
+
+  expect(outputs.some((line) => line.includes("comments not fetched") && line.includes(commentsError))).toBe(true);
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.prompt).toContain("not fetched");
+  // Non-JSON mode never prints a `warnings` array.
+  expect(jsonOutputs).toEqual([]);
+});
+
+test("cmdAdd: --issue whose thread has commentsError folds it into --json's warnings array, not the plain-text path", async () => {
+  reset();
+  const commentsError = "the configured token was rejected";
+  const thread = makeThread({ commentsError });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.prompt).toContain("not fetched");
+  expect(jsonOutputs.length).toBe(1);
+  expect((jsonOutputs[0] as { warnings?: string[] }).warnings).toEqual([commentsError]);
+  // The warning text is never separately printed to stdout in JSON mode.
+  expect(outputs).toEqual([]);
+});
+
+test("cmdAdd: --issue infers taskType from the thread's labels when --type is omitted", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "kind/defect", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("bug");
+});
+
+test("cmdAdd: --issue with an explicit --type keeps it, ignoring the thread's labels", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "bug", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir, "--type", "spike"], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("spike");
+});
+
+test("cmdAdd: --issue with an explicit --type \"\" still infers taskType from the thread's labels", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "bug", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir, "--type", ""], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("bug");
+});
+
+test("cmdAdd: --issue whose thread has unrelated (or no) labels falls back to the default task type", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ labels: [{ name: "good first issue", color: null }] }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.taskType).toBe("task");
+});
+
+test("cmdAdd: --issue whose thread has no commentsError omits `warnings` from the --json result entirely", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(jsonOutputs.length).toBe(1);
+  expect(jsonOutputs[0] as object).not.toHaveProperty("warnings");
+});
+
+// ── chooseAddPath (pure) ─────────────────────────────────────────────────
+//
+// `cmdAdd` always runs with the mocked `isTTY: false`, so it can't exercise
+// the TTY/wizard branch end-to-end without driving `@clack/prompts`. The
+// branching itself is factored into this pure, directly-testable helper —
+// these tests cover the fix for `--issue` alone wrongly bypassing the wizard
+// (its issue-derived title/prompt used to make `o.title && prompt` look
+// "complete" even in a real terminal session).
+
+test("chooseAddPath: --issue alone (not explicit) in a TTY without --json goes to the wizard", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: true, json: false })).toBe("wizard");
+});
+
+test("chooseAddPath: explicit --title + --prompt goes non-interactive even in a TTY without --json", () => {
+  expect(chooseAddPath({ explicit: true, isTTY: true, json: false })).toBe("non-interactive");
+});
+
+test("chooseAddPath: non-TTY always goes non-interactive, explicit or not", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: false, json: false })).toBe("non-interactive");
+  expect(chooseAddPath({ explicit: true, isTTY: false, json: false })).toBe("non-interactive");
+});
+
+test("chooseAddPath: --json always goes non-interactive, even in a TTY", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: true, json: true })).toBe("non-interactive");
+});
+
+// ── resolveInitialModel (pure) ───────────────────────────────────────────
+//
+// Seeds the interactive model picker from `lastModel:<kind>` the same way
+// the webview's NewTaskForm / TaskLaunchPickers pickers validate their own
+// seed — a stored id that's no longer offerable (e.g. a retired model)
+// falls back to DEFAULT_MODEL instead of being re-offered as the
+// pre-selected default via mergeModelOptions' unlisted-row rule.
+
+test("resolveInitialModel: keeps a stored id that is still a curated row", () => {
+  expect(resolveInitialModel("gemini", "gemini-4-argon", [])).toBe("gemini-4-argon");
+  expect(resolveInitialModel("gemini", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
+});
+
+test("resolveInitialModel: a pruned gemini Flash id falls back to the default", () => {
+  // gemini-3.7-flash / gemini-3.5-flash were pruned from the Gemini picker
+  // (migration 066 rewrites the pref on disk too), so a stale one falls through.
+  expect(resolveInitialModel("gemini", "gemini-3.7-flash", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("gemini", "gemini-3.5-flash", [])).toBe(DEFAULT_MODEL.gemini);
+});
+
+test("resolveInitialModel: falls back to DEFAULT_MODEL when the stored id was retired from the catalog", () => {
+  expect(resolveInitialModel("gemini", "gemini-3-pro-preview", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(DEFAULT_MODEL.gemini).toBe("gemini-3.1-pro-preview");
+});
+
+test("resolveInitialModel: falls back to DEFAULT_MODEL when no pref is stored", () => {
+  expect(resolveInitialModel("gemini", undefined, [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("gemini", "", [])).toBe(DEFAULT_MODEL.gemini);
+  expect(resolveInitialModel("codex", undefined, [])).toBe(DEFAULT_MODEL.codex);
+  expect(resolveInitialModel("codex", "", [])).toBe(DEFAULT_MODEL.codex);
+});
+
+test("resolveInitialModel: keeps a discovered-only id (fx account catalogs carry ids the curated list doesn't)", () => {
+  const discovered: DiscoveredModel[] = [{ id: "google/gemini-3.7-flash", label: "Gemini 3.7 Flash" }];
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered)).toBe("google/gemini-3.7-flash");
+});
+
+test("resolveInitialModel: a suffixed cursor variant id is not a curated row, so it falls back to the default like the webview pickers do", () => {
+  expect(resolveInitialModel("cursor", "gemini-3.8-flash-high", [])).toBe(DEFAULT_MODEL.cursor);
+});
+
+test("resolveInitialModel: but the base cursor id is kept", () => {
+  expect(resolveInitialModel("cursor", "gemini-3.8-flash", [])).toBe("gemini-3.8-flash");
+  // A covered variant of Argon is not a picker row; the bare id is.
+  expect(resolveInitialModel("cursor", "gemini-4-argon-high", [])).toBe(DEFAULT_MODEL.cursor);
+  expect(resolveInitialModel("cursor", "gemini-4-argon", [])).toBe("gemini-4-argon");
+});
+
+test("resolveInitialModel: a logged-out harness's discovered catalog is not consulted (mirrors mergeModelOptions rule 7) — discovered-only pref falls back, curated pref survives", () => {
+  const discovered: DiscoveredModel[] = [{ id: "google/gemini-3.7-flash", label: "Gemini 3.7 Flash" }];
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, false)).toBe(DEFAULT_MODEL.fx);
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, true)).toBe("google/gemini-3.7-flash");
+  expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, null)).toBe("google/gemini-3.7-flash");
+  expect(resolveInitialModel("fx", "zai/glm-5v-turbo", discovered, false)).toBe("zai/glm-5v-turbo"); // curated row — kept even when logged out
+});
+
+// ── defaultNonInteractiveMode (pure) + cmdAdd mode seeding (Phase 8 F4,
+// docs/plans/fix-fx-harness-rate-limit.md §3 review finding #9) ────────────
+//
+// Before this fix, `baseInput` forwarded `o.mode` verbatim, so a scripted
+// (non-interactive) `agetor add` with no `--mode` stored a `null` mode and
+// the task spawned on whatever bare launch-time fallback the driver picks —
+// `auto` for fx specifically, its interactive-review mode that stalls
+// without a Gateway reviewer on most accounts — instead of the picker's own
+// default (`AGENT_OPTIONS[kind].modes[0]`, `yolo`/"Full access" for fx since
+// the wave-2 reorder). `defaultNonInteractiveMode` seeds the gap; an
+// explicit `--mode` is always preserved untouched.
+
+test("defaultNonInteractiveMode: fx → yolo (AGENT_OPTIONS.fx.modes[0])", () => {
+  expect(defaultNonInteractiveMode("fx")).toBe("yolo");
+  expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
+});
+
+test("defaultNonInteractiveMode: codex/cursor/gemini/claude-code → auto (unchanged default)", () => {
+  expect(defaultNonInteractiveMode("codex")).toBe("auto");
+  expect(defaultNonInteractiveMode("cursor")).toBe("auto");
+  expect(defaultNonInteractiveMode("gemini")).toBe("auto");
+  expect(defaultNonInteractiveMode("claude-code")).toBe("auto");
+});
+
+test("defaultNonInteractiveMode: an omitted or unrecognized --agent falls back to claude-code's modes, like the wizard's own harness-not-found fallback", () => {
+  expect(defaultNonInteractiveMode(undefined)).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  expect(defaultNonInteractiveMode("")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  // A custom additional-account harness id (not a built-in AgentKind) isn't
+  // resolvable without an async harness lookup here — falls back the same
+  // way, same as an unrecognized value.
+  expect(defaultNonInteractiveMode("fx-2")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+});
+
+test("cmdAdd: a scripted fx add with no --mode stores mode 'yolo' (Full access), not left unset", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.mode).toBe("yolo");
+});
+
+// docs/plans/fx-0.0.10-compat.md §5 TT4 — a scripted (non-interactive, no
+// --effort) fx add leaves `effort` unset on the createTask payload: the
+// scripted path (`baseInput` in add.ts) only ever forwards `o.effort`, which
+// is `undefined` unless `--effort` was passed — the server (createTask's own
+// `input.effort ?? …` default, see orchestrator-fx.test.ts) is what resolves
+// the null case to DEFAULT_EFFORT.fx ("auto"), not the CLI. This mirrors the
+// scripted-mode test above: baseInput leaves the field to the server default
+// rather than pre-resolving it client-side.
+test("cmdAdd: a scripted fx add with no --effort leaves effort undefined on the createTask payload (the daemon's createTask resolves the default, not the CLI)", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.effort).toBeUndefined();
+});
+
+test("cmdAdd: a scripted fx add with an explicit --effort forwards it verbatim on the createTask payload", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--effort", "high"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.effort).toBe("high");
+});
+
+// The interactive wizard's Effort step (add.ts's `wizard()`, ~line 508-512)
+// seeds its `pickOption("Effort", efforts, …)` call from exactly this
+// `supportedEfforts(kind, model, …)` expression. This suite's other tests
+// can't drive `@clack/prompts` end to end (see the chooseAddPath comment
+// block above — cmdAdd always runs with the mocked `isTTY: false`), so this
+// pins the data the picker would render for fx's default model instead of
+// driving the wizard itself.
+test("the interactive picker's effort data for zai/glm-5.3-flash (fx's DEFAULT_MODEL) is exactly Max / High / Low / Model default, in that order", () => {
+  const efforts = supportedEfforts("fx", "zai/glm-5.3-flash");
+  expect(efforts.map((o) => o.id)).toEqual(["max", "high", "low", "auto"]);
+  expect(efforts.map((o) => o.label)).toEqual(["Max thinking", "High", "Low", "Model default"]);
+});
+
+test("cmdAdd: a scripted codex add with no --mode stores mode 'auto', matching the picker default", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "codex"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("codex");
+  expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+test("cmdAdd: an explicit --mode is preserved verbatim, never overridden by the default seed", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--mode", "ask"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.mode).toBe("ask");
+});
+
+test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's modes[0] ('auto'), same as the wizard's fallback", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBeUndefined();
+  expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+// ── --speed / --fast / --no-fast (docs/plans/fx-0.0.14-and-cursor-updates.md
+// §3.1 "CLI alias") ───────────────────────────────────────────────────────
+
+describe("--speed", () => {
+  test("parseAdd: --speed takes each tier", () => {
+    expect(parseAdd(["--speed", "off"]).speed).toBe("off");
+    expect(parseAdd(["--speed", "fast"]).speed).toBe("fast");
+    expect(parseAdd(["--speed", "ultrafast"]).speed).toBe("ultrafast");
+  });
+
+  test("parseAdd: --fast is --speed fast and --no-fast is --speed off", () => {
+    expect(parseAdd(["--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--no-fast"]).speed).toBe("off");
+  });
+
+  test("parseAdd: the later of several speed flags wins", () => {
+    expect(parseAdd(["--speed", "ultrafast", "--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--fast", "--speed", "ultrafast"]).speed).toBe("ultrafast");
+    expect(parseAdd(["--fast", "--no-fast"]).speed).toBe("off");
+    expect(parseAdd(["--no-fast", "--fast"]).speed).toBe("fast");
+    expect(parseAdd(["--speed", "fast", "--no-fast"]).speed).toBe("off");
+  });
+
+  test("parseAdd: no speed flag leaves speed undefined", () => {
+    expect(parseAdd(["--title", "T", "--prompt", "P"]).speed).toBeUndefined();
+  });
+
+  test("parseAdd: an unknown --speed tier is a usage error naming the tiers", () => {
+    expect(() => parseAdd(["--speed", "turbo"])).toThrow("'--speed' must be one of off, fast, ultrafast (got 'turbo')");
+  });
+
+  test("parseAdd: --speed with no value (or a flag as its value) is refused", () => {
+    expect(() => parseAdd(["--speed"])).toThrow("'--speed' needs a value");
+    expect(() => parseAdd(["--speed", "--fast"])).toThrow("'--speed' needs a value");
+  });
+
+  test("cmdAdd: an invalid --speed fails before any request", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await expect(cmdAdd(["--title", "T", "--prompt", "P", "--speed", "warp"], flags())).rejects.toThrow(
+      /'--speed' must be one of off, fast, ultrafast/,
+    );
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --speed ultrafast sends speed, never the legacy fast field", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--speed", "ultrafast"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.speed).toBe("ultrafast");
+    expect("fast" in createTaskCalls[0]!).toBe(false);
+  });
+
+  test("cmdAdd: --fast sends speed fast and --no-fast sends speed off", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "cursor", "--fast"], flags());
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "cursor", "--no-fast"], flags());
+
+    expect(createTaskCalls.map((c) => c.speed)).toEqual(["fast", "off"]);
+    expect(createTaskCalls.some((c) => "fast" in c)).toBe(false);
+  });
+
+  test("cmdAdd: the later speed flag is the one sent", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--fast", "--speed", "ultrafast"], flags());
+
+    expect(createTaskCalls[0]!.speed).toBe("ultrafast");
+  });
+
+  test("cmdAdd: no speed flag leaves speed to the server's default", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "codex"], flags());
+
+    expect(createTaskCalls[0]!.speed).toBeUndefined();
+  });
+
+  // The wizard's Speed step reads exactly this helper (cmdAdd itself always
+  // runs with the mocked `isTTY: false`, so the step isn't driven here).
+
+  test("wizardSpeedChoices: a kind with nothing beyond off offers no step", () => {
+    expect(wizardSpeedChoices("claude-code", DEFAULT_MODEL["claude-code"], null, [])).toEqual([]);
+    expect(wizardSpeedChoices("codex", DEFAULT_MODEL.codex, "high", [])).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: fx offers the tiers discovery flagged on the selected model row", () => {
+    const rows = [
+      { id: "vendor/model-a", label: "A", fast: true, ultrafast: true },
+      { id: "vendor/model-b", label: "B", fast: true },
+      { id: "vendor/model-c", label: "C" },
+    ];
+    expect(wizardSpeedChoices("fx", "vendor/model-a", "auto", rows).map((o) => o.id)).toEqual([
+      "off",
+      "fast",
+      "ultrafast",
+    ]);
+    expect(wizardSpeedChoices("fx", "vendor/model-b", "auto", rows).map((o) => o.id)).toEqual(["off", "fast"]);
+    expect(wizardSpeedChoices("fx", "vendor/model-c", "auto", rows)).toEqual([]);
+    // A model with no merged row (nothing discovered) offers nothing beyond off.
+    expect(wizardSpeedChoices("fx", "vendor/unknown", "auto", rows)).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: cursor offers Fast exactly when the model/effort pair has a Fast variant", () => {
+    const fastCapable = AGENT_OPTIONS.cursor.models.find((m) =>
+      [null, ...supportedEfforts("cursor", m.id).map((e) => e.id)].some((e) => cursorModelSupportsFast(m.id, e)),
+    );
+    expect(fastCapable).toBeDefined();
+    const effort =
+      [null, ...supportedEfforts("cursor", fastCapable!.id).map((e) => e.id)].find((e) =>
+        cursorModelSupportsFast(fastCapable!.id, e),
+      ) ?? null;
+    expect(wizardSpeedChoices("cursor", fastCapable!.id, effort, []).map((o) => o.id)).toEqual(["off", "fast"]);
+    const notCapable = AGENT_OPTIONS.cursor.models.find(
+      (m) => ![null, ...supportedEfforts("cursor", m.id).map((e) => e.id)].some((e) => cursorModelSupportsFast(m.id, e)),
+    );
+    if (notCapable) expect(wizardSpeedChoices("cursor", notCapable.id, null, [])).toEqual([]);
+  });
+
+  test("wizardSpeedChoices: rows carry the shared Off / Fast / Ultrafast labels", () => {
+    const rows = [{ id: "vendor/model-a", label: "A", fast: true, ultrafast: true }];
+    expect(wizardSpeedChoices("fx", "vendor/model-a", null, rows).map((o) => o.label)).toEqual([
+      "Off",
+      "Fast",
+      "Ultrafast",
+    ]);
+  });
+});
+
+// ── --profile (docs/plans/agent-profiles.md §3 D13, TT6) ────────────────
+//
+// `--profile <id|name>` launches a task from a saved AgentProfile instead of
+// picking harness/model/mode/effort by hand. `assertProfileFlagCombo` (not
+// exported — checked through `cmdAdd`'s thrown usage error) rejects
+// combining it with any of the six manual fields; `baseInput` (not exported
+// either) sends only `agentProfileId` and omits agent/model/mode/effort/
+// speed/maxMode entirely when a profile id is present; ref resolution goes
+// through the already-unit-tested `matchAgentProfileRef`.
+
+describe("--profile", () => {
+  // ── parseAdd ───────────────────────────────────────────────────────────
+
+  test("parseAdd: --profile <ref> sets profile", () => {
+    const o = parseAdd(["--profile", "Reviewer"]);
+    expect(o.profile).toBe("Reviewer");
+  });
+
+  test("parseAdd: no --profile leaves profile undefined", () => {
+    const o = parseAdd(["--title", "T", "--prompt", "P"]);
+    expect(o.profile).toBeUndefined();
+  });
+
+  // ── assertProfileFlagCombo, exercised through cmdAdd's thrown usage error ──
+  //
+  // The guard fires before `getClient` is ever called (it's the first thing
+  // `cmdAdd` does after `parseAdd`), so no fake client / --title / --prompt
+  // is needed to observe it — the promise rejects synchronously-caused
+  // before any await that would need one.
+
+  test("cmdAdd: --profile combined with --agent throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--agent", "codex"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined with --agent\/--model\/--mode\/--effort\/--speed\/--fast\/--max-mode/);
+  });
+
+  test("cmdAdd: --profile combined with --model throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--model", "gpt-6-astra"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --mode throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--mode", "auto"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --effort throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--effort", "high"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --speed throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--speed", "ultrafast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --speed off throws the usage error too", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--speed", "off"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile alone (no conflicting flags) passes the combo guard and proceeds to resolve it", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile()]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    // Reaching createTask at all proves the combo guard didn't throw.
+    expect(createTaskCalls.length).toBe(1);
+  });
+
+  // ── ref resolution (matchAgentProfileRef, already unit-tested elsewhere —
+  // one integration-style assertion each for id and name is enough here) ──
+
+  test("cmdAdd: --profile resolves by exact id", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "abc-123"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile resolves by case-insensitive, trimmed name", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "  REVIEWER  "], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile with an unknown ref throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ name: "Reviewer" })]);
+    currentClient = client;
+
+    // `matchAgentProfileRef` itself says "agent" (shared, non-CLI vocabulary)
+    // — `cmdAdd` must rewrite it to "profile" via `asProfileError` before it
+    // reaches the user, same as `agetor profile`'s CLI boundary.
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "does-not-exist"], flags()),
+    ).rejects.toThrow(/unknown profile "does-not-exist"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --profile with an ambiguous name throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([
+      makeAgentProfile({ id: "a", name: "Reviewer" }),
+      makeAgentProfile({ id: "b", name: "Reviewer" }),
+    ]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags()),
+    ).rejects.toThrow(/ambiguous profile "Reviewer"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  // ── baseInput's profile branch: agentProfileId replaces the whole manual
+  // agent/model/mode/effort/speed/maxMode block ───────────────────────────
+
+  test("cmdAdd: a --profile task carries agentProfileId and omits agent/model/mode/effort/speed/maxMode entirely", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.agent).toBeUndefined();
+    expect(input.model).toBeUndefined();
+    expect(input.effort).toBeUndefined();
+    expect(input.speed).toBeUndefined();
+    expect("fast" in input).toBe(false);
+    expect(input.maxMode).toBeUndefined();
+    // Also proves `defaultNonInteractiveMode`'s fill-the-gap fallback is
+    // skipped for a profile add (`if (!o.mode && !o.profile) …`) — a manual
+    // add with no --agent stores mode "auto" (see the test above), but a
+    // profile add must leave mode alone entirely, letting the profile supply
+    // it server-side.
+    expect(input.mode).toBeUndefined();
+  });
+
+  test("cmdAdd: --profile still carries workdir/isolation/baseRef/taskType/references through baseInput normally", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(
+      [
+        "--title",
+        "T",
+        "--prompt",
+        "P",
+        "--profile",
+        "Reviewer",
+        "--workdir",
+        "/tmp/acme-widgets",
+        "--isolation",
+        "none",
+        "--type",
+        "bug",
+      ],
+      flags(),
+    );
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.workdir).toBe("/tmp/acme-widgets");
+    expect(input.isolation).toBe("none");
+    expect(input.taskType).toBe("bug");
+  });
+});
+
+// ── --pipeline (docs/plans/pipelines.md §3 T7) ───────────────────────────
+//
+// `--pipeline <id|name>` launches a task from a saved Pipeline instead of a
+// single agent — the created task becomes the pipeline's parent (board)
+// task. `assertPipelineFlagCombo` (not exported — checked through cmdAdd's
+// thrown usage error) rejects combining it with `--profile` or any of the
+// six manual-launch fields; `baseInput` (not exported either) sends only
+// `pipelineId` and omits agentProfileId/agent/model/mode/effort/speed/
+// maxMode entirely when a pipeline id is present; ref resolution goes
+// through the already-unit-tested `matchPipelineRef`.
+
+describe("--pipeline", () => {
+  // ── parseAdd ───────────────────────────────────────────────────────────
+
+  test("parseAdd: --pipeline <ref> sets pipeline", () => {
+    const o = parseAdd(["--pipeline", "Bug fix flow"]);
+    expect(o.pipeline).toBe("Bug fix flow");
+  });
+
+  test("parseAdd: no --pipeline leaves pipeline undefined", () => {
+    const o = parseAdd(["--title", "T", "--prompt", "P"]);
+    expect(o.pipeline).toBeUndefined();
+  });
+
+  // ── assertPipelineFlagCombo, exercised through cmdAdd's thrown usage error ──
+
+  test("cmdAdd: --pipeline combined with --profile throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--profile", "Reviewer"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined with --profile\/--agent\/--model\/--mode\/--effort\/--speed\/--fast\/--max-mode/);
+  });
+
+  test("cmdAdd: --pipeline combined with --agent throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--agent", "codex"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --model throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--model", "gpt-6-astra"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --mode throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--mode", "auto"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --effort throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--pipeline", "Bug fix flow", "--effort", "high"], flags()),
+    ).rejects.toThrow(/--pipeline cannot be combined/);
+  });
+
+  test("cmdAdd: --pipeline combined with --speed throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--speed", "fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --no-fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--no-fast"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--max-mode"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline combined with --no-max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--pipeline", "Bug fix flow", "--no-max-mode"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --pipeline alone (no conflicting flags) passes the combo guard and proceeds to resolve it", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline()]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags());
+
+    // Reaching createTask at all proves the combo guard didn't throw.
+    expect(createTaskCalls.length).toBe(1);
+  });
+
+  // ── ref resolution (matchPipelineRef, already unit-tested elsewhere — one
+  // integration-style assertion each for id and name is enough here) ──────
+
+  test("cmdAdd: --pipeline resolves by exact id", async () => {
+    reset();
+    const pipeline = makePipeline({ id: "abc-123", name: "Bug fix flow" });
+    const { client, createTaskCalls } = makePipelineClient([pipeline]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "abc-123"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.pipelineId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --pipeline resolves by case-insensitive, trimmed name", async () => {
+    reset();
+    const pipeline = makePipeline({ id: "abc-123", name: "Bug fix flow" });
+    const { client, createTaskCalls } = makePipelineClient([pipeline]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "  BUG FIX FLOW  "], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.pipelineId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --pipeline with an unknown ref throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "does-not-exist"], flags()),
+    ).rejects.toThrow(/unknown pipeline "does-not-exist"/);
+
+    expect(createTaskCalls.length).toBe(0);
+  });
+
+  test("cmdAdd: --pipeline with an ambiguous name throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([
+      makePipeline({ id: "a", name: "Bug fix flow" }),
+      makePipeline({ id: "b", name: "Bug fix flow" }),
+    ]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags()),
+    ).rejects.toThrow(/ambiguous pipeline "Bug fix flow"/);
+
+    expect(createTaskCalls.length).toBe(0);
+  });
+
+  // ── baseInput's pipeline branch: pipelineId replaces the whole manual
+  // agent/model/mode/effort/speed/maxMode AND agentProfileId block ────────
+
+  test("cmdAdd: a --pipeline task carries pipelineId and omits agentProfileId/agent/model/mode/effort/speed/maxMode entirely", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ id: "abc-123", name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--pipeline", "Bug fix flow"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.pipelineId).toBe("abc-123");
+    expect(input.agentProfileId).toBeUndefined();
+    expect(input.agent).toBeUndefined();
+    expect(input.model).toBeUndefined();
+    expect(input.effort).toBeUndefined();
+    expect(input.speed).toBeUndefined();
+    expect("fast" in input).toBe(false);
+    expect(input.maxMode).toBeUndefined();
+    // Also proves the non-interactive mode-fill fallback is skipped for a
+    // pipeline add (`if (!o.mode && !o.profile && !o.pipeline) …`), same as
+    // for --profile — the pipeline supplies mode server-side (per step).
+    expect(input.mode).toBeUndefined();
+  });
+
+  test("cmdAdd: --pipeline still carries workdir/isolation/baseRef/taskType/references through baseInput normally", async () => {
+    reset();
+    const { client, createTaskCalls } = makePipelineClient([makePipeline({ id: "abc-123", name: "Bug fix flow" })]);
+    currentClient = client;
+
+    await cmdAdd(
+      [
+        "--title",
+        "T",
+        "--prompt",
+        "P",
+        "--pipeline",
+        "Bug fix flow",
+        "--workdir",
+        "/tmp/acme-widgets",
+        "--isolation",
+        "none",
+        "--type",
+        "bug",
+      ],
+      flags(),
+    );
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.pipelineId).toBe("abc-123");
+    expect(input.workdir).toBe("/tmp/acme-widgets");
+    expect(input.isolation).toBe("none");
+    expect(input.taskType).toBe("bug");
+  });
+});
+
+describe("--opencode-server", () => {
+  test("parseAdd: takes shared and standalone, refuses anything else with the mode list", () => {
+    expect(parseAdd(["--opencode-server", "shared"]).opencodeServer).toBe("shared");
+    expect(parseAdd(["--opencode-server", "standalone"]).opencodeServer).toBe("standalone");
+    expect(parseAdd(["--title", "T"]).opencodeServer).toBeUndefined();
+    expect(() => parseAdd(["--opencode-server", "Shared"])).toThrow(
+      "'--opencode-server' must be one of shared, standalone (got 'Shared')",
+    );
+    expect(() => parseAdd(["--opencode-server"])).toThrow("'--opencode-server' needs a value");
+    // A typed value is echoed escaped, never as a raw control character.
+    expect(() => parseAdd(["--opencode-server", "x\u001b[2J"])).toThrow("(got 'x\\u001b[2J')");
+  });
+
+  test("cmdAdd: --opencode-server is sent on the create payload", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode", "--opencode-server", "standalone"], flags());
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode"], flags());
+    expect(createTaskCalls.map((c) => c.opencodeServer)).toEqual(["standalone", undefined]);
+  });
+
+  test("cmdAdd: an invalid --opencode-server fails before any request", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await expect(cmdAdd(["--title", "T", "--prompt", "P", "--opencode-server", "both"], flags())).rejects.toThrow(
+      /'--opencode-server' must be one of shared, standalone/,
+    );
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --profile or --pipeline with --opencode-server is the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--opencode-server", "shared"], flags())).rejects.toThrow(
+      /--profile cannot be combined with .*--opencode-server/,
+    );
+    await expect(cmdAdd(["--pipeline", "Flow", "--opencode-server", "standalone"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined with .*--opencode-server/,
+    );
+  });
+
+  test("wizardOpencodeServerChoices: opencode 2 or an unknown version offers Shared / Standalone", () => {
+    for (const version of ["opencode v2.1.3", null, "garbage"]) {
+      const rows = wizardOpencodeServerChoices("opencode", { home: null }, version);
+      expect(rows.map((r) => [r.id, r.label])).toEqual([["shared", "Shared"], ["standalone", "Standalone"]]);
+    }
+    expect(wizardOpencodeServerChoices("opencode", undefined, "2.0.0").map((r) => r.id)).toEqual(["shared", "standalone"]);
+  });
+
+  test("wizardOpencodeServerChoices: no step on OpenCode 1, for a harness with a home, or another kind", () => {
+    expect(wizardOpencodeServerChoices("opencode", { home: null }, "1.19.4")).toEqual([]);
+    expect(wizardOpencodeServerChoices("opencode", { home: "/Users/me/.agetor/oc-2" }, "opencode v2.1.3")).toEqual([]);
+    // A blank home is no home.
+    expect(wizardOpencodeServerChoices("opencode", { home: "  " }, null).length).toBe(2);
+    expect(wizardOpencodeServerChoices("codex", { home: null }, null)).toEqual([]);
+  });
+});

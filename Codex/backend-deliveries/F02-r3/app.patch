@@ -1,0 +1,99 @@
+--- before/app.js
++++ after/app.js
+@@ -273,7 +273,6 @@
+ function sanitizeExecutablePlan(subtasks) {
+   if (!Array.isArray(subtasks)) return undefined;
+   const byId = new Map(subtasks.map((s) => [s.id, s]));
+-  const removedNodes = subtasks.filter((s) => s.stage === 'analysis' || s.code === 'FINAL-REVIEW');
+   const executable = subtasks.filter((s) => s.stage !== 'analysis' && s.code !== 'FINAL-REVIEW');
+   if (executable.length === 0) {
+     const err = new Error(
+@@ -318,59 +317,50 @@
+     return removed;
+   }
+ 
+-  // R3-a: Track assigned criterion IDs plan-wide to guarantee unique criterion IDs across all branches
+-  const assignedCriterionIds = new Set();
+-  for (const s of executable) {
+-    for (const ac of s.acceptanceCriteria || []) {
+-      if (ac?.id) assignedCriterionIds.add(ac.id);
+-    }
+-  }
+-  const allocatedCriteria = new Set();
+-
+-  const result = executable.map((s) => {
++  const inheritedByStep = new Map(
++    executable.map((step) => [step.id, collectRemovedAncestors(step.dependsOn || [])])
++  );
++  // A removed node needs exactly one destination to preserve its acceptance criteria unambiguously.
++  for (const removed of subtasks.filter((step) => !validIds.has(step.id))) {
++    const destinations = executable.filter((step) =>
++      inheritedByStep.get(step.id).some((ancestor) => ancestor.id === removed.id)
++    );
++    if (destinations.length !== 1) {
++      const err = new Error(
++        `INVALID_INPUT: Cannot compress ${removed.code}: expected exactly one executable destination for its acceptance criteria, found ${destinations.length}. Please regenerate the plan with executable stages.`
++      );
++      err.code = 'INVALID_INPUT';
++      throw err;
++    }
++  }
++
++  return executable.map((s) => {
+     const dependsOn = resolveTransitiveDependsOn(s.dependsOn || []);
+-    const removedAncestors = collectRemovedAncestors(s.dependsOn || []);
++    const removedAncestors = inheritedByStep.get(s.id);
+     const next = {
+       ...s,
+       dependsOn
+     };
+     if (removedAncestors.length > 0 && Array.isArray(s.acceptanceCriteria)) {
+-      const currentStepAcIds = new Set(s.acceptanceCriteria.map((ac) => ac.id));
++      const seenAc = new Set(s.acceptanceCriteria.map((ac) => ac.id));
+       const mergedAc = [...s.acceptanceCriteria];
+       for (const rem of removedAncestors) {
+         for (const ac of rem.acceptanceCriteria || []) {
+-          if (ac?.id) {
+-            if (!assignedCriterionIds.has(ac.id)) {
+-              assignedCriterionIds.add(ac.id);
+-              currentStepAcIds.add(ac.id);
+-              mergedAc.push({ ...ac });
+-              allocatedCriteria.add(ac.id);
+-            } else if (currentStepAcIds.has(ac.id) || assignedCriterionIds.has(ac.id)) {
+-              // Criterion was already assigned to an earlier downstream step/branch
+-              allocatedCriteria.add(ac.id);
+-            }
++          if (ac?.id && !seenAc.has(ac.id)) {
++            seenAc.add(ac.id);
++            mergedAc.push(ac);
+           }
+         }
+       }
+-      next.acceptanceCriteria = mergedAc;
+-    }
+-    return next;
+-  });
+-
+-  // R3-b: Guarantee that every acceptance criterion from any removed node was successfully transferred
+-  for (const rem of removedNodes) {
+-    for (const ac of rem.acceptanceCriteria || []) {
+-      if (ac?.id && !allocatedCriteria.has(ac.id)) {
+-        const err = new Error(
+-          `INVALID_INPUT: removed node '${rem.code}' has acceptance criterion '${ac.id}' that cannot be preserved (no downstream executable step to inherit it); please replan or reassign criteria before compression.`
+-        );
++      if (mergedAc.length > 20) {
++        const err = new Error('INVALID_INPUT: Compressed subtask exceeds 20 acceptance criteria. Please regenerate the plan.');
+         err.code = 'INVALID_INPUT';
+         throw err;
+       }
+-    }
+-  }
+-
+-  return result;
++      next.acceptanceCriteria = mergedAc;
++    }
++    return next;
++  });
+ }
+ 
+ globalThis.apiRequest = apiRequest;

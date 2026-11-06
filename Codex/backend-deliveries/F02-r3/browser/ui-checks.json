@@ -1,0 +1,28 @@
+{
+  "browser": "Codex IAB",
+  "mode": "real HubService/HTTP/SQLite/Git; controlled planner/provider; injected Python testRunner",
+  "branch": {
+    "error": "INVALID_INPUT found 2",
+    "previewCount": 4,
+    "taskCount": 0
+  },
+  "terminal": {
+    "error": "INVALID_INPUT found 0",
+    "previewCount": 2,
+    "taskCount": 0
+  },
+  "chain": {
+    "compressedCount": 2,
+    "criteriaObservedInReview": [
+      "ac-A",
+      "ac-B",
+      "ac-C",
+      "ac-1"
+    ],
+    "taskId": "435b1a2d-69a5-444f-8811-919b3f10dd5a",
+    "status": "succeeded",
+    "dag": "3/3"
+  },
+  "consoleErrors": [],
+  "shutdown": "SIGINT exited 130 before request audit flushed; final state recovered read-only from fixture SQLite; old request audit retained only under inputs"
+}

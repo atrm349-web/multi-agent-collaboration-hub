@@ -1,0 +1,1177 @@
+diff --git a/package.json b/package.json
+index a61db81..59c6d12 100644
+--- a/package.json
++++ b/package.json
+@@ -24,9 +24,12 @@
+     "release:upload-only": "bun scripts/upload-release.ts",
+     "typecheck": "tsc --noEmit",
+     "test": "bun test",
+-    "test:hub": "bun test src/bun/hub-codex-runtime.test.ts",
++    "test:hub": "bun test src/bun/hub-codex-runtime.test.ts src/bun/hub-state-store.test.ts src/bun/hub-durable-codex.test.ts",
+     "typecheck:hub": "tsc --noEmit -p tsconfig.hub.json",
+-    "verify:hub:live": "bun scripts/verify-hub-codex.ts"
++    "verify:hub:live": "bun scripts/verify-hub-codex.ts",
++    "test:hub:state": "bun test src/bun/hub-state-store.test.ts",
++    "test:hub:durable": "bun test src/bun/hub-durable-codex.test.ts",
++    "verify:hub:persistence": "bun scripts/verify-hub-persistence.ts"
+   },
+   "devDependencies": {
+     "@playwright/test": "^1.62.1",
+diff --git a/packages/agent-adapters/codex/runtime.ts b/packages/agent-adapters/codex/runtime.ts
+index f49f280..0c114fb 100644
+--- a/packages/agent-adapters/codex/runtime.ts
++++ b/packages/agent-adapters/codex/runtime.ts
+@@ -50,7 +50,7 @@ const HARNESS: Harness = { id: "codex", kind: "codex", label: "Codex", isBuiltin
+   home: null, bin: null, env: {}, enabled: true };
+ 
+ /** One controlled local Codex process. */
+-// shortcut: run state is in memory; add B-03 persistence before long-lived service use.
++// shortcut: direct runtime state is in memory; use DurableCodexRunner for persistent service execution.
+ export class CodexRuntime {
+   private readonly runs = new Map<string, Run>();
+   private busy = false;
+@@ -59,6 +59,7 @@ export class CodexRuntime {
+     workspaceRoot: string;
+     spawn?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+     onEvent?: (runId: string, log: CodexLog) => void;
++    onSpawn?: (runId: string, processGroupId: number) => void;
+     killGraceMs?: number;
+   }) {
+     if (process.platform === "win32") throw new Error("UNSUPPORTED_PLATFORM: process-tree cancellation is not verified on Windows");
+@@ -100,6 +101,12 @@ export class CodexRuntime {
+           || path.isAbsolute(storageRelative) || !(await stat(storage)).isDirectory()) {
+         throw new Error("PERMISSION_DENIED: AGETOR_DATA_DIR escapes the configured root");
+       }
++      const storageFromCwd = path.relative(cwd,storage);
++      const cwdFromStorage = path.relative(storage,cwd);
++      const contained = (relative: string) => relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
++      if (contained(storageFromCwd) || contained(cwdFromStorage)) {
++        throw new Error("PERMISSION_DENIED: execution workspace and control storage must be disjoint");
++      }
+       const { buildCodexCommand } = await import("../../../src/bun/agents.ts");
+       const built = await buildCodexCommand(HARNESS, request.prompt, {
+         mode: request.sandbox === "read-only" ? "ask" : "auto",
+@@ -169,8 +176,17 @@ export class CodexRuntime {
+           this.finish(run);
+         });
+         proc.stdin?.on("error", () => { run.failure ??= "TRANSPORT_ERROR"; });
+-        proc.stdin?.end(request.prompt);
+         run.timer = setTimeout(() => this.stop(run, "TIMEOUT"), request.timeoutMs ?? 120_000);
++        if (proc.pid) {
++          try { this.options.onSpawn?.(runId,proc.pid); }
++          catch {
++            // Do not deliver a task if its process identity could not be persisted.
++            this.stop(run,"CANCELLED");
++            proc.stdin?.end();
++            return runId;
++          }
++        }
++        proc.stdin?.end(request.prompt);
+       } catch {
+         run.failure = "SPAWN_ERROR";
+         this.finish(run);
+diff --git a/packages/core/state/durable-codex.ts b/packages/core/state/durable-codex.ts
+new file mode 100644
+index 0000000..26171c9
+--- /dev/null
++++ b/packages/core/state/durable-codex.ts
+@@ -0,0 +1,97 @@
++import { randomUUID } from "node:crypto";
++import { CodexRuntime, type CodexResult } from "../../agent-adapters/codex/runtime.ts";
++import type { AgentRun } from "../../shared/src/types.ts";
++import { HubStore, type ClaimRequest } from "./store.ts";
++
++interface Job {
++  runtime: CodexRuntime; runtimeId: string | null;
++  completion: Promise<void>; failure: unknown;
++}
++
++/** Persistent claims surround the process lifecycle; a fresh runner never replays old work. */
++export class DurableCodexRunner {
++  private readonly ownerId = randomUUID();
++  private readonly jobs = new Map<string,Job>();
++
++  constructor(private readonly store: HubStore,
++    private readonly options: Pick<ConstructorParameters<typeof CodexRuntime>[0],"workspaceRoot" | "spawn" | "killGraceMs">) {
++    this.store.reconcileExpired();
++  }
++
++  start(input: Omit<ClaimRequest,"ownerId">): string {
++    const claimed = this.store.claim({ ...input,ownerId: this.ownerId });
++    if (!claimed.created) return claimed.run.id;
++    const id = claimed.run.id;
++    let persistenceFailure: unknown = null;
++    const job: Job = { runtime: null as unknown as CodexRuntime,runtimeId: null,completion: Promise.resolve(),failure: null };
++    const stopForFailure = (error: unknown, runtimeId: string) => {
++      persistenceFailure ??= error;
++      // Runtime observers must not throw into a stream callback or leave a process running.
++      queueMicrotask(() => { void job.runtime.cancel(runtimeId).catch((failure) => { job.failure ??= failure; }); });
++    };
++    job.runtime = new CodexRuntime({ ...this.options,
++      onSpawn: (runtimeId,pid) => {
++        job.runtimeId = runtimeId;
++        try { this.store.spawned(id,this.ownerId,pid); }
++        catch (error) { persistenceFailure ??= error; throw error; }
++        if (this.store.get("run",id).status === "cancelling") throw new Error("CANCELLED: task was cancelled before prompt delivery");
++      },
++      onEvent: (runtimeId,log) => {
++        job.runtimeId = runtimeId;
++        try { this.store.recordLog(id,this.ownerId,log); }
++        catch (error) { stopForFailure(error,runtimeId); }
++      },
++    });
++    this.jobs.set(id,job);
++    const heartbeat = setInterval(() => {
++      try {
++        this.store.heartbeat(id,this.ownerId);
++        if (this.store.get("run",id).status === "cancelling" && job.runtimeId) {
++          void job.runtime.cancel(job.runtimeId).catch((error) => { job.failure ??= error; });
++        }
++      } catch (error) {
++        persistenceFailure ??= error;
++        if (job.runtimeId) stopForFailure(error,job.runtimeId);
++      }
++    },Math.max(25,Math.floor(this.store.leaseMs/3)));
++    job.completion = (async () => {
++      let outcome: CodexResult;
++      try {
++        job.runtimeId = await job.runtime.start(input.request);
++        if (persistenceFailure || this.store.get("run",id).status === "cancelling") await job.runtime.cancel(job.runtimeId);
++        outcome = await job.runtime.wait(job.runtimeId);
++      } catch (error) {
++        if (job.runtimeId) await job.runtime.cancel(job.runtimeId);
++        const match = String(error).match(/(?:Error: )?([A-Z_]+):/);
++        outcome = { runId: id,status: "failed",sessionId: null,result: "",exitCode: null,
++          error: { code: match?.[1] ?? "SPAWN_ERROR",message: String(error),retryable: false } };
++      }
++      if (persistenceFailure) outcome = { ...outcome,status: "failed",
++        error: { code: "PROCESS_CRASHED",message: "Persistence failed; owned process was stopped",retryable: false } };
++      // Expired ownership or quarantine is intentionally not overwritten by a late result.
++      this.store.complete(id,this.ownerId,outcome);
++    })().catch((error) => { job.failure = error; }).finally(() => { clearInterval(heartbeat); this.jobs.delete(id); });
++    return id;
++  }
++
++  async wait(runId: string): Promise<AgentRun> {
++    const job = this.jobs.get(runId);
++    if (job) {
++      await job.completion;
++      if (job.failure) throw job.failure;
++    }
++    const saved = this.store.get("run",runId);
++    if (!job && ["starting","running","cancelling"].includes(saved.status)) {
++      throw new Error("AGENT_UNAVAILABLE: run belongs to another worker or requires recovery; inspect stored state");
++    }
++    return saved;
++  }
++  async cancel(runId: string, expectedVersion: number): Promise<AgentRun> {
++    const run = this.store.requestCancel(runId,expectedVersion);
++    if (run.status !== "cancelling") return run;
++    const job = this.jobs.get(runId);
++    if (job?.runtimeId) await job.runtime.cancel(job.runtimeId);
++    // A different worker reads the persisted cancellation on its next heartbeat.
++    return job ? this.wait(runId) : run;
++  }
++}
+diff --git a/packages/core/state/store.ts b/packages/core/state/store.ts
+new file mode 100644
+index 0000000..cd192ab
+--- /dev/null
++++ b/packages/core/state/store.ts
+@@ -0,0 +1,278 @@
++import { Database } from "bun:sqlite";
++import { createHash, randomUUID } from "node:crypto";
++import { migrate } from "../../../src/bun/migrate.ts";
++import schema from "../../../src/bun/migrations/082_hub_execution.sql" with { type: "text" };
++import type { Agent, AgentRun, Approval, Artifact, EventEnvelope, LogLine, Message,
++  Subtask, Task, Validation } from "../../shared/src/types.ts";
++import type { CodexLog, CodexRequest, CodexResult } from "../../agent-adapters/codex/runtime.ts";
++
++type Entities = { task: Task; subtask: Subtask; agent: Agent; run: AgentRun;
++  message: Message; artifact: Artifact; approval: Approval; validation: Validation };
++type Kind = keyof Entities;
++type Claim = { run_id: string; owner_id: string; lease_until_ms: number;
++  process_group_id: number | null; request_hash: string; request_json: string; subtask_id: string };
++const ACTIVE = new Set(["starting", "running", "cancelling"]);
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const allowed: Record<Kind, readonly string[]> = {
++  task: ["draft","decomposing","queued","running","waiting_approval","pausing","paused","cancelling","succeeded","failed","timed_out","cancelled"],
++  subtask: ["pending","ready","running","validating","waiting_approval","retry_wait","blocked","succeeded","failed","timed_out","cancelled"],
++  agent: ["unknown","available","busy","unavailable","disabled"],
++  run: ["queued","starting","running","cancelling","succeeded","failed","timed_out","cancelled","interrupted"],
++  message: ["pending","delivered"], artifact: ["staged","validated","rejected"],
++  approval: ["pending","approved","rejected","expired","invalidated"],
++  validation: ["pending","running","passed","failed","unverified"],
++};
++export interface ClaimRequest {
++  subtaskId: string; agentId: string; expectedVersion: number; idempotencyKey: string;
++  request: CodexRequest; ownerId: string;
++}
++
++/** Uses an explicitly supplied Agetor database, never opens a user's default file. */
++export class HubStore {
++  constructor(readonly db: Database, private readonly clock = Date.now, readonly leaseMs = 10_000) {
++    if (!Number.isSafeInteger(leaseMs) || leaseMs < 100) throw new Error("INVALID_INPUT: invalid lease duration");
++    db.run("PRAGMA foreign_keys=ON"); db.run("PRAGMA busy_timeout=3000");
++    db.run("PRAGMA journal_mode=WAL"); db.run("PRAGMA synchronous=FULL");
++    migrate(db, [{ id: "082_hub_execution", sql: schema }]);
++  }
++  get<K extends Kind>(kind: K, id: string): Entities[K] {
++    const row = this.db.query<{ data: string }, [string,string]>(
++      "SELECT data FROM hub_entities WHERE id=? AND kind=?").get(id,kind);
++    if (!row) throw new Error("NOT_FOUND: unknown entity");
++    return JSON.parse(row.data);
++  }
++  list<K extends Kind>(kind: K, taskId: string, limit = 100): Entities[K][] {
++    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("INVALID_INPUT: limit");
++    return this.db.query<{ data: string }, [string,string,number]>(
++      "SELECT data FROM hub_entities WHERE kind=? AND task_id=? ORDER BY created_at,id LIMIT ?")
++      .all(kind,taskId,limit).map((row) => JSON.parse(row.data));
++  }
++  put<K extends Exclude<Kind,"run">>(kind: K, data: Entities[K], expectedVersion: number | null): Entities[K] {
++    return this.db.transaction(() => this.save(kind,data,expectedVersion)).immediate();
++  }
++  private save<K extends Kind>(kind: K, data: Entities[K], expectedVersion: number | null): Entities[K] {
++    if (!Object.hasOwn(allowed,kind) || !data || !UUID.test(data.id) || !["mock","live"].includes(data.executionMode)
++        || (expectedVersion !== null && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1))) throw new Error("INVALID_INPUT: entity");
++    const old = this.db.query<{ data: string; kind: string }, [string]>("SELECT data,kind FROM hub_entities WHERE id=?").get(data.id);
++    const previous = old ? JSON.parse(old.data) as Entities[K] : null;
++    if (old?.kind !== undefined && old.kind !== kind) throw new Error("CONFLICT: entity kind is immutable");
++    if ((previous?.version ?? null) !== expectedVersion) throw new Error("CONFLICT: stale entity version");
++    if (previous && (previous.executionMode !== data.executionMode ||
++        ("provenance" in previous && "provenance" in data && previous.provenance !== data.provenance))) throw new Error("CONFLICT: evidence origin is immutable");
++    if (previous && "provenance" in previous && previous.provenance === "historical") throw new Error("UNSUPPORTED_TRANSITION: historical evidence is immutable");
++    const taskId = "taskId" in data ? data.taskId : null;
++    if (taskId) this.get("task",taskId);
++    if ("subtaskId" in data) {
++      const linked = this.get("subtask",data.subtaskId);
++      if (linked.taskId !== taskId) throw new Error("CONFLICT: cross-task subtask reference");
++    }
++    const linkedRunId = kind === "artifact" ? (data as Artifact).producerRunId : "runId" in data ? data.runId : kind === "message" ? (data as Message).fromRunId : null;
++    if (linkedRunId) {
++      const linked = this.get("run",linkedRunId);
++      if (linked.taskId !== taskId || ("subtaskId" in data && linked.subtaskId !== data.subtaskId)) throw new Error("CONFLICT: cross-task run reference");
++    }
++    const artifactIds = "artifactRefs" in data ? data.artifactRefs : "evidenceArtifactIds" in data ? data.evidenceArtifactIds : [];
++    for (const id of artifactIds) if (this.get("artifact",id).taskId !== taskId) throw new Error("CONFLICT: cross-task artifact reference");
++    if (kind === "message" && this.get("subtask",(data as Message).toSubtaskId).taskId !== taskId) throw new Error("CONFLICT: message target");
++    if (previous && kind === "approval" && (previous as Approval).status !== "pending") throw new Error("UNSUPPORTED_TRANSITION: approval already decided");
++    if (previous && kind === "artifact") {
++      for (const key of ["sha256","relativePath","sizeBytes","producerRunId"] as const) {
++        if ((previous as Artifact)[key] !== (data as Artifact)[key]) throw new Error("CONFLICT: artifact content is immutable");
++      }
++    }
++    if (previous && "taskId" in previous && previous.taskId !== taskId) throw new Error("CONFLICT: task ownership is immutable");
++    const status = kind === "agent" ? (data as Agent).availability : kind === "artifact" ? (data as Artifact).validationStatus :
++      kind === "message" ? ((data as Message).deliveredAt ? "delivered" : "pending") : (data as Task).status;
++    if (!allowed[kind].includes(status)) throw new Error("INVALID_INPUT: unsupported entity status");
++    if (previous && ["succeeded","failed","timed_out","cancelled","interrupted"].includes((previous as AgentRun).status)
++        && status !== (previous as AgentRun).status && kind !== "subtask") throw new Error("UNSUPPORTED_TRANSITION: terminal state");
++    if (kind === "task" && status === "succeeded" && (data as Task).provenance !== "historical") {
++      throw new Error("UNSUPPORTED_CAPABILITY: task success requires the B-05 result validator");
++    }
++    const now = new Date(this.clock()).toISOString();
++    const saved = { ...data, version: previous ? previous.version + 1 : 1,
++      createdAt: previous?.createdAt ?? now, updatedAt: now } as Entities[K];
++    this.db.query("INSERT INTO hub_entities(id,kind,task_id,status,version,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) " +
++      "ON CONFLICT(id) DO UPDATE SET status=excluded.status,version=excluded.version,data=excluded.data,updated_at=excluded.updated_at")
++      .run(saved.id,kind,taskId,status,saved.version,JSON.stringify(saved),saved.createdAt,saved.updatedAt);
++    const event = kind === "run" ? "run.updated" : kind === "message" ? "message.created" : kind === "artifact" ? "artifact.created" :
++      kind === "approval" ? (status === "pending" ? "approval.required" : "approval.decided") : kind === "validation" ? "validation.completed" : `${kind}.updated`;
++    // Nonterminal validation records are snapshot-only until B-05 defines progress events.
++    if (kind !== "validation" || ["passed","failed"].includes(status)) {
++      this.emit(event,kind === "task" ? saved.id : taskId,kind === "run" ? saved.id : null,saved.version,saved);
++    }
++    return saved;
++  }
++  private emit(type: string, taskId: string | null, runId: string | null, version: number | null, payload: unknown): void {
++    this.db.query("INSERT INTO hub_outbox(event_type,task_id,run_id,entity_version,payload,created_at) VALUES(?,?,?,?,?,?)")
++      .run(type,taskId,runId,version,JSON.stringify(payload),new Date(this.clock()).toISOString());
++  }
++  claim(input: ClaimRequest): { run: AgentRun; created: boolean } {
++    if (!input.idempotencyKey?.trim() || input.idempotencyKey.length > 128 || !input.ownerId?.trim()) throw new Error("INVALID_INPUT: claim key/owner");
++    const request = JSON.stringify({ agentId: input.agentId, request: Object.fromEntries(Object.entries(input.request).sort(([a],[b]) => a.localeCompare(b))) });
++    const hash = createHash("sha256").update(request).digest("hex");
++    return this.db.transaction(() => {
++      const existing = this.db.query<Claim,[string,string]>("SELECT * FROM hub_run_claims WHERE subtask_id=? AND idempotency_key=?")
++        .get(input.subtaskId,input.idempotencyKey);
++      if (existing) {
++        if (existing.request_hash !== hash) throw new Error("CONFLICT: idempotency key payload changed");
++        return { run: this.get("run",existing.run_id), created: false };
++      }
++      const subtask = this.get("subtask",input.subtaskId); const task = this.get("task",subtask.taskId);
++      const agent = this.get("agent",input.agentId);
++      if (subtask.version !== input.expectedVersion) throw new Error("CONFLICT: stale subtask version");
++      if (!["ready","retry_wait"].includes(subtask.status) || !["queued","running"].includes(task.status)
++          || task.provenance !== "current" || !["available","busy"].includes(agent.availability)
++          || agent.adapterId !== "codex-cli" || agent.executionMode !== "live" || task.executionMode !== "live"
++          || subtask.executionMode !== "live") throw new Error("UNSUPPORTED_TRANSITION: subtask/agent is not executable");
++      if (subtask.requiredCapabilities.some((capability) => !agent.capabilities.includes(capability)) || !agent.supportedStages.includes(subtask.stage)) {
++        throw new Error("UNSUPPORTED_CAPABILITY: agent cannot execute this subtask");
++      }
++      if (input.request.sandbox === "workspace-write" && agent.permissionProfile !== "workspace-write") throw new Error("PERMISSION_DENIED: agent profile forbids writes");
++      if (!Number.isSafeInteger(subtask.attempt) || subtask.attempt < 1 || subtask.attempt > subtask.maxAttempts) throw new Error("UNSUPPORTED_TRANSITION: attempts exhausted");
++      if (subtask.dependsOn.some((id) => { const dep = this.get("subtask",id); return dep.taskId !== task.id || dep.status !== "succeeded"; })) {
++        throw new Error("DEPENDENCY_FAILED: prerequisites are not satisfied");
++      }
++      if (this.db.query("SELECT 1 FROM hub_execution_slot").get()) throw new Error("AGENT_UNAVAILABLE: execution slot is occupied or quarantined");
++      if (this.db.query("SELECT 1 FROM hub_run_claims WHERE subtask_id=? AND attempt=?").get(subtask.id,subtask.attempt)) {
++        throw new Error("CONFLICT: attempt already has a run");
++      }
++      const now = new Date(this.clock()).toISOString();
++      const run = this.save("run",{ id: randomUUID(), version: 1, createdAt: now, updatedAt: now,
++        executionMode: "live", provenance: "current", taskId: task.id, subtaskId: subtask.id, agentId: agent.id,
++        status: "starting", attempt: subtask.attempt, providerSessionId: input.request.sessionId ?? null,
++        workspaceId: subtask.workspaceId ?? subtask.id, startedAt: null, endedAt: null, exitCode: null, error: null },null);
++      this.db.query("INSERT INTO hub_run_claims(run_id,subtask_id,attempt,idempotency_key,request_hash,request_json,owner_id,lease_until_ms) VALUES(?,?,?,?,?,?,?,?)")
++        .run(run.id,subtask.id,subtask.attempt,input.idempotencyKey,hash,JSON.stringify(input.request),input.ownerId,this.clock()+this.leaseMs);
++      this.db.query("INSERT INTO hub_execution_slot(id,run_id) VALUES(1,?)").run(run.id);
++      this.save("subtask",{ ...subtask,status: "running",assignedAgentId: agent.id },subtask.version);
++      this.save("agent",{ ...agent,availability: "busy" },agent.version);
++      if (task.status === "queued") this.save("task",{ ...task,status: "running",startedAt: now },task.version);
++      return { run, created: true };
++    }).immediate();
++  }
++  private owned(runId: string, owner: string): { run: AgentRun; claim: Claim } {
++    const claim = this.db.query<Claim,[string]>("SELECT * FROM hub_run_claims WHERE run_id=?").get(runId);
++    const run = this.get("run",runId);
++    if (!claim || claim.owner_id !== owner || claim.lease_until_ms <= this.clock() || !ACTIVE.has(run.status)) {
++      throw new Error("CONFLICT: execution lease lost or run is terminal");
++    }
++    return { run,claim };
++  }
++  heartbeat(runId: string, owner: string): void {
++    this.db.transaction(() => { this.owned(runId,owner);
++      this.db.query("UPDATE hub_run_claims SET lease_until_ms=? WHERE run_id=?").run(this.clock()+this.leaseMs,runId);
++    }).immediate();
++  }
++  spawned(runId: string, owner: string, pid: number): void {
++    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("INVALID_INPUT: process group");
++    this.db.transaction(() => { const { run } = this.owned(runId,owner);
++      this.db.query("UPDATE hub_run_claims SET process_group_id=? WHERE run_id=?").run(pid,runId);
++      this.save("run",{ ...run,status: run.status === "cancelling" ? "cancelling" : "running",startedAt: new Date(this.clock()).toISOString() },run.version);
++    }).immediate();
++  }
++  recordLog(runId: string, owner: string, log: CodexLog): void {
++    this.db.transaction(() => {
++      const { run } = this.owned(runId,owner);
++      if (!Number.isSafeInteger(log.seq) || log.seq < 1) throw new Error("INVALID_INPUT: log sequence");
++      const existing = this.db.query<{ data: string },[string,number]>("SELECT data FROM hub_logs WHERE run_id=? AND log_seq=?").get(runId,log.seq);
++      const item = log.event?.item as { text?: string } | undefined;
++      const line: LogLine = { logSeq: log.seq,timestamp: new Date(this.clock()).toISOString(),stream: log.stream === "stderr" ? "stderr" : "system",
++        text: log.text ?? item?.text ?? JSON.stringify(log.event), ...(run.status === "cancelling" ? { drained: true } : {}) };
++      const stored = JSON.stringify({ raw: log,line });
++      if (existing) {
++        if (JSON.stringify(JSON.parse(existing.data).raw) !== JSON.stringify(log)) throw new Error("CONFLICT: log sequence reused");
++        return;
++      }
++      this.db.query("INSERT INTO hub_logs VALUES(?,?,?)").run(runId,log.seq,stored);
++      if (log.event?.type === "thread.started" && typeof log.event.thread_id === "string") {
++        this.save("run",{ ...run,providerSessionId: log.event.thread_id },run.version);
++      }
++      this.emit("run.output",run.taskId,run.id,null,line);
++    }).immediate();
++  }
++  logs(runId: string, afterSeq = 0, limit = 200): LogLine[] {
++    this.get("run",runId);
++    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error("INVALID_INPUT: log cursor");
++    return this.db.query<{ data: string },[string,number,number]>("SELECT data FROM hub_logs WHERE run_id=? AND log_seq>? ORDER BY log_seq LIMIT ?")
++      .all(runId,afterSeq,limit).map((row) => JSON.parse(row.data).line);
++  }
++  requestCancel(runId: string, expectedVersion: number): AgentRun {
++    return this.db.transaction(() => { const run = this.get("run",runId);
++      if (!ACTIVE.has(run.status)) return run;
++      return this.save("run",{ ...run,status: "cancelling" },expectedVersion);
++    }).immediate();
++  }
++  complete(runId: string, owner: string, result: CodexResult): AgentRun {
++    return this.db.transaction(() => {
++      const { run,claim } = this.owned(runId,owner);
++      if (claim.process_group_id) {
++        try { process.kill(-claim.process_group_id,0); throw new Error("AGENT_UNAVAILABLE: process group has not stopped"); }
++        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
++      }
++      if (!["succeeded","failed","cancelled","timed_out"].includes(result.status)) throw new Error("INVALID_INPUT: nonterminal result");
++      const status = (run.status === "cancelling" ? "cancelled" : result.status) as "succeeded" | "failed" | "cancelled" | "timed_out";
++      const saved = this.save("run",{ ...run,status,providerSessionId: result.sessionId ?? run.providerSessionId,
++        endedAt: new Date(this.clock()).toISOString(),exitCode: result.exitCode,
++        error: status === "cancelled" ? { code: "CANCELLED",message: "Cancellation requested",retryable: false } : result.error },run.version);
++      const subtask = this.get("subtask",run.subtaskId);
++      this.save("subtask",{ ...subtask,status: status === "succeeded" ? "validating" : status,error: saved.error },subtask.version);
++      this.db.query("DELETE FROM hub_execution_slot WHERE run_id=?").run(run.id);
++      const agent = this.get("agent",run.agentId);
++      if (agent.availability === "busy") this.save("agent",{ ...agent,availability: "available" },agent.version);
++      return saved;
++    }).immediate();
++  }
++  reconcileExpired(): string[] {
++    return this.db.transaction(() => {
++      const rows = this.db.query<{ run_id: string },[number]>("SELECT c.run_id FROM hub_run_claims c JOIN hub_entities e ON e.id=c.run_id " +
++        "WHERE e.status IN ('starting','running','cancelling') AND c.lease_until_ms<=?").all(this.clock());
++      for (const { run_id } of rows) {
++        const run = this.get("run",run_id);
++        const error = { code: "PROCESS_CRASHED",message: "Execution owner lost; reconcile side effects before retry",retryable: false };
++        this.save("run",{ ...run,status: "interrupted",endedAt: new Date(this.clock()).toISOString(),error },run.version);
++        const subtask = this.get("subtask",run.subtaskId);
++        this.save("subtask",{ ...subtask,status: "blocked",error },subtask.version);
++        const task = this.get("task",run.taskId);
++        this.save("task",{ ...task,error },task.version);
++      }
++      // Keep the occupied slot: old children may still be executing. Never kill a reused PID.
++      return rows.map((row) => row.run_id);
++    }).immediate();
++  }
++  acknowledgeInterruption(runId: string, expectedVersion: number, evidence: { processGroupVerifiedStopped: boolean; reason: string }): void {
++    this.db.transaction(() => {
++      const run = this.get("run",runId);
++      if (run.version !== expectedVersion) throw new Error("CONFLICT: stale run version");
++      if (run.status !== "interrupted" || evidence.processGroupVerifiedStopped !== true || !evidence.reason.trim()) {
++        throw new Error("UNSUPPORTED_TRANSITION: explicit stopped-process and side-effect review required");
++      }
++      if (!this.db.query("SELECT 1 FROM hub_execution_slot WHERE run_id=?").get(runId)) return;
++      const claim = this.db.query<Claim,[string]>("SELECT * FROM hub_run_claims WHERE run_id=?").get(runId)!;
++      if (claim.process_group_id) {
++        try { process.kill(-claim.process_group_id,0); throw new Error("AGENT_UNAVAILABLE: process group is still present"); }
++        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
++      }
++      this.db.query("DELETE FROM hub_execution_slot WHERE run_id=?").run(runId);
++      const agent = this.get("agent",run.agentId);
++      if (agent.availability === "busy") this.save("agent",{ ...agent,availability: "available" },agent.version);
++      this.emit("run.updated",run.taskId,run.id,run.version,{ ...run,reconciliationNote: evidence.reason });
++    }).immediate();
++  }
++  snapshot<T>(read: () => T): { snapshotSeq: number; data: T } {
++    return this.db.transaction(() => ({ data: read(),snapshotSeq: this.db.query<{ seq: number },[]>("SELECT COALESCE(MAX(seq),0) AS seq FROM hub_outbox").get()!.seq })).deferred();
++  }
++  events(afterSeq = 0, limit = 100): EventEnvelope[] {
++    const max = this.db.query<{ seq: number },[]>("SELECT COALESCE(MAX(seq),0) AS seq FROM hub_outbox").get()!.seq;
++    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error("INVALID_INPUT: event cursor");
++    if (afterSeq > max) throw new Error("EVENT_CURSOR_EXPIRED: event cursor is ahead of the store");
++    return this.db.query<{ seq: number; event_type: EventEnvelope["type"]; task_id: string|null; run_id: string|null; entity_version: number|null; payload: string; created_at: string },[number,number]>(
++      "SELECT * FROM hub_outbox WHERE seq>? ORDER BY seq LIMIT ?").all(afterSeq,limit).map((row) => ({ schemaVersion: "0.2",seq: row.seq,type: row.event_type,
++        timestamp: row.created_at,...(row.task_id ? { taskId: row.task_id } : {}),...(row.run_id ? { runId: row.run_id } : {}),
++        ...(row.entity_version !== null ? { version: row.entity_version } : {}),payload: JSON.parse(row.payload) }));
++  }
++  acknowledgeEvent(consumer: string, seq: number): boolean {
++    if (!consumer.trim() || !Number.isSafeInteger(seq) || seq < 1) throw new Error("INVALID_INPUT: receipt");
++    return this.db.query("INSERT OR IGNORE INTO hub_event_receipts VALUES(?,?)").run(consumer,seq).changes === 1;
++  }
++}
+diff --git a/packages/shared/src/types.ts b/packages/shared/src/types.ts
+new file mode 100644
+index 0000000..2784040
+--- /dev/null
++++ b/packages/shared/src/types.ts
+@@ -0,0 +1,115 @@
++/** Contract baseline only. Existing mock implementation still requires migration. */
++export type ExecutionMode = 'mock' | 'live';
++export type Provenance = 'current' | 'historical';
++export type Capability = 'stream' | 'resume' | 'cancel' | 'live-context' | 'structured-output';
++export type TaskStatus = 'draft' | 'decomposing' | 'queued' | 'running' |
++  'waiting_approval' | 'pausing' | 'paused' | 'cancelling' |
++  'succeeded' | 'failed' | 'timed_out' | 'cancelled';
++export type SubtaskStatus = 'pending' | 'ready' | 'running' | 'validating' |
++  'waiting_approval' | 'retry_wait' | 'blocked' | 'succeeded' | 'failed' |
++  'timed_out' | 'cancelled';
++export type RunStatus = 'queued' | 'starting' | 'running' | 'cancelling' |
++  'succeeded' | 'failed' | 'cancelled' | 'timed_out' | 'interrupted';
++export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'invalidated';
++export type Stage = 'analysis' | 'implementation' | 'testing' | 'review' | 'documentation';
++export interface StructuredError {
++  code: string; message: string; retryable: boolean;
++  details?: Record<string, unknown>; occurredAt?: string;
++}
++export interface Entity {
++  id: string; version: number; createdAt: string; updatedAt: string;
++  executionMode: ExecutionMode;
++}
++export interface EvidenceEntity extends Entity { provenance: Provenance }
++export interface Page<T> { items: T[]; nextCursor: string | null }
++export interface ApiResponse<T> { data: T; requestId: string }
++export interface ApiError { error: StructuredError; requestId: string }
++export interface AcceptanceCriterion { id: string; description: string; testProfileId?: string }
++export interface RepositoryRef { id: string; label: string; baseBranch: string; baseCommit: string }
++export interface Task extends EvidenceEntity {
++  title: string; goal: string; repositoryId: string; baseCommit: string;
++  status: TaskStatus; priority: 'low' | 'medium' | 'high' | 'critical';
++  progressPct: number; pendingApprovalCount: number; artifactCount: number;
++  acceptanceCriteria: AcceptanceCriterion[]; error: StructuredError | null;
++  startedAt: string | null; endedAt: string | null; deadlineAt: string | null;
++}
++export interface PlannedSubtask {
++  id: string; code: string; title: string; description: string; stage: Stage;
++  dependsOn: string[]; requiredCapabilities: Capability[];
++  acceptanceCriteria: AcceptanceCriterion[];
++}
++export interface Subtask extends Entity, PlannedSubtask {
++  taskId: string; status: SubtaskStatus; assignedAgentId: string | null;
++  workspaceId: string | null; branchName: string | null; progressPct: number;
++  attempt: number; maxAttempts: number; timeoutMs: number; idleTimeoutMs?: number;
++  outputArtifactIds: string[]; error: StructuredError | null;
++}
++export interface Agent extends Entity {
++  label: string; roleTitle: string; adapterId: string; adapterVersion: string;
++  availability: 'unknown' | 'available' | 'busy' | 'unavailable' | 'disabled';
++  capabilities: Capability[]; unsupportedReasons?: Partial<Record<Capability, string>>;
++  supportedStages: Stage[]; permissionProfile: string; maxConcurrency: number;
++}
++export interface AgentRun extends EvidenceEntity {
++  taskId: string; subtaskId: string; agentId: string; status: RunStatus;
++  attempt: number; providerSessionId: string | null; workspaceId: string;
++  startedAt: string | null; endedAt: string | null; exitCode: number | null;
++  error: StructuredError | null;
++}
++export interface Message extends EvidenceEntity {
++  taskId: string; fromRunId: string | null; toSubtaskId: string;
++  fromLabel: string; toLabel: string; summary: string; content: string;
++  kind: 'task_decomposition' | 'context_handoff' | 'review_feedback' |
++    'approval_request' | 'rework_instruction' | 'error_alert' | 'human_directive';
++  correlationId: string; causationId: string | null; artifactRefs: string[];
++  deliveredAt: string | null;
++}
++export interface Artifact extends EvidenceEntity {
++  taskId: string; subtaskId: string; producerRunId: string; name: string;
++  relativePath: string; sha256: string; sizeBytes: number; mimeType: string;
++  category: 'code' | 'diff' | 'test_report' | 'documentation' | 'config';
++  validationStatus: 'staged' | 'validated' | 'rejected';
++  diffStats?: { filesChanged: number; insertions: number; deletions: number };
++  testSummary?: { total: number; passed: number; failed: number; coveragePct?: number };
++}
++export interface Approval extends Entity {
++  taskId: string; subtaskId: string; runId: string;
++  actionType: string; actionDigest: string; summary: string;
++  status: ApprovalStatus; expiresAt: string; artifactRefs: string[];
++  diffArtifactId?: string; decidedAt: string | null; decidedBy: string | null;
++}
++export interface Validation extends EvidenceEntity {
++  taskId: string; subtaskId: string; runId: string; criterionId: string;
++  status: 'pending' | 'running' | 'passed' | 'failed' | 'unverified';
++  exitCode: number | null; evidenceArtifactIds: string[];
++}
++export interface TaskDetail {
++  task: Task; subtasks: Subtask[]; runs: Page<AgentRun>;
++  validations: Page<Validation>; approvals: Page<Approval>; artifacts: Page<Artifact>;
++}
++export interface DraftPlan { id: string; repositoryId: string; goal: string; subtasks: PlannedSubtask[]; executionMode: ExecutionMode }
++export interface CreateTaskRequest {
++  title: string; goal: string; repositoryId: string;
++  acceptanceCriteria: AcceptanceCriterion[]; priority?: Task['priority'];
++  plannedSubtasks?: PlannedSubtask[];
++}
++export interface Meta {
++  contractVersion: '0.2'; executionMode: ExecutionMode;
++  liveExecutionAvailable: boolean; enabledFeatures: string[];
++}
++export interface Snapshot {
++  schemaVersion: '0.2'; snapshotSeq: number;
++  tasks: Page<Task>; agents: Page<Agent>; selectedTask: TaskDetail | null;
++}
++export interface LogLine {
++  logSeq: number; timestamp: string; stream: 'stdout' | 'stderr' | 'system';
++  text: string; drained?: boolean;
++}
++export interface LogPage { runId: string; items: LogLine[]; nextSeq: number; hasMore: boolean }
++export type EventType = 'task.updated' | 'subtask.updated' | 'agent.updated' |
++  'run.updated' | 'run.output' | 'message.created' | 'artifact.created' |
++  'validation.completed' | 'approval.required' | 'approval.decided';
++export interface EventEnvelope {
++  schemaVersion: '0.2'; seq: number; type: EventType; timestamp: string;
++  taskId?: string; runId?: string; version?: number; payload: Record<string, unknown>;
++}
+diff --git a/scripts/verify-hub-codex.ts b/scripts/verify-hub-codex.ts
+index d3cc455..d340402 100644
+--- a/scripts/verify-hub-codex.ts
++++ b/scripts/verify-hub-codex.ts
+@@ -12,13 +12,13 @@ const workspace = path.join(output, "workspace");
+ const forbidden = path.join(output, "outside-workspace");
+ mkdirSync(workspace, { recursive: true, mode: 0o700 });
+ mkdirSync(forbidden, { mode: 0o700 });
+-process.env.AGETOR_DATA_DIR = path.join(workspace, "state");
++process.env.AGETOR_DATA_DIR = path.join(output, "state");
+ mkdirSync(process.env.AGETOR_DATA_DIR, { mode: 0o700 });
+ const { CodexRuntime } = await import("../packages/agent-adapters/codex/runtime.ts");
+ const auth = spawnSync("codex", ["login", "status"], { encoding: "utf8" });
+ assert.equal(auth.status, 0, "Official CLI must already be authenticated");
+ assert.match(auth.stdout + auth.stderr, /Logged in using ChatGPT/);
+-const runtime = new CodexRuntime({ workspaceRoot: workspace,
++const runtime = new CodexRuntime({ workspaceRoot: output,
+   onEvent(runId, log) {
+     if (log.stream === "event") appendFileSync(path.join(output, `${runId}.jsonl`), JSON.stringify(log) + "\n");
+   } });
+diff --git a/scripts/verify-hub-persistence.ts b/scripts/verify-hub-persistence.ts
+new file mode 100644
+index 0000000..d590d1e
+--- /dev/null
++++ b/scripts/verify-hub-persistence.ts
+@@ -0,0 +1,85 @@
++import assert from "node:assert/strict";
++import { Database } from "bun:sqlite";
++import { randomUUID } from "node:crypto";
++import { spawn } from "node:child_process";
++import { existsSync, mkdirSync, writeFileSync } from "node:fs";
++import path from "node:path";
++import { HubStore } from "../packages/core/state/store.ts";
++import { DurableCodexRunner } from "../packages/core/state/durable-codex.ts";
++import type { Agent, Task, Subtask } from "../packages/shared/src/types.ts";
++
++const argument = process.argv[2];
++if (!argument) throw new Error("Supply a new evidence directory");
++const output = path.resolve(argument);
++if (existsSync(output)) throw new Error("Existing evidence is never overwritten");
++const workspace = path.join(output,"workspace");
++process.env.AGETOR_DATA_DIR = path.join(output,"state");
++mkdirSync(workspace,{ recursive: true,mode: 0o700 });
++mkdirSync(process.env.AGETOR_DATA_DIR,{ recursive: true,mode: 0o700 });
++const { db } = await import("../src/bun/db.ts");
++const store = new HubStore(db);
++const common = () => ({ id: randomUUID(),version: 1,createdAt: new Date().toISOString(),updatedAt: new Date().toISOString(),executionMode: "live" as const });
++const task: Task = store.put("task",{ ...common(),provenance: "current",title: "persistence proof",goal: "prove durable CLI execution",repositoryId: randomUUID(),baseCommit: "none",status: "queued",priority: "medium",progressPct: 0,pendingApprovalCount: 0,artifactCount: 0,acceptanceCriteria: [],error: null,startedAt: null,endedAt: null,deadlineAt: null },null);
++const agent: Agent = store.put("agent",{ ...common(),label: "Codex",roleTitle: "developer",adapterId: "codex-cli",adapterVersion: "0.166.0-alpha.5.1",availability: "available",capabilities: ["stream","cancel","resume"],supportedStages: ["implementation"],permissionProfile: "workspace-write",maxConcurrency: 1 },null);
++const step: Subtask = store.put("subtask",{ ...common(),taskId: task.id,code: "SUB-01",title: "real CLI",description: "durable proof",stage: "implementation",dependsOn: [],requiredCapabilities: ["stream"],acceptanceCriteria: [],status: "ready",assignedAgentId: null,workspaceId: randomUUID(),branchName: null,progressPct: 0,attempt: 1,maxAttempts: 2,timeoutMs: 90000,outputArtifactIds: [],error: null },null);
++let modelCalls = 0;
++const runner = new DurableCodexRunner(store,{ workspaceRoot: output,spawn: (command,args,options) => {
++  modelCalls++; return spawn(command,args,options);
++} });
++const blockedStateFile = path.join(process.env.AGETOR_DATA_DIR,"control-state-write-blocked.txt");
++const denialCommand = `python3 -c ${JSON.stringify(`open(${JSON.stringify(blockedStateFile)}, 'w').write('SHOULD_BE_DENIED')`)}`;
++const input = { subtaskId: step.id,agentId: agent.id,expectedVersion: step.version,idempotencyKey: "real-once",
++  request: { cwd: workspace,prompt: `This is an authorized negative test on a dedicated fixture. Execute exactly this shell command: ${denialCommand}. Permission denial is expected. Do not escalate or try alternatives. Then reply HUB_DURABLE_OK.`,sandbox: "workspace-write" as const,model: "gpt-6.1-sol",effort: "high",timeoutMs: 90000 } };
++const runId = runner.start(input);
++assert.equal(runner.start(input),runId);
++const completed = await runner.wait(runId);
++assert.equal(completed.status,"succeeded"); assert.equal(modelCalls,1);
++assert.ok(store.logs(runId).some((log) => log.text.includes("HUB_DURABLE_OK")));
++assert.equal(existsSync(blockedStateFile),false);
++const deniedCommandRecorded = store.logs(runId).some((line) => {
++  try {
++    const e = JSON.parse(line.text);
++    return e.type === "item.completed" && e.item?.type === "command_execution" && e.item?.exit_code !== 0
++      && typeof e.item?.exit_code === "number" && String(e.item.command).includes("control-state-write-blocked");
++  } catch { return false; }
++});
++assert.ok(deniedCommandRecorded,"Need an actual denied control-storage write command");
++assert.equal(store.get("subtask",step.id).status,"validating");
++assert.equal(store.get("task",task.id).status,"running");
++const crashStep = store.put("subtask",{ ...step,id: randomUUID(),code: "SUB-02" },null);
++const crashInput = { ...input,subtaskId: crashStep.id,idempotencyKey: "startup-crash",ownerId: "crash-fixture" };
++const file = path.join(process.env.AGETOR_DATA_DIR,"agetor.sqlite");
++db.run("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();
++const moduleFile = path.resolve(import.meta.dir,"../packages/core/state/store.ts");
++// This worker intentionally crashes AFTER claim commit and BEFORE launching any model.
++const crashSource = `import {Database} from 'bun:sqlite';import {HubStore} from ${JSON.stringify(moduleFile)};
++  const store=new HubStore(new Database(${JSON.stringify(file)}),Date.now,100);
++  console.log(JSON.stringify(store.claim(${JSON.stringify(crashInput)})));
++  process.kill(process.pid,'SIGKILL');`;
++const worker = Bun.spawn([process.execPath,"--eval",crashSource],{ stdout: "pipe",stderr: "pipe" });
++const [exit,workerOut,workerErr] = await Promise.all([worker.exited,new Response(worker.stdout).text(),new Response(worker.stderr).text()]);
++assert.notEqual(exit,0); assert.equal(workerErr,"");
++const crashedId = JSON.parse(workerOut).run.id as string;
++await Bun.sleep(150);
++const reopenedDb = new Database(file); const reopened = new HubStore(reopenedDb);
++assert.equal(reopened.get("run",runId).status,"succeeded");
++assert.equal(reopened.get("run",runId).providerSessionId,completed.providerSessionId);
++assert.ok(reopened.logs(runId).some((log) => log.text.includes("HUB_DURABLE_OK")));
++assert.deepEqual(reopened.reconcileExpired(),[crashedId]);
++assert.equal(reopened.get("run",crashedId).status,"interrupted");
++assert.equal(reopened.get("subtask",crashStep.id).status,"blocked");
++assert.equal(reopened.claim({ ...input,ownerId: "restarted-worker" }).created,false);
++assert.equal(reopened.claim(crashInput).created,false);
++const watermark = reopened.snapshot(() => reopened.get("task",task.id));
++const summary = { passed: true,execution: "real",modelCalls,runId,providerSessionId: completed.providerSessionId,
++  persistedRunStatus: reopened.get("run",runId).status,subtaskStatus: reopened.get("subtask",step.id).status,
++  taskNotPrematurelySucceeded: reopened.get("task",task.id).status === "running",
++  logsAfterReopen: reopened.logs(runId).length,snapshotSeq: watermark.snapshotSeq,
++  startupWorkerCrashInjected: true,modelProcessCrashTested: false,crashedRunId: crashedId,
++  crashedRunStatus: reopened.get("run",crashedId).status,
++  quarantinedSlotRetained: reopenedDb.query("SELECT * FROM hub_execution_slot").all().length === 1,
++  noAutomaticModelReplay: modelCalls === 1,controlStorageWriteDenied: deniedCommandRecorded };
++writeFileSync(path.join(output,"summary.json"),JSON.stringify(summary,null,2));
++writeFileSync(path.join(output,"events.json"),JSON.stringify(reopened.events(0,500),null,2));
++reopenedDb.close();
++console.log("REAL_PERSISTENCE_AND_STARTUP_CRASH_VERIFIED");
+diff --git a/src/bun/hub-codex-runtime.test.ts b/src/bun/hub-codex-runtime.test.ts
+index 026dcfa..5880dad 100644
+--- a/src/bun/hub-codex-runtime.test.ts
++++ b/src/bun/hub-codex-runtime.test.ts
+@@ -13,6 +13,7 @@ beforeEach(async () => {
+   originalDataDir = process.env.AGETOR_DATA_DIR;
+   process.env.AGETOR_DATA_DIR = path.join(root, "state");
+   await mkdir(process.env.AGETOR_DATA_DIR);
++  await mkdir(path.join(root,"workspace"));
+ });
+ afterEach(async () => {
+   await Promise.all(runtimes.map(({ runtime, id }) => runtime.cancel(id)));
+@@ -21,7 +22,7 @@ afterEach(async () => {
+   else process.env.AGETOR_DATA_DIR = originalDataDir;
+ });
+ const success = `console.log(JSON.stringify({type:'turn.completed'}));`;
+-const request = (): CodexRequest => ({ cwd: root, prompt: "test", sandbox: "read-only",
++const request = (): CodexRequest => ({ cwd: path.join(root,"workspace"), prompt: "test", sandbox: "read-only",
+   model: "gpt-6.1-sol", effort: "high", timeoutMs: 5_000 });
+ function fixture(script: string, observed?: (args: readonly string[], options: SpawnOptions) => void) {
+   const runtime = new CodexRuntime({ workspaceRoot: root, killGraceMs: 30,
+@@ -111,6 +112,12 @@ test("storage must be explicitly isolated under the workspace root before import
+   await expect(runtime.start(request())).rejects.toThrow("PERMISSION_DENIED");
+ });
+ 
++test("an Agent cannot run inside control storage or an ancestor that could overwrite it", async () => {
++  const runtime = fixture(success);
++  await expect(runtime.start({ ...request(),cwd: root })).rejects.toThrow("must be disjoint");
++  await expect(runtime.start({ ...request(),cwd: path.join(root,"state") })).rejects.toThrow("must be disjoint");
++});
++
+ test("one active run prevents concurrent and racing starts", async () => {
+   const runtime = fixture("setInterval(()=>{},1000)");
+   const first = runtime.start(request());
+diff --git a/src/bun/hub-durable-codex.test.ts b/src/bun/hub-durable-codex.test.ts
+new file mode 100644
+index 0000000..e270937
+--- /dev/null
++++ b/src/bun/hub-durable-codex.test.ts
+@@ -0,0 +1,118 @@
++import { afterEach, beforeEach, expect, test } from "bun:test";
++import { Database } from "bun:sqlite";
++import { randomUUID } from "node:crypto";
++import { spawn } from "node:child_process";
++import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { HubStore } from "../../packages/core/state/store.ts";
++import { DurableCodexRunner } from "../../packages/core/state/durable-codex.ts";
++import type { Agent, Task, Subtask } from "../../packages/shared/src/types.ts";
++
++let root: string; let db: Database; let store: HubStore; let task: Task; let agent: Agent; let step: Subtask;
++let count: number; const active: { runner: DurableCodexRunner; id: string }[] = [];
++const previousDataDir = process.env.AGETOR_DATA_DIR;
++const common = () => ({ id: randomUUID(),version: 1,createdAt: new Date().toISOString(),updatedAt: new Date().toISOString(),executionMode: "live" as const });
++beforeEach(() => {
++  root = mkdtempSync(path.join(tmpdir(),"hub-durable-"));
++  process.env.AGETOR_DATA_DIR = path.join(root,"state"); mkdirSync(process.env.AGETOR_DATA_DIR); mkdirSync(path.join(root,"workspace"));
++  db = new Database(path.join(root,"state","test.sqlite")); store = new HubStore(db); count = 0;
++  task = store.put("task",{ ...common(),provenance: "current",title: "durable",goal: "test",repositoryId: randomUUID(),baseCommit: "abc",status: "queued",priority: "medium",
++    progressPct: 0,pendingApprovalCount: 0,artifactCount: 0,acceptanceCriteria: [],error: null,startedAt: null,endedAt: null,deadlineAt: null },null);
++  agent = store.put("agent",{ ...common(),label: "Codex",roleTitle: "developer",adapterId: "codex-cli",adapterVersion: "test",availability: "available",capabilities: ["stream","cancel"],supportedStages: ["implementation"],permissionProfile: "read-only",maxConcurrency: 1 },null);
++  step = store.put("subtask",{ ...common(),taskId: task.id,code: "SUB-01",title: "step",description: "test",stage: "implementation",dependsOn: [],requiredCapabilities: [],acceptanceCriteria: [],status: "ready",assignedAgentId: null,workspaceId: randomUUID(),branchName: null,progressPct: 0,attempt: 1,maxAttempts: 2,timeoutMs: 3000,outputArtifactIds: [],error: null },null);
++});
++afterEach(async () => {
++  for (const item of active.splice(0)) {
++    const run = store.get("run",item.id);
++    if (["starting","running","cancelling"].includes(run.status)) await item.runner.cancel(item.id,run.version).catch(() => {});
++  }
++  db.close(); rmSync(root,{ recursive: true,force: true });
++  if (previousDataDir === undefined) delete process.env.AGETOR_DATA_DIR; else process.env.AGETOR_DATA_DIR = previousDataDir;
++});
++function input() { return { subtaskId: step.id,agentId: agent.id,expectedVersion: step.version,idempotencyKey: "one",
++  request: { cwd: path.join(root,"workspace"),prompt: "test",sandbox: "read-only" as const,model: "gpt-6.1-sol",effort: "high",timeoutMs: 3000 } }; }
++const success = `console.log(JSON.stringify({type:'thread.started',thread_id:'11111111-1111-4111-8111-111111111111'}));console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'persisted'}}));console.log(JSON.stringify({type:'turn.completed'}));`;
++function runner(script = success) {
++  return new DurableCodexRunner(store,{ workspaceRoot: root,killGraceMs: 30,spawn: (_cmd,args,options) => {
++    count++; return spawn(process.execPath,["--eval",script],options);
++  } });
++}
++function start(r: DurableCodexRunner, request = input()) { const id = r.start(request);active.push({ runner: r,id });return id; }
++
++test("persistent wrapper records process identity, logs and completion, without a duplicate process", async () => {
++  const r = runner(); const id = start(r); const duplicate = r.start(input());
++  expect(duplicate).toBe(id);
++  expect((await r.wait(id)).status).toBe("succeeded"); expect(count).toBe(1);
++  expect(store.logs(id).some((log) => log.text === "persisted")).toBe(true);
++  expect(store.get("run",id).providerSessionId).toBe("11111111-1111-4111-8111-111111111111");
++  const otherDb = new Database(path.join(root,"state","test.sqlite"));
++  try {
++    const reopened = new HubStore(otherDb); const restarted = new DurableCodexRunner(reopened,{ workspaceRoot: root });
++    expect((await restarted.wait(id)).status).toBe("succeeded");
++    expect(restarted.start(input())).toBe(id); expect(count).toBe(1);
++  } finally { otherDb.close(); }
++});
++
++test("cancel before asynchronous preflight never delivers the task prompt", async () => {
++  const r = runner("let text='';process.stdin.on('data',x=>text+=x);process.stdin.on('end',()=>{if(text)process.exit(9)});setInterval(()=>{},1000)");
++  const id = start(r); const run = store.get("run",id);
++  expect((await r.cancel(id,run.version)).status).toBe("cancelled");
++  expect(store.logs(id)).toEqual([]);
++});
++
++test("active timeout is durable and releases the stopped execution slot", async () => {
++  const r = runner("process.on('SIGTERM',()=>{});setInterval(()=>{},1000)");
++  const id = start(r,{ ...input(),request: { ...input().request,timeoutMs: 100 } });
++  expect((await r.wait(id)).status).toBe("timed_out");
++  expect(store.get("subtask",step.id).status).toBe("timed_out");
++  expect(db.query("SELECT * FROM hub_execution_slot").all()).toEqual([]);
++});
++
++test("logging failure stops the owned process and cannot produce durable success", async () => {
++  const r = runner(`console.log(JSON.stringify({type:'turn.started'}));setInterval(()=>{},1000)`);
++  db.run("CREATE TEMP TRIGGER reject_log BEFORE INSERT ON hub_logs BEGIN SELECT RAISE(ABORT,'injected log failure'); END");
++  const id = start(r);
++  expect((await r.wait(id)).status).toBe("failed");
++  expect(store.get("run",id).error?.code).toBe("PROCESS_CRASHED");
++  expect(db.query("SELECT * FROM hub_execution_slot").all()).toEqual([]);
++});
++
++test("preflight failure is persisted rather than leaving an active run", async () => {
++  const r = runner(); const id = start(r,{ ...input(),request: { ...input().request,cwd: tmpdir() } });
++  expect((await r.wait(id)).status).toBe("failed");
++  expect(store.get("run",id).error?.code).toBe("PERMISSION_DENIED"); expect(count).toBe(0);
++});
++
++test("a fresh runner quarantines expired startup claims without replay", async () => {
++  const claim = store.claim({ ...input(),ownerId: "dead-worker" });
++  db.query("UPDATE hub_run_claims SET lease_until_ms=0 WHERE run_id=?").run(claim.run.id);
++  const r = runner();
++  expect(r.start(input())).toBe(claim.run.id);
++  expect((await r.wait(claim.run.id)).status).toBe("interrupted");
++  expect(count).toBe(0);
++  expect(db.query("SELECT * FROM hub_execution_slot").all().length).toBe(1);
++});
++
++test("a foreign live owner is not mistaken for a completed wait", async () => {
++  const claim = store.claim({ ...input(),ownerId: "other-worker" });
++  const r = runner();
++  await expect(r.wait(claim.run.id)).rejects.toThrow("AGENT_UNAVAILABLE");
++  expect(count).toBe(0);
++});
++
++test("process identity persistence failure stops before delivering a prompt", async () => {
++  db.run("CREATE TEMP TRIGGER reject_identity BEFORE UPDATE OF process_group_id ON hub_run_claims BEGIN SELECT RAISE(ABORT,'injected identity failure'); END");
++  let delivered = false;
++  const r = new DurableCodexRunner(store,{ workspaceRoot: root,killGraceMs: 30,spawn: (_cmd,_args,options) => {
++    const proc = spawn(process.execPath,["--eval","setInterval(()=>{},1000)"],options);
++    const stdin = proc.stdin!;
++    const original = stdin.end.bind(stdin);
++    stdin.end = ((...args: unknown[]) => { if (typeof args[0] === "string" && args[0]) delivered = true; return (original as (...args: unknown[]) => unknown)(...args); }) as typeof stdin.end;
++    return proc;
++  } });
++  const id = start(r);
++  expect((await r.wait(id)).status).toBe("failed");
++  expect(delivered).toBe(false);
++  expect(store.get("run",id).error?.code).toBe("PROCESS_CRASHED");
++});
+diff --git a/src/bun/hub-state-store.test.ts b/src/bun/hub-state-store.test.ts
+new file mode 100644
+index 0000000..a80b395
+--- /dev/null
++++ b/src/bun/hub-state-store.test.ts
+@@ -0,0 +1,202 @@
++import { afterEach, beforeEach, expect, test } from "bun:test";
++import { Database } from "bun:sqlite";
++import { randomUUID } from "node:crypto";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { spawn } from "node:child_process";
++import { HubStore, type ClaimRequest } from "../../packages/core/state/store.ts";
++import type { Agent, Subtask, Task } from "../../packages/shared/src/types.ts";
++import type { CodexResult } from "../../packages/agent-adapters/codex/runtime.ts";
++
++let folder: string; let db: Database; let store: HubStore; let now: number;
++let task: Task; let agent: Agent; let subtask: Subtask;
++const common = () => ({ id: randomUUID(),version: 1,createdAt: new Date(now).toISOString(),updatedAt: new Date(now).toISOString(),executionMode: "live" as const });
++beforeEach(() => {
++  folder = mkdtempSync(path.join(tmpdir(),"hub-state-")); now = 1_790_000_000_000;
++  db = new Database(path.join(folder,"test.sqlite"));
++  store = new HubStore(db,() => now,1000);
++  task = store.put("task",{ ...common(),provenance: "current",title: "test",goal: "test",repositoryId: randomUUID(),baseCommit: "abc",
++    status: "queued",priority: "medium",progressPct: 0,pendingApprovalCount: 0,artifactCount: 0,acceptanceCriteria: [],
++    error: null,startedAt: null,endedAt: null,deadlineAt: null },null);
++  agent = store.put("agent",{ ...common(),label: "Codex",roleTitle: "developer",adapterId: "codex-cli",adapterVersion: "test",
++    availability: "available",capabilities: ["stream","cancel","resume"],supportedStages: ["implementation"],permissionProfile: "read-only",maxConcurrency: 1 },null);
++  subtask = store.put("subtask",{ ...common(),taskId: task.id,code: "SUB-01",title: "test",description: "test",stage: "implementation",status: "ready",
++    dependsOn: [],requiredCapabilities: [],acceptanceCriteria: [],assignedAgentId: null,workspaceId: randomUUID(),branchName: null,
++    progressPct: 0,attempt: 1,maxAttempts: 2,timeoutMs: 1000,outputArtifactIds: [],error: null },null);
++});
++afterEach(() => { db.close(); rmSync(folder,{ recursive: true,force: true }); });
++function input(key = "request-1"): ClaimRequest {
++  return { subtaskId: subtask.id,agentId: agent.id,expectedVersion: subtask.version,idempotencyKey: key,ownerId: "worker-1",
++    request: { cwd: folder,prompt: "hello",sandbox: "read-only",model: "gpt-6.1-sol",effort: "high",timeoutMs: 1000 } };
++}
++const result = (runId: string): CodexResult => ({ runId,status: "succeeded",sessionId: null,result: "done",exitCode: 0,error: null });
++
++test("entity CAS and outbox commit together, and stale writes do not mutate either", () => {
++  const count = store.events().length;
++  const changed = store.put("task",{ ...task,title: "changed" },task.version);
++  expect(changed.version).toBe(2);
++  expect(store.events().length).toBe(count+1);
++  expect(() => store.put("task",{ ...task,title: "lost update" },task.version)).toThrow("CONFLICT");
++  expect(store.get("task",task.id).title).toBe("changed");
++  expect(store.events().length).toBe(count+1);
++});
++
++test("a failed outbox insert rolls back the entity update", () => {
++  db.run("CREATE TEMP TRIGGER reject_event BEFORE INSERT ON hub_outbox BEGIN SELECT RAISE(ABORT,'injected disk failure'); END");
++  expect(() => store.put("task",{ ...task,title: "uncommitted" },task.version)).toThrow();
++  expect(store.get("task",task.id).title).toBe("test");
++  expect(store.get("task",task.id).version).toBe(1);
++});
++
++test("same idempotency key survives reopening and never creates a second run", () => {
++  const first = store.claim(input());
++  const other = new Database(path.join(folder,"test.sqlite"));
++  try {
++    const reopened = new HubStore(other,() => now,1000);
++    const second = reopened.claim(input());
++    expect(second.created).toBe(false); expect(second.run.id).toBe(first.run.id);
++    expect(reopened.list("run",task.id).length).toBe(1);
++    expect(() => reopened.claim({ ...input(),request: { ...input().request,prompt: "different" } })).toThrow("CONFLICT");
++  } finally { other.close(); }
++});
++
++test("single execution slot blocks other workers and attempts", () => {
++  store.claim(input());
++  const second = store.put("subtask",{ ...subtask,id: randomUUID(),code: "SUB-02" },null);
++  expect(() => store.claim({ ...input("second"),subtaskId: second.id,expectedVersion: second.version,ownerId: "worker-2" })).toThrow("AGENT_UNAVAILABLE");
++  expect(store.list("run",task.id).length).toBe(1);
++});
++
++test("unmet dependencies and historical tasks cannot launch", () => {
++  const blocked = store.put("subtask",{ ...subtask,id: randomUUID(),dependsOn: [subtask.id] },null);
++  expect(() => store.claim({ ...input(),subtaskId: blocked.id })).toThrow("DEPENDENCY_FAILED");
++  const history = store.put("task",{ ...task,id: randomUUID(),provenance: "historical" },null);
++  const historyStep = store.put("subtask",{ ...subtask,id: randomUUID(),taskId: history.id },null);
++  expect(() => store.claim({ ...input(),subtaskId: historyStep.id })).toThrow("UNSUPPORTED_TRANSITION");
++  expect(() => store.put("task",{ ...history,title: "change history" },history.version)).toThrow("historical");
++  expect(() => store.put("task",{ ...task,provenance: "historical" },task.version)).toThrow("CONFLICT");
++});
++
++test("cancel intention is durable and wins over a late successful result", () => {
++  const claim = store.claim(input()); store.spawned(claim.run.id,"worker-1",99_999_999);
++  const running = store.get("run",claim.run.id);
++  store.requestCancel(running.id,running.version);
++  const completed = store.complete(running.id,"worker-1",result(running.id));
++  expect(completed.status).toBe("cancelled");
++  expect(store.get("subtask",subtask.id).status).toBe("cancelled");
++  expect(() => store.complete(running.id,"worker-1",result(running.id))).toThrow("CONFLICT");
++});
++
++test("logs and provider session persist with deduplication", () => {
++  const { run } = store.claim(input()); const seq = store.snapshot(() => null).snapshotSeq;
++  const log = { seq: 1,stream: "event" as const,event: { type: "thread.started",thread_id: randomUUID() } };
++  store.recordLog(run.id,"worker-1",log); store.recordLog(run.id,"worker-1",log);
++  expect(store.logs(run.id).length).toBe(1);
++  expect(store.get("run",run.id).providerSessionId).toBe(log.event.thread_id);
++  expect(store.events(seq).filter((e) => e.type === "run.output").length).toBe(1);
++  expect(() => store.recordLog(run.id,"worker-1",{ ...log,event: { ...log.event,type: "different" } })).toThrow("CONFLICT");
++});
++
++test("successful process only moves subtask to validating, never completes the task", () => {
++  const { run } = store.claim(input());
++  store.complete(run.id,"worker-1",result(run.id));
++  expect(store.get("subtask",subtask.id).status).toBe("validating");
++  const activeTask = store.get("task",task.id);
++  expect(activeTask.status).toBe("running");
++  expect(() => store.put("task",{ ...activeTask,status: "succeeded" },activeTask.version)).toThrow("B-05");
++});
++
++test("expired ownership is quarantined; no blind replay or stale completion", () => {
++  const { run } = store.claim(input()); now += 1001;
++  expect(store.reconcileExpired()).toEqual([run.id]);
++  expect(store.reconcileExpired()).toEqual([]);
++  expect(store.get("run",run.id).status).toBe("interrupted");
++  expect(store.get("subtask",subtask.id).status).toBe("blocked");
++  expect(() => store.complete(run.id,"worker-1",result(run.id))).toThrow("CONFLICT");
++  const second = store.put("subtask",{ ...subtask,id: randomUUID(),code: "SUB-02" },null);
++  expect(() => store.claim({ ...input("second"),subtaskId: second.id })).toThrow("AGENT_UNAVAILABLE");
++  const interrupted = store.get("run",run.id);
++  expect(() => store.acknowledgeInterruption(run.id,interrupted.version,{ processGroupVerifiedStopped: false,reason: "unchecked" })).toThrow();
++  store.acknowledgeInterruption(run.id,interrupted.version,{ processGroupVerifiedStopped: true,reason: "No process was spawned; reviewed pending request" });
++  expect(store.claim({ ...input("second"),subtaskId: second.id }).created).toBe(true);
++});
++
++test("heartbeat extends the lease but cannot resurrect an expired owner", () => {
++  const { run } = store.claim(input()); now += 700; store.heartbeat(run.id,"worker-1");
++  now += 700; expect(store.reconcileExpired()).toEqual([]);
++  now += 301; expect(() => store.heartbeat(run.id,"worker-1")).toThrow("CONFLICT");
++  expect(store.reconcileExpired()).toEqual([run.id]);
++});
++
++test("snapshot watermark replays later mutations and consumer receipts are idempotent", () => {
++  const snapshot = store.snapshot(() => store.get("task",task.id));
++  store.put("task",{ ...task,title: "after snapshot" },task.version);
++  const events = store.events(snapshot.snapshotSeq);
++  expect(snapshot.data.title).toBe("test"); expect(events.length).toBe(1);
++  expect(events[0]!.payload.title).toBe("after snapshot");
++  expect(store.acknowledgeEvent("frontend",events[0]!.seq)).toBe(true);
++  expect(store.acknowledgeEvent("frontend",events[0]!.seq)).toBe(false);
++  expect(() => store.events(999999)).toThrow("EVENT_CURSOR_EXPIRED");
++});
++
++test("all seven entities and validation evidence survive reopening without touching old tables", () => {
++  db.run("CREATE TABLE old_tasks(id TEXT PRIMARY KEY); INSERT INTO old_tasks VALUES('original')");
++  const { run } = store.claim(input());
++  const msg = store.put("message",{ ...common(),provenance: "current",taskId: task.id,fromRunId: run.id,toSubtaskId: subtask.id,
++    fromLabel: "developer",toLabel: "reviewer",summary: "handoff",content: "result",kind: "context_handoff",
++    correlationId: randomUUID(),causationId: null,artifactRefs: [],deliveredAt: null },null);
++  const artifact = store.put("artifact",{ ...common(),provenance: "current",taskId: task.id,subtaskId: subtask.id,producerRunId: run.id,
++    name: "code",relativePath: "result.py",sha256: "a".repeat(64),sizeBytes: 4,mimeType: "text/plain",category: "code",validationStatus: "staged" },null);
++  const approval = store.put("approval",{ ...common(),taskId: task.id,subtaskId: subtask.id,runId: run.id,actionType: "test",
++    actionDigest: "a".repeat(64),summary: "review",status: "pending",expiresAt: new Date(now+5000).toISOString(),artifactRefs: [artifact.id],decidedAt: null,decidedBy: null },null);
++  const check = store.put("validation",{ ...common(),provenance: "current",taskId: task.id,subtaskId: subtask.id,runId: run.id,
++    criterionId: "criterion",status: "unverified",exitCode: null,evidenceArtifactIds: [] },null);
++  const other = new Database(path.join(folder,"test.sqlite"));
++  try {
++    const reopened = new HubStore(other);
++    expect(reopened.get("message",msg.id).summary).toBe("handoff");
++    expect(reopened.get("artifact",artifact.id).sha256).toBe("a".repeat(64));
++    expect(reopened.get("approval",approval.id).status).toBe("pending");
++    expect(reopened.get("validation",check.id).status).toBe("unverified");
++    expect(other.query("SELECT id FROM old_tasks").get()).toEqual({ id: "original" });
++  } finally { other.close(); }
++});
++
++test("two real worker processes race the same idempotency key without duplicate claims", async () => {
++  const modulePath = path.resolve(import.meta.dir,"../../packages/core/state/store.ts");
++  const source = `import {Database} from 'bun:sqlite';import {HubStore} from ${JSON.stringify(modulePath)};
++    const db=new Database(${JSON.stringify(path.join(folder,"test.sqlite"))});
++    const store=new HubStore(db,()=>${now},1000);
++    console.log(JSON.stringify(store.claim(${JSON.stringify(input())})));db.close();`;
++  const workers = [Bun.spawn([process.execPath,"--eval",source],{ stdout: "pipe",stderr: "pipe" }),
++    Bun.spawn([process.execPath,"--eval",source],{ stdout: "pipe",stderr: "pipe" })];
++  const results = await Promise.all(workers.map(async (worker) => {
++    const [code,out,err] = await Promise.all([worker.exited,new Response(worker.stdout).text(),new Response(worker.stderr).text()]);
++    expect(err).toBe(""); expect(code).toBe(0); return JSON.parse(out);
++  }));
++  expect(results.filter((item) => item.created).length).toBe(1);
++  expect(results[0].run.id).toBe(results[1].run.id);
++  expect(store.list("run",task.id).length).toBe(1);
++});
++
++test("agent capability and permission mismatches cannot claim a process", () => {
++  const writes = { ...input(),request: { ...input().request,sandbox: "workspace-write" as const } };
++  expect(() => store.claim(writes)).toThrow("PERMISSION_DENIED");
++  subtask = store.put("subtask",{ ...subtask,requiredCapabilities: ["live-context"] },subtask.version);
++  expect(() => store.claim(input())).toThrow("UNSUPPORTED_CAPABILITY");
++  expect(store.list("run",task.id)).toEqual([]);
++});
++
++test("interruption acknowledgement never releases a still-present process group", async () => {
++  const child = spawn(process.execPath,["--eval","setInterval(()=>{},1000)"],{ detached: true,stdio: "ignore" });
++  try {
++    const { run } = store.claim(input()); store.spawned(run.id,"worker-1",child.pid!);
++    now += 1001; store.reconcileExpired();
++    const interrupted = store.get("run",run.id);
++    expect(() => store.acknowledgeInterruption(run.id,interrupted.version,{ processGroupVerifiedStopped: true,reason: "wrong assertion" })).toThrow("AGENT_UNAVAILABLE");
++  } finally {
++    process.kill(-child.pid!,"SIGKILL");
++    await new Promise<void>((resolve) => child.once("close",() => resolve()));
++  }
++});
+diff --git a/src/bun/migrate.test.ts b/src/bun/migrate.test.ts
+index fb407a4..1db6689 100644
+--- a/src/bun/migrate.test.ts
++++ b/src/bun/migrate.test.ts
+@@ -1995,9 +1995,11 @@ test("077_copilot_harness is only backfilled, never re-run, on a DB that already
+   db.close();
+ });
+ 
+-test("081 (cursor asks) is the last registered migration, after 080 (harness auto-enabled), after 079 (opencode task fields), after 078 (opencode harness), after 077 (copilot harness)", () => {
++test("081 (cursor asks) preserves its registered order before the additive Hub migration", () => {
+   const at = migrations.findIndex((m) => m.id === "081_cursor_asks");
+-  expect(at).toBe(migrations.length - 1);
++  expect(at).toBe(migrations.length - 2);
++  expect(migrations[at + 1]?.id).toBe("082_hub_execution");
++  expect(migrations[at + 1]?.sql).toContain("CREATE TABLE hub_entities");
+   expect(migrations[at - 1]?.id).toBe("080_harness_auto_enabled");
+   expect(migrations[at - 2]?.id).toBe("079_opencode_task_fields");
+   expect(migrations[at - 3]?.id).toBe("078_opencode_harness");
+@@ -2036,6 +2038,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
+     "079_opencode_task_fields",
+     "080_harness_auto_enabled",
+     "081_cursor_asks",
++    "082_hub_execution",
+   ]);
+   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
+ 
+diff --git a/src/bun/migrations/082_hub_execution.sql b/src/bun/migrations/082_hub_execution.sql
+new file mode 100644
+index 0000000..fe4fc07
+--- /dev/null
++++ b/src/bun/migrations/082_hub_execution.sql
+@@ -0,0 +1,49 @@
++-- Additive Hub state: existing Agetor task/run tables remain untouched.
++CREATE TABLE hub_entities (
++  id TEXT PRIMARY KEY,
++  kind TEXT NOT NULL CHECK(kind IN ('task','subtask','agent','run','message','artifact','approval','validation')),
++  task_id TEXT REFERENCES hub_entities(id),
++  status TEXT NOT NULL,
++  version INTEGER NOT NULL CHECK(version > 0),
++  data TEXT NOT NULL CHECK(json_valid(data)),
++  created_at TEXT NOT NULL,
++  updated_at TEXT NOT NULL
++);
++CREATE INDEX hub_entities_by_task ON hub_entities(task_id,kind,created_at,id);
++CREATE TABLE hub_run_claims (
++  run_id TEXT PRIMARY KEY REFERENCES hub_entities(id),
++  subtask_id TEXT NOT NULL REFERENCES hub_entities(id),
++  attempt INTEGER NOT NULL CHECK(attempt > 0),
++  idempotency_key TEXT NOT NULL,
++  request_hash TEXT NOT NULL,
++  request_json TEXT NOT NULL,
++  owner_id TEXT NOT NULL,
++  lease_until_ms INTEGER NOT NULL,
++  process_group_id INTEGER,
++  UNIQUE(subtask_id,attempt),
++  UNIQUE(subtask_id,idempotency_key)
++);
++CREATE TABLE hub_execution_slot (
++  id INTEGER PRIMARY KEY CHECK(id=1),
++  run_id TEXT NOT NULL UNIQUE REFERENCES hub_run_claims(run_id)
++);
++CREATE TABLE hub_logs (
++  run_id TEXT NOT NULL REFERENCES hub_run_claims(run_id),
++  log_seq INTEGER NOT NULL,
++  data TEXT NOT NULL CHECK(json_valid(data)),
++  PRIMARY KEY(run_id,log_seq)
++);
++CREATE TABLE hub_outbox (
++  seq INTEGER PRIMARY KEY AUTOINCREMENT,
++  event_type TEXT NOT NULL,
++  task_id TEXT,
++  run_id TEXT,
++  entity_version INTEGER,
++  payload TEXT NOT NULL CHECK(json_valid(payload)),
++  created_at TEXT NOT NULL
++);
++CREATE TABLE hub_event_receipts (
++  consumer_id TEXT NOT NULL,
++  event_seq INTEGER NOT NULL REFERENCES hub_outbox(seq),
++  PRIMARY KEY(consumer_id,event_seq)
++);
+diff --git a/src/bun/migrations/index.ts b/src/bun/migrations/index.ts
+index 5114153..c6110d7 100644
+--- a/src/bun/migrations/index.ts
++++ b/src/bun/migrations/index.ts
+@@ -109,6 +109,7 @@ import m078 from "./078_opencode_harness.sql" with { type: "text" };
+ import m079 from "./079_opencode_task_fields.sql" with { type: "text" };
+ import m080 from "./080_harness_auto_enabled.sql" with { type: "text" };
+ import m081 from "./081_cursor_asks.sql" with { type: "text" };
++import m082 from "./082_hub_execution.sql" with { type: "text" };
+ 
+ 
+ import type { Migration } from "../migrate.ts";
+@@ -208,4 +209,5 @@ export const migrations: Migration[] = [
+   { id: "079_opencode_task_fields", sql: m079, aliases: ["078_opencode_task_fields"] },
+   { id: "080_harness_auto_enabled", sql: m080, aliases: ["079_harness_auto_enabled"] },
+   { id: "081_cursor_asks", sql: m081 },
++  { id: "082_hub_execution", sql: m082 },
+ ];
+diff --git a/tsconfig.hub.json b/tsconfig.hub.json
+index fed7a5b..384f4b3 100644
+--- a/tsconfig.hub.json
++++ b/tsconfig.hub.json
+@@ -1,4 +1,4 @@
+ {
+   "extends": "./tsconfig.json",
+-  "include": ["packages/agent-adapters/codex/**/*.ts", "src/bun/hub-codex-runtime.test.ts", "scripts/verify-hub-codex.ts", "src/types/**/*.d.ts"]
++  "include": ["packages/agent-adapters/codex/**/*.ts", "src/bun/hub-codex-runtime.test.ts", "scripts/verify-hub-codex.ts", "scripts/verify-hub-persistence.ts", "src/types/**/*.d.ts", "packages/core/**/*.ts", "packages/shared/**/*.ts", "src/bun/hub-state-store.test.ts", "src/bun/hub-durable-codex.test.ts"]
+ }
+diff --git a/tsconfig.json b/tsconfig.json
+index 7682e5c..e79fd36 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -22,5 +22,5 @@
+       "@/*": ["./src/mainview/*"]
+     }
+   },
+-  "include": ["src", "e2e", "packages/agent-adapters/codex", "electrobun.config.ts", "vite.config.ts", "playwright.config.ts"]
++  "include": ["src", "e2e", "packages/agent-adapters/codex", "packages/core", "packages/shared", "electrobun.config.ts", "vite.config.ts", "playwright.config.ts"]
+ }

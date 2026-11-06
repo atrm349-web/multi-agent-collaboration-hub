@@ -1,0 +1,4 @@
+{"seq":1,"stream":"event","event":{"type":"thread.started","thread_id":"01a19b5c-0cf9-7c52-9ed5-6da3b719acb8"}}
+{"seq":2,"stream":"event","event":{"type":"turn.started"}}
+{"seq":4,"stream":"event","event":{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"我将执行这条命令。\n"}}}
+{"seq":5,"stream":"event","event":{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"python3 -c \\\"import time; print('HUB_CANCEL_WAIT', flush=True); time.sleep(60)\\\"\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}}

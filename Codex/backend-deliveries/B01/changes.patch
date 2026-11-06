@@ -1,0 +1,428 @@
+diff --git a/src/bun/agents.test.ts b/src/bun/agents.test.ts
+index 060f939..0abfe1b 100644
+--- a/src/bun/agents.test.ts
++++ b/src/bun/agents.test.ts
+@@ -629,6 +629,12 @@ test("codex with defaults emits --model + reasoning effort + structured-stream f
+     "--model", "gpt-6-astra",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -642,6 +648,12 @@ test("codex 'ask' mode uses --sandbox read-only so codex can't change anything",
+     "--model", "gpt-6-astra",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "read-only",
+     "-",
+   ]);
+@@ -654,6 +666,12 @@ test("codex model 'gpt-6-astra' passes through verbatim as --model", () => {
+     "--model", "gpt-6-astra",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -666,6 +684,12 @@ test("codex model 'gpt-6-astra-aeon' passes through verbatim as --model", () =>
+     "--model", "gpt-6-astra-aeon",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -678,6 +702,12 @@ test("codex model 'gpt-6.1-sol' passes through verbatim as --model", () => {
+     "--model", "gpt-6.1-sol",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -690,6 +720,12 @@ test("codex model 'gpt-6-sol' passes through verbatim as --model", () => {
+     "--model", "gpt-6-sol",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -702,6 +738,12 @@ test("codex model 'gpt-6-luna' passes through verbatim as --model", () => {
+     "--model", "gpt-6-luna",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -714,6 +756,12 @@ test("codex model 'gpt-6.1-terra' passes through verbatim as --model", () => {
+     "--model", "gpt-6.1-terra",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -726,6 +774,12 @@ test("codex model 'gpt-5.6-sol' passes through verbatim as --model", () => {
+     "--model", "gpt-5.6-sol",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -738,6 +792,12 @@ test("codex model 'gpt-5.6-cyber' passes through verbatim as --model", () => {
+     "--model", "gpt-5.6-cyber",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -750,6 +810,12 @@ test("codex model 'gpt-5' adds --model gpt-5", () => {
+     "--model", "gpt-5",
+     "-c", "model_reasoning_effort=high",
+     "--json", "--color", "never", "--skip-git-repo-check",
++    "--ignore-user-config", "-c", "features.apps=false",
++    "-c", "approval_policy=never",
++    "-c", "sandbox_workspace_write.writable_roots=[]",
++    "-c", "sandbox_workspace_write.network_access=false",
++    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+     "--sandbox", "workspace-write",
+     "-",
+   ]);
+@@ -762,45 +828,31 @@ test("codex resume injects the `resume <thread_id>` subcommand before the stdin
+   expect(cmd.indexOf("--json")).toBeLessThan(cmd.indexOf("resume"));
+ });
+ 
+-test("codex auto with external git dirs escalates to danger-full-access + approval_policy=never", () => {
+-  const { cmd } = buildCommand(builtin("codex"), "hi", {
+-    ...codexDefaults,
+-    mode: "auto",
+-    codexExternalGitDirs: ["/Users/me/Projects/app/.git"],
+-  });
+-  // Sandbox is dropped to full access (workspace-write can't reach the external
+-  // .git), paired with approval_policy=never so headless exec never stalls.
+-  expect(cmd).toContain("danger-full-access");
+-  expect(cmd).not.toContain("workspace-write");
+-  const ap = cmd.indexOf("approval_policy=never");
+-  expect(ap).toBeGreaterThan(-1);
+-  expect(cmd[ap - 1]).toBe("-c");
++test.each([null, "thread-xyz"])("codex refuses external Git writes for fresh/resumed auto runs (%s)", (resumeSessionId) => {
++  expect(() => buildCommand(builtin("codex"), "hi", {
++    ...codexDefaults, mode: "auto", codexExternalGitDirs: ["/repo/.git"], resumeSessionId,
++  })).toThrow(/PERMISSION_DENIED.*external Git/);
+ });
+ 
+-test("codex auto + external git dirs keeps the escalation before the `resume` subcommand", () => {
+-  const { cmd } = buildCommand(builtin("codex"), "hi", {
+-    ...codexDefaults,
+-    mode: "auto",
+-    codexExternalGitDirs: ["/repo/.git"],
+-    resumeSessionId: "thread-xyz",
+-  });
+-  // Parent flags (incl. the approval_policy -c) must precede `resume`.
+-  expect(cmd.indexOf("danger-full-access")).toBeLessThan(cmd.indexOf("resume"));
+-  expect(cmd.indexOf("approval_policy=never")).toBeLessThan(cmd.indexOf("resume"));
+-});
+-
+-test("codex 'ask' mode stays read-only even when external git dirs are present", () => {
++test("codex ask stays read-only with external Git metadata", () => {
+   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "ask", codexExternalGitDirs: ["/repo/.git"] });
+   expect(cmd).toContain("read-only");
+   expect(cmd).not.toContain("danger-full-access");
+-  expect(cmd).not.toContain("approval_policy=never");
+ });
+ 
+-test("codex auto with no external git dirs stays on workspace-write (ordinary checkout)", () => {
++test("codex ordinary checkout stays workspace-write and ignores user execution config", () => {
+   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "auto", codexExternalGitDirs: [] });
+   expect(cmd).toContain("workspace-write");
++  expect(cmd).toContain("--ignore-user-config");
+   expect(cmd).not.toContain("danger-full-access");
+-  expect(cmd).not.toContain("approval_policy=never");
++});
++
++test.each(["--last", "-x", "thread id", "id\n--sandbox"])("codex rejects ambiguous resume id %s", (resumeSessionId) => {
++  expect(() => buildCommand(builtin("codex"), "hi", { ...codexDefaults, resumeSessionId })).toThrow(/INVALID_INPUT/);
++});
++
++test("codex rejects an unsupported permission mode", () => {
++  expect(() => buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "bypass" })).toThrow(/UNSUPPORTED_CAPABILITY/);
+ });
+ 
+ test("codex effort 'high' adds -c model_reasoning_effort=high", () => {
+@@ -2673,10 +2725,9 @@ test("AGETOR_CLAUDE_ARGS extra args land before the prompt (and before the `--`
+   expect(cmd.slice(-4)).toEqual(["--verbose", "--foo", "--", "p"]);
+ });
+ 
+-test("AGETOR_CODEX_ARGS extra args land before the stdin sentinel", () => {
+-  process.env.AGETOR_CODEX_ARGS = "--verbose --foo";
+-  const { cmd } = buildCommand(builtin("codex"), "p", { ...codexDefaults });
+-  expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "-"]);
++test.each(["--sandbox danger-full-access", "--dangerously-bypass-approvals-and-sandbox", "-c sandbox_mode=\"danger-full-access\"", "--add-dir /", "--verbose"])("Codex refuses arbitrary extra flags %s", (flags) => {
++  process.env.AGETOR_CODEX_ARGS = flags;
++  expect(() => buildCommand(builtin("codex"), "p", { ...codexDefaults })).toThrow(/PERMISSION_DENIED.*AGETOR_CODEX_ARGS/);
+ });
+ 
+ // Invariant test for AGENT_OPTIONS — guards against re-introducing the
+diff --git a/src/bun/agents.ts b/src/bun/agents.ts
+index fb110fd..6598a2d 100644
+--- a/src/bun/agents.ts
++++ b/src/bun/agents.ts
+@@ -153,16 +153,8 @@ export interface AgentRunOptions {
+    * Ignored by codex.
+    */
+   sessionId?: string | null;
+-  /**
+-   * Git directories that live OUTSIDE the codex run's cwd — the source repo's
+-   * `.git` common dir when a task runs in a linked worktree (or a repo-subdir
+-   * workdir). When this is non-empty, a `git commit`'s objects/refs must reach
+-   * a dir the cwd-scoped `workspace-write` sandbox doesn't cover, so the codex
+-   * `auto` run is escalated to `--sandbox danger-full-access` (see
+-   * `buildCommand`). Resolved by `await gitWritableRoots(cwd)` and only set on the
+-   * codex spawn path; ignored by claude-code and by codex's read-only ("ask")
+-   * sandbox (which can't write anything regardless).
+-   */
++  /** External Git metadata writes cannot be granted by the cwd sandbox.
++   *  Auto mode refuses these runs; a coordinator must own Git changes. */
+   codexExternalGitDirs?: string[];
+   /**
+    * The run row id, threaded into `buildCommand` ONLY for fx: fx's argv
+@@ -1031,7 +1023,9 @@ export function buildCommand(
+     // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
+     // element: it's delivered on stdin (the trailing `-`), so the driver can
+     // pipe a prompt file in and no user text touches the shell wrapper.
+-    const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
++    if (process.env.AGETOR_CODEX_ARGS?.trim()) {
++      throw new Error("PERMISSION_DENIED: AGETOR_CODEX_ARGS is disabled; arbitrary flags can override the sandbox");
++    }
+ 
+     const args: string[] = [bin, "exec"];
+ 
+@@ -1046,44 +1040,25 @@ export function buildCommand(
+       throw new Error(`effort is required for codex model ${opts.model}`);
+     }
+ 
+-    // Structured streaming + deterministic capture: `--json` emits NDJSON events
+-    // on stdout (tailed by the driver); `--color never` guarantees clean JSON
+-    // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
+-    // task run in a non-git workdir (agetor has no sandbox philosophy).
+-    args.push("--json", "--color", "never", "--skip-git-repo-check");
+-
+-    // Sandbox policy from the agetor mode. `auto` (hands-off) →
+-    // `workspace-write` so codex can edit files in the working dir without
+-    // approval prompts (codex exec is non-interactive — it can't prompt anyway).
+-    // `ask` → `read-only` (the most it can do without changing anything). We use
+-    // `--sandbox` rather than the deprecated `--full-auto`, which prints a
+-    // warning to stderr on every turn in codex 0.140+.
++    args.push("--json", "--color", "never", "--skip-git-repo-check",
++      "--ignore-user-config", "-c", "features.apps=false",
++      "-c", "approval_policy=never",
++      "-c", "sandbox_workspace_write.writable_roots=[]",
++      "-c", "sandbox_workspace_write.network_access=false",
++      "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
++      "-c", "sandbox_workspace_write.exclude_slash_tmp=true");
++
+     const mode = opts.mode ?? defaultModeFor(harness.kind);
+-    // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
+-    // `workspace-write` (edit the cwd without approval prompts) for the common
+-    // case, BUT escalated to `danger-full-access` when the task's git writes have
+-    // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
+-    // the source repo's shared `.git`, where a commit's objects/refs go, and
+-    // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
+-    // Granting the external dir via `sandbox_workspace_write.writable_roots` is
+-    // unreliable (codex keeps `.git` read-only under some workspace policies), so
+-    // for those runs we drop the sandbox entirely. That's consistent with
+-    // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
+-    // shell privileges … There is no sandbox") and with claude-code's `auto` mode
+-    // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
+-    // access so a headless `codex exec` never stalls on an approval it can't show
+-    // — the empirically-validated combo for full filesystem access. Parent flags
+-    // must precede the `resume` subcommand, so emit here.
+-    const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
+-    if (mode !== "auto") {
+-      args.push("--sandbox", "read-only");
+-    } else if (needsExternalGitWrites) {
+-      args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
+-    } else {
+-      args.push("--sandbox", "workspace-write");
++    if (mode !== "auto" && mode !== "ask") {
++      throw new Error("UNSUPPORTED_CAPABILITY: Codex supports only auto or ask mode");
++    }
++    if (mode === "auto" && opts.codexExternalGitDirs?.length) {
++      throw new Error("PERMISSION_DENIED: external Git metadata writes require a coordinator; use read-only review instead");
++    }
++    args.push("--sandbox", mode === "auto" ? "workspace-write" : "read-only");
++    if (opts.resumeSessionId && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(opts.resumeSessionId)) {
++      throw new Error("INVALID_INPUT: resumeSessionId must be an explicit session identifier");
+     }
+-
+-    args.push(...extra);
+ 
+     // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
+     // rejects `--json`/`--color` placed after it). codex loads the prior
+@@ -1103,20 +1078,8 @@ export function buildCommand(
+   throw new Error(`unknown harness kind: ${String(_never)}`);
+ }
+ 
+-/**
+- * Build the codex argv for a specific `cwd`, resolving the cwd-dependent
+- * `codexExternalGitDirs` (the source repo's `.git` for a linked worktree) so
+- * `buildCommand` can decide whether to escalate the sandbox to full access. This
+- * is the seam `spawnAgent` uses — kept separate from the pure `buildCommand` so
+- * the cwd→sandbox wiring is unit-testable without standing up tmux.
+- *
+- * Async because `gitWritableRoots` now spawns `git` via the async `git()`
+- * helper (see worktree.ts) instead of `child_process.spawnSync` — this is the
+- * only reason `buildCodexCommand` differs from the otherwise-synchronous
+- * `buildCommand`, whose exported signature stays sync on purpose (100+ sync
+- * call sites in agents.test.ts, and orchestrator-fx.test.ts's fake gemini
+- * driver relies on `buildCommand` staying synchronous).
+- */
++/** Resolve external Git metadata before applying the same launch policy to
++ *  fresh and resumed Codex runs. Worktree isolation is not a permission grant. */
+ export async function buildCodexCommand(
+   harness: Harness,
+   prompt: string,
+@@ -4068,13 +4031,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
+         kind: harness.kind,
+       });
+     }
+-    // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
+-    // worktree) so a codex `auto` run that has to write there escalates its
+-    // sandbox to full access. Computed here — the single choke point every codex
+-    // spawn path funnels through — rather than at each orchestrator call site.
+-    // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
+-    // there. `buildCodexCommand` is the testable seam for this wiring (async —
+-    // it awaits `gitWritableRoots`, which now shells out via `Bun.spawn`).
++    // Shared policy rejects unsupported Git writes without dropping the sandbox.
+     const built = await buildCodexCommand(harness, prompt, opts, cwd);
+     return await spawnCodexViaTmux({
+       taskId,
+diff --git a/src/bun/harness-auto-enable.test.ts b/src/bun/harness-auto-enable.test.ts
+index 53252db..ab693c5 100644
+--- a/src/bun/harness-auto-enable.test.ts
++++ b/src/bun/harness-auto-enable.test.ts
+@@ -190,7 +190,7 @@ test("a non-delivering or throwing broadcaster leaves the ids pending", () => {
+   expect(sent[0]!.harnessIds.sort()).toEqual(["codex", "gemini"]);
+ });
+ 
+-test("the NODE_ENV=test default is off; =1 turns it on, =0 turns it off", () => {
++test("discovery stays off by default in tests and production; only explicit opt-in enables it", () => {
+   delete process.env.AGETOR_HARNESS_AUTO_ENABLE;
+   expect(process.env.NODE_ENV).toBe("test");
+   expect(harnessAutoEnableActive()).toBe(false);
+@@ -209,7 +209,7 @@ test("the NODE_ENV=test default is off; =1 turns it on, =0 turns it off", () =>
+   process.env.NODE_ENV = "production";
+   try {
+     delete process.env.AGETOR_HARNESS_AUTO_ENABLE;
+-    expect(harnessAutoEnableActive()).toBe(true);
++    expect(harnessAutoEnableActive()).toBe(false);
+   } finally {
+     process.env.NODE_ENV = prev;
+   }
+diff --git a/src/bun/harness-auto-enable.ts b/src/bun/harness-auto-enable.ts
+index baa4a52..053e5a2 100644
+--- a/src/bun/harness-auto-enable.ts
++++ b/src/bun/harness-auto-enable.ts
+@@ -24,16 +24,9 @@ type Broadcaster = (e: AppEvent) => boolean;
+ let broadcaster: Broadcaster | null = null;
+ let refreshModels: (harnessId: string) => Promise<void> = refreshHarnessModels;
+ 
+-/**
+- * Off under `NODE_ENV=test` unless `AGETOR_HARNESS_AUTO_ENABLE=1`;
+- * `AGETOR_HARNESS_AUTO_ENABLE=0` disables it anywhere. The seam keeps tests
+- * that stub `AGETOR_CODEX_BIN=/bin/echo` from silently turning codex on.
+- */
++/** Discovery is informational unless the local operator explicitly opts in. */
+ export function harnessAutoEnableActive(): boolean {
+-  const v = process.env.AGETOR_HARNESS_AUTO_ENABLE;
+-  if (v === "0") return false;
+-  if (v === "1") return true;
+-  return process.env.NODE_ENV !== "test";
++  return process.env.AGETOR_HARNESS_AUTO_ENABLE === "1";
+ }
+ 
+ /** Live broadcast hook. `fn` reports whether ≥1 client received the event. */
+diff --git a/src/bun/worktree.test.ts b/src/bun/worktree.test.ts
+index 74cafb8..bfd1cc5 100644
+--- a/src/bun/worktree.test.ts
++++ b/src/bun/worktree.test.ts
+@@ -346,17 +346,17 @@ const codexHarness = {
+ };
+ const codexOpts = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+ 
+-test("buildCodexCommand escalates to danger-full-access in a linked worktree", async () => {
++test("buildCodexCommand refuses external Git writes in a linked worktree", async () => {
+   const { prepareWorkdir } = await import("./worktree.ts");
+   const { buildCodexCommand } = await import("./agents.ts");
+   const repo = await makeRepo();
+   const r = await prepareWorkdir(fakeTask({ workdir: repo }));
+   if ("error" in r) throw new Error(r.error);
+ 
+-  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd);
+-  expect(cmd).toContain("danger-full-access");
+-  expect(cmd).not.toContain("workspace-write");
+-  expect(cmd).toContain("approval_policy=never");
++  await expect(buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd)).rejects.toThrow(/PERMISSION_DENIED.*external Git/);
++  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts, mode: "ask" }, r.cwd);
++  expect(cmd).toContain("read-only");
++  expect(cmd).not.toContain("danger-full-access");
+ });
+ 
+ test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout", async () => {

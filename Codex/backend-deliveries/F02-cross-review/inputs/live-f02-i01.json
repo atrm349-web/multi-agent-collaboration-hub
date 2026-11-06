@@ -1,0 +1,158 @@
+{
+  "verifiedAt": "2026-11-03T00:42:55.056Z",
+  "origin": "http://127.0.0.1:54600",
+  "frontendDir": ".//apps/web/public",
+  "checks": {
+    "bootstrapAndLiveMode": {
+      "hasBootToken": true,
+      "modeText": "SERVICE: LIVE · contractVersion=0.2 · liveExecutionAvailable=true",
+      "sseText": "SSE v0.2: Connected (snapshotSeq=2, seq=2)",
+      "mockControlButtons": 0,
+      "repoCount": 1,
+      "selectedRepoId": "f249856e-6601-48e3-be6b-db73331d96a7"
+    },
+    "decomposeAndCreate": {
+      "draftPreview": {
+        "hasPlan": true,
+        "subtaskCodes": [
+          "SUB-01:implementation"
+        ]
+      },
+      "createdTaskState": {
+        "taskId": "abd6b603-c87d-4907-8e4e-f30cbbeeb5f8",
+        "status": "running",
+        "subtaskCodes": [
+          "FINAL-REVIEW",
+          "SUB-01"
+        ],
+        "runCount": 1
+      }
+    },
+    "pauseResumeMessageAndValidation": {
+      "pauseInitiated": "pausing",
+      "pausedConverged": "paused",
+      "msgCountAfterSend": 1,
+      "waitingApprovalState": {
+        "taskStatus": "waiting_approval",
+        "pendingApprovals": [
+          {
+            "id": "f388d3e7-3ab2-4efe-a498-61754e2213a4",
+            "version": 1,
+            "createdAt": "2026-11-03T00:42:59.823Z",
+            "updatedAt": "2026-11-03T00:42:59.823Z",
+            "executionMode": "live",
+            "taskId": "abd6b603-c87d-4907-8e4e-f30cbbeeb5f8",
+            "subtaskId": "78b83a14-bf4d-489b-aef4-9d9d1dc63d32",
+            "runId": "7e429e92-99c7-4aba-9653-b1bf965de1cb",
+            "actionType": "final_delivery",
+            "actionDigest": "5bfb8b21ae6c03a30f08efbe649de62acdebafd32cfde63bfca9e820e66ef4c9",
+            "summary": "Final delivery: Python 智能车视觉识别系统（赛道识别 + 障碍物检测 + 测试与文档）",
+            "status": "pending",
+            "expiresAt": "2026-11-03T01:12:59.823Z",
+            "artifactRefs": [
+              "23a2442c-7779-4b14-b48b-eb98d0895f68",
+              "7093dddd-e790-4ee5-8bee-4e80ccc239a7",
+              "c39d4c3c-7f66-43aa-9c47-786c99ef086a",
+              "d6dd766d-676b-4c1b-8d20-e3c323db5e35",
+              "ea1780ec-c8d6-45fa-bf46-43a3d545dd25"
+            ],
+            "diffArtifactId": "7093dddd-e790-4ee5-8bee-4e80ccc239a7",
+            "decidedAt": null,
+            "decidedBy": null
+          }
+        ],
+        "validations": [
+          {
+            "criterionId": "ac-clamp-01",
+            "status": "passed",
+            "exitCode": 0
+          },
+          {
+            "criterionId": "ac-1",
+            "status": "passed",
+            "exitCode": 0
+          }
+        ],
+        "artifacts": [
+          {
+            "id": "ea1780ec-c8d6-45fa-bf46-43a3d545dd25",
+            "category": "diff",
+            "relativePath": "SUB-01-attempt-1.diff"
+          },
+          {
+            "id": "d6dd766d-676b-4c1b-8d20-e3c323db5e35",
+            "category": "code",
+            "relativePath": "src/clamp.ts"
+          },
+          {
+            "id": "23a2442c-7779-4b14-b48b-eb98d0895f68",
+            "category": "test_report",
+            "relativePath": "SUB-01-clamp.json"
+          },
+          {
+            "id": "7093dddd-e790-4ee5-8bee-4e80ccc239a7",
+            "category": "diff",
+            "relativePath": "FINAL-REVIEW-attempt-1.diff"
+          },
+          {
+            "id": "c39d4c3c-7f66-43aa-9c47-786c99ef086a",
+            "category": "test_report",
+            "relativePath": "FINAL-REVIEW-clamp.json"
+          }
+        ]
+      }
+    },
+    "sseCursorRecovery": {
+      "sseConnected": true,
+      "badge": "SSE v0.2: Connected (snapshotSeq=46, seq=54)",
+      "snapshotSeq": 54
+    },
+    "artifactCenter": {
+      "artifactCount": 5,
+      "hasReportJson": true,
+      "hasDiffText": true,
+      "downloadButtons": 5
+    },
+    "approvalAndReworkLifecycle": {
+      "conflictStatus": 409,
+      "afterReject": {
+        "rejectedStatus": "rejected",
+        "taskStatus": "waiting_approval",
+        "hasExplicitReworkBtn": true
+      },
+      "afterExplicitRework": {
+        "totalApprovals": 2,
+        "pendingId": "228a5b22-19be-4d61-97bb-0a57bdd19c31",
+        "pendingDigest": "55f64e84a989652535937b3d43d1a5ec13c1040d0244b36a381e1b07eebba9ab"
+      },
+      "finalApprovedState": {
+        "taskStatus": "succeeded",
+        "progressPct": 100,
+        "approvalStatuses": [
+          "rejected",
+          "approved"
+        ]
+      },
+      "pendingInvalidatedByRework": {
+        "taskStatus": "running",
+        "invalidatedStatus": "invalidated",
+        "hasRunningAttempt2": true
+      }
+    },
+    "cancelAndDrainedLogs": {
+      "task2ReworkRunning": {
+        "taskStatus": "running",
+        "invalidatedStatus": "invalidated",
+        "hasRunningAttempt2": true
+      },
+      "task2Cancelled": {
+        "taskStatus": "cancelled",
+        "runStatus": "cancelled",
+        "logCount": 2,
+        "hasDrainedLog": false
+      }
+    }
+  },
+  "consoleErrors": [],
+  "pageExceptions": []
+}

@@ -1,0 +1,2936 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import {
+  AlertTriangle,
+  Archive,
+  ArchiveRestore,
+  CheckCircle2,
+  CircleDot,
+  Copy,
+  FolderGit2,
+  FolderOpen,
+  Folder,
+  GitBranch,
+  GitCompare,
+  GitPullRequest,
+  Import,
+  Mail,
+  MailOpen,
+  Play,
+  PlayCircle,
+  Settings,
+  Square,
+  TimerOff,
+  Trash2,
+  Workflow,
+  X,
+  type LucideIcon,
+} from "lucide-react";
+import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { parseIssueUrl } from "../shared/issue-task.ts";
+import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { Column } from "@/components/kanban/Column";
+import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
+import { DiffDialog } from "@/components/kanban/DiffDialog";
+import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
+import { UsageMeter } from "@/components/usage/UsageMeter";
+import { UsagePopover } from "@/components/usage/UsagePopover";
+import { visibleTopbarAgents } from "@/lib/usage";
+import { KanbanFilters } from "@/components/kanban/KanbanFilters";
+import { isMacPlatform } from "@/lib/platform";
+import { activeLeaveGuard } from "@/lib/leave-guard";
+import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
+import { NewTaskForm } from "@/components/kanban/NewTaskForm";
+import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
+import { useAgentProfiles } from "@/lib/agent-profiles";
+import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
+import { discardBoardDeparture, recordBoardDeparture, restoreBoardScroll, saveBoardScroll } from "@/lib/board-scroll";
+import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
+import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
+import { ThemeProvider, useTheme } from "@/components/theme-provider";
+import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
+import { CoreBusyBanner } from "@/components/CoreBusyBanner";
+import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
+import { UpdateBanner } from "@/components/updater/UpdateBanner";
+import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
+import { ImportSessionsDialog } from "@/components/kanban/ImportSessionsDialog";
+import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
+import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
+import type { UpdateSnapshot } from "@/lib/api";
+import { useConfirm } from "@/components/ui/confirm";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
+import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
+import { PendingInputTracker } from "@/lib/pending-input-tracker";
+import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
+import { findTaskById } from "@/lib/notification-open";
+import { publishCloneProgress } from "@/lib/clone-progress";
+import { publishBackgroundStatus } from "@/lib/background";
+import { QuitConfirmDialog } from "@/components/QuitConfirmDialog";
+import type { QuitRequestEvent } from "@/lib/quit-dialog";
+import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
+import { parseThemePreference } from "@/lib/theme";
+import { parsePullNumber } from "@/lib/pr-url";
+import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
+import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
+import { cn } from "@/lib/utils";
+import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
+import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
+import type { SettingsSectionId } from "@/lib/settings-dialog-view";
+import { reconcileById } from "@/lib/reconcile";
+import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
+import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
+import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
+import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
+
+/** The `pipelineParentId` a `GlobalEvent` carries when it concerns a hidden
+ *  pipeline STEP task — the orchestrator stamps it on the `run-status`/
+ *  `column`/`interaction`/`files-sent`/`fx-auto-resume` kinds (the
+ *  `update`/`pipeline` kinds never carry one). The polled task list is the
+ *  caller's fallback for an older core (or a row not yet polled in). */
+function stepParentIdOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentId" in ev)) return null;
+  return ev.pipelineParentId ? ev.pipelineParentId : null;
+}
+
+/** The parent title the core stamped next to `pipelineParentId` — what a
+ *  retargeted toast falls back to before the polled list has the parent. */
+function stepParentTitleOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentTitle" in ev)) return null;
+  return ev.pipelineParentTitle ? ev.pipelineParentTitle : null;
+}
+
+/** Subtitle for a step task's toast once it's retargeted at its pipeline
+ *  parent (M-A3): the step's own name. A step row's title is
+ *  `<pipeline name> · <step name>` (`pipeline-runner.ts`), so the
+ *  pipeline-name prefix is trimmed whenever the parent's run confirms it —
+ *  the parent's title already leads the toast. */
+function stepSubtitle(step: Task | undefined, parent: Task | undefined): string | undefined {
+  if (!step) return undefined;
+  const prefix = parent?.pipelineRun?.pipelineName;
+  const sep = " · ";
+  if (prefix && step.title.startsWith(`${prefix}${sep}`)) return step.title.slice(prefix.length + sep.length);
+  return step.title;
+}
+
+/**
+ * Floating top-right error toast. Auto-dismisses after 6s; the user can
+ * also close it manually. Renders mounted with a translate animation so a
+ * rapid succession of errors doesn't snap-jitter the layout.
+ */
+function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () => void }) {
+  // Hold the last non-null message so the exit animation has something to
+  // render after the parent clears the error.
+  const [shown, setShown] = useState<string | null>(error);
+  useEffect(() => {
+    if (error) setShown(error);
+    if (!error) return;
+    const t = setTimeout(onDismiss, 6000);
+    return () => clearTimeout(t);
+  }, [error, onDismiss]);
+  // Drop the stale message ~250ms after dismissal so the slide-out completes
+  // before the node unmounts.
+  useEffect(() => {
+    if (error) return;
+    if (!shown) return;
+    const t = setTimeout(() => setShown(null), 250);
+    return () => clearTimeout(t);
+  }, [error, shown]);
+  if (!shown) return null;
+  return (
+    <div
+      role="alert"
+      className={cn(
+        "fixed top-14 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
+        error ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-2 opacity-0",
+      )}
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden />
+      <span className="min-w-0 flex-1 whitespace-pre-wrap text-foreground">{shown}</span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss error"
+        className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+/** Muted one-line hints shown in empty columns while onboarding's checklist
+ *  is visible (see `Column`'s `emptyHint` prop). Review/done intentionally
+ *  have no entry — an empty Review/Done column needs no explanation. */
+const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
+  backlog: "Ideas you haven't queued yet",
+  ready: "Tasks return here when a run needs another go",
+  running: "Agents working right now",
+  blocked: "Needs your attention",
+};
+
+/** One icon per `TaskMenuAction`, for the task context menu built from
+ *  `buildTaskContextMenu`'s pure entries (see the `taskMenuItems` memo
+ *  below). Keyed exhaustively so a new action added to the union surfaces
+ *  as a type error here instead of rendering an icon-less menu item. */
+const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
+  open: FolderOpen,
+  "open-pipeline": Workflow,
+  start: Play,
+  stop: Square,
+  "resume-recovery": PlayCircle,
+  "cancel-auto-resume": TimerOff,
+  "mark-done": CheckCircle2,
+  archive: Archive,
+  unarchive: ArchiveRestore,
+  diff: GitCompare,
+  "open-in-finder": Folder,
+  "view-pr": GitPullRequest,
+  "view-issue": CircleDot,
+  "mark-read": MailOpen,
+  "mark-unread": Mail,
+  "copy-branch": GitBranch,
+  "copy-worktree-path": Copy,
+  delete: Trash2,
+};
+
+/**
+ * Full-page view state (D5, `docs/plans/pipelines.md`) — the first true
+ * page-swap in the app. `board` is today's kanban board; `pipelines` is the
+ * pipelines list (`pipelineId: null`) or the canvas editor for one pipeline
+ * (`editing: true`, `pipelineId` the pipeline being edited or `null` for a
+ * blank draft); `pipeline-run` is the full-page live run view for one
+ * pipeline TASK (`taskId`, not a pipeline id). The header/NewTaskForm/
+ * dialogs/RunPanel/context menu stay mounted regardless of `view` — only
+ * `<main>`'s board-vs-page content swaps.
+ */
+type AppView =
+  | { kind: "board" }
+  | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
+  | { kind: "pipeline-run"; taskId: string };
+
+/** The `key` a view's page mounts under in the AnimatePresence below: two
+ *  views with the same key render the same page instance, so switching
+ *  between them unmounts nothing (the pipelines list ignores `pipelineId`). */
+function viewMountKey(view: AppView): string {
+  switch (view.kind) {
+    case "board":
+      return "board";
+    case "pipelines":
+      return view.editing ? `pipelines-editor-${view.pipelineId ?? "new"}` : "pipelines-list";
+    case "pipeline-run":
+      return `pipeline-run-${view.taskId}`;
+  }
+}
+
+/**
+ * The actual app tree. Split out from the default-exported `App` so it can
+ * live *inside* `<ThemeProvider>` and call `useTheme()` — the provider must
+ * wrap this component, not be called from within it.
+ */
+function AppInner() {
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+  const { setPercent: setFontSizePercent, percentRef: fontSizePercentRef, hasUserAdjustedRef: fontSizeUserAdjustedRef } = useFontSize();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [agents, setAgents] = useState<AgentStatus[]>([]);
+  const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  // True once `/harnesses` has resolved at least once — lets onboarding's
+  // harness step tell "not loaded yet" (skip the disabled/enabled
+  // distinction) apart from "loaded, and it happens to be empty".
+  const [harnessesLoaded, setHarnessesLoaded] = useState(false);
+  // Module-cached agent-profile list, shared with every mounted picker
+  // (NewTaskForm, RunPanel's header chip + task-details lock) so switching
+  // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
+  // `useAgentProfiles`'s own doc comment.
+  const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], opencode: [], copilot: [] });
+  // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
+  // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
+  // the first `GET /agent-models/harnesses` reports `ready: true`, which is
+  // what the ready-retry effect below polls for (closes the boot race where
+  // the webview's first fetch can race the sweep's own first probe).
+  const [harnessModels, setHarnessModels] = useState<HarnessModelMap["byHarness"]>({});
+  const [discoveryReady, setDiscoveryReady] = useState(false);
+  // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
+  // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
+  // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler
+  // below) — no polling here, the Bun-side poller drives freshness.
+  const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
+  const [selected, setSelected] = useState<Task | null>(null);
+  // One-shot "land on this subagent's tab" request for the run panel — set
+  // by the pipeline run view's satellite details ("Open transcript"), see
+  // `RunPanel`'s `focusSubagent` prop. `taskId` is the step task the request
+  // targets; `consumed` flips once the panel has actually selected the tab
+  // (`onFocusSubagentConsumed` below) — tracked HERE, in App state, rather
+  // than in a ref inside `RunPanelBody`, so a body remount can never replay
+  // an already-honoured nonce. The request stays non-null (consumed or not)
+  // for as long as that step task is the open panel — that's what keeps the
+  // panel's subagent tab strip visible for a finished helper — and is
+  // cleared the moment the panel closes or opens a different task (M-A2).
+  const [focusSubagent, setFocusSubagent] = useState<{ taskId: string; id: string; nonce: number; consumed: boolean } | null>(null);
+  const onFocusSubagentConsumed = useCallback((nonce: number) => {
+    setFocusSubagent((cur) => (cur && cur.nonce === nonce && !cur.consumed ? { ...cur, consumed: true } : cur));
+  }, []);
+  // Full-page view — see `AppView`'s doc comment above.
+  const [view, setView] = useState<AppView>({ kind: "board" });
+  const [diffTask, setDiffTask] = useState<Task | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [textQuery, setTextQuery] = useState("");
+  const [repoFilter, setRepoFilter] = useState<string[]>([]);
+  const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
+  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
+  const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Missing preference intentionally resolves to sticky so existing users
+  // retain the last-sent-message reminder until they opt into the standard
+  // scrolling chat list in Settings.
+  const [stickyUserMessages, setStickyUserMessages] = useState(true);
+  // fx auto-resume prefs (`FX_AUTO_RESUME_PREF` / `FX_AUTO_RESUME_DELAY_PREF`
+  // — see `docs/plans/fx-recovery-follow-ups.md` §3). Missing preferences
+  // resolve to "on" / the default delay via `parseFxAutoResumePrefs`, same
+  // shape the orchestrator reads at schedule time.
+  const [fxAutoResumePrefs, setFxAutoResumePrefs] = useState(() => parseFxAutoResumePrefs({}));
+  // Section the Settings dialog should land on when it next opens — set by
+  // onboarding's "Enable in Settings…" deep link, cleared on close so the
+  // plain gear-icon open still lands on General.
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSectionId | undefined>(undefined);
+  // Agent profile whose edit subpage the Settings dialog should open on —
+  // set only by the "Edit in Settings" buttons (task-details Agent row,
+  // pipeline subagent satellite), cleared on every close/other open path so a
+  // later "Manage agents…" or gear open lands on the plain list.
+  const [settingsInitialAgentId, setSettingsInitialAgentId] = useState<string | null>(null);
+  // --- Onboarding (docs/plans/onboarding-first-run.md) ---------------------
+  // Server preference mirror. `undefined` = never fetched OR never set;
+  // `resolveOnboardingVisibility` treats those the same (both gate on
+  // `prefsLoaded` below), so no separate "not yet fetched" sentinel is
+  // needed here.
+  const [onboardingDismissedPref, setOnboardingDismissedPref] = useState<string | undefined>(undefined);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  // Saved pipelines (mirrors `useAgentProfiles`), shared with the New Task
+  // picker and Settings → Pipelines. Gated on `prefsLoaded` on purpose: this
+  // hook's fetch effect is declared before the boot `listPreferences` effect
+  // below, so an ungated `/pipelines` request went out ahead of the theme
+  // preference read and — under the browser's per-host connection cap, with
+  // two SSE channels already open — delayed the `dark` class past first
+  // paint (e2e/theme.spec.ts caught it). Nothing on the board needs the
+  // pipelines list in that first window.
+  const { pipelines, loaded: pipelinesLoaded, refresh: refreshPipelines } = usePipelines({ enabled: prefsLoaded });
+  // First successful /tasks fetch — `resolveOnboardingVisibility`'s `loaded`
+  // must not fire before this, or a genuinely-empty fresh board could flash
+  // the welcome dialog for a beat before the first real fetch lands (same
+  // class of bug the boot-splash minimum-dwell guards against elsewhere).
+  const [tasksLoaded, setTasksLoaded] = useState(false);
+  // First successful `/projects` fetch — mirrors `tasksLoaded`/
+  // `harnessesLoaded`. Onboarding's "project" step needs a live projects
+  // list (added mid-session via NewTaskForm) to ever be able to check off,
+  // and gating on this (rather than assuming the boot-time fetch is enough)
+  // keeps the compact-strip flash guard consistent: a transient poll
+  // failure just delays onboarding rather than flashing it early.
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  // "Get started" in WelcomeDialog is session-only (doesn't write the
+  // server pref) — only "Skip" and the checklist's own dismiss persist.
+  const [welcomeAcknowledged, setWelcomeAcknowledged] = useState(false);
+  // Nonce bumped by onboarding's "Choose a project…" / "Create your first
+  // task" actions — NewTaskForm reacts to increments (expand + focus Title).
+  const [newTaskFocusNonce, setNewTaskFocusNonce] = useState(0);
+  const [githubOpen, setGithubOpen] = useState(false);
+  // Set by RunPanel's "Open PR" chip to open GitHubDialog pre-seeded for a
+  // specific task; cleared when the dialog closes so a later plain "GitHub"
+  // open (no prefill) doesn't inherit a stale project/task.
+  const [githubPullPrefill, setGithubPullPrefill] = useState<GitHubPullPrefill | null>(null);
+  // Set by RunPanel's "View PR" / "View issue" header affordances to open
+  // GitHubDialog straight on that item's detail subpage; cleared alongside
+  // `githubPullPrefill` above (dialog close, or the other prefill kind
+  // winning a race) so only one prefill kind is ever live at a time.
+  // Generalized from the PR-only `GitHubPullDetailPrefill` (was
+  // `githubPullDetailPrefill`) so pulls and issues share one mechanism —
+  // see `GitHubItemDetailPrefill`'s doc comment in GitHubDialog.tsx.
+  const [githubItemDetailPrefill, setGithubItemDetailPrefill] = useState<GitHubItemDetailPrefill | null>(null);
+  const [worktreesOpen, setWorktreesOpen] = useState(false);
+  const [importSessionsOpen, setImportSessionsOpen] = useState(false);
+  // Pending `quit_request` (Cmd+Q / window close with runs active); null = closed.
+  const [quitRequest, setQuitRequest] = useState<QuitRequestEvent | null>(null);
+  const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
+  const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
+  const [homeDir, setHomeDir] = useState<string>("");
+  // Active data dir resolved server-side (~/.agetor for the packaged .app,
+  // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
+  // SettingsDialog so new-harness HOME suggestions point under the current
+  // data dir instead of always hard-coding the prod tree.
+  const [dataDir, setDataDir] = useState<string>("");
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const confirm = useConfirm();
+
+  // True while the pipeline canvas editor has unsaved changes — set via the
+  // `onDirtyChange` prop `<PipelineEditor>` calls below (m2,
+  // docs/plans/pipelines.md review). `navigate` below is the single place
+  // that reads it: PipelineEditor's own Back button already runs its own
+  // confirm-then-`onBack` before ever reaching `navigate`, so `onBack`/
+  // `onSaved` still call `setView` directly (a second confirm there would
+  // double-prompt) — every OTHER way to leave the editor (header button,
+  // Settings' "Open pipelines"/"Edit"/"New pipeline", a toast's onOpen,
+  // `openPipelineRun`, Escape) goes through `navigate` instead.
+  const [pipelineEditorDirty, setPipelineEditorDirty] = useState(false);
+  // Mirrored into refs so `navigate` below can read the latest `view`/
+  // `pipelineEditorDirty` without depending on them directly — keeping
+  // `navigate` (and everything chained off it: `openPipelineRun`,
+  // `openTask`) referentially stable across renders, same idiom as
+  // `tasksRef`/`selectedIdRef` elsewhere in this file. Without this, a
+  // `view`-keyed `navigate` would change identity on every navigation,
+  // which would in turn destabilize `openTask`/`openPipelineRun` — both
+  // passed to memoized `Column`/`TaskCard` and read by effect dep arrays
+  // that assume a stable identity.
+  const viewRef = useRef(view);
+  useEffect(() => { viewRef.current = view; }, [view]);
+  const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
+  useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
+  /** The view switch behind `navigate`, past the leave guards (below): the
+   *  pipeline editor's own guard, then the switch. Reads refs, so it's
+   *  stable like `navigate`. `onNavigated` runs right after the switch
+   *  commits (synchronously, or once the discard-confirm is accepted) and
+   *  never when that confirm is cancelled. */
+  const switchView = useCallback((next: AppView, onNavigated?: () => void) => {
+    const current = viewRef.current;
+    if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
+      void confirm({
+        title: "Discard unsaved pipeline changes?",
+        confirmLabel: "Discard",
+        cancelLabel: "Keep editing",
+        variant: "destructive",
+      }).then((ok) => {
+        if (!ok) return;
+        setPipelineEditorDirty(false);
+        setView(next);
+        onNavigated?.();
+      });
+      return;
+    }
+    setView(next);
+    onNavigated?.();
+  }, [confirm]);
+  /** Central app-level navigation: switches `view`, confirming first when
+   *  leaving the pipeline editor with unsaved changes. Every `view` change
+   *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
+   *  handle — or don't need — the guard themselves, see
+   *  `pipelineEditorDirty` above) must go through this rather than calling
+   *  `setView` directly, so a stray click while mid-edit can't silently
+   *  discard the draft. `onNavigated` runs right after the view switch
+   *  commits (synchronously, or once a discard-confirm is accepted) and
+   *  never when a confirm is cancelled — so whatever a landing opens on
+   *  top of the new view (a step's run panel, or closing a leftover one)
+   *  can't land over work the user chose to keep. */
+  const navigate = useCallback((next: AppView, onNavigated?: () => void) => {
+    const current = viewRef.current;
+    // Unsaved work elsewhere that this view switch would unmount (an edited
+    // import preview on the Pipelines page — lib/leave-guard.ts) asks first;
+    // a switch that keeps the same page mounted unmounts nothing.
+    const guard = viewMountKey(next) === viewMountKey(current) ? null : activeLeaveGuard();
+    if (guard) {
+      void confirm({
+        title: guard.title,
+        description: guard.description,
+        confirmLabel: "Discard",
+        variant: "destructive",
+      }).then((ok) => {
+        if (!ok) return;
+        // Drop the guarded work first (closes the import dialog now) so it
+        // doesn't linger over the old view's exit animation.
+        guard.discard?.();
+        switchView(next, onNavigated);
+      });
+      return;
+    }
+    switchView(next, onNavigated);
+  }, [confirm, switchView]);
+  /** What a step-resolving pipeline landing (`openPipelineAttention`,
+   *  `openPipelineStep`) does to the run panel once its view switch
+   *  commits: with a `step`, open that step (keeping a pending subagent-
+   *  focus request only if it's for that same step); without one (nothing
+   *  needs the user, or the row isn't polled in yet), close a leftover
+   *  panel from ANOTHER task but keep a step panel of this same pipeline
+   *  (`parentId`) — and its subagent-focus request — open, so a toast or
+   *  OS-notification click about the pipeline the user is already reading
+   *  never closes the step under them.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. Stable identity. */
+  const landOnPipeline = useCallback((parentId: string, step: Task | null) => {
+    if (step) {
+      setFocusSubagent((f) => (f && f.taskId === step.id ? f : null));
+      setSelected(step);
+      return;
+    }
+    setSelected((cur) => (cur && cur.pipelineParentId === parentId ? cur : null));
+    setFocusSubagent((f) => {
+      if (!f) return f;
+      const row = tasksRef.current.find((t) => t.id === f.taskId);
+      return row?.pipelineParentId === parentId ? f : null;
+    });
+  }, []);
+  /** Switch the app-level `view` to a pipeline TASK's live run view — the
+   *  card-open / context-menu / RunPanel-strip destination for a pipeline
+   *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
+   *  (rather than beside its sibling `openPipelinesPage`/`openTask`
+   *  further down) because the app-wide global-events subscription effect
+   *  below reads it. Routes through `navigate` (m2) so leaving a dirty
+   *  editor for a run view still confirms. A run-view-only landing also
+   *  closes whatever run panel was left open (another task's, or a step of
+   *  this same pipeline), so the run view isn't covered by something the
+   *  user didn't ask to see — the attention paths that DO open a step go
+   *  through `openPipelineAttention` instead. The same-pipeline case is
+   *  deliberate: RunPanel's own "Open pipeline" strip button lands here,
+   *  and must reveal the run view that step panel is covering. The
+   *  step-named toasts that must NOT close the step being read go through
+   *  `openPipelineStep`. `opts.fromBoardCard` is passed only by the board
+   *  card paths (`openTaskFromBoard`, the context menu's Open pipeline): it
+   *  records the card as the board's departure once the navigation commits,
+   *  so the first return to the board can reveal it (`lib/board-scroll.ts`).
+   *  Every other caller stays flag-less, which is what lets a non-card hop
+   *  while away keep the original card's record (D8). */
+  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean }) => {
+    navigate({ kind: "pipeline-run", taskId }, () => {
+      if (opts?.fromBoardCard) recordBoardDeparture(taskId);
+      setFocusSubagent(null);
+      setSelected(null);
+    });
+  }, [navigate]);
+  /** The "attention" landing for a pipeline PARENT — its card's amber
+   *  Answer/Review button, the "Waiting on you" / "Pipeline needs you"
+   *  toasts and the OS-notification click: the run view PLUS the run panel
+   *  of the step that needs the user, in one click. The step is resolved
+   *  only once the navigation commits (`navigate`'s `onNavigated`, so a
+   *  cancelled discard-confirm opens nothing), from already-polled state —
+   *  `opts.tasks` when the caller just fetched a fresher list, else
+   *  `tasksRef` — via `pipelineAttentionStepTask` (`opts.stepTaskId` pins
+   *  the step a toast announced). Nothing resolvable (only run-level
+   *  blocks, or a step row not polled in yet) lands on the run view alone,
+   *  closing another task's leftover panel but keeping a step panel of
+   *  this same pipeline (`landOnPipeline`). Landing on a step
+   *  also dismisses the parent-keyed pending toast — the panel-open
+   *  dismissal effect below is keyed on the STEP id, so it would miss it.
+   *  `tasksRef` is declared further down; it's only read inside the
+   *  callback, by which time it exists. `opts.fromBoardCard` is passed only
+   *  by the card's own Answer/Review button (`openAttention`) and records
+   *  the board departure, like `openPipelineRun`'s. Stable identity. */
+  const openPipelineAttention = useCallback(
+    (parentId: string, opts?: { stepTaskId?: string; tasks?: readonly Task[]; fromBoardCard?: boolean }) => {
+      navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+        if (opts?.fromBoardCard) recordBoardDeparture(parentId);
+        const list = opts?.tasks ?? tasksRef.current;
+        const parent = list.find((t) => t.id === parentId);
+        const step = parent ? pipelineAttentionStepTask(parent, list, opts?.stepTaskId) : null;
+        landOnPipeline(parentId, step);
+        if (step) dismissPending(parentId);
+      });
+    },
+    [navigate, landOnPipeline],
+  );
+  /** A step-NAMED, non-attention landing — the retargeted `files-sent` /
+   *  `fx-auto-resume` toasts: the run view plus the panel of the step the
+   *  toast is about (its sent-files card, its paused-recovery notice),
+   *  whether or not that step needs the user. Unlike
+   *  `openPipelineAttention` it never re-resolves to another step and
+   *  doesn't itself dismiss the parent's "Waiting on you" toast — this
+   *  toast isn't about a question. (The panel-open dismissal effect below
+   *  still clears it when the named step is itself asking, same as opening
+   *  that step any other way.) A step row not polled in yet lands on the
+   *  run view alone (same `landOnPipeline` rules). Stable identity. */
+  const openPipelineStep = useCallback((parentId: string, stepTaskId: string) => {
+    navigate({ kind: "pipeline-run", taskId: parentId }, () => {
+      const row = tasksRef.current.find((t) => t.id === stepTaskId && t.pipelineParentId === parentId);
+      landOnPipeline(parentId, row ?? null);
+    });
+  }, [navigate, landOnPipeline]);
+  /** Card click / row-open handler for every task in the board and every
+   *  other list that opens a task (Worktrees dialog, etc. still call
+   *  `setSelected` directly where a run panel is always the right target,
+   *  e.g. a step task). A pipeline PARENT task (`task.pipelineId` set)
+   *  opens the full-page run view instead of the run panel (D5); every
+   *  other task opens the run panel as before. Declared here (rather than
+   *  beside `onFocusNewTask` further down) so the app-events subscription
+   *  effect below — and the native-notification `open_task` deep link
+   *  handler in particular (m5) — can call it instead of duplicating the
+   *  pipelineId branch inline. Stable identity — passed to `Column`/
+   *  `TaskCard`, both memoized (see the `useCallback` block comment further
+   *  down). */
+  const openTask = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineRun(t.id);
+      return;
+    }
+    // A plain open never carries a subagent-focus request — clear any
+    // stale one so it can't force the tab strip on the wrong task (M-A2).
+    setFocusSubagent(null);
+    setSelected(t);
+  }, [openPipelineRun]);
+  /** A board card's body and its Open buttons (`TaskCard`'s `onOpen`):
+   *  exactly `openTask`, except a pipeline PARENT also records the card as
+   *  the board's departure (`fromBoardCard`), so the first return to the
+   *  board can reveal it. Board cards only — every other `openTask` caller
+   *  (toasts, OS notification, Worktrees) stays flag-less, which is why the
+   *  card origin can't be inferred inside `openTask` itself. Stable
+   *  identity — passed to the memoized `Column`/`TaskCard`. */
+  const openTaskFromBoard = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineRun(t.id, { fromBoardCard: true });
+      return;
+    }
+    openTask(t);
+  }, [openPipelineRun, openTask]);
+  /** The card's amber "waiting on you" button (`TaskCard`'s
+   *  `onOpenAttention` — its only caller): a pipeline PARENT lands on its
+   *  run view plus the step that needs the user (`openPipelineAttention`,
+   *  recording the card as the board's departure), while the card body and
+   *  its plain Open button keep browsing the run view alone
+   *  (`openTaskFromBoard`). Any other task opens exactly like `openTask`.
+   *  Stable identity — passed to the memoized `Column`/`TaskCard`. */
+  const openAttention = useCallback((t: Task) => {
+    if (t.pipelineId) {
+      openPipelineAttention(t.id, { fromBoardCard: true });
+      return;
+    }
+    openTask(t);
+  }, [openPipelineAttention, openTask]);
+  /** The board's `.kanban-scroll` element while it is mounted (`null` while
+   *  another page is shown), for the fast-return guard below. */
+  const boardScrollerElRef = useRef<HTMLDivElement | null>(null);
+  /** Callback ref for `.kanban-scroll`: restores the board's saved scroll
+   *  position (and reveals the departure card) every time the board mounts
+   *  again — `<AnimatePresence mode="wait">` mounts it only after the
+   *  leaving page's exit, so `navigate` can't do it. Its identity must be
+   *  stable: a new ref on every render would re-run the restore on each 2 s
+   *  task poll and yank the board back mid-scroll. `restoreBoardScroll` is
+   *  idempotent, so StrictMode's double ref call is harmless. */
+  const boardScrollerRef = useCallback((el: HTMLDivElement | null) => {
+    boardScrollerElRef.current = el;
+    if (el) restoreBoardScroll(el);
+  }, []);
+  // Fast-return guard: when `view` flips back to the board while the leaving
+  // board is still mounted (Escape inside the 0.18 s exit), motion may keep
+  // or re-enter that element without a remount, so the departure would never
+  // be consumed and would fire on some later return. On a normal return the
+  // board isn't mounted yet at this commit (the ref is `null`), and on a
+  // normal remount the ref already consumed the record in this same commit
+  // (children's refs attach before this layout effect), so both are no-ops.
+  useLayoutEffect(() => {
+    if (view.kind === "board" && boardScrollerElRef.current?.isConnected) discardBoardDeparture();
+  }, [view.kind]);
+
+  // Fade out the boot splash (defined in index.html) once React has mounted,
+  // with a minimum dwell so fast machines don't flash a 200ms splash. Not
+  // gated on API fetches — a stuck Bun side shouldn't trap the user behind
+  // the logo.
+  useEffect(() => {
+    const splash = document.getElementById("splash");
+    if (!splash) return;
+    const MIN_DWELL_MS = 800;
+    const FADE_MS = 350;
+    const remaining = Math.max(0, MIN_DWELL_MS - performance.now());
+    const hideTimer = setTimeout(() => splash.classList.add("is-hidden"), remaining);
+    const removeTimer = setTimeout(() => splash.remove(), remaining + FADE_MS);
+    return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
+  }, []);
+
+  // Reconcile the theme preference from the server once at boot. The boot
+  // hash (read by ThemeProvider before this component even mounts) is
+  // authoritative for first paint — this only catches the DB having been
+  // edited out-of-band since then, so on the normal path `themePreference`
+  // already matches and this is a silent no-op (no flash).
+  // Reconcile the font-size preference from the same fetch, for the same
+  // reason as theme above: the boot channel (window.__AGETOR / hash, read
+  // synchronously by FontSizeProvider before this component even mounts) is
+  // authoritative for first paint — this only catches the DB having been
+  // edited out-of-band since then. Unlike theme, this compares against a
+  // *live* ref (`fontSizePercentRef`) rather than the `fontSizePercent`
+  // value this effect's closure would otherwise capture at mount — by the
+  // time this async `.then()` resolves, a fast Cmd+= press could already
+  // have moved the real state past that stale snapshot. It also bails
+  // entirely once the user has touched the shortcut at all
+  // (`fontSizeUserAdjustedRef`), since at that point a possibly-stale DB
+  // read racing the user's own change should never win.
+  useEffect(() => {
+    api.listPreferences().then((prefs) => {
+      const dbTheme = parseThemePreference(prefs.theme);
+      if (dbTheme !== themePreference) setThemePreference(dbTheme);
+      if (!fontSizeUserAdjustedRef.current) {
+        const dbFontSize = clampFontSizePercent(prefs.fontSize);
+        if (dbFontSize !== fontSizePercentRef.current) setFontSizePercent(dbFontSize);
+      }
+      // Onboarding's dismissal flag piggybacks on this same fetch — no
+      // paint-blocking concern (unlike theme/font-size), so a single async
+      // read at boot is enough. `refetchOnboardingPref` (used after Settings
+      // closes) re-reads just this key via the same route.
+      setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
+      setStickyUserMessages(parseStickyUserMessagesPreference(prefs[STICKY_USER_MESSAGES_PREF]));
+      setFxAutoResumePrefs(parseFxAutoResumePrefs(prefs));
+      setPrefsLoaded(true);
+    }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
+    // Run once at boot only — intentionally not re-run when either local
+    // preference changes (that would fight the user's own picker/shortcut).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Re-reads just the onboarding dismissal pref. Called after SettingsDialog
+   *  closes so a "Show getting started guide" replay (which writes the pref
+   *  server-side, then closes the dialog) is reflected without a full
+   *  preferences round-trip through the boot-only effect above. */
+  const refetchOnboardingPref = useCallback(() => {
+    api.listPreferences()
+      .then((prefs) => setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]))
+      .catch(() => { /* keep last known value */ });
+  }, []);
+
+  // Per-task serialized-form cache for `reconcileById` below — see that
+  // function's doc comment. A ref (not state) since it's pure bookkeeping
+  // that must survive across polls without itself triggering a render.
+  const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
+  // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
+  // a tick is skipped while the previous poll of the same kind hasn't
+  // resolved yet, so a slow request never stacks with the next tick's.
+  const refreshPollInFlightRef = useRef(false);
+  const refreshAgentsPollInFlightRef = useRef(false);
+  const refreshProjectsPollInFlightRef = useRef(false);
+  // Ids the last SUCCESSFUL `/tasks` poll listed — the "previous list" for
+  // the in-app toast sweep in `refresh()` below. A task that simply hasn't
+  // been polled yet (just created, not in this set) is never swept.
+  const polledTaskIdsRef = useRef<Set<string> | null>(null);
+
+  /** Re-list tasks. Returns the fetched list so callers that need to inspect a
+   *  task right after a mutation don't have to issue a second GET. `null` on
+   *  failure — the last good snapshot stays rendered and the poll retries. */
+  const refresh = useCallback(async (): Promise<Task[] | null> => {
+    try {
+      const list = await api.listTasks();
+      // `list` (unreconciled) is what callers get back for immediate reads
+      // (e.g. re-checking a just-created task's branch); the reconciled,
+      // identity-preserving version is what actually lands in state.
+      setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
+      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+      // `loaded` input) — set unconditionally on every success, cheap no-op
+      // once already true.
+      setTasksLoaded(true);
+      // Toast-slot sweep (after a SUCCESSFUL poll only): a task whose toast
+      // can no longer be acted on — archived, or listed by the previous poll
+      // and gone from this one — must not keep an in-app toast up. O(n);
+      // `dismissTaskToast` is a Map lookup and a no-op on an empty slot.
+      const prevIds = polledTaskIdsRef.current;
+      const nextIds = new Set<string>();
+      for (const t of list) {
+        nextIds.add(t.id);
+        if (t.archivedAt != null) dismissTaskToast(t.id);
+      }
+      if (prevIds) {
+        for (const id of prevIds) if (!nextIds.has(id)) dismissTaskToast(id);
+      }
+      polledTaskIdsRef.current = nextIds;
+      return list;
+    } catch { return null; /* keep last good snapshot; retry next tick */ }
+  }, []);
+  const refreshAgents = useCallback(async () => {
+    try {
+      const payload = await api.listHarnesses();
+      setHarnesses((prev) => reconcileById(prev, payload.harnesses, (h) => h.id));
+      setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
+      // Harness rows (carries `enabled`) are already fetched here for the
+      // header's status dots — onboarding's harness step reuses this same
+      // state instead of a second fetch, but needs to distinguish "not
+      // loaded yet" from "loaded, zero harnesses" (the latter can't
+      // actually happen — built-ins are always seeded — but the checklist
+      // degrades gracefully either way per its contract).
+      setHarnessesLoaded(true);
+    } catch { /* leave previous state */ }
+  }, []);
+  // Last-serialized-form cache for `agentModels`/`harnessModels`, mirroring
+  // `taskReconcileCacheRef`'s rationale above: the ready-retry (every 2s
+  // until ready), the twice-per-refocus `onVisible`, and every SSE-triggered
+  // refetch would otherwise call `setAgentModels`/`setHarnessModels` with a
+  // brand-new object graph even when the fetched catalog is byte-identical
+  // to what's already rendered — re-rendering `NewTaskForm` and the whole
+  // `RunPanel` for nothing. A plain `JSON.stringify` compare is cheap at
+  // this scale (a handful of harnesses/kinds, once per poll).
+  const agentModelsJsonRef = useRef<string>(JSON.stringify({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] }));
+  const harnessModelsJsonRef = useRef<string>(JSON.stringify({}));
+  const refreshAgentModels = useCallback(async () => {
+    try {
+      const map = await api.listAgentModels();
+      const json = JSON.stringify(map);
+      if (json !== agentModelsJsonRef.current) {
+        agentModelsJsonRef.current = json;
+        setAgentModels(map);
+      }
+    } catch { /* leave previous state */ }
+  }, []);
+  /** Refetch the per-harness catalog. Errors (including a 404 from an old
+   *  daemon that predates this route) are swallowed and leave state as-is —
+   *  `discoveryReady` simply never flips true, and the bounded ready-retry
+   *  effect below gives up after 30 attempts, at which point every picker
+   *  just falls back to `agentModels`' kind-level list (today's behavior).
+   *  Returns the fetched `ready` boolean (or `false` on failure) so the
+   *  ready-retry effect can read the *fresh* value instead of a stale
+   *  closure over `discoveryReady` state — see that effect's comment. */
+  const refreshHarnessModels = useCallback(async (): Promise<boolean> => {
+    try {
+      const map = await api.listHarnessModels();
+      const json = JSON.stringify(map.byHarness);
+      if (json !== harnessModelsJsonRef.current) {
+        harnessModelsJsonRef.current = json;
+        setHarnessModels(map.byHarness);
+      }
+      setDiscoveryReady(map.ready);
+      return map.ready;
+    } catch { /* leave previous state */ return false; }
+  }, []);
+  /** Manual ↻ in a model picker: force a fresh discovery probe (one harness,
+   *  or every enabled harness when omitted), then refetch both maps so the
+   *  picker reflects it immediately rather than waiting on SSE. */
+  const onRefreshModels = useCallback(async (harnessId?: string) => {
+    await api.refreshAgentModels(harnessId);
+    await Promise.all([refreshAgentModels(), refreshHarnessModels()]);
+  }, [refreshAgentModels, refreshHarnessModels]);
+  // Per-project serialized-form cache for `reconcileById` below, mirroring
+  // `taskReconcileCacheRef` — keeps `projects` referentially stable across
+  // polls where nothing actually changed.
+  const projectReconcileCacheRef = useRef(new Map<string, { obj: Project; json: string }>());
+  /** Re-list projects. GET /projects is a cheap DB read, so this rides the
+   *  same 2s poll as `refresh()` — projects added mid-session via
+   *  NewTaskForm now show up without a reload, which onboarding's "project"
+   *  step depends on to ever be able to check off. */
+  const refreshProjects = useCallback(async () => {
+    try {
+      const list = await api.listProjects();
+      setProjects((prev) => reconcileById(prev, list, (p) => p.path, projectReconcileCacheRef.current));
+      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+      // `loaded` input) — set unconditionally on every success, cheap no-op
+      // once already true. A transient failure just delays onboarding
+      // (the poll retries), which is the safe direction.
+      setProjectsLoaded(true);
+    } catch { /* leave previous state; poll retries */ }
+  }, []);
+  useEffect(() => {
+    void refresh();
+    void refreshAgents();
+    void refreshAgentModels();
+    void refreshHarnessModels();
+    void refreshProjects();
+    // Seed the topbar usage tracker with whatever the Bun side last
+    // persisted, so chips show a meter immediately on boot rather than
+    // waiting for the next poll or SSE push. Best-effort — a failure here
+    // just means chips render without a mini-bar until the first
+    // `harness_usage` event arrives.
+    api.getAllUsage()
+      .then((list) => setUsage(Object.fromEntries(list.map((q) => [q.harnessId, q]))))
+      .catch(() => { /* leave empty */ });
+    // Resolve the user's home dir once so SettingsDialog can expand `~/…`
+    // template paths into concrete absolute paths before validation.
+    // `/defaults` is small + local, but a hiccup at boot would now leave
+    // dataDir empty for the whole session — SettingsDialog's "Add harness"
+    // button stays disabled until dataDir is set. Retry every 2s until it
+    // lands; the effect's cleanup clears the timer when App unmounts.
+    let defaultsTimer: ReturnType<typeof setTimeout> | null = null;
+    const fetchDefaults = () => {
+      void api.defaults().then((d) => {
+        setHomeDir(d.home);
+        setDataDir(d.dataDir);
+        defaultsTimer = null;
+      }).catch(() => {
+        defaultsTimer = setTimeout(fetchDefaults, 2_000);
+      });
+    };
+    fetchDefaults();
+    // Prime the update snapshot. SSE is live-only, so without this a
+    // freshly-opened webview wouldn't know about an update that was already
+    // downloaded by the previous main-process tick.
+    api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
+    // Skip poll ticks while the window is hidden — a backgrounded kanban
+    // board has no reason to keep re-fetching + re-rendering every 2s/15s.
+    // The intervals themselves keep running (cheap — it's just the fetch +
+    // setState that's skipped) so there's nothing to re-arm; `visible`
+    // fires an immediate refresh so returning to the window doesn't wait
+    // out a stale tick. This mirrors the existing `flushNow`-on-visible
+    // wiring in RunPanel and is mandatory, not an optimization: WKWebView
+    // suspends rAF (not setInterval) while occluded, but a naive "just
+    // gate the poll" change without an immediate on-return refresh would
+    // reintroduce the same class of "frozen until you nudge the window"
+    // bug previously fixed there.
+    const t = setInterval(() => {
+      if (!document.hidden) {
+        // Skip this tick if the previous `refresh()` poll is still in
+        // flight — see `refreshPollInFlightRef`'s comment above.
+        if (!refreshPollInFlightRef.current) {
+          refreshPollInFlightRef.current = true;
+          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+        }
+        // Same guard, its own ref — a slow `/projects` fetch must not stack
+        // with the next 2s tick either.
+        if (!refreshProjectsPollInFlightRef.current) {
+          refreshProjectsPollInFlightRef.current = true;
+          void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+        }
+      }
+    }, 2000);
+    const a = setInterval(() => {
+      if (!document.hidden && !refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
+    }, 15_000);
+    const onVisible = () => {
+      if (document.hidden) return;
+      // Route through the same in-flight guard the interval poll uses — a
+      // focus/visibility event landing mid-poll must not stack a second
+      // `/tasks` request on top of one already in flight.
+      if (!refreshPollInFlightRef.current) {
+        refreshPollInFlightRef.current = true;
+        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+      }
+      if (!refreshProjectsPollInFlightRef.current) {
+        refreshProjectsPollInFlightRef.current = true;
+        void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+      }
+      if (!refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
+      // fx login (and any other harness auth flow) often happens in a
+      // separate window/terminal — returning focus to agetor should reflect
+      // whatever the account's catalog looks like now, not whatever it was
+      // when the window last had focus.
+      void refreshAgentModels();
+      void refreshHarnessModels();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      clearInterval(t);
+      clearInterval(a);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      if (defaultsTimer) clearTimeout(defaultsTimer);
+    };
+  }, [refresh, refreshAgents, refreshAgentModels, refreshHarnessModels, refreshProjects]);
+
+  // Ready-retry for the per-harness discovery sweep: while the daemon's
+  // boot sweep hasn't resolved yet (`discoveryReady === false`), re-poll
+  // `GET /agent-models/harnesses` every 2s so the picker picks up the
+  // catalog the moment the sweep finishes, without waiting on the SSE
+  // connection or a poll tick. Capped at 30 attempts (60s) so an old daemon
+  // that predates the `/agent-models/harnesses` route (which never reports
+  // `ready: true`) can't spin the retry forever — every picker just falls
+  // back to `agentModels`' kind-level list once the cap is hit, matching
+  // pre-discovery behavior.
+  //
+  // The stop condition reads the value `refreshHarnessModels` just fetched
+  // (its resolved `ready`), not `discoveryReady` state read from this
+  // closure — that state was always `false` at the moment this effect ran
+  // (a `true` value makes the effect return above before ever scheduling a
+  // tick), so a stale in-closure read could never observe the flip to
+  // `true`. What actually stops the loop when the sweep finishes is React
+  // re-running this effect (since `discoveryReady` is a dep) and its
+  // cleanup clearing the pending timer; checking the fresh return value
+  // here is a same-tick belt-and-suspenders stop, not the primary
+  // mechanism.
+  useEffect(() => {
+    if (discoveryReady) return;
+    let cancelled = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = () => {
+      if (cancelled) return;
+      attempts += 1;
+      void refreshHarnessModels().then((ready) => {
+        if (cancelled || ready || attempts >= 30) return;
+        timer = setTimeout(tick, 2_000);
+      });
+    };
+    timer = setTimeout(tick, 2_000);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [discoveryReady, refreshHarnessModels]);
+
+  // Suppress WebKit's native right-click menu everywhere except editable
+  // text, the xterm terminal, and while read-only text is selected (owner
+  // decision D2 (b) in docs/plans/task-context-menu.md, widened at review
+  // time for the selection case — the native menu is the only mouse path to
+  // Copy / Look Up on selected assistant output). Our own `<ContextMenu>`
+  // (below) is the replacement on task cards; elsewhere a right-click now
+  // just does nothing. Cmd+C/V/X/Z keep working everywhere regardless of
+  // this — those come from the Edit-menu roles `src/bun/index.ts` installs,
+  // not from the native context menu.
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      if (keepsNativeContextMenu(e.target)) return;
+      if (hasTextSelection(window.getSelection())) return;
+      e.preventDefault();
+    };
+    document.addEventListener("contextmenu", onCtx);
+    return () => document.removeEventListener("contextmenu", onCtx);
+  }, []);
+
+  // Keep the selected task in sync as the list refreshes — and drop it when
+  // its row VANISHES between two successful polls (L-A10): a task deleted
+  // out from under us (the CLI, another agetor instance, a pipeline parent's
+  // delete cascade taking its step rows with it) would otherwise leave the
+  // run panel open on a ghost. "Vanished" is `prevIds.has(id) && !ids.has(id)`
+  // rather than a bare `!ids.has(id)`, so a task selected before its row was
+  // ever polled in (a just-created one, or a step task opened from the run
+  // view's own `getPipelineRun` fetch) is left alone until the list has
+  // actually seen and then lost it. `tasks` only changes on a successful
+  // `/tasks` fetch (a failed poll keeps the last snapshot) or an optimistic
+  // patch that preserves ids, so "vanished" is always a real server-side
+  // absence. The same rule sends the full-page pipeline run view back to the
+  // board when ITS parent task disappears (L-A11).
+  const prevTaskIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const prevIds = prevTaskIdsRef.current;
+    const ids = new Set(tasks.map((t) => t.id));
+    prevTaskIdsRef.current = ids;
+    const vanished = (id: string) => prevIds.has(id) && !ids.has(id);
+    if (selected) {
+      if (vanished(selected.id)) {
+        setSelected(null);
+      } else {
+        const fresh = tasks.find((t) => t.id === selected.id);
+        if (fresh && fresh !== selected) setSelected(fresh);
+      }
+    }
+    const v = viewRef.current;
+    if (v.kind === "pipeline-run" && vanished(v.taskId)) {
+      toast("That pipeline task no longer exists — back to the board.");
+      navigate({ kind: "board" });
+    }
+  }, [tasks, selected, navigate]);
+
+  // Backstop for the explicit clears in `openTask`/`onClose`: a subagent
+  // focus request is only ever meaningful for the step task it was raised
+  // for, so any switch of the open panel to a different task (or to none)
+  // drops it (M-A2). Keyed on `selected?.id`, not `selected`, so a poll's
+  // identity refresh of the same task doesn't touch it.
+  useEffect(() => {
+    if (focusSubagent && selected?.id !== focusSubagent.taskId) setFocusSubagent(null);
+  }, [selected?.id, focusSubagent]);
+
+  // Once the user opens a task's panel, any "Waiting on you" toast for that
+  // task is noise — they're already looking at the prompt. Clearing it also
+  // removes one more high-z-index click target that could otherwise sit on
+  // top of the panel header and eat clicks meant for the X button.
+  // Every event toast shares the task's ONE in-app slot (D12), so opening
+  // the panel drops whatever holds it, whatever its kind. Opening a pipeline
+  // step's panel also drops the parent's slot (D16): a step's toasts are
+  // retargeted at (and keyed by) the pipeline parent, so dismissing by the
+  // step id alone would leave one up over the very panel it is about.
+  // Keyed on the open task's id only: most toast helpers skip the in-app toast
+  // for the selected task (`isSelected`), so firing on open or switch is enough
+  // for them. Two kinds can still land while the panel stays open — `files-sent`
+  // with the window unfocused, and `send-failed`, which is ungated because its
+  // toast is the only place that failure shows — and both are left up on purpose.
+  useEffect(() => {
+    if (!selected) return;
+    dismissTaskToast(selected.id);
+    if (selected.pipelineParentId) dismissTaskToast(selected.pipelineParentId);
+  }, [selected?.id]);
+
+  // Opening the full-page pipeline run view counts as opening the parent
+  // task (D6a/D16, plan §8 Q1): its OS Notification Center entry goes (the
+  // `/seen` route only covers the run panel and "Mark as read") and so does
+  // its in-app toast slot. Keyed on the viewed run's task id so a poll
+  // re-render of the same view doesn't re-fire.
+  const runViewTaskId = view.kind === "pipeline-run" ? view.taskId : null;
+  useEffect(() => {
+    if (!runViewTaskId) return;
+    api.clearTaskNotification(runViewTaskId).catch(() => {});
+    dismissTaskToast(runViewTaskId);
+  }, [runViewTaskId]);
+
+  // Mark-seen wiring for the unread-bullet indicator (see TaskCard's corner
+  // dot). Fires whenever the open task changes — open, switch, or close —
+  // and marks BOTH the newly-opened id and the previously-open id: opening
+  // clears the dot for the task you're about to read, and closing clears it
+  // again for whatever streamed in while you were watching (the panel
+  // suppresses the dot live via `isOpen`, so nothing needs to change while
+  // it's open). `prevMarkSeenIdRef` (distinct from `selectedIdRef` below,
+  // which the global-events subscription owns) is updated at the end of
+  // this same effect, after reading its pre-update value, so it always
+  // holds "the id that was open before this transition".
+  const prevMarkSeenIdRef = useRef<string | null>(null);
+  // Per-task counter guarding read-state (`unread`) response merges against
+  // out-of-order arrival — bumped before every mark-seen/markRead/markUnread
+  // call below so a stale in-flight response (e.g. this effect's
+  // fire-and-forget close-time `markTaskSeen` landing after a later "Mark as
+  // unread" click on the same task) is detected and dropped instead of
+  // clobbering the newer value.
+  const readStateGen = useRef(new Map<string, number>());
+  const bumpReadStateGen = useCallback((id: string) => {
+    const next = (readStateGen.current.get(id) ?? 0) + 1;
+    readStateGen.current.set(id, next);
+    return next;
+  }, []);
+
+  // Shared optimistic-merge helper: patches only the named fields of one
+  // task, never the whole snapshot — a wholesale replace could revert a
+  // concurrent optimistic patch (e.g. the SSE column handler's
+  // running→review flip, or another in-flight partial update). The
+  // mark-seen effect below is the original caller; RunPanel's
+  // `onTaskFieldsChanged` (e.g. an agent-profile Detach) reuses the same
+  // helper rather than growing its own merge logic.
+  const mergeTaskFields = useCallback((id: string, partial: Partial<Task>) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...partial } : t)));
+  }, []);
+  useEffect(() => {
+    const currentId = selected?.id ?? null;
+    const previousId = prevMarkSeenIdRef.current;
+    const idsToMark = new Set<string>();
+    if (currentId) idsToMark.add(currentId);
+    if (previousId) idsToMark.add(previousId);
+    for (const id of idsToMark) {
+      const gen = bumpReadStateGen(id);
+      api.markTaskSeen(id)
+        .then((updated) => {
+          // Stale response guard — see `readStateGen` above.
+          if (readStateGen.current.get(id) !== gen) return;
+          // Optimistic reconcile — don't wait for the next 2s poll to clear
+          // the dot. Merges ONLY the `unread` field via the shared helper
+          // above: `updated` is a snapshot taken server-side at POST time
+          // and lands asynchronously, so a wholesale replace could revert a
+          // concurrent optimistic patch (e.g. the SSE column handler's
+          // running→review flip).
+          mergeTaskFields(updated.id, { unread: updated.unread });
+        })
+        .catch((e) => {
+          // Fire-and-forget: a failed mark-seen must never block or break
+          // opening/switching/closing a task.
+          console.warn("[agetor] markTaskSeen failed", e);
+        });
+    }
+    prevMarkSeenIdRef.current = currentId;
+  }, [selected?.id, bumpReadStateGen, mergeTaskFields]);
+
+  // `panelMounted` follows `selected !== null` on open but lags by the
+  // RunPanel's exit animation on close, so the Toaster doesn't snap back to
+  // the right edge (and slide under the receding panel) for ~250ms.
+  const [panelMounted, setPanelMounted] = useState(false);
+  useEffect(() => {
+    if (selected) {
+      setPanelMounted(true);
+      return;
+    }
+    const t = setTimeout(() => setPanelMounted(false), RUN_PANEL_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [selected]);
+
+  // Refs mirror the latest tasks + selected task so the global-events
+  // subscription (which closes over its handler ONCE on mount) can read
+  // current state without re-subscribing on every render.
+  const tasksRef = useRef<Task[]>(tasks);
+  const selectedIdRef = useRef<string | null>(selected?.id ?? null);
+  // Tracks interaction ids awaiting an answer, keyed by task. Lets the
+  // notification hook alert only on the FIRST prompt for a task (not once per
+  // stacked prompt) and clear the alert only when the LAST one resolves.
+  const pendingInputRef = useRef<PendingInputTracker>(new PendingInputTracker());
+  // Focus target for the board's Cmd/Ctrl+F handler below.
+  const boardSearchRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
+
+  /** The "Pipeline needs you" toast (and, unfocused, OS notification) for a
+   *  blocked pipeline parent. Lands on the run view plus the step that needs
+   *  the user (resolved at click time), not the run view alone. */
+  const raisePipelineNeedsYou = useCallback((parentId: string) => {
+    const parent = tasksRef.current.find((t) => t.id === parentId);
+    toastPending({
+      taskId: parentId,
+      title: parent?.title || `Pipeline ${parentId.slice(0, 7)}`,
+      subtitle: "Pipeline needs you",
+      isSelected:
+        parentId === selectedIdRef.current
+        || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === parentId),
+      isFocused: document.hasFocus(),
+      onOpen: () => {
+        openPipelineAttention(parentId);
+        void api.focusWindow();
+      },
+    });
+  }, [openPipelineAttention]);
+
+  // "Pipeline needs you" alerts a step's retargeted "Waiting on you" toast
+  // suppressed or displaced (see OwedPipelineAlerts). Once no question is left
+  // and no reason toast holds the parent's slot, the alert is raised if the
+  // run is still blocked on something else, or dropped if it no longer is.
+  const owedPipelineAlertsRef = useRef(new OwedPipelineAlerts());
+  const settleOwedPipelineAlert = useCallback((parentId: string) => {
+    const owed = owedPipelineAlertsRef.current;
+    if (!owed.isOwed(parentId)) return;
+    if (pendingInputRef.current.hasPending(parentId) || hasPendingToast(parentId)) return;
+    const rows = tasksRef.current;
+    const decision = owed.decide(
+      parentId,
+      rows.find((t) => t.id === parentId),
+      (stepId) => rows.find((t) => t.id === stepId)?.column === "running",
+    );
+    if (decision === "wait") return;
+    owed.forget(parentId);
+    if (decision === "raise") raisePipelineNeedsYou(parentId);
+  }, [raisePipelineNeedsYou]);
+  // Re-checked on every tasks change (poll, refetch merge), after `tasksRef`
+  // has caught up: the block that keeps the run blocked may only show up in a
+  // later snapshot. A Map lookup per owed parent; usually none.
+  useEffect(() => {
+    for (const id of owedPipelineAlertsRef.current.parentIds()) settleOwedPipelineAlert(id);
+  }, [tasks, settleOwedPipelineAlert]);
+
+  // Window focus (D6d): the window the user is looking at may already show
+  // the open task (panel or pipeline run view) while a newer Notification
+  // Center entry for it arrived in the background — returning focus clears
+  // it. Deliberately does NOT mark the task seen and leaves in-app toasts
+  // alone. Reads refs so the listener binds once; the server maps a step id
+  // to its pipeline parent.
+  useEffect(() => {
+    const onFocus = () => {
+      const openId = selectedIdRef.current;
+      if (openId) api.clearTaskNotification(openId).catch(() => {});
+      const v = viewRef.current;
+      if (v.kind === "pipeline-run") api.clearTaskNotification(v.taskId).catch(() => {});
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  // Cmd/Ctrl+F while no task details panel is open focuses the board's
+  // free-text search box and selects its contents so typing replaces the
+  // query. Ownership of the chord is complementary with RunPanel's own
+  // Cmd/Ctrl+F handler (RunPanel.tsx, the message-search shortcut), but not
+  // perfectly interlocked: on close, RunPanel's listener outlives this
+  // gate by at least one scheduler task, because its `setOpen(false)` is
+  // scheduled from a passive effect rather than applied synchronously —
+  // `selectedIdRef` below can already be null while that listener is still
+  // attached and its `open` state hasn't caught up. RunPanel additionally
+  // checks a synchronously-written `openRef` inside its handler and stays
+  // inert for that window, so this board listener is the only one that
+  // acts on a chord landing there. On open there's a one-frame rAF gap
+  // where neither fires, which is pre-existing and harmless. The gate
+  // reads `selectedIdRef` — kept current by the effect above — rather than
+  // `selected`, so this listener is attached once instead of being torn
+  // down and re-added on every kanban poll. Same higher-priority-layer
+  // guard as RunPanel (modal dialog / non-escape-only popover), bailing
+  // WITHOUT preventDefault so those layers keep their own behavior. No
+  // `.xterm` bail is needed here: terminals only mount inside RunPanel,
+  // where this listener is off.
+  useEffect(() => {
+    const isMac = isMacPlatform();
+    const onKey = (e: KeyboardEvent) => {
+      if (!isFindShortcut(e, isMac)) return;
+      if (selectedIdRef.current !== null) return;
+      if (document.querySelector(FIND_SHORTCUT_BLOCKING_LAYERS)) return;
+      const input = boardSearchRef.current;
+      if (!input) return;
+      e.preventDefault();
+      input.focus();
+      input.select();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Escape returns a full-page view (pipelines list / pipeline run view) to
+  // the board (D5, `docs/plans/pipelines.md`) — only when no dialog/popover/
+  // RunPanel outranks it, same layer-precedence selector RunPanel's own
+  // Cmd/Ctrl+F handler uses (`data-quote-open`/`data-search-open` included).
+  // Routed through `navigate` (m2) for consistency with every other
+  // board-return path, though this listener is never even attached while
+  // `view.editing` is true (see below) — the pipeline EDITOR is deliberately
+  // excluded here: it has its own Escape-deselect (clicking off a selected
+  // node) to preserve, and its own Back button already confirms before
+  // calling `onBack` (see `pipelineEditorDirty`'s doc comment above), so a
+  // second guard here would double-prompt.
+  useEffect(() => {
+    if (view.kind === "board") return;
+    if (view.kind === "pipelines" && view.editing) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (selectedIdRef.current !== null) return;
+      // Escape inside a text field (the run view's Advance form, a search
+      // box) is the field's own — blur/clear — never a page-level "back to
+      // board" (M-A1). Same text-entry selector the native-context-menu
+      // suppressor keys on.
+      if (keepsNativeContextMenu(e.target)) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      navigate({ kind: "board" });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [view, navigate]);
+
+  // Confirm-on-quit. The main process emits `quit_request` over the app
+  // SSE channel when Cmd+Q / window close lands while runs are active. We
+  // surface a modal explaining tasks will keep running detached; on "Quit
+  // anyway" the server arms a one-shot flag and re-issues Utils.quit().
+  useEffect(() => {
+    const cancel = api.subscribeAppEvents((ev) => {
+      if (ev.type === "harness_usage") {
+        setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
+        return;
+      }
+      if (ev.type === "claude_sessions_found") {
+        const n = ev.count;
+        toast(`${n} Claude Code session${n === 1 ? "" : "s"} found outside Agetor — Review`, {
+          action: { label: "Review", onClick: () => setImportSessionsOpen(true) },
+        });
+        return;
+      }
+      if (ev.type === "opencode_sessions_found") {
+        toast(opencodeSessionsFoundText(ev.count), {
+          action: { label: "Review", onClick: () => setImportSessionsOpen(true) },
+        });
+        return;
+      }
+      if (ev.type === "harnesses_auto_enabled") {
+        // D-14: built-in harnesses turned on because their CLI is installed.
+        // Reload the header's harness state so the new rows show at once.
+        const text = autoEnabledToastText(ev.harnessIds, ev.labels);
+        void refreshAgents();
+        if (text) {
+          toast(text, {
+            action: {
+              label: "Settings",
+              onClick: () => {
+                setSettingsInitialSection("harnesses");
+                setSettingsInitialAgentId(null);
+                setSettingsOpen(true);
+              },
+            },
+          });
+        }
+        return;
+      }
+      if (ev.type === "claude_session_import") {
+        void refresh();
+        return;
+      }
+      if (ev.type === "clone_progress") {
+        // Forwarded to the module store CloneProjectDialog subscribes to —
+        // never opens its own event stream (see clone-progress.ts for why).
+        publishCloneProgress(ev);
+        return;
+      }
+      if (ev.type === "agent_models_changed") {
+        // The model-discovery scheduler re-probed one or more harnesses and
+        // at least one catalog changed — refetch both the kind-level and
+        // per-harness maps so every open picker reflects it live.
+        void refreshAgentModels();
+        void refreshHarnessModels();
+        return;
+      }
+      if (ev.type === "open_task") {
+        // A native notification deep-link (`agetor://task/<id>`) was
+        // clicked. Open that task via `openTask` (m5) — fetching a fresh
+        // task list first if it isn't loaded yet (e.g. the task was just
+        // created and hasn't been picked up by the 2s poll). A pipeline
+        // PARENT goes through `openPipelineAttention` instead: its run view
+        // plus the step that needs the user, if any. The link carries only
+        // the parent id, so it can't tell which notification was clicked —
+        // a "finished" one simply finds nothing waiting and lands on the
+        // run view alone. Mirrors the onOpen idiom in the
+        // GlobalEvent handler below, but this handler closes over its own
+        // scope, so the fresh list has to be fetched directly rather than
+        // relying on `tasksRef` updating synchronously after `setTasks`. No
+        // focusWindow() call here: this handler only fires after the main
+        // process has already handled `open-url` and focused the window
+        // itself, so a second call would be redundant.
+        const fresh = findTaskById(tasksRef.current, ev.taskId);
+        if (fresh) {
+          if (fresh.pipelineId) openPipelineAttention(fresh.id);
+          else openTask(fresh);
+          return;
+        }
+        void (async () => {
+          try {
+            const list = await api.listTasks();
+            setTasks(list);
+            const found = findTaskById(list, ev.taskId);
+            if (found) {
+              // `tasksRef` only catches up with `setTasks` after the next
+              // commit, so the resolver reads the list just fetched.
+              if (found.pipelineId) openPipelineAttention(found.id, { tasks: list });
+              else openTask(found);
+            }
+            // else: silently no-op — the task doesn't exist (deleted?).
+          } catch {
+            // Best-effort — no-op on fetch failure.
+          }
+        })();
+        return;
+      }
+      if (ev.type === "background_changed") {
+        // Forwarded to the module store the Settings background section
+        // subscribes to — never opens its own event stream.
+        publishBackgroundStatus(ev.status);
+        return;
+      }
+      if (ev.type !== "quit_request") return;
+      setQuitRequest(ev);
+    });
+    return cancel;
+  }, [refreshAgents, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
+
+  // App-wide lifecycle subscription. Drives toasts + native notifications.
+  //
+  // Per-parent coalescing state for the `pipeline` event's refetch (L-A2):
+  // at most one in-flight `GET /tasks/:id` per parent id, with a single
+  // trailing re-fetch when further events landed while it was out — so a
+  // burst of step settles collapses to at most two round-trips, and the last
+  // one always reflects the newest state.
+  const pipelineRefetchRef = useRef(new Map<string, { pending: boolean }>());
+  // Last `pipeline`-event status seen per parent, so the "pipeline finished"
+  // toast fires exactly once, on the transition INTO `done` — `persist()`
+  // broadcasts on every run-state mutation, and a manual Advance that lands
+  // on an already-`done` run must not re-toast.
+  const pipelineStatusRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    /** Refetch just one pipeline parent and merge the three fields the
+     *  board's `PipelineBadge`, the card's column and the "needs input"
+     *  glow read — never the whole snapshot (a wholesale replace would
+     *  revert a concurrent optimistic patch, same rule `mergeTaskFields`'s
+     *  doc comment states). A failed refetch just leaves the 2s `/tasks`
+     *  poll as the fallback (the `refresh()` degrade-gracefully posture). */
+    const refetchPipelineParent = (id: string) => {
+      const inFlight = pipelineRefetchRef.current.get(id);
+      if (inFlight) {
+        inFlight.pending = true;
+        return;
+      }
+      const entry = { pending: false };
+      pipelineRefetchRef.current.set(id, entry);
+      const run = (): Promise<void> =>
+        api.getTask(id)
+          .then((fresh) => {
+            mergeTaskFields(id, {
+              pipelineRun: fresh.pipelineRun,
+              column: fresh.column,
+              pendingInteractionCount: fresh.pendingInteractionCount,
+            });
+          })
+          .catch(() => { /* 2s poll catches up */ })
+          .then(() => {
+            if (entry.pending) {
+              entry.pending = false;
+              return run();
+            }
+            pipelineRefetchRef.current.delete(id);
+          });
+      void run();
+    };
+    const handle = (ev: GlobalEvent) => {
+      // Fan the pipeline-relevant kinds out to the module store FIRST —
+      // before any of the gating below — so the pipeline run view and the
+      // RunPanel's pipeline strip get every event without opening a second
+      // permanent event stream (one `openEventStream` fetch each; WKWebView's
+      // ~6-per-host connection cap; see `lib/pipeline-events.ts`). `interaction` lets the run view repaint a
+      // step's amber "waiting on you" highlight the moment it asks.
+      if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status" || ev.kind === "interaction") {
+        publishPipelineGlobalEvent(ev);
+      }
+      // Update events are app-scoped, not task-scoped — handle them before
+      // reading any taskId-derived state.
+      if (ev.kind === "update") {
+        setUpdateSnapshot({
+          status: ev.status,
+          version: ev.version,
+          error: ev.status === "error" ? ev.message : null,
+          lastCheckedAt: ev.ts,
+        });
+        return;
+      }
+      // "Already looking at it" — the run panel is open on the task, OR the
+      // full-page pipeline run view is showing it (L-A3: a pipeline parent
+      // never opens in the panel, so `selectedIdRef` alone would toast a
+      // block the user is literally watching happen on the canvas).
+      const viewingTask = (id: string) =>
+        id === selectedIdRef.current
+        || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === id);
+      const isSelected = viewingTask(ev.taskId);
+      const isFocused = document.hasFocus();
+      // Resolve a display title from the latest tasks snapshot; fall back to
+      // a short id slice if the row hasn't been polled in yet.
+      const task = tasksRef.current.find((t) => t.id === ev.taskId);
+      const title = task?.title || `Task ${ev.taskId.slice(0, 7)}`;
+      const subtitle = task?.agent;
+      const onOpen = () => {
+        const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
+        // `openTask` routes a pipeline PARENT task to its full-page run view
+        // instead of the run panel (D5, `docs/plans/pipelines.md`), same as
+        // a board card click.
+        if (fresh) openTask(fresh);
+        // Best-effort: bring the agetor window forward when the user clicks
+        // through from a toast. Unlike the open_task handler above, nothing
+        // else focuses the window on this path — a WKWebView's own
+        // `window.focus()` can't activate the host NSApplication, so it has
+        // to round-trip through the main process.
+        void api.focusWindow();
+      };
+      // A hidden pipeline STEP task's user-facing events are RETARGETED at
+      // its parent, never dropped and never shown under the step's own
+      // (hidden, meaningless-to-the-user) id (M-A3): the toast reads the
+      // parent's title with the step named in the subtitle, is keyed on the
+      // parent id so `pendingByTask` collapses/dismisses per pipeline, and
+      // opens the pipeline run view. The event's own `pipelineParentId`
+      // stamp is authoritative; the polled list is the fallback for an older
+      // core (or a row not yet polled in).
+      const stepParentId = stepParentIdOf(ev) ?? task?.pipelineParentId ?? null;
+      const target: ToastArgs = stepParentId
+        ? (() => {
+            const parent = tasksRef.current.find((t) => t.id === stepParentId);
+            return {
+              taskId: stepParentId,
+              title: parent?.title || stepParentTitleOf(ev) || `Pipeline ${stepParentId.slice(0, 7)}`,
+              subtitle: stepSubtitle(task, parent),
+              isSelected: viewingTask(stepParentId),
+              isFocused,
+              onOpen: () => {
+                openPipelineStep(stepParentId, ev.taskId);
+                void api.focusWindow();
+              },
+            };
+          })()
+        : { taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen };
+      if (ev.kind === "interaction") {
+        // A question / permission prompt opened or closed. The tracker raises
+        // the alert only on the first prompt for a task and clears it only when
+        // the last one resolves — stacked prompts don't re-alert. For a step
+        // task the tracker is keyed on the PARENT (via `target`), so several
+        // steps' prompts on one pipeline still alert once per pipeline.
+        const tracker = pendingInputRef.current;
+        if (ev.state === "pending") {
+          if (tracker.add(target.taskId, ev.interactionId)) {
+            // A step's question takes the parent's one toast slot. If the run
+            // is already blocked and its "Pipeline needs you" toast is still
+            // up, the question displaces it, so the alert is owed once the
+            // question is answered. One the user already dismissed (or saw
+            // in the run view, where it was suppressed) is not owed again.
+            if (stepParentId && hasPendingToast(stepParentId)) {
+              const parent = tasksRef.current.find((t) => t.id === stepParentId);
+              if (parent?.column === "blocked" || parent?.pipelineRun?.status === "blocked") {
+                owedPipelineAlertsRef.current.owe(stepParentId);
+              }
+            }
+            // The retargeted step toast names the exact step that asked, so
+            // its Open is an ATTENTION landing (run view + that step's panel,
+            // or another step that still needs the user once this one is
+            // answered, plus dismissing this toast). `files-sent`/
+            // `fx-auto-resume` below reuse `target`, whose Open lands on the
+            // named step unconditionally and leaves this toast alone.
+            notifyWaitingInput(
+              stepParentId
+                ? {
+                    ...target,
+                    onOpen: () => {
+                      openPipelineAttention(stepParentId, { stepTaskId: ev.taskId });
+                      void api.focusWindow();
+                    },
+                  }
+                : target,
+            );
+          }
+        } else {
+          // Every answered step counts, not just the pipeline's last answer:
+          // with two steps asking, the first one answered still carries its
+          // `step-blocked` block when the second is answered. Settling waits
+          // while anything is still pending, so marking early is safe.
+          if (stepParentId) owedPipelineAlertsRef.current.noteAnswered(stepParentId, ev.taskId);
+          if (tracker.remove(target.taskId, ev.interactionId)) {
+            dismissPending(target.taskId);
+            if (stepParentId) settleOwedPipelineAlert(stepParentId);
+          }
+        }
+        // Optimistically reflect the change in the card's pending count so the
+        // "needs input" amber-pulse flag (TaskCard, gated on
+        // pendingInteractionCount) appears the instant the prompt lands rather
+        // than waiting up to 2s for the next /tasks poll, which then reconciles
+        // the true count. A step's prompt also bumps its PARENT's count — the
+        // server aggregates a parent's `pendingInteractionCount` across its
+        // steps, so the parent card's glow should move in the same beat.
+        const affected = new Set(stepParentId ? [ev.taskId, stepParentId] : [ev.taskId]);
+        setTasks((cur) =>
+          cur.map((t) => {
+            if (!affected.has(t.id)) return t;
+            const next = ev.state === "pending"
+              ? t.pendingInteractionCount + 1
+              : Math.max(0, t.pendingInteractionCount - 1);
+            return { ...t, pendingInteractionCount: next };
+          }),
+        );
+        return;
+      }
+      if (ev.kind === "run-status") {
+        // Any terminal run state supersedes a pending-input prompt — clear the
+        // "Waiting on you" toast so it doesn't linger next to the success/
+        // failure toast (or silently after a cancel). Also drop the tracker's
+        // entry: a run that ends with a modal still on the pane may never emit
+        // a resolved interaction, and a stale id would otherwise suppress the
+        // first-prompt alert for this task's next run.
+        dismissPending(ev.taskId);
+        pendingInputRef.current.clearTask(ev.taskId);
+        // A hidden pipeline STEP task's own run settling never toasts (or OS-
+        // notifies, via `toastSuccess`/`toastError`'s internal
+        // `maybeNotifyOS`) — the parent's own `pipeline`/column events are
+        // the user-facing signal (m3). Deliberately does NOT touch the
+        // parent's retargeted pending toast either: a step routinely settles
+        // with its card still pending (the runner's `user-ask` block), and
+        // the parent's `blocked` event follows right behind — clearing here
+        // would defeat the double-notify suppression below. The parent's own
+        // `pipeline` status transitions own that toast's lifecycle instead.
+        if (!stepParentId) {
+          if (ev.status === "succeeded") {
+            toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+          } else if (ev.status === "failed" || ev.status === "orphaned") {
+            toastError({
+              taskId: ev.taskId,
+              title,
+              subtitle,
+              isSelected,
+              isFocused,
+              onOpen,
+              reason: ev.status === "orphaned" ? "agetor restarted while running" : undefined,
+            });
+          }
+        }
+        // `cancelled` is intentionally silent — the user issued the cancel.
+        return;
+      }
+      if (ev.kind === "send-failed") {
+        // A message accepted with `pending: true` failed late (the bounded
+        // pre-dispatch of `sendInput` — session/worktree restore — finished
+        // after the response had returned). Live-only, so a replayed history
+        // never re-toasts; NOT gated on the open panel (see
+        // `toastSendFailed`). `target` already retargets a hidden pipeline
+        // step at its parent (title = parent, subtitle = step, Open lands on
+        // the step), exactly like `files-sent` below.
+        toastSendFailed({
+          taskId: target.taskId,
+          title: target.title,
+          subtitle: target.subtitle,
+          reason: ev.reason,
+          savedToBacklog: ev.savedToBacklog,
+          onOpen: target.onOpen,
+        });
+        if (ev.savedToBacklog) {
+          // The server re-stashed the text into THIS task's backlog (a step's
+          // own tray for a pipeline step). Pull just the backlog so an open
+          // RunPanel's tray shows it now instead of at the next 2s poll —
+          // never the whole snapshot (would revert concurrent optimistic
+          // patches, same rule as `refetchPipelineParent`).
+          api.getTask(ev.taskId)
+            .then((fresh) => mergeTaskFields(ev.taskId, { backlog: fresh.backlog }))
+            .catch(() => { /* the 2s poll catches up */ });
+        }
+        return;
+      }
+      if (ev.kind === "files-sent") {
+        // Live-only signal (a replayed historical send must not notify) — no
+        // optimistic board patch here, unlike `column`/`interaction` above:
+        // the board polls `task.sentFiles` every 2s already, and the badge
+        // count isn't time-sensitive the way a running/blocked column is.
+        notifyFilesSent({
+          ...target,
+          count: ev.count,
+          caption: ev.caption,
+          proactive: ev.proactive,
+        });
+        return;
+      }
+      if (ev.kind === "fx-auto-resume") {
+        // Live-only signal (a replayed historical schedule/cancel must not
+        // re-notify), same contract as `files-sent` above. Only the two
+        // outcomes worth interrupting the user for get a toast — `fired`
+        // (info: a resume just went out) and `exhausted` (error: the chain
+        // gave up, manual action needed). `scheduled`/`cancelled`/`disabled`
+        // drive only the card badge / RunPanel notice / context-menu state,
+        // all read from the task's own polled `fxRecovery` field, not this
+        // event — so they're silent here by design.
+        if (ev.state === "fired") {
+          toastFxAutoResumeFired({ ...target, attempt: ev.attempt, max: ev.max });
+        } else if (ev.state === "exhausted") {
+          toastFxAutoResumeExhausted({ ...target, max: ev.max });
+        }
+        return;
+      }
+      // Pipeline run-state changes ride their own kind (D12,
+      // `docs/plans/pipelines.md`). The event only carries a status/active-
+      // step-ids summary, not the full `PipelineRunState` the board's
+      // `PipelineBadge` and an open run view need, so the parent is
+      // refetched (coalesced per parent, see `refetchPipelineParent`) and
+      // only its run-derived fields merged in.
+      if (ev.kind === "pipeline") {
+        const prevStatus = pipelineStatusRef.current.get(ev.taskId) ?? task?.pipelineRun?.status ?? null;
+        pipelineStatusRef.current.set(ev.taskId, ev.status);
+        if (ev.status !== "blocked") {
+          // No block left on the run — a retargeted step "Waiting on you"
+          // toast (and its tracker entry) is stale now. This, not the step's
+          // own run-status, is what clears them: the next block on any step
+          // of this pipeline should alert afresh.
+          dismissPending(ev.taskId);
+          pendingInputRef.current.clearTask(ev.taskId);
+          owedPipelineAlertsRef.current.forget(ev.taskId);
+        }
+        // ONE "finished" toast + OS notification per run, on the transition
+        // into `done` (M-A3) — the outcome someone waiting on a long
+        // multi-step run actually wants to hear about; the parent's own
+        // `review` column event stays silent, as every plain success →
+        // review transition does.
+        if (ev.status === "done" && prevStatus !== "done") {
+          toastSuccess({ taskId: ev.taskId, title, subtitle: "Pipeline finished", isSelected, isFocused, onOpen, kind: "pipeline-finished" });
+        }
+        refetchPipelineParent(ev.taskId);
+        return;
+      }
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
+      // A step running again ends the "answered question" exemption for its
+      // blocks (see OwedPipelineAlerts).
+      if (stepParentId && ev.column === "running") {
+        owedPipelineAlertsRef.current.noteStepRunning(stepParentId, ev.taskId);
+      }
+      // A hidden pipeline STEP task's own `blocked` transition never toasts
+      // on its own — the pipeline PARENT's `blocked` column event (reason
+      // "pipeline") is the one the user should see, and toasting both would
+      // be a double notification for one underlying block (D9/D11).
+      if (ev.column === "blocked" && !stepParentId) {
+        if (ev.reason === "api-error") {
+          toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "session-died") {
+          toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "unknown-command") {
+          toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "pipeline") {
+          // Suppressed while a step's RETARGETED "Waiting on you" toast is
+          // already live for this parent (M-A3) — that toast already names
+          // the exact step and opens the same run view, so a second
+          // "Pipeline needs you" for the same block would be noise (and a
+          // second OS notification). The suppressed alert is owed: once that
+          // question is answered, it is raised if the run is still blocked.
+          if (!hasPendingToast(ev.taskId)) {
+            raisePipelineNeedsYou(ev.taskId);
+          } else {
+            owedPipelineAlertsRef.current.owe(ev.taskId);
+          }
+        } else {
+          toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        }
+      } else if (ev.prev === "blocked") {
+        // Auto-clear the pending toast once the agent unblocks (the user
+        // answered, the run was cancelled, etc.). A pipeline parent also
+        // drops its (retargeted, parent-keyed) tracker entries here, so the
+        // next step's prompt alerts afresh.
+        dismissPending(ev.taskId);
+        if (task?.pipelineId) {
+          pendingInputRef.current.clearTask(ev.taskId);
+          owedPipelineAlertsRef.current.forget(ev.taskId);
+        }
+      }
+    };
+    const cancel = api.subscribeGlobalEvents(handle);
+    return cancel;
+    // `openTask`, `openPipelineStep`, `openPipelineAttention`,
+    // `mergeTaskFields`, `raisePipelineNeedsYou` and `settleOwedPipelineAlert`
+    // all have stable identities (the first three read
+    // `view`/`pipelineEditorDirty` via refs rather than depending on them
+    // directly — see `viewRef`'s doc comment above) — listing them doesn't
+    // cause a resubscribe, it just keeps this effect honest about what it
+    // closes over.
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, settleOwedPipelineAlert]);
+
+  // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
+  // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
+  // harness filter's option set (m4) must both be computed over this, not
+  // the raw `tasks` state, or a running pipeline's hidden steps would
+  // silently inflate the total and spam the harness filter with ids the
+  // user never picked.
+  const nonStepTasks = useMemo(
+    () => tasks.filter((t) => t.pipelineParentId == null),
+    [tasks],
+  );
+
+  // Text + repo filter applied here; status filter narrows the rendered
+  // columns (not the task list) so an unselected status disappears entirely
+  // rather than rendering an empty column.
+  const visibleTasks = useMemo(() => {
+    const q = textQuery.trim().toLowerCase();
+    return tasks.filter((t) => {
+      // Hidden pipeline STEP tasks never appear as their own board cards
+      // (D11, `docs/plans/pipelines.md`) — they're driven entirely from the
+      // pipeline run view, opened via the parent's `PipelineBadge`. `tasks`
+      // state itself still holds them (the run panel's `selected`-sync
+      // effect and `GET /tasks/:id/pipeline` both need the full list/row).
+      if (t.pipelineParentId != null) return false;
+      if (q) {
+        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
+      if (typeFilter.length > 0 && !typeFilter.includes(t.taskType)) return false;
+      if (archivedView === "active" && t.archivedAt != null) return false;
+      if (archivedView === "archived" && t.archivedAt == null) return false;
+      return true;
+    });
+  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
+
+  const visibleColumns = useMemo(
+    () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
+    [statusFilter],
+  );
+
+  // Distinct harness ids referenced by any (non-step) task — feeds the
+  // harness filter so ids belonging to removed harnesses still show up as
+  // filter options. Computed over `nonStepTasks` (m4) so a pipeline's
+  // hidden step tasks — which can run under a different harness per step —
+  // can't add filter options for harnesses the user never launched a
+  // visible task on.
+  const taskAgentIds = useMemo(
+    () => Array.from(new Set(nonStepTasks.map((t) => t.agent))),
+    [nonStepTasks],
+  );
+
+  // --- Onboarding derivation (pure lib/onboarding.ts, thin wiring here) ---
+  const enabledHarnessIds = useMemo(
+    () => (harnessesLoaded ? new Set(harnesses.filter((h) => h.enabled).map((h) => h.id)) : null),
+    [harnessesLoaded, harnesses],
+  );
+  const onboardingSteps = useMemo(
+    () => deriveOnboardingSteps({ statuses: agents, enabledHarnessIds, projectCount: projects.length, tasks }),
+    [agents, enabledHarnessIds, projects.length, tasks],
+  );
+  const onboardingVisibility = useMemo(
+    () => resolveOnboardingVisibility({
+      dismissedPref: onboardingDismissedPref,
+      // All four sources the derivation reads from (prefs, tasks, harnesses,
+      // projects) must have resolved at least once — otherwise the checklist
+      // can flash the compact "some steps missing" strip for an existing
+      // user whose harnesses/projects just haven't loaded yet on a slow boot.
+      loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded,
+      steps: onboardingSteps,
+      taskCount: tasks.length,
+      welcomeAcknowledged,
+    }),
+    [
+      onboardingDismissedPref,
+      prefsLoaded,
+      tasksLoaded,
+      harnessesLoaded,
+      projectsLoaded,
+      onboardingSteps,
+      tasks.length,
+      welcomeAcknowledged,
+    ],
+  );
+  // Existing-user upgrade path: write the dismissal pref once, the instant
+  // `resolveOnboardingVisibility` signals every step already derives as
+  // done and the pref was never set — a ref guard (not just relying on the
+  // pref write to flip `autoDismiss` back false) because the write is
+  // async and several renders can land before it resolves.
+  const autoDismissWrittenRef = useRef(false);
+  useEffect(() => {
+    if (!onboardingVisibility.autoDismiss || autoDismissWrittenRef.current) return;
+    autoDismissWrittenRef.current = true;
+    setOnboardingDismissedPref("true");
+    void api.setPreference(ONBOARDING_DISMISSED_PREF, "true").catch(() => {
+      // Best-effort — worst case onboarding re-evaluates (and re-attempts
+      // this write) on the next state change; it never blocks the UI.
+      autoDismissWrittenRef.current = false;
+    });
+  }, [onboardingVisibility.autoDismiss]);
+
+  // Shared by WelcomeDialog's "Skip" and OnboardingChecklist's "Dismiss" —
+  // both permanently hide onboarding.
+  const dismissOnboarding = useCallback(() => {
+    setOnboardingDismissedPref("true");
+    void api.setPreference(ONBOARDING_DISMISSED_PREF, "true").catch(() => {
+      /* best-effort, matching the theme/defaultHarness write idiom elsewhere */
+    });
+  }, []);
+  const openSettingsHarnesses = useCallback(() => {
+    setSettingsInitialSection("harnesses");
+    setSettingsInitialAgentId(null);
+    setSettingsOpen(true);
+  }, []);
+  // `profileId` deep-links to that profile's edit subpage; no argument opens
+  // the plain Agents list. The `typeof` guard is load-bearing: callers may
+  // hand this straight to an `onClick`, and a click event must never become
+  // a profile id.
+  const openSettingsAgents = useCallback((profileId?: string) => {
+    setSettingsInitialSection("agents");
+    setSettingsInitialAgentId(typeof profileId === "string" ? profileId : null);
+    setSettingsOpen(true);
+  }, []);
+  /** Switch the app-level `view` to the full-page pipelines list — the
+   *  header's Pipelines button (m2: routed through `navigate` so leaving a
+   *  dirty editor confirms first). */
+  const openPipelinesPage = useCallback(() => {
+    navigate({ kind: "pipelines", pipelineId: null, editing: false });
+  }, [navigate]);
+  /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
+   *  to the matching app-level view — Settings closes itself in the same
+   *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). Routed
+   *  through `navigate` (m2) — Settings can be opened while mid-edit (the
+   *  gear icon stays live), so this can also be leaving a dirty editor. */
+  const onSettingsOpenPipelines = useCallback((id: string | null, editing: boolean) => {
+    setSettingsOpen(false);
+    setSettingsInitialAgentId(null);
+    setSettingsInitialSection(undefined);
+    navigate({ kind: "pipelines", pipelineId: id, editing });
+  }, [navigate]);
+  const onFocusNewTask = useCallback(() => {
+    setNewTaskFocusNonce((n) => n + 1);
+  }, []);
+  const onOpenOnboardingTerminal = useCallback((harnessId: string) => {
+    void api.openHarnessTerminal(harnessId).catch((e: unknown) => {
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error("Couldn't open terminal", { description: message });
+    });
+  }, []);
+
+  // Every handler below is wrapped in `useCallback` so it keeps a stable
+  // identity across App re-renders (poll ticks, unrelated state changes,
+  // etc.) — they're passed straight down to `Column`/`TaskCard`, both
+  // `React.memo`'d, and an unstable function prop would force every card in
+  // every column to re-render on every tick regardless of the task-list
+  // equality guard above. None of these actually need to read the current
+  // `tasks`/`selected` state (they operate on the `t` argument the caller
+  // already has), except `del`'s "is the deleted task the open one" check —
+  // that reads `selectedIdRef` (already kept in sync by the effect above)
+  // instead of `selected` directly, so `del` doesn't have to change identity
+  // every time the user opens a different task.
+  const surfaceError = useCallback((e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e));
+  }, []);
+
+  const onDragEnd = useCallback(async (e: DragEndEvent) => {
+    const id = String(e.active.id);
+    const col = e.over?.id as ColumnId | undefined;
+    if (!col) return;
+    const t = tasksRef.current.find((x) => x.id === id);
+    if (!t || t.column === col) return;
+    // A pipeline PARENT's column mirrors its run while that run is in
+    // progress (the server 409s any other column patch). Once the run
+    // status is `done`, dropping the card on Done is the same park the
+    // Done buttons perform. Every other drop stays refused — an optimistic
+    // flip would 409 and snap back (L-A4).
+    if (t.pipelineId && !(col === "done" && t.pipelineRun?.status === "done")) {
+      toast("This pipeline task's column is managed by its run.");
+      return;
+    }
+    setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
+    try {
+      setError(null);
+      await api.moveTask(id, col);
+    } catch (e) {
+      surfaceError(e);
+      // Server didn't accept the move — re-sync the optimistic UI.
+      await refresh();
+    }
+  }, [refresh, surfaceError]);
+
+  // `startTask` materializes the worktree, which can re-pin the branch when a
+  // create-time uniqueness race is only detectable once the branch actually
+  // exists. Surface the change so the user isn't left believing the name they
+  // saw. Reads the new branch out of the refresh we already do — no extra GET.
+  // Best-effort: if the refresh failed, the 2s poll still shows the real branch.
+  const startAndNotifyBranch = useCallback(async (taskId: string, branchBefore: string | null) => {
+    await api.startTask(taskId);
+    const list = await refresh();
+    if (!branchBefore || !list) return;
+    const after = list.find((t) => t.id === taskId);
+    if (after?.branch && after.branch !== branchBefore) {
+      toast(`Branch changed to “${after.branch}” — “${branchBefore}” was already taken.`);
+    }
+  }, [refresh]);
+
+  const start = useCallback(async (t: Task) => {
+    try {
+      setError(null);
+      await startAndNotifyBranch(t.id, t.branch);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // tmux-missing errors get a guided fix dialog instead of a toast — the
+      // toast is a dead end, the dialog routes to a resolution.
+      if (errorIsTmuxMissing(msg)) {
+        setTmuxDialogOpen(true);
+      } else {
+        surfaceError(e);
+      }
+      void refreshAgents();
+    }
+  }, [startAndNotifyBranch, surfaceError, refreshAgents]);
+  const cancel = useCallback(async (t: Task) => {
+    // A pipeline PARENT task has no `runId` of its own (only its active step
+    // tasks do) — stop every active execution via the dedicated pipeline
+    // route instead (D9, `docs/plans/pipelines.md`), then refresh so the
+    // parent's column/pipelineRun and every step task reflect the cancel —
+    // same "refresh after the mutation" idiom as `archive`/`unarchive`
+    // below, rather than a partial merge of just this one response.
+    if (t.pipelineId) {
+      try {
+        setError(null);
+        await api.cancelPipeline(t.id);
+        await refresh();
+      } catch (e) {
+        surfaceError(e);
+      }
+      return;
+    }
+    if (!t.runId) return;
+    try {
+      setError(null);
+      await api.cancelRun(t.runId);
+    } catch (e) {
+      surfaceError(e);
+    }
+  }, [surfaceError, refresh]);
+  const markDone = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
+    try {
+      setError(null);
+      await api.moveTask(t.id, "done");
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError]);
+  // m6: clears the open run panel when it's showing a hidden pipeline STEP
+  // task whose parent is `parentId` — archiving/deleting a pipeline parent
+  // can cascade its steps out from under an open panel that was pointed at
+  // one directly (e.g. via the pipeline run view). Deliberately does NOT
+  // clear when `selected` IS `parentId` itself — archiving (unlike delete)
+  // doesn't remove the row, and the panel staying open on the now-archived
+  // task is the existing, still-correct behavior. Reads refs rather than
+  // `selected` directly so `archive`/`del` keep a stable identity.
+  const clearSelectedStepOf = useCallback((parentId: string) => {
+    const openId = selectedIdRef.current;
+    if (!openId) return;
+    const open = tasksRef.current.find((x) => x.id === openId);
+    if (open?.pipelineParentId === parentId) setSelected(null);
+  }, []);
+  const archive = useCallback(async (t: Task) => {
+    const active = t.column === "running" || t.column === "blocked";
+    if (active) {
+      const ok = await confirm({
+        title: `Archive "${t.title}"?`,
+        description:
+          "An agent is still working on this task. Archiving will stop it.",
+        confirmLabel: "Stop & archive",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
+    const now = Date.now();
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
+    try {
+      setError(null);
+      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      dismissTaskToast(t.id);
+      clearSelectedStepOf(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [confirm, refresh, surfaceError, clearSelectedStepOf]);
+  const unarchive = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
+    try {
+      setError(null);
+      await api.unarchiveTask(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError]);
+  const del = useCallback(async (t: Task) => {
+    // Ask the core which branches the delete would remove — `t.branch`, plus
+    // the branch a drifted worktree is actually on — so the confirm names
+    // every one. Best-effort: on failure (or an older core) fall back to the
+    // task row — `t.branch`, plus the last-seen drifted checkout as a branch
+    // the delete may also remove (the core's exclusions — default branch, a
+    // branch another task holds — can't be applied client-side).
+    const preview = t.worktreePath
+      ? await api.getTaskTeardownPreview(t.id).catch(() => null)
+      : null;
+    const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
+    const ok = await confirm({
+      title: `Delete "${t.title}"?`,
+      description: (
+        <>
+          The task and its run history will be removed.
+          {t.worktreePath && preview && preview.branches.length > 0 && (
+            <>
+              {" "}Its git worktree and {preview.branches.length === 1 ? "branch" : "branches"}{" "}
+              <span data-testid="delete-confirm-branches">
+                {preview.branches.map((b, i) => (
+                  <span key={b}>
+                    {i > 0 && ", "}
+                    <span className="font-mono text-foreground/80">{b}</span>
+                  </span>
+                ))}
+              </span>{" "}
+              will be torn down.
+            </>
+          )}
+          {t.worktreePath && preview && preview.branches.length === 0 && (
+            <> Its git worktree will be torn down; no branches will be deleted.</>
+          )}
+          {t.worktreePath && !preview && (
+            <>
+              {" "}Its git worktree (
+              <span className="font-mono text-foreground/80">{t.branch}</span>
+              ) will also be torn down
+              {maybeDrifted ? (
+                <>
+                  , and possibly the branch it was last on (
+                  <span data-testid="delete-confirm-maybe-branch" className="font-mono text-foreground/80">{maybeDrifted}</span>
+                  ).
+                </>
+              ) : "."}
+            </>
+          )}
+        </>
+      ),
+      confirmLabel: "Delete",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      setError(null);
+      await api.deleteTask(t.id);
+      dismissTaskToast(t.id);
+      if (selectedIdRef.current === t.id) setSelected(null);
+      // m6: a step task's own panel can't outlive its deleted parent either.
+      clearSelectedStepOf(t.id);
+      // m6: the full-page pipeline run view has nothing left to show once
+      // its own task is gone — back to the board. Reads `viewRef` (not
+      // `view` directly) so `del` keeps a stable identity; `navigate` is
+      // used (rather than a bare `setView`) purely for consistency — there's
+      // no pipeline-editor dirty state to protect on this path.
+      if (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === t.id) {
+        navigate({ kind: "board" });
+      }
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      // Refresh anyway so the UI matches the server.
+      await refresh();
+    }
+  }, [confirm, refresh, surfaceError, clearSelectedStepOf, navigate]);
+
+  // Best-effort "reveal in Finder" — same fire-and-forget idiom as
+  // RunPanel's own Open button (`RunPanel.tsx`'s `api.openPath` call): a
+  // failure here has no useful recovery, so it's swallowed rather than
+  // routed through `surfaceError`.
+  const openInFinder = useCallback((t: Task) => {
+    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch(() => { /* best-effort */ });
+  }, []);
+
+  // Shared by RunPanel's `onViewPullRequest` prop and the task context
+  // menu's "View pull request" entry — extracted so the two call sites
+  // can't drift: parse the PR number out of the URL and drive the in-app
+  // GitHub detail subpage when possible, else fall back to opening the URL
+  // in the OS browser.
+  const viewPullRequest = useCallback(({ projectPath, prUrl }: { projectPath: string; prUrl: string }) => {
+    const number = parsePullNumber(prUrl);
+    if (number == null) {
+      // Can't drive the in-app detail subpage without a parsed PR number —
+      // fall back to the plain external link rather than silently doing
+      // nothing.
+      void api.openExternal(prUrl).catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "Could not open link");
+      });
+      return;
+    }
+    setGithubItemDetailPrefill({ projectPath, kind: "pulls", number, url: prUrl });
+    setGithubPullPrefill(null);
+    setGithubOpen(true);
+  }, []);
+
+  // Issue-flavored sibling of `viewPullRequest` above — same fallback
+  // rationale (an unparseable URL can't drive the in-app detail subpage) and
+  // the same generalized `GitHubItemDetailPrefill` mechanism, just with
+  // `kind: "issues"`.
+  const viewIssue = useCallback(({ projectPath, issueUrl }: { projectPath: string; issueUrl: string }) => {
+    const number = parseIssueUrl(issueUrl)?.number;
+    if (number == null) {
+      void api.openExternal(issueUrl).catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "Could not open link");
+      });
+      return;
+    }
+    setGithubItemDetailPrefill({ projectPath, kind: "issues", number, url: issueUrl });
+    setGithubPullPrefill(null);
+    setGithubOpen(true);
+  }, []);
+
+  // `markRead`/`markUnread`: optimistic single-field `unread` merge (never
+  // the whole `Task` snapshot — see the mark-seen effect above for why),
+  // then reconcile from the server response, same single-field merge.
+  // `surfaceError` + `refresh()` on failure so an optimistic flip that the
+  // server rejected doesn't stick.
+  const markRead = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: false } : x)));
+    const gen = bumpReadStateGen(t.id);
+    try {
+      setError(null);
+      const updated = await api.markTaskSeen(t.id);
+      // "Mark as read" counts as reading the news: drop the in-app toast too
+      // (the OS entry is removed server-side by `/seen`). Before the stale
+      // guard: the toast is stale whichever response order wins.
+      dismissTaskToast(t.id);
+      // Stale response guard — see `readStateGen`'s doc comment above.
+      if (readStateGen.current.get(t.id) !== gen) return;
+      setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError, bumpReadStateGen]);
+  const markUnread = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: true } : x)));
+    const gen = bumpReadStateGen(t.id);
+    try {
+      setError(null);
+      const updated = await api.markTaskUnread(t.id);
+      // Stale response guard — see `readStateGen`'s doc comment above.
+      if (readStateGen.current.get(t.id) !== gen) return;
+      setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError, bumpReadStateGen]);
+
+  // Clipboard copy for the menu's "Copy branch name" / "Copy worktree path"
+  // entries — same idiom as `md-components.tsx`'s code-block copy button.
+  const copyToClipboard = useCallback(async (text: string, what: "branch name" | "worktree path") => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(`Copied ${what}`);
+    } catch {
+      toast.error("Couldn't copy to clipboard");
+    }
+  }, []);
+
+  // Task context menu (right-click on a board card). `taskMenu` freezes a
+  // snapshot of the task (and whether it was the open one) at the moment the
+  // menu opens, rather than re-resolving from `tasks` on every render — the
+  // board polls every 2s, and re-resolving would let a task's column change
+  // (e.g. `running` settling to `review`) rewrite the menu's entries *under
+  // the user's cursor*: Stop/Archive disappear, Mark done and a whole read
+  // group appear, `Delete…` moves — and a click the user already committed
+  // to lands on a different action than the one they saw. Freezing at open
+  // time means the entries never shift while the menu is up; the live task
+  // is resolved only when an action actually fires (see `runTaskMenuAction`
+  // below), so actions still act on current state (e.g. `cancel` sees the
+  // current `runId`) even though the menu itself is a snapshot.
+  const [taskMenu, setTaskMenu] = useState<{ task: Task; isOpen: boolean; x: number; y: number } | null>(null);
+  const openTaskMenu = useCallback((t: Task, pos: { x: number; y: number }) => {
+    setTaskMenu({ task: t, isOpen: t.id === selectedIdRef.current, x: pos.x, y: pos.y });
+  }, []);
+  const closeTaskMenu = useCallback(() => setTaskMenu(null), []);
+  // The task the menu was opened for got deleted (by this client or another
+  // one) while the menu was still open — close it rather than leave a menu
+  // full of handlers pointing at a task that no longer exists.
+  useEffect(() => {
+    if (taskMenu && !tasks.some((t) => t.id === taskMenu.task.id)) setTaskMenu(null);
+  }, [taskMenu, tasks]);
+
+  // Exhaustive dispatch from a `TaskMenuAction` (buildTaskContextMenu's pure
+  // output) to the real App.tsx handler. State-transition actions target the
+  // LIVE task (e.g. `cancel` needs the current `runId`); field-derived ones
+  // (`view-pr` / `copy-*`) read the field from the SNAPSHOT the entry was
+  // gated on, falling back to the live task — the live value can't be
+  // trusted to still be set, and a `!` would only hide that.
+const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
+    const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
+    switch (action) {
+      case "open":
+        setFocusSubagent(null);
+        setSelected(t);
+        break;
+      case "open-pipeline":
+        openPipelineRun(t.id, { fromBoardCard: true });
+        break;
+      case "start":
+        void start(t);
+        break;
+      case "stop":
+        void cancel(t);
+        break;
+      case "resume-recovery":
+        void api.resumeFxRecovery(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't resume", { description: message });
+        });
+        break;
+      case "cancel-auto-resume":
+        void api.cancelFxAutoResume(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't cancel auto-resume", { description: message });
+        });
+        break;
+      case "mark-done":
+        void markDone(t);
+        break;
+      case "archive":
+        void archive(t);
+        break;
+      case "unarchive":
+        void unarchive(t);
+        break;
+      case "diff":
+        setDiffTask(t);
+        break;
+      case "open-in-finder":
+        openInFinder(t);
+        break;
+      case "view-pr": {
+        // Field-derived entries were gated on the SNAPSHOT (the menu the
+        // user saw), so read the field from there and only fall back to the
+        // live task — the live value can't be trusted to still be set.
+        const prUrl = snapshot.prUrl ?? t.prUrl;
+        if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
+        break;
+      }
+      case "view-issue": {
+        // Same snapshot-first rationale as "view-pr" above.
+        const issueUrl = snapshot.issueUrl ?? t.issueUrl;
+        if (issueUrl) viewIssue({ projectPath: t.workdir, issueUrl });
+        break;
+      }
+      case "mark-read":
+        void markRead(t);
+        break;
+      case "mark-unread":
+        void markUnread(t);
+        break;
+      case "copy-branch": {
+        const branch = snapshot.branch ?? t.branch;
+        if (branch) void copyToClipboard(branch, "branch name");
+        break;
+      }
+      case "copy-worktree-path": {
+        const worktreePath = snapshot.worktreePath ?? t.worktreePath;
+        if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
+        break;
+      }
+      case "delete":
+        void del(t);
+        break;
+      default: {
+        const exhaustive: never = action;
+        return exhaustive;
+      }
+    }
+  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun]);
+
+  // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
+  // `ContextMenuItem[]`, inserting a separator whenever the group changes
+  // (per the entries' own ordering — see `TaskMenuGroup`'s doc comment).
+  // Built from the frozen `taskMenu` snapshot (task + isOpen), not `tasks`/
+  // `selected` directly, so the entries can't shift under the cursor while
+  // the menu is open (see `taskMenu`'s doc comment above).
+  const taskMenuItems = useMemo<ContextMenuItem[]>(() => {
+    if (!taskMenu) return [];
+    const entries = buildTaskContextMenu(taskMenu.task, { isOpen: taskMenu.isOpen });
+    const items: ContextMenuItem[] = [];
+    let prevGroup: TaskMenuGroup | null = null;
+    for (const entry of entries) {
+      if (prevGroup !== null && entry.group !== prevGroup) {
+        items.push({ type: "separator", id: `sep-${entry.group}` });
+      }
+      items.push({
+        id: entry.action,
+        label: entry.label,
+        danger: entry.danger,
+        icon: ICON_BY_ACTION[entry.action],
+        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task),
+      });
+      prevGroup = entry.group;
+    }
+    return items;
+  }, [taskMenu, runTaskMenuAction]);
+
+  // Shared by GitHubDialog's `onClose` and `onOpenSettings` (the latter also
+  // opens SettingsDialog) so the three-setter teardown can't drift out of
+  // sync between the two call sites — both must clear the dialog's own open
+  // state and both prefill kinds, or a later plain "GitHub" open (no
+  // prefill) could inherit a stale project/task from whichever prefill path
+  // was last used.
+  const closeGithubDialog = useCallback(() => {
+    setGithubOpen(false);
+    setGithubPullPrefill(null);
+    setGithubItemDetailPrefill(null);
+  }, []);
+
+  return (
+    <div className="flex h-screen w-screen flex-col bg-background text-foreground">
+      {/* Top app bar sits on the same row as the macOS traffic lights (see
+          titleBarStyle: "hiddenInset" in src/bun/index.ts). `pl-20` clears the
+          traffic-light cluster (≈64px wide + the 8px x-offset configured on
+          the BrowserWindow). The bar itself is a drag region; the icon + h1
+          inside have no click handlers, but if one is ever added the target
+          must be wrapped in `electrobun-webkit-app-region-no-drag` or the
+          mousedown will be swallowed by the window-move handler. */}
+      {/* Double-click zooms the window — Electrobun's drag-region preload
+          fires startWindowMove on mousedown but doesn't preventDefault, so
+          React's synthesized dblclick still arrives. Guard against zooming
+          when the click originates on a no-drag child (Settings, agent
+          badges) to match AppKit's title-bar behavior — clicking a control
+          there shouldn't zoom. */}
+      <header
+        className="electrobun-webkit-app-region-drag flex h-10 shrink-0 items-center justify-between border-b border-border/60 pl-20 pr-4"
+        onDoubleClick={(e) => {
+          if ((e.target as Element).closest(".electrobun-webkit-app-region-no-drag")) return;
+          void api.toggleWindowZoom().catch(() => {});
+        }}
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <img src={iconUrl} alt="" className="block size-7 shrink-0 -translate-y-0.5 object-contain" />
+            <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
+          </div>
+          <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
+            {visibleTopbarAgents(agents, harnesses).map((a) => {
+              const harness = harnesses.find((h) => h.id === a.harnessId);
+              const displayName = harness?.label ?? a.harnessId;
+              const q = usage[a.harnessId];
+              const loggedOut = a.available && a.loggedIn === false;
+              const dot = (
+                <span
+                  className={
+                    "inline-block size-1.5 rounded-full " +
+                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid")
+                  }
+                />
+              );
+              // Every chip is clickable: with a snapshot the popover shows
+              // meters; without one it explains WHY there's no data (kind
+              // unsupported / first poll pending) instead of silently
+              // rendering a bare chip — "no bar and no explanation" reads as
+              // broken.
+              const kindSupported = (USAGE_SUPPORTED_KINDS as readonly string[]).includes(a.kind);
+              const placeholder = !kindSupported
+                ? { message: "Usage tracking isn't supported for this harness yet.", canRefresh: false }
+                : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
+              const chip = (
+                <span
+                  className="flex items-center gap-1"
+                  title={loggedOut ? (a.authHelp ?? "Not logged in") : (a.reason ?? a.path ?? "")}
+                >
+                  <AgentIcon kind={a.kind} className="size-3" />
+                  {displayName}
+                  {q && <UsageMeter quota={q} />}
+                  {dot}
+                </span>
+              );
+              return (
+                <UsagePopover
+                  key={a.harnessId}
+                  quota={q ?? null}
+                  harnessLabel={displayName}
+                  placeholder={placeholder}
+                  onRefresh={async () => {
+                    const fresh = await api.refreshHarnessUsage(a.harnessId);
+                    setUsage((prev) => ({ ...prev, [fresh.harnessId]: fresh }));
+                  }}
+                >
+                  {chip}
+                </UsagePopover>
+              );
+            })}
+          </div>
+        </div>
+        <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
+                pipeline step must not inflate the total. */}
+            {visibleTasks.length === nonStepTasks.length
+              ? `${nonStepTasks.length} tasks`
+              : `${visibleTasks.length} of ${nonStepTasks.length} tasks`}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setGithubOpen(true)}
+            aria-label="Git"
+            title="Git pull requests and issues (GitHub, GitLab, Bitbucket)"
+          >
+            <GitPullRequest className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setImportSessionsOpen(true)}
+            aria-label="Import Claude Code sessions and OpenCode sessions"
+            title="Import Claude Code sessions and OpenCode sessions"
+            data-testid="import-claude-sessions-open"
+          >
+            <Import className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setWorktreesOpen(true)}
+            aria-label="Worktrees"
+            title="Worktrees"
+          >
+            <FolderGit2 className="size-4" />
+          </Button>
+          <Button
+            variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="pipelines-button"
+            onClick={openPipelinesPage}
+            aria-label="Pipelines"
+            title="Pipelines"
+          >
+            <Workflow className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Settings"
+            title="Settings"
+          >
+            <Settings className="size-4" />
+          </Button>
+        </div>
+      </header>
+      <div className="flex min-h-0 flex-1">
+        <NewTaskForm
+          agents={agents}
+          harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={openSettingsAgents}
+          pipelines={pipelines}
+          pipelinesLoaded={pipelinesLoaded}
+          onOpenPipelines={openPipelinesPage}
+          agentModels={agentModels}
+          harnessModels={harnessModels}
+          onRefreshModels={onRefreshModels}
+          focusNonce={newTaskFocusNonce}
+          onSubmit={async (input, { start }) => {
+            try {
+              setError(null);
+              // "Run task" creates the row in `ready` (so it's briefly visible in
+              // that column even when the agent starts immediately afterward),
+              // then asks the orchestrator to start it — which moves the card to
+              // `running`. "To backlog" just queues with no auto-start.
+              const created = await api.createTask({
+                ...input,
+                column: start ? "ready" : "backlog",
+              });
+              // The server makes the branch unique within the repo, so the
+              // pinned name can differ from what the sidebar showed (a
+              // same-name task already exists). Surface the final name rather
+              // than let the user assume the one they saw.
+              if (input.branch && created.branch && created.branch !== input.branch) {
+                toast(`Branch set to “${created.branch}” to keep it unique.`);
+              }
+              // nit8: keep the picker's per-pipeline `taskCount` fresh right
+              // away rather than waiting on Settings/the editor's own
+              // refetch triggers — fire-and-forget, same posture as every
+              // other best-effort refresh in this handler.
+              if (input.pipelineId) void refreshPipelines();
+              await refresh();
+              if (start) {
+                // Refreshes internally, so no second refresh here.
+                await startAndNotifyBranch(created.id, created.branch);
+              }
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e));
+            }
+          }}
+        />
+        <main className="flex min-w-0 flex-1 flex-col">
+          {/* Chrome that stays mounted regardless of `view` (D5,
+              docs/plans/pipelines.md): update/tmux banners and the global
+              error toast + Toaster are cross-cutting concerns, not
+              board-specific content. Only what's below (the board grid, or
+              the pipelines page/editor/run view) swaps. */}
+          <UpdateBanner
+            snapshot={updateSnapshot}
+            onChange={() => { void api.getUpdateStatus().then(setUpdateSnapshot).catch(() => {}); }}
+          />
+          <TmuxMissingBanner
+            show={isTmuxMissing(agents)}
+            onResolve={() => setTmuxDialogOpen(true)}
+          />
+          <CoreBusyBanner />
+          <ErrorToast error={error} onDismiss={() => setError(null)} />
+          <Toaster panelOpen={panelMounted} />
+          <AnimatePresence mode="wait">
+            {view.kind === "board" && (
+              <motion.div
+                key="board"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                {onboardingVisibility.showChecklist && tasks.length > 0 && (
+                  <div className="px-4 pt-3">
+                    <OnboardingChecklist
+                      steps={onboardingSteps}
+                      statuses={agents}
+                      harnessRows={harnessesLoaded ? harnesses : null}
+                      compact
+                      onOpenSettingsHarnesses={openSettingsHarnesses}
+                      onFocusNewTask={onFocusNewTask}
+                      onOpenTerminal={onOpenOnboardingTerminal}
+                      onDismiss={dismissOnboarding}
+                    />
+                  </div>
+                )}
+                <KanbanFilters
+                  searchInputRef={boardSearchRef}
+                  textQuery={textQuery}
+                  onTextQueryChange={setTextQuery}
+                  repoFilter={repoFilter}
+                  onRepoFilterChange={setRepoFilter}
+                  statusFilter={statusFilter}
+                  onStatusFilterChange={setStatusFilter}
+                  archivedView={archivedView}
+                  onArchivedViewChange={setArchivedView}
+                  harnessFilter={harnessFilter}
+                  onHarnessFilterChange={setHarnessFilter}
+                  typeFilter={typeFilter}
+                  onTypeFilterChange={setTypeFilter}
+                  projects={projects}
+                  harnesses={harnesses}
+                  taskAgentIds={taskAgentIds}
+                />
+                {/* Kanban gets all remaining vertical space and scrolls horizontally
+                    on its own — the bottom bar stays anchored regardless of column
+                    count. */}
+                {/* Outer positioning context lives OUTSIDE the horizontal
+                    scroller: the zero-task overlay below is absolutely positioned
+                    against this div, not `.kanban-scroll`, so scrolling the board
+                    horizontally can't carry the card off-screen with it (an
+                    abs-positioned descendant of a scrolling containing block
+                    scrolls along with it — the previous bug). */}
+                <div className="relative flex-1">
+                  <div
+                    ref={boardScrollerRef}
+                    className="kanban-scroll absolute inset-0 overflow-x-scroll"
+                    onScroll={(e) => saveBoardScroll(e.currentTarget.scrollLeft, e.currentTarget.scrollTop)}
+                  >
+                    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                      <div className="flex gap-3 p-4">
+                        {visibleColumns.map((c) => (
+                          <Column
+                            key={c.id}
+                            id={c.id}
+                            label={c.label}
+                            tasks={visibleTasks.filter((t) => t.column === c.id)}
+                            homeDir={homeDir}
+                            onStart={start}
+                            onCancel={cancel}
+                            onDelete={del}
+                            onOpen={openTaskFromBoard}
+                            onOpenAttention={openAttention}
+                            onDiff={setDiffTask}
+                            onMarkDone={markDone}
+                            onArchive={archive}
+                            onUnarchive={unarchive}
+                            emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
+                            selectedTaskId={selected?.id ?? null}
+                            onContextMenu={openTaskMenu}
+                          />
+                        ))}
+                      </div>
+                    </DndContext>
+                  </div>
+                  {/* Zero-task state: the full onboarding card sits above the
+                      (still-visible, still-empty) column grid rather than
+                      replacing it — dnd-kit's drop zones stay mounted underneath.
+                      Positioned against the outer `relative flex-1` div (a sibling
+                      of `.kanban-scroll`, not a descendant of it), so it stays
+                      visually centered over the viewport regardless of how far
+                      the board is scrolled horizontally. */}
+                  {onboardingVisibility.showChecklist && tasks.length === 0 && (
+                    <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex justify-center px-4">
+                      <div className="pointer-events-auto">
+                        <OnboardingChecklist
+                          steps={onboardingSteps}
+                          statuses={agents}
+                          harnessRows={harnessesLoaded ? harnesses : null}
+                          compact={false}
+                          onOpenSettingsHarnesses={openSettingsHarnesses}
+                          onFocusNewTask={onFocusNewTask}
+                          onOpenTerminal={onOpenOnboardingTerminal}
+                          onDismiss={dismissOnboarding}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
+            {view.kind === "pipelines" && !view.editing && (
+              <motion.div
+                key={viewMountKey(view)}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelinesPage
+                  // Through `navigate`, like every other view switch: an
+                  // edited import preview on this page asks before it goes.
+                  onOpenEditor={(id) => navigate({ kind: "pipelines", pipelineId: id, editing: true })}
+                  onBack={() => navigate({ kind: "board" })}
+                  onImported={(result) => {
+                    // A bundle import may enable a harness — refresh the
+                    // header/picker harness state now, not on the next poll.
+                    // (The Agents/Pipelines caches are refreshed by the
+                    // import dialog itself.)
+                    if (result.enabledHarnesses.length > 0) void refreshAgents();
+                  }}
+                />
+              </motion.div>
+            )}
+
+            {view.kind === "pipelines" && view.editing && (
+              <motion.div
+                key={viewMountKey(view)}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelineEditor
+                  pipelineId={view.pipelineId}
+                  onOpenSettingsAgents={openSettingsAgents}
+                  // Set directly (not `navigate`) — the editor's own Back
+                  // button already ran its own confirm-then-call before
+                  // reaching here (see `pipelineEditorDirty`'s doc comment
+                  // above); a second guard would double-prompt. Reset the
+                  // dirty flag defensively so a NEXT editor session doesn't
+                  // inherit a stale `true` if `onDirtyChange(false)` didn't
+                  // already fire before this callback ran.
+                  onBack={() => {
+                    setPipelineEditorDirty(false);
+                    setView({ kind: "pipelines", pipelineId: null, editing: false });
+                  }}
+                  onSaved={() => {
+                    setPipelineEditorDirty(false);
+                    setView({ kind: "pipelines", pipelineId: null, editing: false });
+                    void refreshPipelines();
+                  }}
+                  onDirtyChange={setPipelineEditorDirty}
+                />
+              </motion.div>
+            )}
+
+            {view.kind === "pipeline-run" && (
+              <motion.div
+                key={viewMountKey(view)}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <PipelineRunView
+                  taskId={view.taskId}
+                  onMarkDone={markDone}
+                  onOpenTask={(t, opts) => {
+                    setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);
+                    setSelected(t);
+                  }}
+                  onOpenSettingsAgents={openSettingsAgents}
+                  onBack={() => setView({ kind: "board" })}
+                  homeDir={homeDir || null}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </main>
+      </div>
+      <RunPanel
+        task={selected}
+        stickyUserMessages={stickyUserMessages}
+        agents={agents}
+        harnesses={harnesses}
+        profiles={profilesLoaded ? profiles : null}
+        onOpenSettingsAgents={openSettingsAgents}
+        agentModels={agentModels}
+        harnessModels={harnessModels}
+        onRefreshModels={onRefreshModels}
+        homeDir={homeDir}
+        onTaskFieldsChanged={mergeTaskFields}
+        onClose={() => {
+          setSelected(null);
+          // A closed panel has no tab to land on — drop the request so it
+          // can't force the strip open on the next task (M-A2).
+          setFocusSubagent(null);
+        }}
+        onShowDiff={setDiffTask}
+        onArchive={archive}
+        onUnarchive={unarchive}
+        onOpenPullRequest={(prefill) => {
+          setGithubPullPrefill(prefill);
+          setGithubItemDetailPrefill(null);
+          setGithubOpen(true);
+        }}
+        onViewPullRequest={viewPullRequest}
+        onViewIssue={viewIssue}
+        onOpenPipeline={(parentTaskId) => openPipelineRun(parentTaskId)}
+        focusSubagent={focusSubagent}
+        onFocusSubagentConsumed={onFocusSubagentConsumed}
+      />
+      <DiffDialog
+        open={!!diffTask}
+        task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}
+        onClose={() => setDiffTask(null)}
+      />
+      <ContextMenu
+        open={taskMenu != null}
+        x={taskMenu?.x ?? 0}
+        y={taskMenu?.y ?? 0}
+        items={taskMenuItems}
+        onClose={closeTaskMenu}
+        label="Task actions"
+        testId="task-context-menu"
+      />
+      <GitHubDialog
+        open={githubOpen}
+        projects={projects}
+        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        pullPrefill={githubPullPrefill}
+        itemDetailPrefill={githubItemDetailPrefill}
+        onClose={closeGithubDialog}
+        onOpenSettings={() => {
+          closeGithubDialog();
+          setSettingsOpen(true);
+        }}
+      />
+      <QuitConfirmDialog request={quitRequest} onClose={() => setQuitRequest(null)} />
+      <ImportSessionsDialog
+        open={importSessionsOpen}
+        onClose={() => setImportSessionsOpen(false)}
+        onImported={() => { void refresh(); }}
+      />
+      <WorktreesDialog
+        open={worktreesOpen}
+        onClose={() => setWorktreesOpen(false)}
+        tasks={tasks}
+        projects={projects}
+        homeDir={homeDir}
+        onOpenTask={(t) => {
+          setWorktreesOpen(false);
+          // Routes a pipeline task to its full-page run view, everything
+          // else to the run panel — same decision the board's cards make.
+          openTask(t);
+        }}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        stickyUserMessages={stickyUserMessages}
+        onStickyUserMessagesChange={(sticky) => {
+          setStickyUserMessages(sticky);
+          void api.setPreference(STICKY_USER_MESSAGES_PREF, String(sticky)).catch(() => {
+            // Revert only if this failed write is still the latest selection;
+            // a subsequent click must not be overwritten by an older request.
+            setStickyUserMessages((current) => current === sticky ? !sticky : current);
+          });
+        }}
+        fxAutoResume={fxAutoResumePrefs}
+        onFxAutoResumeChange={(next) => {
+          const prevEnabled = fxAutoResumePrefs.enabled;
+          const prevDelaySec = fxAutoResumePrefs.delaySec;
+          setFxAutoResumePrefs(next);
+          // Each field reverts independently (same "still the latest
+          // selection" guard as `onStickyUserMessagesChange` above) so a
+          // failed delay write can't also stomp an unrelated, already-
+          // succeeded toggle flip, and vice versa.
+          if (next.enabled !== prevEnabled) {
+            void api.setPreference(FX_AUTO_RESUME_PREF, next.enabled ? "on" : "off").catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.enabled === next.enabled ? { ...current, enabled: prevEnabled } : current);
+            });
+          }
+          if (next.delaySec !== prevDelaySec) {
+            void api.setPreference(FX_AUTO_RESUME_DELAY_PREF, String(next.delaySec)).catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.delaySec === next.delaySec ? { ...current, delaySec: prevDelaySec } : current);
+            });
+          }
+        }}
+        onClose={() => {
+          setSettingsOpen(false);
+          // Clear the deep-link so a later plain gear-icon open lands back
+          // on General instead of wherever onboarding last sent it.
+          setSettingsInitialSection(undefined);
+          setSettingsInitialAgentId(null);
+          // Reflects a "Show getting started guide" replay (General section
+          // writes the pref server-side, then calls this same onClose) —
+          // simplest correct option without threading a dedicated callback
+          // through SettingsDialog.
+          refetchOnboardingPref();
+          // Same posture as harnesses/saved-prompts (A4: no SSE broadcast for
+          // profile CRUD) — refetch once on close so an already-open picker
+          // elsewhere (NewTaskForm, RunPanel) picks up a create/edit/delete
+          // made in the Agents section without a remount.
+          void refreshProfiles();
+        }}
+        onChange={refreshAgents}
+        homeDir={homeDir}
+        dataDir={dataDir}
+        initialSection={settingsInitialSection}
+        initialAgentProfileId={settingsInitialAgentId}
+        onOpenPipelines={onSettingsOpenPipelines}
+      />
+      <TmuxInstallDialog
+        open={tmuxDialogOpen}
+        onClose={() => setTmuxDialogOpen(false)}
+        onResolved={refreshAgents}
+      />
+      <WelcomeDialog
+        open={onboardingVisibility.showWelcome}
+        onAcknowledge={() => setWelcomeAcknowledged(true)}
+        onSkip={dismissOnboarding}
+      />
+    </div>
+  );
+}
+
+/** Root export — mounts `ThemeProvider` and `FontSizeProvider` above
+ *  everything so `AppInner` (and, transitively, `SettingsDialog`'s Theme
+ *  picker) can call `useTheme()` / `useFontSize()`. */
+export default function App() {
+  return (
+    <ThemeProvider>
+      <FontSizeProvider>
+        <AppInner />
+      </FontSizeProvider>
+    </ThemeProvider>
+  );
+}

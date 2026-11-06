@@ -1,0 +1,16 @@
+{
+  "task": "B03-1",
+  "status": "storage-verified-runtime-integration-pending",
+  "files": {
+    "state-tests.log": "26b2770b3d72467500ecdd99361a87072a4755c8b477c8f04aaa0b7048c69da9",
+    "typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "README.md": "1bf535d39edd605a143826805fbdcc20bb427cf6077ba11b788ccf7fc21e63f9",
+    "source/tsconfig.json": "d734c8b531c0f5d084eb387dad8b4b995cb23a85fc8c9075ee3d2bc7c6458cd9",
+    "source/tsconfig.hub.json": "b43f4db9f141ad526ac316a404c8be8ee948b7e8f34c868f40f6ee0a64d6fc7a",
+    "source/packages/core/state/store.ts": "8a59b64662557a99816cb1d601f14b83cb78f5778ae2e5072583817b20408f89",
+    "source/packages/shared/src/types.ts": "a6b0fc147ff22e7508abc79631b3d3f6c4d29bcbe7c49d1378b3a7ce21a6fd42",
+    "source/src/bun/hub-state-store.test.ts": "91a3dd0b2e5a32d8c3aebae3c8772c988aad7183c3654c1520bd22c74059d76d",
+    "source/src/bun/migrations/082_hub_execution.sql": "1f5434fb462e3f6cf75723100bbf873d89570b46c7651893fc32a243af079b52",
+    "source/src/bun/migrations/index.ts": "f37604ca50e7236135d38d552782b2c502aabef8bd4acdb8237616d9fff2f24e"
+  }
+}

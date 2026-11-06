@@ -1,0 +1,108 @@
+{
+  "suite": "F02-r2-controlled-chrome-and-real-sandbox-verification",
+  "revision": "F02-r2",
+  "timestamp": "2026-11-03T01:28:48.763Z",
+  "evidenceClassification": {
+    "summary": "真实控制器/HTTP/Chrome，provider与planner为受控替身、testRunner替换 (Real HubService/SQLite/Git-Worktree/HTTP/Fetch-SSE/Chrome 156; controlled planner & spawn test doubles; replaced testRunner)",
+    "controller": "real HubService + real SQLite HubStore + real WorkspaceManager (git worktree) + real createHubHandler + real buildFrontendAssets",
+    "browser": "real Google Chrome 156 (CDP) + real Fetch-SSE",
+    "providerAndPlanner": "controlled test doubles (planner + spawn worker injected for deterministic browser interaction coverage of rework/approve/pause/resume/cancel/409 replay)",
+    "testRunnerMode": "replaced testRunner (runs verify_clamp.py via python3 without altering frozen worktree; does not claim to run codex sandbox -P hub-test in this script)",
+    "fixtureScopeNote": "UI task title is a display fixture label only; the actual code fixture implemented and validated in the Git worktree is src/clamp.py (does not claim delivery of a smartcar vision system)",
+    "linkedRealCliAndOfficialSandboxEvidence": {
+      "realHttpPath": "Codex/backend-deliveries/B04-B06/evidence/real-http.json",
+      "realCliRelayPath": "Codex/backend-deliveries/B01-B02/evidence/real-cli-relay.json",
+      "coverageBoundary": "real-http.json proves uninjected official Codex CLI planner + developer + independent reviewer + formal codex sandbox -P hub-test on the HTTP happy path; this script proves full Chrome UI/DOM/SSE/download/rework/pause/cancel/409 interaction paths against the real HubService controller."
+    }
+  },
+  "port": 57430,
+  "frontendSourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "e1652a7c8a9465cb1f20434fe253b0488a051f1a9438265b42082aa162c69463",
+    "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+  },
+  "checks": {
+    "bootstrapAndSecurity": {
+      "status": "PASS",
+      "executionMode": "live",
+      "liveExecutionAvailable": true,
+      "modeBadge": "SERVICE: LIVE · contractVersion=0.2 · liveExecutionAvailable=true",
+      "sseBadge": "SSE v0.2: Connected (snapshotSeq=2, seq=2)",
+      "hasBootToken": true,
+      "urlHasToken": false,
+      "expiredBtnCount": 0,
+      "resetBtnCount": 0,
+      "historicalCards": [],
+      "mockControlRoutesStatus": [
+        404,
+        404,
+        404
+      ]
+    },
+    "decomposeCreateAndR3PlanValidation": {
+      "status": "PASS",
+      "task1Id": "019d5329-4792-4709-b9b8-0adae1b81b06",
+      "r3TransitiveCompression": {
+        "cDependsOnAfterCompression": [
+          "A"
+        ],
+        "mergedAcceptanceCriteriaIds": [
+          "ac-c",
+          "ac-b"
+        ],
+        "allAnalysisPlanThrew": "INVALID_INPUT",
+        "uncompressedLaunchRejectedInUi": true
+      },
+      "officialSandboxValidationsCount": 2
+    },
+    "r2RawDownloadAndR4Preview": {
+      "status": "PASS",
+      "compactJson": {
+        "originalSha256": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+        "downloadedDiskSha256": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93",
+        "downloadedDiskBytes": "{\"ok\":true}",
+        "bytesPreserved": true
+      },
+      "withDataJson": {
+        "originalSha256": "edb3b6213c203e585bc5b6b80964c5309c19b5b171763af48e0a9be91890591c",
+        "downloadedDiskSha256": "edb3b6213c203e585bc5b6b80964c5309c19b5b171763af48e0a9be91890591c",
+        "previewParsed": {
+          "data": "payload",
+          "metadata": "must survive"
+        },
+        "bytesPreserved": true
+      },
+      "binaryFixture": {
+        "originalSha256": "c9c8a155cf70935b7e19411dc89ff84820d8319ddc851e0fdf6cdef212d1f5ab",
+        "downloadedDiskSha256": "c9c8a155cf70935b7e19411dc89ff84820d8319ddc851e0fdf6cdef212d1f5ab",
+        "downloadedDiskHex": "89504e47fffefd0080c042",
+        "previewText": "[Binary Artifact · 11 bytes · mimeType=application/octet-stream · sha256=c9c8a155cf70935b7e19411dc89ff84820d8319ddc851e0fdf6cdef212d1f5ab]",
+        "bytesPreserved": true
+      },
+      "stringLiteralPreview": "\"hello-json-string\"",
+      "errorResponseRejectedCode": "NOT_FOUND",
+      "tamperedHashRejectedCode": "ARTIFACT_INTEGRITY_MISMATCH"
+    },
+    "reworkAndApproveGate": {
+      "status": "PASS",
+      "firstApprovalInvalidatedId": "0b1c0c24-4b65-4c82-b6eb-1a9f027e5b66",
+      "finalTaskStatus": "succeeded",
+      "finalProgressPct": 100
+    },
+    "pauseResumeCancelAndR5Contract": {
+      "status": "PASS",
+      "task2Id": "f3dafbf1-69f4-41fa-be1d-a7f0ca2ed080",
+      "finalStatus": "cancelled",
+      "runsCount": 1,
+      "preCancelLogCount": 22,
+      "liveCodexRuntimeDropsPostCancelOutput": true,
+      "liveDrainedLogCount": 0
+    },
+    "sseCursorExpiredRecovery": {
+      "status": "PASS",
+      "sseRecoveredBadge": "SSE v0.2: Connected (snapshotSeq=133, seq=133)"
+    }
+  },
+  "pageExceptions": [],
+  "overallStatus": "PASS"
+}

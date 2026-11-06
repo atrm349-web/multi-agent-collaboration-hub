@@ -1,0 +1,29 @@
+{
+  "deliveryId": "F02",
+  "title": "Frontend Live Backend Integration & Real Chrome E2E Verification Bundle",
+  "deliveredAt": "2026-11-03T00:35:00.000Z",
+  "alignedBackendCommit": "9322bac26700a251947469a379658607cff4bb4b",
+  "alignedBackendBranch": "codex/b04-b06-local-platform",
+  "frontendBridgeTest": {
+    "command": "bun test src/bun/hub-frontend.test.ts",
+    "passed": 7,
+    "failed": 0,
+    "assertions": 36
+  },
+  "sourceHashes": {
+    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
+    "app.js": "60612e4e148ff138ff9451263f22965c5daa1360a15bb78b21303ff5b6e9e2f1",
+    "styles.css": "cf18944d3c0fb913ff95ace72b40acd6216662d5d5e6203933214e0c88039fbe"
+  },
+  "liveNativeBundleHashes": {
+    "app.live-native.js": "57ae412748763aecc81b4ffabe99cd362a141c9d429e55056934b1d16ad09122",
+    "index.live-native.html": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523"
+  },
+  "evidenceFiles": {
+    "liveVerificationJson": ".//Antigravity/evidence/live-f02-i01.json",
+    "liveVerificationLog": ".//Antigravity/evidence/live-f02-i01.log",
+    "liveVerificationReport": ".//Antigravity/evidence/live-f02-i01-verification.md",
+    "mockContractLog": ".//Antigravity/evidence/mock-contract-v0.2.log",
+    "mockBrowserLog": ".//Antigravity/evidence/mock-browser-v0.2.log"
+  }
+}
