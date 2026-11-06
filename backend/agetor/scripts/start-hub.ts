@@ -45,7 +45,7 @@ if (gitCheck.status === 0) {
   root = await realpath(runtimeRoot);
 }
 
-const port = config.port ?? (process.env.PORT ? parseInt(process.env.PORT, 10) : 4321);
+const port = (process.env.PORT ? parseInt(process.env.PORT, 10) : null) ?? config.port ?? 4321;
 if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid port: ' + port);
 
 const state = path.join(root, 'state');
