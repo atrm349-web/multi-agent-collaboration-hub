@@ -18,8 +18,10 @@ if command -v bun &> /dev/null; then
   BUN_BIN="$(command -v bun)"
 elif [ -f "$HOME/.bun/bin/bun" ]; then
   BUN_BIN="$HOME/.bun/bin/bun"
-elif [ -f "$HOME/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun" ]; then
-  BUN_BIN="$HOME/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun"
+elif [ -f "/opt/homebrew/bin/bun" ]; then
+  BUN_BIN="/opt/homebrew/bin/bun"
+elif [ -f "/usr/local/bin/bun" ]; then
+  BUN_BIN="/usr/local/bin/bun"
 fi
 
 if [ -z "$BUN_BIN" ]; then

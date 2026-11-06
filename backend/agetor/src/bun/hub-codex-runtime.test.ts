@@ -28,7 +28,7 @@ function fixture(script: string, observed?: (args: readonly string[], options: S
   const runtime = new CodexRuntime({ workspaceRoot: root, killGraceMs: 30,
     spawn: ((_: string, args: readonly string[], options: SpawnOptions) => {
       observed?.(args, options);
-      return spawn("node", ["-e", script], options);
+      return spawn(process.execPath || "node", ["-e", script], options);
     }) as typeof spawn });
   return runtime;
 }
@@ -184,7 +184,7 @@ test("runtime requests cannot override trusted process configuration", async () 
 test("cancel kills a descendant in the owned process group before resolving", async () => {
   const runtime = fixture(`const {spawn}=require('node:child_process');
     process.on('SIGTERM',()=>{});
-    const child=spawn('node',['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'inherit'});
+    const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'inherit'});
     console.log(JSON.stringify({type:'test.descendant',pid:child.pid}));
     setInterval(()=>{},1000);`);
   const id = await start(runtime);
@@ -206,7 +206,7 @@ test("cancel kills a descendant in the owned process group before resolving", as
 
 test("cancel also reaps a silent descendant after its leader has already exited", async () => {
   const runtime = fixture(`const {spawn}=require('node:child_process');
-    const child=spawn('node',['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'});
+    const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'});
     console.log(JSON.stringify({type:'test.descendant',pid:child.pid}));setInterval(()=>{},1000);`);
   const id = await start(runtime);
   let descendant: number | undefined;

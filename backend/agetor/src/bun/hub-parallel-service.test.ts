@@ -114,6 +114,13 @@ test("interruption recovery via HTTP endpoint frees quarantined slot and restore
     expect(db.query("SELECT * FROM hub_execution_slot").all().length).toBe(1);
     expect(service.meta().liveExecutionAvailable).toBe(false);
 
+    // Operator verifies and ensures process group is stopped before acknowledging
+    const claim = db.query<any, [string]>("SELECT * FROM hub_run_claims WHERE run_id=?").get(run.id);
+    if (claim?.process_group_id) {
+      try { process.kill(claim.process_group_id, "SIGKILL"); } catch {}
+      await new Promise((r) => setTimeout(r, 30));
+    }
+
     // Operator sends POST /api/v1/runs/:id/acknowledge
     const ackRes = await post(`runs/${run.id}/acknowledge`, {
       expectedVersion: interruptedRun.version,

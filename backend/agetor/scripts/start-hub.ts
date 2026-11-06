@@ -37,7 +37,8 @@ await mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
 let root = await realpath(runtimeRoot);
 
 // Ensure runtime root is NOT inside any Git repository checkout
-const gitCheck = spawnSync('/usr/bin/git', ['-C', root, 'rev-parse', '--show-toplevel']);
+const gitBin = Bun.which('git') || 'git';
+const gitCheck = spawnSync(gitBin, ['-C', root, 'rev-parse', '--show-toplevel']);
 if (gitCheck.status === 0) {
   runtimeRoot = path.join(os.homedir(), '.agent-hub-runtime');
   await mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
@@ -73,11 +74,11 @@ if (rawRepos.length === 0 || !existsSync(rawRepos[0]?.path || '')) {
   if (!existsSync(path.join(demoTargetDir, '.git')) && existsSync(demoSeedDir)) {
     await mkdir(demoTargetDir, { recursive: true });
     spawnSync('cp', ['-r', `${demoSeedDir}/.`, demoTargetDir]);
-    spawnSync('/usr/bin/git', ['init', '-q', demoTargetDir]);
-    spawnSync('/usr/bin/git', ['-C', demoTargetDir, 'config', 'user.name', 'Agent Hub Demo']);
-    spawnSync('/usr/bin/git', ['-C', demoTargetDir, 'config', 'user.email', 'demo@agent-hub.local']);
-    spawnSync('/usr/bin/git', ['-C', demoTargetDir, 'add', '.']);
-    spawnSync('/usr/bin/git', ['-C', demoTargetDir, 'commit', '-qm', 'feat: initial demo geometry suite']);
+    spawnSync(gitBin, ['init', '-q', demoTargetDir]);
+    spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.name', 'Agent Hub Demo']);
+    spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.email', 'demo@agent-hub.local']);
+    spawnSync(gitBin, ['-C', demoTargetDir, 'add', '.']);
+    spawnSync(gitBin, ['-C', demoTargetDir, 'commit', '-qm', 'feat: initial demo geometry suite']);
   }
 
   if (existsSync(demoTargetDir)) {
