@@ -703,7 +703,7 @@ function renderTopbarAndSidebar() {
         <div class="sidebar-task-title">${escapeHtml(t.title)}</div>
         <div class="sidebar-task-meta">
           <span class="status-badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>
-          <span>v${t.version} · ${t.progressPct}% · <span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
+          <span>v${t.version} · ${t.status === 'waiting_approval' ? '<strong style="color:#fbbf24;">待批准 (95%)</strong>' : `${t.progressPct}%`} · <span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
         </div>
       </div>
     `;

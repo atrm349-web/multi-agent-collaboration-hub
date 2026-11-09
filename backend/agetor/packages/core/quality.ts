@@ -154,7 +154,7 @@ export class QualityGate {
         summary: `Final delivery: ${current.task.title}`, status: "pending", expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
         artifactRefs: current.artifacts.map((artifact) => artifact.id), ...(current.artifacts.find((artifact) => artifact.category === "diff") ? { diffArtifactId: current.artifacts.find((artifact) => artifact.category === "diff")!.id } : {}), decidedAt: null, decidedBy: null }, null);
       const task = this.store.get("task", taskId);
-      this.store.put("task", { ...task, status: "waiting_approval", pendingApprovalCount: 1, progressPct: Math.min(99, task.progressPct), error: null }, task.version);
+      this.store.put("task", { ...task, status: "waiting_approval", pendingApprovalCount: 1, progressPct: Math.max(95, task.progressPct), error: null }, task.version);
       return approval;
     }).immediate();
   }
