@@ -225,8 +225,8 @@ export function createHubHandler(options: HubHttpOptions): (request: Request) =>
         const key = request.headers.get("idempotency-key");
         if (!key || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key)) fail("INVALID_INPUT", "Idempotency-Key is required");
         let operation: ((data: unknown) => Promise<MutationResult>) | undefined; let fields: string[] = [];
-        if (route === "/api/v1/tasks/decompose") { fields = ["goal", "repositoryId"]; operation = async (data) => ({ status: 200, data: await service.decompose(data) }); }
-        else if (route === "/api/v1/tasks") { fields = ["title", "goal", "repositoryId", "acceptanceCriteria", "priority", "plannedSubtasks"]; operation = async (data) => ({ status: 201, data: await service.create(data) }); }
+        if (route === "/api/v1/tasks/decompose") { fields = ["goal", "repositoryId", "models"]; operation = async (data) => ({ status: 200, data: await service.decompose(data) }); }
+        else if (route === "/api/v1/tasks") { fields = ["title", "goal", "repositoryId", "acceptanceCriteria", "priority", "plannedSubtasks", "models"]; operation = async (data) => ({ status: 201, data: await service.create(data) }); }
         else {
           const task = route.match(/^\/api\/v1\/tasks\/([^/]+)\/(pause|resume|cancel)$/);
           const subtask = route.match(/^\/api\/v1\/subtasks\/([^/]+)\/(retry|rework)$/);

@@ -2316,7 +2316,7 @@ function renderAgentRouterView() {
                 <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">执行代码仓库 (Repository)</label>
                 <select id="newTaskRepoSelect" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:13px;">
                   ${(uiState.repositories || []).map((r) => `
-                    <option value="${r.id}">${escapeHtml(r.label)} (${escapeHtml(r.path)})</option>
+                    <option value="${r.id}">${escapeHtml(r.label)} (${escapeHtml(r.baseBranch || 'main')} @ ${escapeHtml((r.baseCommit || '').slice(0, 7))})</option>
                   `).join('')}
                 </select>
               </div>
