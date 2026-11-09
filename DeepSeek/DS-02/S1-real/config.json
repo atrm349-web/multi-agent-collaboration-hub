@@ -1,0 +1,34 @@
+{
+  "root": "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/runtime",
+  "port": 4341,
+  "maxConcurrency": 1,
+  "frontendDir": "/Users/anyunhong/Desktop/集合agent/apps/web/public",
+  "repositories": [
+    {
+      "id": "88888888-8888-4888-8888-888888888888",
+      "label": "duration-kit strict (DS-02 real)",
+      "path": "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/repo",
+      "defaultTestProfileId": "acceptance",
+      "model": "deepseek-chat",
+      "models": {
+        "planner": "deepseek-reasoner",
+        "developer": "deepseek-chat",
+        "reviewer": "deepseek-chat"
+      },
+      "effort": "low",
+      "testProfiles": [
+        {
+          "id": "acceptance",
+          "command": [
+            "/usr/local/bin/node",
+            "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/owner-tests/check.mjs"
+          ],
+          "timeoutMs": 20000,
+          "readPaths": [
+            "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/owner-tests"
+          ]
+        }
+      ]
+    }
+  ]
+}

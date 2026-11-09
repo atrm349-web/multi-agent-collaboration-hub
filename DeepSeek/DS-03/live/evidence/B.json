@@ -1,0 +1,39 @@
+{
+  "scenario": "B",
+  "startedAt": "2026-11-09T06:05:29.539Z",
+  "base": "c98645fbdf6107df89673e69a47a5cb22bc17716",
+  "reconcile": {
+    "task": [
+      {
+        "s": "failed",
+        "e": "PROCESS_CRASHED"
+      }
+    ],
+    "runs": [
+      {
+        "s": "succeeded"
+      }
+    ],
+    "subs": [
+      {
+        "c": "IMPL",
+        "s": "failed"
+      },
+      {
+        "c": "FINAL-REVIEW",
+        "s": "pending"
+      }
+    ],
+    "slotRows": 0,
+    "live": true,
+    "childStillAlive": false,
+    "orphansBeforeRecovery": [
+      "11373",
+      "11377"
+    ]
+  },
+  "repo": {
+    "headSame": true,
+    "clean": true
+  }
+}

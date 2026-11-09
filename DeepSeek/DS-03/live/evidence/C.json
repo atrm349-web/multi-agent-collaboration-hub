@@ -1,0 +1,75 @@
+{
+  "scenario": "C",
+  "startedAt": "2026-11-09T05:56:30.716Z",
+  "base": "c582537d9906be8e4817569d1004d02172b3852f",
+  "afterKill": {
+    "before": [
+      {
+        "s": "succeeded",
+        "v": 4
+      },
+      {
+        "s": "succeeded",
+        "v": 4
+      },
+      {
+        "s": "running",
+        "v": 3
+      }
+    ],
+    "runs": [
+      {
+        "s": "succeeded",
+        "a": 1,
+        "e": null
+      },
+      {
+        "s": "succeeded",
+        "a": 1,
+        "e": null
+      },
+      {
+        "s": "failed",
+        "a": 1,
+        "e": "PROCESS_CRASHED"
+      }
+    ],
+    "subs": [
+      {
+        "c": "IMPL",
+        "s": "succeeded",
+        "a": 1
+      },
+      {
+        "c": "FINAL-REVIEW",
+        "s": "waiting_approval",
+        "a": 1
+      },
+      {
+        "c": "IMPL",
+        "s": "failed",
+        "a": 1
+      },
+      {
+        "c": "FINAL-REVIEW",
+        "s": "pending",
+        "a": 1
+      }
+    ],
+    "task": [
+      {
+        "s": "waiting_approval",
+        "e": null
+      },
+      {
+        "s": "failed",
+        "e": "PROCESS_CRASHED"
+      }
+    ],
+    "slotRows": 0
+  },
+  "repo": {
+    "headSame": true,
+    "clean": true
+  }
+}

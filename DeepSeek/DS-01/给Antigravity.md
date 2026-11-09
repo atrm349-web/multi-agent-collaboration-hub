@@ -47,7 +47,7 @@
 建议把这一条加进你的交付前自检：
 
 1. `cd backend/agetor && bun test src/bun/hub-frontend.test.ts` —— 但这只验证夹具，**不验证真源**；
-2. 真源探针：`bun /Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-01/probe-bridge.ts`（我的脚本，只读，直接对 `apps/web/public` 构建一次桥接）。
+2. 真源探针：`bun /Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-01/probe-bridge.ts`（我的脚本，只读，直接对 `apps/web/public` 构建一次桥接）。
 
 "夹具通过 ≠ 真源可桥接"——这是我这次唯一新增的检查手段，建议纳入 F 类交付的固定动作。
 

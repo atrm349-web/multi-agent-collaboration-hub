@@ -1,0 +1,11 @@
+{
+  "README.md": "eda2699cc333af2aa4aff4c893f10390117ca1b238495202cade59ffb39ea7a1",
+  "tests.log": "b1352bfee4827bb156ba90e1bbb72ab7010d43061253a822648f04fb131c61ed",
+  "source/packages/agent-adapters/workspace-files.ts": "9d2c43da2ad317d1ad5d8e92eb804d2f1d62811058f5cc75c3b2a9a1ecaf84b9",
+  "source/packages/agent-adapters/provider.ts": "3eef3032217b70db31ca34b1a309874392085b5fc070822ca3b23eddf0629977",
+  "source/packages/agent-adapters/gemini/runtime.ts": "396ff0e1aba5886e9b04d7ac54ad778a7780013b117637e273387c14ad3988d3",
+  "source/packages/agent-adapters/claude/runtime.ts": "10a8fd0e7cbd27322a9494068ab978fb8ebd841af38dbc7bcce8d6ba638ed8fb",
+  "source/packages/agent-adapters/codex/runtime.ts": "4e59bf3207c3ef0967ce4ba35bd8c1215dd74f82ccd4ca2281df6be418455081",
+  "source/packages/agent-adapters/deepseek/runtime.ts": "911acb74e55f27bfeb82ff91e6e66109ffb48b27e8b17ed6d0000f4f396f5425",
+  "source/packages/agent-adapters/workbuddy/runtime.ts": "19ec0d9fd72258b0e8440a79467132af7f82c705670f14c29c87fb6e555908ab"
+}

@@ -3,7 +3,7 @@
 - 接收方：DeepSeek（DeepSeek Harness 本地 agent 会话）
 - 交接来源：`Codex/DeepSeek交接报告.md`（2026-11-03，Codex 编写）
 - 记录时间：2026-11-03T20:11Z 前后（Asia/Tokyo，UTC 11:11–11:25）
-- 共享根目录实读：`./`（拼写已按磁盘确认，含全角"集"）
+- 共享根目录实读：`/Users/anyunhong/Desktop/集合agent`（拼写已按磁盘确认，含全角"集"）
 - 共享后端 repo：`backend/agetor`，分支 `codex/b04-b06-local-platform`
   - `HEAD = 9f56aa45219df6544a7d2a62177a16ce78aa9a20`（与交接报告一致）
   - 工作区状态：` M docs/hub/frontend-source-lock.json`（与交接报告第 9 节一致，未提交）
@@ -28,7 +28,7 @@
 本轮所有产出写在本地 workspace 镜像目录：
 
 ```
-/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/
+/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/
   README.md                  发布说明（如何转交到共享目录）
   交接进度.md                 进度信箱
   DS-01/README.md            本文件（接收记录）

@@ -3,9 +3,9 @@
 // Read-only: buildFrontendAssets only reads the source snapshot.
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { buildFrontendAssets } from ".//backend/agetor/packages/core/frontend.ts";
+import { buildFrontendAssets } from "/Users/anyunhong/Desktop/集合agent/backend/agetor/packages/core/frontend.ts";
 
-const dir = ".//apps/web/public";
+const dir = "/Users/anyunhong/Desktop/集合agent/apps/web/public";
 try {
   const assets = await buildFrontendAssets(dir, "b".repeat(64));
   const hashes = Object.fromEntries(

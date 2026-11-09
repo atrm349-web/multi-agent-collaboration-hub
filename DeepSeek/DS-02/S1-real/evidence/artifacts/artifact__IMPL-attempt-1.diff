@@ -1,0 +1,156 @@
+diff --git a/sanity-check.js b/sanity-check.js
+new file mode 100644
+index 0000000..6501ab4
+--- /dev/null
++++ b/sanity-check.js
+@@ -0,0 +1,63 @@
++"use strict";
++
++const { parseDuration } = require("./src/duration.js");
++
++const valid = [
++  ["90s", 90],
++  ["1h30m", 5400],
++  ["2d4h", 2 * 86400 + 4 * 3600],
++  ["1H30M", 5400],
++  ["1h 30m", 5400],
++  ["1w", 604800],
++  ["1w 2d 3h 4m 5s", 604800 + 2 * 86400 + 3 * 3600 + 4 * 60 + 5],
++  ["0s", 0],
++];
++
++const invalid = [
++  "1 h",
++  "90",
++  "1.5h",
++  "",
++  " ",
++  "1h  30m",
++  " 1h",
++  "1h ",
++  "-1h",
++  "1x",
++  "1h30",
++  "999999999999999999999s",
++  "1h 999999999999999999999s",
++  "1h30m ",
++  "1h\t30m",
++];
++
++let failures = 0;
++
++for (const [input, expected] of valid) {
++  try {
++    const got = parseDuration(input);
++    if (got !== expected) {
++      failures++;
++      console.log(`FAIL valid ${JSON.stringify(input)}: got ${got}, want ${expected}`);
++    }
++  } catch (err) {
++    failures++;
++    console.log(`FAIL valid ${JSON.stringify(input)} threw ${err.message}`);
++  }
++}
++
++for (const input of invalid) {
++  try {
++    parseDuration(input);
++    failures++;
++    console.log(`FAIL invalid ${JSON.stringify(input)} did not throw`);
++  } catch (err) {
++    if (!(err instanceof RangeError) || !err.message.includes("INVALID_DURATION")) {
++      failures++;
++      console.log(`FAIL invalid ${JSON.stringify(input)} wrong error: ${err}`);
++    }
++  }
++}
++
++console.log(failures === 0 ? "ALL CHECKS PASSED" : `${failures} FAILURES`);
++process.exit(failures === 0 ? 0 : 1);
+diff --git a/src/duration.js b/src/duration.js
+index 333de8e..fff6288 100644
+--- a/src/duration.js
++++ b/src/duration.js
+@@ -2,11 +2,81 @@
+ 
+ /**
+  * Duration parsing for the reporting service.
++ *
++ * Grammar (README rules 1-9):
++ *   duration := segment ( " "? segment )*
++ *   segment  := digits unit
++ *   unit     := "s" | "m" | "h" | "d" | "w"   (case-insensitive)
++ *
++ * - No bare numbers, no decimals, no negatives, no empty input.
++ * - A single space is allowed *between* segments only, never between a
++ *   number and its unit.
++ * - The total must fit in a safe integer, otherwise it is invalid.
++ *
+  * @param {string} text
+  * @returns {number} total seconds
+  */
+ function parseDuration(text) {
+-  throw new Error("NOT_IMPLEMENTED");
++  if (typeof text !== "string") {
++    throw invalid();
++  }
++
++  // Reject empty input up front.
++  if (text.length === 0) {
++    throw invalid();
++  }
++
++  // Split on single spaces between segments. Consecutive spaces, leading or
++  // trailing spaces produce empty segments and are therefore rejected below.
++  const segments = text.split(" ");
++
++  let total = 0;
++
++  for (const segment of segments) {
++    // Empty segment => leading/trailing space or double space.
++    if (segment.length === 0) {
++      throw invalid();
++    }
++
++    // digits followed by exactly one unit character; nothing else allowed.
++    const match = /^([0-9]+)([smhdw])$/i.exec(segment);
++    if (match === null) {
++      throw invalid();
++    }
++
++    const amountText = match[1];
++    const unit = match[2].toLowerCase();
++
++    // Reject values that cannot be represented exactly as a safe integer.
++    const amount = Number(amountText);
++    if (!Number.isSafeInteger(amount)) {
++      throw invalid();
++    }
++
++    const segmentSeconds = amount * UNIT_SECONDS[unit];
++    if (!Number.isSafeInteger(segmentSeconds)) {
++      throw invalid();
++    }
++
++    total += segmentSeconds;
++    if (!Number.isSafeInteger(total)) {
++      throw invalid();
++    }
++  }
++
++  return total;
++}
++
++const UNIT_SECONDS = {
++  s: 1,
++  m: 60,
++  h: 3600,
++  d: 86400,
++  w: 604800,
++};
++
++function invalid() {
++  return new RangeError("INVALID_DURATION");
+ }
+ 
+ module.exports = { parseDuration };

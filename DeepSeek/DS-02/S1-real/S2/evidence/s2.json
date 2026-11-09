@@ -1,0 +1,36 @@
+{
+  "base": "1419525ff3ebd262c70f246c33bc5ee38701d11f",
+  "taskId": "b4c54515-5125-4575-9a40-63a08e685bf4",
+  "firstStatus": "waiting_approval",
+  "reject": "rejected",
+  "taskAfterReject": "waiting_approval",
+  "rework": {
+    "subtaskId": "0ab75d3d-53f2-47ad-abb1-872cb696387c",
+    "status": "retry_wait",
+    "operationId": "34404d03-fed9-4a96-9679-54660569b7b7"
+  },
+  "approvals": [
+    {
+      "status": "rejected",
+      "digest": "df7c47657a8938b2a5046c8c7028c33d25267e408344ad6eb62b96773211bc0c",
+      "refs": 6
+    },
+    {
+      "status": "pending",
+      "digest": "3b13908af274fb6fb2ddf8eaafbb2b4a9eb5f7679fddc75738bf62889413509c",
+      "refs": 5
+    }
+  ],
+  "finalStatus": "succeeded",
+  "runs": 4,
+  "sessions": [
+    "25faf702-09b9-44d6-a9de-ccc573d3ee95",
+    "6c76626b-1c3e-437c-81ee-8ad44f772519",
+    "0b8af7f1-68eb-4d6b-b2ee-0ed12ff5ab0b",
+    "c4eab822-f07f-471a-bba4-f98b1462eb84"
+  ],
+  "repo": {
+    "headSame": true,
+    "clean": true
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "checkedAt": "2026-11-09T06:23:56.155389+00:00",
+  "root": "/Users/anyunhong/Desktop/集合agent",
+  "head": "1c693a347ecbc4c29cdeda2f63437f879cd996ee",
+  "files": {
+    "Antigravity/交接进度.md": "a442061ed0e502fd25fb166828a76f2c944b31592a793aa82dc48940c44bbc90",
+    "DeepSeek/最终验收报告.md": "e39f5e805763b23888f6f5a19d6cbbd916eb8fcad183ae38d488469e07f9bd5c",
+    "DeepSeek/交接进度.md": "2970d064789041921837a7299de234ee719baf32b2d04fb355adf802a3a23e46",
+    "backend/agetor/packages/core/hub.ts": "1b3f83ef5e7afe852356fe1c0a15d8114b077ba37f7d1079f9ae99d523bcc5fd",
+    "backend/agetor/packages/core/state/store.ts": "b33ed2d64408f71072cbc06ddbb5e718df167cb13597bfb6733f417d8670b81b",
+    "backend/agetor/packages/agent-adapters/claude/runtime.ts": "4f93a0145a1d4ed22ae0d750386865508606b251e79b45e1fabe1d1a5356bd7d",
+    "apps/web/public/app.js": "df7d76c0258392c2b421a75d893e5206f98c865b61b677e60b7f662672d2ae5e",
+    "config/hub-config.json": "6aba5fc1805534b9907743d0e4005443b8f6aff2666455f38143da61c832922d"
+  }
+}

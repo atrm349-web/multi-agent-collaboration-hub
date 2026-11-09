@@ -1,6 +1,6 @@
 {
   "port": 4321,
-  "maxConcurrency": 2,
+  "maxConcurrency": 1,
   "frontendDir": "apps/web/public",
   "repositories": [
     {
@@ -8,11 +8,11 @@
       "label": "demo-geometry-repo",
       "path": "examples/demo-geometry-repo",
       "defaultTestProfileId": "geom-tests",
-      "model": "deepseek-chat",
+      "model": "workbuddy",
       "models": {
-        "planner": "deepseek-reasoner",
-        "developer": "deepseek-chat",
-        "reviewer": "deepseek-chat"
+        "planner": "workbuddy",
+        "developer": "workbuddy",
+        "reviewer": "workbuddy"
       },
       "effort": "low",
       "testProfiles": [

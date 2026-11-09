@@ -5,11 +5,11 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildCodexCommand } from ".//backend/agetor/src/bun/agents.ts";
-import type { Harness } from ".//backend/agetor/src/shared/types.ts";
+import { buildCodexCommand } from "/Users/anyunhong/Desktop/集合agent/backend/agetor/src/bun/agents.ts";
+import type { Harness } from "/Users/anyunhong/Desktop/集合agent/backend/agetor/src/shared/types.ts";
 
 const CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
-const REPO = "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/repo";
+const REPO = "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework/repo";
 const MODEL = "gpt-6.1-sol";
 const EFFORT = "high";
 

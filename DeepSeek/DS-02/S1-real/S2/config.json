@@ -1,0 +1,34 @@
+{
+  "root": "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/S2/runtime",
+  "port": 4346,
+  "maxConcurrency": 1,
+  "frontendDir": "/Users/anyunhong/Desktop/集合agent/apps/web/public",
+  "repositories": [
+    {
+      "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "label": "DS-02 S2 reject/rework",
+      "path": "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/S2/repo",
+      "defaultTestProfileId": "acceptance",
+      "model": "deepseek-chat",
+      "models": {
+        "planner": "deepseek-reasoner",
+        "developer": "deepseek-chat",
+        "reviewer": "deepseek-chat"
+      },
+      "effort": "low",
+      "testProfiles": [
+        {
+          "id": "acceptance",
+          "command": [
+            "/usr/local/bin/node",
+            "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-04-real-e2e/owner-tests/check.mjs"
+          ],
+          "timeoutMs": 20000,
+          "readPaths": [
+            "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-04-real-e2e/owner-tests"
+          ]
+        }
+      ]
+    }
+  ]
+}

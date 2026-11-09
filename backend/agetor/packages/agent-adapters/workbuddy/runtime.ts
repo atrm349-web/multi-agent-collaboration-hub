@@ -71,6 +71,7 @@ export class WorkBuddyRuntime {
 
       const timeoutMs = request.timeoutMs ?? 180_000;
       run.timer = setTimeout(() => {
+        if (run.wbRunId) void this.client.cancelRun(run.wbRunId).catch(() => {});
         run.result.status = "timed_out";
         run.result.error = { code: "TIMEOUT", message: `Execution timed out after ${timeoutMs}ms`, retryable: true };
         this.finish(run);
@@ -86,10 +87,15 @@ export class WorkBuddyRuntime {
 
   private async execute(run: Run, request: CodexRequest, cwd: string): Promise<void> {
     try {
+      const wantsJson = Boolean(request.outputSchema);
+      const taskPrompt = wantsJson
+        ? `${request.prompt}\n\n[WorkBuddy 网关说明]：请正常写入平台指定的本轮结果文件 output.json 并调用 report（这属于平台正常交付机制，不违反只读/不修改代码目录的约束）。请将上述要求的纯 JSON 结构同时放入 output.json 的 "json" 字段与 "text" 字段中，"artifacts" 設为空数组 []。`
+        : `${request.prompt}\n\n[WorkBuddy 网关说明]：请在当前工作目录 (${cwd}) 完成任务要求的文件修改或编写，并正常写入平台指定的本轮结果文件 output.json（将中文成果说明填入 "text" 字段）及调用 report。`;
+
       const submitRes = await this.client.submitRun({
-        task: request.prompt,
+        task: taskPrompt,
         workspace: cwd,
-        output: "artifacts",
+        output: wantsJson ? "json" : "text",
         timeoutSeconds: Math.floor((request.timeoutMs ?? 180_000) / 1000),
       });
 
@@ -107,7 +113,7 @@ export class WorkBuddyRuntime {
       while (Date.now() - startTime < timeoutMs) {
         if (run.terminal) break;
 
-        const current = await this.client.waitRun(submitRes.run.id, 10);
+        const current = await this.client.waitRun(submitRes.run.id, 15);
         this.record(run, {
           seq: run.logs.length + 1,
           stream: "event",
@@ -117,7 +123,13 @@ export class WorkBuddyRuntime {
         if (current.status === "completed") {
           run.result.status = "succeeded";
           run.result.exitCode = 0;
-          run.result.result = current.result?.text ?? "WorkBuddy completed task successfully";
+          if (wantsJson && current.result?.json !== undefined) {
+            run.result.result = typeof current.result.json === "string"
+              ? current.result.json
+              : JSON.stringify(current.result.json);
+          } else {
+            run.result.result = current.result?.text ?? (current.result?.json !== undefined ? JSON.stringify(current.result.json) : "WorkBuddy completed task successfully");
+          }
           this.record(run, {
             seq: run.logs.length + 1,
             stream: "event",
@@ -126,7 +138,7 @@ export class WorkBuddyRuntime {
           break;
         }
 
-        if (current.status === "failed" || current.status === "cancelled" || current.status === "blocked") {
+        if (current.status === "failed" || current.status === "cancelled" || current.status === "blocked" || current.status === "uncertain") {
           run.result.status = current.status === "cancelled" ? "cancelled" : "failed";
           run.result.error = {
             code: current.error?.code ?? "WORKBUDDY_EXECUTION_FAILED",
@@ -136,7 +148,13 @@ export class WorkBuddyRuntime {
           break;
         }
 
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 250));
+      }
+
+      if (!run.terminal && run.result.status === "running") {
+        if (run.wbRunId) void this.client.cancelRun(run.wbRunId).catch(() => {});
+        run.result.status = "timed_out";
+        run.result.error = { code: "TIMEOUT", message: `Execution timed out after ${timeoutMs}ms`, retryable: true };
       }
     } catch (err: any) {
       if (!run.terminal) {

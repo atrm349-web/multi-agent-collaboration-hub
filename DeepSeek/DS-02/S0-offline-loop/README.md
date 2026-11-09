@@ -67,7 +67,7 @@ s2 里第 1 轮的 approval 有 5 个 artifactRefs，其中包含一份空 diff�
 
 ```sh
 cd DeepSeek/DS-02/S0-offline-loop
-BUN=/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
+BUN=/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
 $BUN s0-loop.ts s1     # exit 0
 $BUN s0-loop.ts s2     # exit 0（rejected>approved）
 $BUN s0-loop.ts s3     # exit 0（failed / 2 runs / 0 approvals）

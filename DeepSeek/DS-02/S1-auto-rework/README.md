@@ -35,7 +35,7 @@ cd repo && /usr/local/bin/node ../owner-tests/check.mjs ; echo "expect 1"
 #   mkdir -p /tmp/correct/src && 写一份正确实现 → node ../owner-tests/check.mjs → expect 0
 
 # 2) payload 校验
-BUN=/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
+BUN=/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
 $BUN validate-fixture.ts
 
 # 3) 启动（这是真实运行的第一步，会开始消耗额度 —— 需授权）
@@ -45,8 +45,8 @@ $BUN validate-fixture.ts
 ## 真实运行的完整步骤（需授权后执行）
 
 ```sh
-cd "/Users/developer/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework"
-BUN=/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
+cd "/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-auto-rework"
+BUN=/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
 
 # 0) 记录基线
 git -C repo rev-parse HEAD          # 期望 5770c451ffe34636e59a0a12d7608a9b1d92e484

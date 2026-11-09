@@ -18,7 +18,7 @@ scenario/
 ```sh
 cd DeepSeek/DS-03/scenario
 ./run.sh A                     # 打印 scenario/port/root，等 "Hub ready"
-BUN=/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
+BUN=/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun
 DS02_CONFIRM_REAL_RUN=1 DS02_REPOSITORY_ID=66666666-6666-4666-8666-666666666666 \
   DS02_PROFILE_ID=slow DS02_RUNTIME="$PWD/A/runtime" DS02_EVIDENCE="$PWD/A/evidence" \
   DS02_TITLE="DS-03 A normal stop" $BUN ../DS-02/S1-auto-rework/drive-s1.ts create

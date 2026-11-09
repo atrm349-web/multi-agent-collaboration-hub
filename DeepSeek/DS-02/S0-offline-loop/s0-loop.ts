@@ -18,7 +18,7 @@ if (!["s1", "s2", "s3"].includes(SCENARIO)) throw new Error("usage: s0-loop.ts s
 process.env.DS0_FIRST_ATTEMPT_CORRECT = SCENARIO === "s2" ? "1" : "0";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
-const BACKEND = ".//backend/agetor";
+const BACKEND = "/Users/anyunhong/Desktop/集合agent/backend/agetor";
 const ROOT = path.join(HERE, `runtime-${SCENARIO}`);
 const REPO = path.join(HERE, "..", "S1-auto-rework", "repo");
 const OWNER_TESTS = path.join(HERE, "..", "S1-auto-rework", "owner-tests");

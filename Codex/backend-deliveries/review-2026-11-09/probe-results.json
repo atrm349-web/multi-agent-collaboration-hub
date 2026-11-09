@@ -1,0 +1,31 @@
+{
+  "mode": "local fake provider; no API requests or credentials",
+  "findings": [
+    {
+      "scenario": "normal-review",
+      "status": "succeeded",
+      "result": "{\"approved\":true,\"findings\":[]}",
+      "expectedAnswerEvents": 0
+    },
+    {
+      "scenario": "readonly-write",
+      "status": "succeeded",
+      "result": "{\"approved\":true,\"findings\":[]}",
+      "expectedAnswerEvents": 0,
+      "readonlyFileCreated": "modified"
+    },
+    {
+      "scenario": "symlink-escape",
+      "status": "succeeded",
+      "result": "{\"approved\":true,\"findings\":[]}",
+      "expectedAnswerEvents": 0,
+      "outsideFileContent": "modified"
+    },
+    {
+      "scenario": "malformed-review",
+      "status": "succeeded",
+      "result": "{\"approved\":true,\"findings\":[\"Automated Claude review accepted.\"]}",
+      "expectedAnswerEvents": 0
+    }
+  ]
+}

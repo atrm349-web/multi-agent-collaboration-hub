@@ -6,7 +6,7 @@ baseline and records the verdict per artifact. Run from anywhere:
 
     python3 baseline-check.py [shared-root] [--json out.json]
 
-Default shared root: ./
+Default shared root: /Users/anyunhong/Desktop/集合agent
 """
 import hashlib
 import json
@@ -15,7 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_ROOT = "./"
+DEFAULT_ROOT = "/Users/anyunhong/Desktop/集合agent"
 
 
 def sha256(path):

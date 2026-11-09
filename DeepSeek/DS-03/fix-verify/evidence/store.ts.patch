@@ -1,0 +1,41 @@
+--- /Users/anyunhong/Desktop/集合agent/backend/agetor/packages/core/state/store.ts	2026-11-06 14:43:27
++++ backend/agetor/packages/core/state/store.ts	2026-11-09 15:01:27
+@@ -264,6 +264,38 @@
+       }
+       // Keep the occupied slot: old children may still be executing. Never kill a reused PID.
+       return rows.map((row) => row.run_id);
++    }).immediate();
++  }
++  /**
++   * Startup-only sweep for a validation phase that a controller crash orphaned.
++   * `reconcileExpired` only inspects active runs; when the model run already
++   * succeeded and the controller died while the registered tests were running,
++   * nothing else notices and the subtask stays "validating" forever.
++   * Safe only before any local job exists (called from the controller constructor).
++   */
++  reconcileInterruptedValidations(): string[] {
++    return this.db.transaction(() => {
++      const rows = this.db.query<{ id: string; run_id: string | null },[]>(
++        `SELECT s.id AS id,
++           (SELECT r.id FROM hub_entities r
++              WHERE r.kind='run' AND json_extract(r.data,'$.subtaskId')=s.id
++              ORDER BY r.created_at DESC LIMIT 1) AS run_id
++           FROM hub_entities s
++          WHERE s.kind='subtask' AND json_extract(s.data,'$.status')='validating'
++            AND NOT EXISTS (SELECT 1 FROM hub_entities r
++                              WHERE r.kind='run' AND json_extract(r.data,'$.subtaskId')=s.id
++                                AND json_extract(r.data,'$.status') IN ('starting','running','cancelling'))`).all();
++      const error = { code: "PROCESS_CRASHED", message: "Validation was interrupted by a controller crash; review the workspace before retrying", retryable: false };
++      for (const row of rows) {
++        const subtask = this.get("subtask", row.id);
++        this.save("subtask", { ...subtask, status: "failed", error }, subtask.version);
++        const task = this.get("task", subtask.taskId);
++        if (!["succeeded","failed","cancelled","timed_out"].includes(task.status)) {
++          this.save("task", { ...task, status: "failed", endedAt: new Date(this.clock()).toISOString(), error }, task.version);
++        }
++        if (row.run_id) this.db.query("DELETE FROM hub_execution_slot WHERE run_id=?").run(row.run_id);
++      }
++      return rows.map((row) => row.id);
+     }).immediate();
+   }
+   acknowledgeInterruption(runId: string, expectedVersion: number, evidence: { processGroupVerifiedStopped: boolean; reason: string }): void {

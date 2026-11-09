@@ -2321,23 +2321,32 @@ function renderAgentRouterView() {
                 </select>
               </div>
 
+              <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">执行速度与拆解模式 (Execution Speed Mode)</label>
+                <select id="newTaskExecModeSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #10b981;border-radius:6px;color:#6ee7b7;font-size:12px;font-weight:600;">
+                  <option value="fast">⚡ 极速协同模式 (推荐 · 跳过冗长拆解，单步综合实现 + 终审，提速 70%)</option>
+                  <option value="dag">🕸️ 完整多节点 DAG 拆解模式 (适合复杂大型工程，耗时较长)</option>
+                </select>
+              </div>
+
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div>
                   <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">规划模型 (Planner)</label>
                   <select id="newTaskPlannerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
-                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
+                    <option value="workbuddy">🛠️ WorkBuddy (本地网关 · 优先推荐)</option>
                     <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
+                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
+                    <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
                     <option value="codex">⚙️ Codex (CLI)</option>
                   </select>
                 </div>
                 <div>
-                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">开发执行模型 (Developer)</label>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">开发与审查模型 (Developer & Reviewer)</label>
                   <select id="newTaskDevSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="deepseek-chat">🧠 DeepSeek Chat (V3)</option>
-                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
-                    <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
+                    <option value="workbuddy">🛠️ WorkBuddy (本地网关 · 优先推荐)</option>
                     <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
+                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
+                    <option value="deepseek-chat">🧠 DeepSeek Chat (V3)</option>
                   </select>
                 </div>
               </div>
@@ -2464,10 +2473,12 @@ document.addEventListener('click', async (e) => {
     const repoSelect = document.getElementById('newTaskRepoSelect');
     const plannerSelect = document.getElementById('newTaskPlannerSelect');
     const devSelect = document.getElementById('newTaskDevSelect');
+    const execModeSelect = document.getElementById('newTaskExecModeSelect');
 
     const title = titleInput?.value.trim() || '多智能体真实协同研发任务';
     const goal = goalInput?.value.trim();
     const repositoryId = repoSelect?.value || uiState.repositories?.[0]?.id;
+    const execMode = execModeSelect?.value || 'fast';
 
     if (!goal) {
       showToast('请输入具体的任务目标与 Prompt！', true);
@@ -2475,7 +2486,12 @@ document.addEventListener('click', async (e) => {
     }
 
     try {
-      showToast('🚀 正在向 Hub 主调度器下发真实目标并启动多模型协同...');
+      const plannerModel = plannerSelect?.value || 'workbuddy';
+      const devModel = devSelect?.value || 'workbuddy';
+      const fastSubtaskId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+        ? globalThis.crypto.randomUUID()
+        : '10000000-1000-4000-8000-' + String(Date.now()).padStart(12, '0').slice(-12);
+      showToast(`🚀 正在向 Hub 主调度器下发真实目标 (模型: ${devModel}, 模式: ${execMode === 'fast' ? '⚡极速直达' : '🕸️DAG拆解'})...`);
       const created = await apiRequest('/api/v1/tasks', {
         method: 'POST',
         body: JSON.stringify({
@@ -2483,9 +2499,30 @@ document.addEventListener('click', async (e) => {
           goal,
           repositoryId,
           priority: 'high',
+          models: {
+            planner: plannerModel,
+            developer: devModel,
+            reviewer: devModel
+          },
           acceptanceCriteria: [
             { id: 'ac-core', description: 'All generated modules pass automated tests and review gate' }
-          ]
+          ],
+          ...(execMode === 'fast' ? {
+            plannedSubtasks: [
+              {
+                id: fastSubtaskId,
+                code: 'SUB-01',
+                title: `${title} · 综合实现与中文成果报告`,
+                description: `直接完成用户目标（${goal}），生成所需代码/数据文件以及一份详尽直观的中文成果说明报告 DELIVERY_REPORT.md，并在最终回复中直接给出完整的中文文字解答。`,
+                stage: 'implementation',
+                dependsOn: [],
+                requiredCapabilities: ['stream'],
+                acceptanceCriteria: [
+                  { id: 'ac-sub-01', description: 'Deliver complete implementation and Chinese summary report' }
+                ]
+              }
+            ]
+          } : {})
         })
       });
 

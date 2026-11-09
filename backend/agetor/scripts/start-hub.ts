@@ -108,11 +108,11 @@ if (rawRepos.length === 0) {
       label: 'demo-geometry-repo',
       path: demoTargetDir,
       defaultTestProfileId: 'geom-tests',
-      model: 'deepseek-chat',
+      model: 'workbuddy',
       models: {
-        planner: 'deepseek-reasoner',
-        developer: 'deepseek-chat',
-        reviewer: 'deepseek-chat'
+        planner: 'workbuddy',
+        developer: 'workbuddy',
+        reviewer: 'workbuddy'
       },
       effort: 'low',
       testProfiles: [

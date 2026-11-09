@@ -1,0 +1,203 @@
+diff --git a/src/duration.js b/src/duration.js
+index fff6288..c3bf360 100644
+--- a/src/duration.js
++++ b/src/duration.js
+@@ -16,6 +16,19 @@
+  * @param {string} text
+  * @returns {number} total seconds
+  */
++
++const UNIT_SECONDS = {
++  s: 1,
++  m: 60,
++  h: 3600,
++  d: 86400,
++  w: 604800,
++};
++
++function invalid() {
++  return new RangeError("INVALID_DURATION");
++}
++
+ function parseDuration(text) {
+   if (typeof text !== "string") {
+     throw invalid();
+@@ -38,28 +51,44 @@ function parseDuration(text) {
+       throw invalid();
+     }
+ 
+-    // digits followed by exactly one unit character; nothing else allowed.
+-    const match = /^([0-9]+)([smhdw])$/i.exec(segment);
+-    if (match === null) {
+-      throw invalid();
+-    }
++    // A segment is one or more "digits unit" pairs concatenated together,
++    // e.g. "1h30m". Anything else (bare numbers, decimals, negatives,
++    // unknown units, spaces inside a segment) fails to match.
++    const pairPattern = /([0-9]+)([smhdw])/gi;
++    let consumed = 0;
++    let pairCount = 0;
++    let match;
+ 
+-    const amountText = match[1];
+-    const unit = match[2].toLowerCase();
++    while ((match = pairPattern.exec(segment)) !== null) {
++      // Reject gaps: the match must start exactly where the previous one ended.
++      if (match.index !== consumed) {
++        throw invalid();
++      }
++      consumed = pairPattern.lastIndex;
++      pairCount++;
+ 
+-    // Reject values that cannot be represented exactly as a safe integer.
+-    const amount = Number(amountText);
+-    if (!Number.isSafeInteger(amount)) {
+-      throw invalid();
+-    }
++      const amountText = match[1];
++      const unit = match[2].toLowerCase();
+ 
+-    const segmentSeconds = amount * UNIT_SECONDS[unit];
+-    if (!Number.isSafeInteger(segmentSeconds)) {
+-      throw invalid();
++      // Reject values that cannot be represented exactly as a safe integer.
++      const amount = Number(amountText);
++      if (!Number.isSafeInteger(amount)) {
++        throw invalid();
++      }
++
++      const segmentSeconds = amount * UNIT_SECONDS[unit];
++      if (!Number.isSafeInteger(segmentSeconds)) {
++        throw invalid();
++      }
++
++      total += segmentSeconds;
++      if (!Number.isSafeInteger(total)) {
++        throw invalid();
++      }
+     }
+ 
+-    total += segmentSeconds;
+-    if (!Number.isSafeInteger(total)) {
++    // The whole segment must be covered by "digits unit" pairs.
++    if (pairCount === 0 || consumed !== segment.length) {
+       throw invalid();
+     }
+   }
+@@ -67,16 +96,4 @@ function parseDuration(text) {
+   return total;
+ }
+ 
+-const UNIT_SECONDS = {
+-  s: 1,
+-  m: 60,
+-  h: 3600,
+-  d: 86400,
+-  w: 604800,
+-};
+-
+-function invalid() {
+-  return new RangeError("INVALID_DURATION");
+-}
+-
+ module.exports = { parseDuration };
+diff --git a/test/duration.test.js b/test/duration.test.js
+new file mode 100644
+index 0000000..ab07378
+--- /dev/null
++++ b/test/duration.test.js
+@@ -0,0 +1,94 @@
++"use strict";
++
++// Local verification for parseDuration (README rules 1-9).
++// Run with: node test/duration.test.js
++
++const assert = require("assert");
++const { parseDuration } = require("../src/duration.js");
++
++const valid = [
++  ["90s", 90],
++  ["1h30m", 5400],
++  ["2d4h", 2 * 86400 + 4 * 3600],
++  ["1H30M", 5400],
++  ["1h 30m", 5400],
++  ["1w", 604800],
++  ["1w 2d 3h 4m 5s", 604800 + 2 * 86400 + 3 * 3600 + 4 * 60 + 5],
++  ["0s", 0],
++  ["1h30m15s", 3600 + 1800 + 15],
++  ["2D4H", 2 * 86400 + 4 * 3600],
++  ["1m", 60],
++  ["1d", 86400],
++];
++
++const invalid = [
++  "1 h",
++  "90",
++  "1.5h",
++  "",
++  " ",
++  "1h  30m",
++  " 1h",
++  "1h ",
++  "-1h",
++  "1x",
++  "1h30",
++  "999999999999999999999s",
++  "1h 999999999999999999999s",
++  "1h30m ",
++  "1h\t30m",
++  "1h30mx",
++  "h",
++  "1hh",
++  "1h-30m",
++  "1h+30m",
++  "1e3s",
++  "0x10s",
++  "1h 30",
++  "1h30m 1 h",
++];
++
++let failures = 0;
++
++for (const [input, expected] of valid) {
++  try {
++    const got = parseDuration(input);
++    if (got !== expected) {
++      failures++;
++      console.log(`FAIL valid ${JSON.stringify(input)}: got ${got}, want ${expected}`);
++    }
++  } catch (err) {
++    failures++;
++    console.log(`FAIL valid ${JSON.stringify(input)} threw ${err.message}`);
++  }
++}
++
++for (const input of invalid) {
++  try {
++    parseDuration(input);
++    failures++;
++    console.log(`FAIL invalid ${JSON.stringify(input)} did not throw`);
++  } catch (err) {
++    if (!(err instanceof RangeError) || !err.message.includes("INVALID_DURATION")) {
++      failures++;
++      console.log(`FAIL invalid ${JSON.stringify(input)} wrong error: ${err}`);
++    }
++  }
++}
++
++// Non-string inputs must also be rejected.
++for (const input of [undefined, null, 90, {}, [], true]) {
++  try {
++    parseDuration(input);
++    failures++;
++    console.log(`FAIL non-string ${String(input)} did not throw`);
++  } catch (err) {
++    if (!(err instanceof RangeError) || !err.message.includes("INVALID_DURATION")) {
++      failures++;
++      console.log(`FAIL non-string ${String(input)} wrong error: ${err}`);
++    }
++  }
++}
++
++console.log(failures === 0 ? "ALL CHECKS PASSED" : `${failures} FAILURES`);
++process.exit(failures === 0 ? 0 : 1);

@@ -5,9 +5,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BUN="${BUN:-/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun}"
+BUN="${BUN:-/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun}"
 CODEX_BIN="${CODEX_BIN:-/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex}"
-BACKEND="${BACKEND:-.//backend/agetor}"
+BACKEND="${BACKEND:-/Users/anyunhong/Desktop/集合agent/backend/agetor}"
 
 if [[ ! -x "$BUN" ]]; then echo "bun not found at $BUN" >&2; exit 1; fi
 if [[ ! -x "$CODEX_BIN" ]]; then echo "codex CLI not found at $CODEX_BIN" >&2; exit 1; fi

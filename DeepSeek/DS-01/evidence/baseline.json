@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "generatedBy": "DeepSeek DS-01",
   "generatedAt": "2026-11-06T04:51:00Z",
-  "sharedRoot": "./",
+  "sharedRoot": "/Users/anyunhong/Desktop/集合agent",
   "backendGit": {
     "branch": "codex/b04-b06-local-platform",
     "head": "9f56aa45219df6544a7d2a62177a16ce78aa9a20",

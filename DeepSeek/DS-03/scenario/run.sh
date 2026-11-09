@@ -6,9 +6,9 @@ set -euo pipefail
 
 SCENARIO="${1:?usage: ./run.sh A|B|C}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BUN="${BUN:-/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun}"
+BUN="${BUN:-/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun}"
 CODEX_BIN="${CODEX_BIN:-/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex}"
-BACKEND="${BACKEND:-.//backend/agetor}"
+BACKEND="${BACKEND:-/Users/anyunhong/Desktop/集合agent/backend/agetor}"
 SRC_REPO="$HERE/../../DS-02/S1-auto-rework/repo"
 
 case "$SCENARIO" in
@@ -32,7 +32,7 @@ cat > "$DIR/config.json" <<JSON
 {
   "root": "$DIR/runtime",
   "port": $PORT,
-  "frontendDir": ".//apps/web/public",
+  "frontendDir": "/Users/anyunhong/Desktop/集合agent/apps/web/public",
   "repositories": [{
     "id": "66666666-6666-4666-8666-666666666666",
     "label": "DS-03 $SCENARIO",

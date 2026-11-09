@@ -1,0 +1,9 @@
+{
+  "before": "running",
+  "cancel": 202,
+  "after": "cancelled",
+  "subtasks": [
+    "IMPL:cancelled",
+    "FINAL-REVIEW:cancelled"
+  ]
+}

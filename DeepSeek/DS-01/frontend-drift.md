@@ -101,8 +101,8 @@ bun test src/bun/hub-frontend.test.ts     # 7 项/36 断言，只验证夹具
 python3 DeepSeek/DS-01/baseline-check.py --json /tmp/baseline.json
 
 # 2) 真源桥接探针
-/Users/developer/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun DeepSeek/DS-01/probe-bridge.ts
+/Users/anyunhong/Documents/Codex/2026-11-02/multi-agent-collaboration-hub-ai-agent/work/tooling/node_modules/@oven/bun-darwin-aarch64/bin/bun DeepSeek/DS-01/probe-bridge.ts
 
 # 3) 计划压缩测试
-cd "./" && <bun> test ./tests/test-f02-r3-plan.ts
+cd "/Users/anyunhong/Desktop/集合agent" && <bun> test ./tests/test-f02-r3-plan.ts
 ```

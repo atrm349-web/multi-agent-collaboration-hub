@@ -122,9 +122,13 @@ export class WorkBuddyClient {
 
   async cancelRun(id: string): Promise<void> {
     const token = await this.ensureToken();
-    await fetch(`${this.baseUrl}/v1/runs/${id}/cancel`, {
+    await fetch(`${this.baseUrl}/v1/runs/${encodeURIComponent(id)}/cancel`, {
       method: "POST",
-      headers: { authorization: `Bearer ${token}` }
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({})
     });
   }
 }

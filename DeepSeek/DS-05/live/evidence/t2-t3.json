@@ -1,0 +1,62 @@
+{
+  "base": "9aa10ca0e636feeefd7cd7122e4a81cdebf4754b",
+  "tasks": [
+    {
+      "n": 1,
+      "taskId": "766a9fa8-da40-48e4-b870-ff2c56cdab42",
+      "status": "succeeded",
+      "approved": true,
+      "seconds": 29,
+      "maxAttempt": 1,
+      "footprint": "26 MB",
+      "dbBytes": 4096
+    },
+    {
+      "n": 2,
+      "taskId": "c982e9bd-ff0f-4cc5-aa73-392c68d0f595",
+      "status": "succeeded",
+      "approved": true,
+      "seconds": 45,
+      "maxAttempt": 2,
+      "footprint": "27 MB",
+      "dbBytes": 425984
+    },
+    {
+      "n": 3,
+      "taskId": "7478ed4f-4771-483a-858c-56efcf01b70f",
+      "status": "failed",
+      "approved": false,
+      "seconds": 30,
+      "maxAttempt": 2,
+      "footprint": "28 MB",
+      "dbBytes": 425984
+    }
+  ],
+  "sse": {
+    "expiredStatus": 409,
+    "reconnects": {
+      "ok": 10,
+      "of": 10,
+      "latencyMs": [
+        4,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "memoryIdle": "21 MB",
+  "dbIdle": 4096,
+  "memoryEnd": "28 MB",
+  "dbEnd": 425984,
+  "repo": {
+    "headSame": true,
+    "clean": true
+  }
+}

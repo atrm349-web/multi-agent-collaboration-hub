@@ -1,7 +1,7 @@
 // DS-02 fixture validator — offline check that the payload I will POST is
 // accepted by the SAME validation the hub applies, before any real model call.
 // Reproduces HubService.create()'s checks without touching a live service.
-import { validatePlan } from ".//backend/agetor/packages/core/planner.ts";
+import { validatePlan } from "/Users/anyunhong/Desktop/集合agent/backend/agetor/packages/core/planner.ts";
 
 const IMPL_ID = "55555555-5555-4555-8555-555555555555";
 

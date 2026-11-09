@@ -1,0 +1,34 @@
+{
+  "scenario": "A",
+  "startedAt": "2026-11-09T05:50:57.219Z",
+  "base": "de09da6b160c55e2e4af51950b7d2303e8818e0c",
+  "after": {
+    "task": [
+      {
+        "s": "cancelled"
+      }
+    ],
+    "subs": [
+      {
+        "c": "IMPL",
+        "s": "cancelled"
+      },
+      {
+        "c": "FINAL-REVIEW",
+        "s": "cancelled"
+      }
+    ],
+    "slotRows": 0,
+    "childAlive": false,
+    "headSame": true,
+    "repoClean": true
+  },
+  "restart": {
+    "live": true,
+    "interruptedRuns": 0
+  },
+  "repo": {
+    "headSame": true,
+    "clean": true
+  }
+}

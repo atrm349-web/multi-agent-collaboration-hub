@@ -1,0 +1,8 @@
+{
+  "profileId": "acceptance",
+  "exitCode": 0,
+  "stdout": "PASS parseDuration(\"90s\") === 90\nPASS parseDuration(\"1h30m\") === 5400\nPASS parseDuration(\"2d\") === 172800\nPASS parseDuration(\"1H30M\") === 5400\nPASS parseDuration(\"1h 30m\") === 5400\nPASS parseDuration(\"1w\") === 604800\nPASS parseDuration(\"2d4h\") === 187200\nPASS parseDuration(\"1 h\") threw RangeError(INVALID_DURATION)\nPASS parseDuration(\"90\") threw RangeError(INVALID_DURATION)\nPASS parseDuration(\"1.5h\") threw RangeError(INVALID_DURATION)\nPASS parseDuration(\"-5m\") threw RangeError(INVALID_DURATION)\nPASS parseDuration(\"abc\") threw RangeError(INVALID_DURATION)\nPASS parseDuration(\"999999999999999999999s\") threw RangeError(INVALID_DURATION)\n--- 13/13 checks passed (/Users/anyunhong/Documents/deepseek-harness/default-workspace/DeepSeek/DS-02/S1-real/runtime/workspaces/d95392e2-3b5d-45e7-8786-b5d85660abd6/src/duration.js)\n",
+  "stderr": "",
+  "timedOut": false,
+  "cancelled": false
+}
