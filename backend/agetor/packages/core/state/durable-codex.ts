@@ -3,6 +3,7 @@ import { CodexRuntime, type CodexResult, type CodexLog } from "../../agent-adapt
 import { DeepSeekRuntime } from "../../agent-adapters/deepseek/runtime.ts";
 import { GeminiRuntime } from "../../agent-adapters/gemini/runtime.ts";
 import { WorkBuddyRuntime } from "../../agent-adapters/workbuddy/runtime.ts";
+import { MuseRuntime } from "../../agent-adapters/muse/runtime.ts";
 import { ClaudeRuntime } from "../../agent-adapters/claude/runtime.ts";
 import type { AgentRun } from "../../shared/src/types.ts";
 import { HubStore, type ClaimRequest } from "./store.ts";
@@ -55,17 +56,19 @@ export class DurableCodexRunner {
     const isTestSpawn = Boolean(this.options.spawn);
     const reqModel = input.request.model ?? "";
     const hasClaudeKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_API_KEY?.trim());
-    job.runtime = (!isTestSpawn && (reqModel === "auto" || reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy") || (reqModel.startsWith("claude") && !hasClaudeKey) || reqModel.startsWith("deepseek") || reqModel.startsWith("codex")))
-      ? new WorkBuddyRuntime(runtimeOptions)
-      : reqModel.startsWith("deepseek")
-        ? new DeepSeekRuntime(runtimeOptions)
-        : reqModel.startsWith("claude")
-          ? new ClaudeRuntime(runtimeOptions)
-          : (reqModel.startsWith("gemini") || reqModel.startsWith("antigravity"))
-            ? new GeminiRuntime(runtimeOptions)
-            : (reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy"))
-              ? new WorkBuddyRuntime(runtimeOptions)
-              : new CodexRuntime(runtimeOptions);
+    job.runtime = reqModel.startsWith("muse")
+      ? new MuseRuntime(runtimeOptions)
+      : (!isTestSpawn && (reqModel === "auto" || reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy") || (reqModel.startsWith("claude") && !hasClaudeKey) || reqModel.startsWith("deepseek") || reqModel.startsWith("codex")))
+        ? new WorkBuddyRuntime(runtimeOptions)
+        : reqModel.startsWith("deepseek")
+          ? new DeepSeekRuntime(runtimeOptions)
+          : reqModel.startsWith("claude")
+            ? new ClaudeRuntime(runtimeOptions)
+            : (reqModel.startsWith("gemini") || reqModel.startsWith("antigravity"))
+              ? new GeminiRuntime(runtimeOptions)
+              : (reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy"))
+                ? new WorkBuddyRuntime(runtimeOptions)
+                : new CodexRuntime(runtimeOptions);
     this.jobs.set(id,job);
     const heartbeat = setInterval(() => {
       try {

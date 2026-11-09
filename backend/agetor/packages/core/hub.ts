@@ -7,7 +7,7 @@ import { migrate } from "../../src/bun/migrate.ts";
 import schema from "../../src/bun/migrations/083_hub_service.sql" with { type: "text" };
 import { HubStore } from "./state/store.ts";
 import { DurableCodexRunner } from "./state/durable-codex.ts";
-import { planWithCodex, planWithDeepSeek, planWithGemini, planWithClaude, planWithWorkBuddy, validatePlan, type PlannerOptions } from "./planner.ts";
+import { planWithCodex, planWithDeepSeek, planWithGemini, planWithClaude, planWithWorkBuddy, planWithMuse, validatePlan, type PlannerOptions } from "./planner.ts";
 import { WorkspaceManager, writeArtifact, freezeArtifact, readFrozenArtifact, runTestProfile, workspaceFingerprint,
   type WorkspaceHandle, type FrozenArtifact, type TestProfile, type TestResult } from "./workspace.ts";
 import { QualityGate, extractReviewJson } from "./quality.ts";
@@ -260,9 +260,11 @@ export class HubService implements HTTPService {
           ? planWithClaude
           : (plannerModel.startsWith("gemini") || plannerModel.startsWith("antigravity"))
             ? planWithGemini
-            : (plannerModel.startsWith("workbuddy") || plannerModel.startsWith("wb") || plannerModel.startsWith("codebuddy") || plannerModel === "auto" || plannerModel === "codex")
-              ? planWithWorkBuddy
-              : planWithCodex;
+            : plannerModel.startsWith("muse")
+              ? planWithMuse
+              : (plannerModel.startsWith("workbuddy") || plannerModel.startsWith("wb") || plannerModel.startsWith("codebuddy") || plannerModel === "auto" || plannerModel === "codex")
+                ? planWithWorkBuddy
+                : planWithCodex;
       const plan = await (this.options.planner ?? defaultPlanner)({ goal: `${goal}\nProduce only implementation, testing, review or documentation stages. Planning is already complete; do not add an analysis stage. IMPORTANT FOR SPEED: Prefer 1 consolidated 'implementation' subtask (or at most 2 parallel subtasks) rather than splitting simple queries, scripts, or reports into many serial steps. Ensure the implementation subtask also produces a clear, human-readable Chinese summary report (DELIVERY_REPORT.md) directly answering the user's goal in plain text alongside the code. Available capabilities: stream, resume, cancel, structured-output. Registered test profile IDs: ${repo.testProfiles.map((p) => p.id).join(", ")}.`,
         cwd: handle.agentPath,workspaceRoot: this.options.root,repositoryId: repo.id,model: plannerModel,effort: repo.effort,timeoutMs: 120000,signal: abort.signal });
       return { ...plan,goal,subtasks: validatePlan(plan.subtasks).map((step) => ({ ...step,acceptanceCriteria: this.criteria(step.acceptanceCriteria,repo) })) };
@@ -295,7 +297,7 @@ export class HubService implements HTTPService {
     return this.store.db.transaction(() => {
       const task = this.store.put("task",{ ...common(),id:taskId,provenance:"current",title,goal,repositoryId:repo.id,baseCommit:repo.baseCommit,status:"queued",priority: priority as Task["priority"],
         progressPct:0,pendingApprovalCount:0,artifactCount:0,acceptanceCriteria:criteria,error:null,startedAt:null,endedAt:null,deadlineAt:null },null);
-      const defaultWorkers = ["workbuddy", "gemini-3.5-flash-lite", "deepseek-chat"];
+      const defaultWorkers = ["workbuddy", "muse", "gemini-3.5-flash-lite", "deepseek-chat"];
       let workIdx = 0;
       for (const item of [...plan,reviewed]) {
         const isRev = item.stage === "review" || item.stage === "testing" || item.code === "FINAL-REVIEW";

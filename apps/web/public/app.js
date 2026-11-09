@@ -1789,6 +1789,20 @@ function renderSettingsView() {
             <div>核心分工: 本地工作区工具链协同 · 跨模块集成辅助</div>
           </div>
         </div>
+
+        <div class="agent-card">
+          <div class="agent-card-top">
+            <div>
+              <div class="agent-name" style="font-size:14px;font-weight:700;">Muse (Meta Muse 智能体)</div>
+              <div class="agent-role" style="font-size:11px;color:#a855f7;">模型: Meta Muse Spark / 自带独立额度</div>
+            </div>
+            <span class="status-badge status-available">在线</span>
+          </div>
+          <div style="font-size:11.5px;color:var(--text-secondary);margin-top:8px;line-height:1.5;">
+            <div>连接模式: <code>自带专属周额度 · 零额外 API 消耗</code></div>
+            <div>核心分工: 全自主复杂长任务 · 网页/终端综合执行 · 跨阶段协同</div>
+          </div>
+        </div>
       </div>
 
       <details style="margin-top:14px;font-size:11.5px;color:var(--text-secondary);background:rgba(255,255,255,0.02);border:1px solid var(--border-subtle);border-radius:6px;padding:8px 12px;cursor:pointer;">
@@ -1809,6 +1823,7 @@ const AGENT_LOGOS = {
   claude: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="#ffffff"><path d="M12 2L13.2 8.3L18.5 4.8L15 10.1L21.3 11.3L15.3 13.5L20 18L13.8 15.7L13 22L10.8 15.7L5.5 19.2L9 13.9L2.7 12.7L8.7 10.5L4 6L10.2 8.3L11 2Z"/></svg>`,
   gemini: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none"><path d="M12 2C12 7.52285 7.52285 12 2 12C7.52285 12 12 16.4772 12 22C12 16.4772 16.4772 12 22 12C16.4772 12 12 7.52285 12 2Z" fill="#ffffff"/><circle cx="19" cy="5" r="1.5" fill="#38bdf8"/></svg>`,
   workbuddy: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none"><rect x="3" y="5" width="18" height="14" rx="4.5" stroke="#ffffff" stroke-width="1.8"/><circle cx="8.5" cy="12" r="1.6" fill="#ffffff"/><circle cx="15.5" cy="12" r="1.6" fill="#ffffff"/><path d="M12 2V5" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="2" r="1" fill="#34d399"/><path d="M9.5 15.5C10.3 16.3 11.1 16.6 12 16.6C12.9 16.6 13.7 16.3 14.5 15.5" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+  muse: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none"><path d="M4 19V5L12 13L20 5V19" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="7" r="1.8" fill="#a855f7"/><circle cx="6" cy="17" r="1.2" fill="#38bdf8"/><circle cx="18" cy="17" r="1.2" fill="#38bdf8"/></svg>`,
   codex: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="#ffffff"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813v6.7227zm1.145-1.708l2.5484-1.4687 2.5484 1.4687v2.9374l-2.5484 1.4687-2.5484-1.4687z"/></svg>`
 };
 
@@ -1820,6 +1835,7 @@ function resolveSubtaskModel(s, task, detail) {
   if (explicit) {
     if (explicit === 'auto' || explicit === 'default') return isReview ? 'claude' : 'auto';
     if (explicit.includes('workbuddy') || explicit.includes('codebuddy') || explicit.includes('wb')) return 'workbuddy';
+    if (explicit.includes('muse')) return 'muse';
     if (explicit.includes('deepseek')) return 'deepseek';
     if (explicit.includes('claude') || explicit.includes('sonnet') || explicit.includes('opus')) return 'claude';
     if (explicit.includes('gemini') || explicit.includes('antigravity')) return 'gemini';
@@ -1836,13 +1852,14 @@ function resolveSubtaskModel(s, task, detail) {
   const candStr = String(candidate).toLowerCase();
   if (candStr === 'auto' || candStr === 'default') return isReview ? 'claude' : 'auto';
   if (candStr.includes('workbuddy') || candStr.includes('codebuddy') || candStr.includes('wb')) return 'workbuddy';
+  if (candStr.includes('muse')) return 'muse';
   if (candStr.includes('deepseek')) return 'deepseek';
   if (candStr.includes('claude') || candStr.includes('sonnet') || candStr.includes('opus')) return 'claude';
   if (candStr.includes('gemini') || candStr.includes('antigravity')) return 'gemini';
   if (candStr.includes('codex') || candStr.includes('openai') || candStr.includes('gpt')) return 'codex';
 
   // 3. Default division of labor when not specified:
-  // Working agents = Gemini + DeepSeek + WorkBuddy ('auto'); Acceptance agent = Claude ('claude')
+  // Working agents = Gemini + DeepSeek + WorkBuddy + Muse ('auto'); Acceptance agent = Claude ('claude')
   if (isReview) return 'claude';
   if (s?.assignedAgentId?.includes('3333')) return 'workbuddy';
   if (s?.assignedAgentId?.includes('1111')) return 'deepseek';
@@ -1851,8 +1868,9 @@ function resolveSubtaskModel(s, task, detail) {
 
 function getSubtaskModelDisplayName(modelKey) {
   switch (modelKey) {
-    case 'auto': return 'Gemini / DeepSeek / WorkBuddy';
+    case 'auto': return 'Gemini / DeepSeek / WorkBuddy / Muse';
     case 'workbuddy': return 'WorkBuddy';
+    case 'muse': return 'Muse';
     case 'deepseek': return 'DeepSeek';
     case 'claude': return 'Claude';
     case 'gemini': return 'Gemini';
@@ -1900,7 +1918,7 @@ function renderAgentRouterView() {
   const matchesMember = (s, memberId) => {
     const resolved = resolveSubtaskModel(s, task, detail);
     if (resolved === 'auto') {
-      return memberId === 'gemini' || memberId === 'deepseek' || memberId === 'workbuddy';
+      return memberId === 'gemini' || memberId === 'deepseek' || memberId === 'workbuddy' || memberId === 'muse';
     }
     return resolved === memberId;
   };
@@ -1917,7 +1935,7 @@ function renderAgentRouterView() {
           ? 'Codex · 主代理 (WorkBuddy 协同)'
           : 'Codex · 主代理';
 
-  // 5 Real Executive Member cards reflecting default roles (Workers: Gemini/DeepSeek/WorkBuddy, Reviewer: Claude, Master: Codex)
+  // 6 Real Executive Member cards reflecting default roles (Workers: Gemini/DeepSeek/WorkBuddy/Muse, Reviewer: Claude, Master: Codex)
   const memberCards = [
     {
       id: "deepseek",
@@ -1992,6 +2010,24 @@ function renderAgentRouterView() {
       })
     },
     {
+      id: "muse",
+      name: "Muse",
+      model: "Meta Muse · 专属周额度",
+      icon: AGENT_LOGOS.muse(15),
+      avatarCls: "ar-avatar-m",
+      status: "主力工作",
+      statusCls: "ar-status-success",
+      tasks: subtasks.filter((s) => matchesMember(s, "muse")).map((s, i) => {
+        const st = resolveSubtaskStatus(s);
+        return {
+          code: s.displayIndex || s.code || `T${i + 1}`,
+          title: s.title,
+          status: st.label,
+          color: st.color
+        };
+      })
+    },
+    {
       id: "codex",
       name: "Codex",
       model: "OpenAI Codex · 默认主 Agent",
@@ -2020,7 +2056,7 @@ function renderAgentRouterView() {
           <div class="ar-brand-title">Agent Router</div>
           <div class="ar-nav-tab">协作拓扑</div>
           <div class="ar-pills">
-            <span class="ar-pill">5 执行成员 (DeepSeek / Claude / Gemini / WorkBuddy / Codex)</span>
+            <span class="ar-pill">6 执行成员 (DeepSeek / Claude / Gemini / WorkBuddy / Muse / Codex)</span>
             <span class="ar-pill">${subtasks.length} 任务</span>
             <span class="ar-pill" style="color:#10b981;border-color:rgba(16,185,129,0.3);">${subtasks.filter((s) => s.status === 'succeeded').length} 已完成</span>
           </div>
@@ -2075,6 +2111,10 @@ function renderAgentRouterView() {
               <div class="ar-member-item" data-ar-member="workbuddy" title="腾讯 WorkBuddy (本地智能体网关)">
                 <div class="ar-avatar ar-avatar-d" style="${selectedMember === 'workbuddy' ? 'outline: 2px solid #fff;' : ''}">${AGENT_LOGOS.workbuddy(20)}</div>
                 <div class="ar-avatar-label">WorkBuddy</div>
+              </div>
+              <div class="ar-member-item" data-ar-member="muse" title="Meta Muse (自带专属周额度)">
+                <div class="ar-avatar ar-avatar-m" style="${selectedMember === 'muse' ? 'outline: 2px solid #fff;' : ''}">${AGENT_LOGOS.muse(20)}</div>
+                <div class="ar-avatar-label">Muse</div>
               </div>
               <div class="ar-member-item" data-ar-member="codex" title="OpenAI Codex (CLI 门禁)">
                 <div class="ar-avatar ar-avatar-x" style="${selectedMember === 'codex' ? 'outline: 2px solid #fff;' : ''}">${AGENT_LOGOS.codex(20)}</div>
@@ -2131,10 +2171,10 @@ function renderAgentRouterView() {
 
             <!-- 3 Column Cards Layout -->
             <div class="ar-flow-grid">
-              <!-- Column 1: 执行成员 5 -->
+              <!-- Column 1: 执行成员 6 -->
               <div>
                 <div class="ar-col-title">
-                  <span>执行成员 5</span>
+                  <span>执行成员 6</span>
                 </div>
 
                 ${memberCards.map((card) => {
@@ -2176,7 +2216,7 @@ function renderAgentRouterView() {
                     <div class="ar-center-avatar">${AGENT_LOGOS.codex(22)}</div>
                     <div class="ar-center-meta">
                       <div class="ar-center-title">${masterName}</div>
-                      <div class="ar-center-sub">默认主 Agent · 统筹分配任务 · 工作: Gemini/DeepSeek/WorkBuddy · 验收: Claude</div>
+                      <div class="ar-center-sub">默认主 Agent · 统筹分配任务 · 工作: Gemini/DeepSeek/WorkBuddy/Muse · 验收: Claude</div>
                     </div>
                     <div class="ar-center-status">
                       <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>
@@ -2422,6 +2462,7 @@ function renderAgentRouterView() {
                   <select id="newTaskPlannerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
                     <option value="codex" selected>⚙️ 默认主 Agent: Codex (分配任务与统筹)</option>
                     <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
+                    <option value="muse">🎨 Meta Muse (自带专属周额度)</option>
                     <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
                     <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
                     <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
@@ -2430,8 +2471,9 @@ function renderAgentRouterView() {
                 <div>
                   <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">工作与验收模型 (Workers & Reviewer)</label>
                   <select id="newTaskDevSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="auto" selected>🤖 默认协同 (工作: Gemini/DeepSeek/WorkBuddy · 验收: Claude)</option>
+                    <option value="auto" selected>🤖 默认协同 (工作: Gemini/DeepSeek/WorkBuddy/Muse · 验收: Claude)</option>
                     <option value="workbuddy">🛠️ 指定单模型: WorkBuddy (本地网关)</option>
+                    <option value="muse">🎨 指定单模型: Meta Muse (自带专属周额度)</option>
                     <option value="gemini-3.5-flash-lite">🌐 指定单模型: Gemini 3.5 Flash</option>
                     <option value="deepseek-chat">🧠 指定单模型: DeepSeek Chat (V3)</option>
                     <option value="claude-3-5-sonnet-20241022">⚡ 指定单模型: Claude 3.5 Sonnet</option>
@@ -2670,7 +2712,7 @@ document.addEventListener('click', async (e) => {
       const fastSubtaskId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
         ? globalThis.crypto.randomUUID()
         : '10000000-1000-4000-8000-' + String(Date.now()).padStart(12, '0').slice(-12);
-      showToast(`🚀 正在向主代理 (${plannerModel.toUpperCase()}) 下发真实目标 (工作模型: ${devModel === 'auto' ? 'Gemini/DeepSeek/WorkBuddy · 验收: Claude' : devModel})...`);
+      showToast(`🚀 正在向主代理 (${plannerModel.toUpperCase()}) 下发真实目标 (工作模型: ${devModel === 'auto' ? 'Gemini/DeepSeek/WorkBuddy/Muse · 验收: Claude' : devModel})...`);
       const created = await apiRequest('/api/v1/tasks', {
         method: 'POST',
         body: JSON.stringify({
