@@ -271,7 +271,7 @@ export class HubService implements HTTPService {
       const task = this.store.put("task",{ ...common(),id:taskId,provenance:"current",title,goal,repositoryId:repo.id,baseCommit:repo.baseCommit,status:"queued",priority: priority as Task["priority"],
         progressPct:0,pendingApprovalCount:0,artifactCount:0,acceptanceCriteria:criteria,error:null,startedAt:null,endedAt:null,deadlineAt:null },null);
       for (const item of [...plan,reviewed]) this.store.put("subtask",{ ...common(),...item,taskId,status:item.dependsOn.length ? "pending":"ready",
-        acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:2,timeoutMs:120000,outputArtifactIds:[],error:null },null);
+        acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:120000,outputArtifactIds:[],error:null },null);
       this.store.db.query("INSERT INTO hub_task_policies VALUES(?,?)").run(taskId,JSON.stringify(repo));
       return task;
     }).immediate();
@@ -328,7 +328,10 @@ export class HubService implements HTTPService {
     if (action==="retry" && !["failed","timed_out"].includes(step.status) || action==="rework" && !["validating","waiting_approval"].includes(step.status)) throw new Error("UNSUPPORTED_TRANSITION: retry/rework state");
     const refs = b.artifactRefs === undefined ? [] : this.artifactRefs(b.artifactRefs,task.id);
     let target=step;
-    if (step.code==="FINAL-REVIEW") target=this.store.list("subtask",task.id).filter((s)=>s.stage==="implementation"||s.stage==="documentation").at(-1) ?? step;
+    if (step.code==="FINAL-REVIEW" || step.stage==="review") {
+      const impls = this.store.list("subtask",task.id).filter((s)=>s.stage==="implementation"||s.stage==="documentation");
+      target = impls.filter((s)=>step.dependsOn.includes(s.id)).at(-1) ?? impls.at(-1) ?? step;
+    }
     this.rework(target,text(b.reason,"reason",8000),refs);
     return {subtaskId:target.id,status:"retry_wait",operationId:randomUUID()};
   }
@@ -462,7 +465,11 @@ export class HubService implements HTTPService {
       if(!review.approved)failures.push("Independent review rejected the result",...review.findings);
     }
     if(failures.length) {
-      const target=step.code==="FINAL-REVIEW"?this.store.list("subtask",task.id).filter((s)=>s.stage==="implementation"||s.stage==="documentation").at(-1)??step:step;
+      let target = step;
+      if (step.code === "FINAL-REVIEW" || step.stage === "review") {
+        const impls = this.store.list("subtask", task.id).filter((s) => s.stage === "implementation" || s.stage === "documentation");
+        target = impls.filter((s) => step.dependsOn.includes(s.id)).at(-1) ?? impls.at(-1) ?? step;
+      }
       this.rework(target,failures.join("\n").slice(0,16000),artifacts.map((a)=>a.id));return;
     }
     if(job.abort.signal.aborted || this.store.get("task",task.id).status === "cancelling")return;

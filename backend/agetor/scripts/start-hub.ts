@@ -66,50 +66,29 @@ if (!frontendDir || !existsSync(frontendDir)) {
 // 4. Resolve Repositories & Auto-seed Demo Repository if needed
 let rawRepos = Array.isArray(config.repositories) ? config.repositories : [];
 
-// If no repositories configured or demo repo path does not exist, auto-seed a local git repository
-if (rawRepos.length === 0 || !existsSync(rawRepos[0]?.path || '')) {
-  const demoSeedDir = path.join(projectRoot, 'examples/demo-geometry-repo');
-  const demoTargetDir = path.join(os.homedir(), '.agent-hub-demo-repo');
-
-  if (!existsSync(path.join(demoTargetDir, '.git')) && existsSync(demoSeedDir)) {
-    await mkdir(demoTargetDir, { recursive: true });
-    spawnSync('cp', ['-r', `${demoSeedDir}/.`, demoTargetDir]);
-    spawnSync(gitBin, ['init', '-q', demoTargetDir]);
-    spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.name', 'Agent Hub Demo']);
-    spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.email', 'demo@agent-hub.local']);
-    spawnSync(gitBin, ['-C', demoTargetDir, 'add', '.']);
-    spawnSync(gitBin, ['-C', demoTargetDir, 'commit', '-qm', 'feat: initial demo geometry suite']);
-  }
-
-  if (existsSync(demoTargetDir)) {
-    rawRepos = [
-      {
-        id: '11111111-2222-3333-4444-555555555555',
-        label: 'demo-geometry-repo',
-        path: demoTargetDir,
-        defaultTestProfileId: 'geom-tests',
-        model: 'deepseek-chat',
-        models: {
-          planner: 'deepseek-reasoner',
-          developer: 'deepseek-chat',
-          reviewer: 'deepseek-chat'
-        },
-        effort: 'low',
-        testProfiles: [
-          { id: 'circle-tests', command: [process.execPath || 'node', 'test_circle.js'], timeoutMs: 15000 },
-          { id: 'rect-tests', command: [process.execPath || 'node', 'test_rect.js'], timeoutMs: 15000 },
-          { id: 'geom-tests', command: [process.execPath || 'node', 'test_geom.js'], timeoutMs: 15000 }
-        ]
-      }
-    ];
-  }
-}
-
 // Ensure repository paths and test commands are absolute/executable
 for (const r of rawRepos) {
   if (r.path && !path.isAbsolute(r.path)) {
     r.path = path.resolve(projectRoot, r.path);
   }
+
+  // If the path does not have its own .git (e.g. an examples subfolder template), use/seed ~/.agent-hub-demo-repo
+  if (!existsSync(path.join(r.path, '.git'))) {
+    const demoTargetDir = path.join(os.homedir(), '.agent-hub-demo-repo');
+    if (!existsSync(path.join(demoTargetDir, '.git'))) {
+      await mkdir(demoTargetDir, { recursive: true });
+      if (existsSync(r.path)) {
+        spawnSync('cp', ['-r', `${r.path}/.`, demoTargetDir]);
+      }
+      spawnSync(gitBin, ['init', '-q', demoTargetDir]);
+      spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.name', 'Agent Hub Demo']);
+      spawnSync(gitBin, ['-C', demoTargetDir, 'config', 'user.email', 'demo@agent-hub.local']);
+      spawnSync(gitBin, ['-C', demoTargetDir, 'add', '.']);
+      spawnSync(gitBin, ['-C', demoTargetDir, 'commit', '-qm', 'feat: initial demo geometry suite']);
+    }
+    r.path = demoTargetDir;
+  }
+
   if (Array.isArray(r.testProfiles)) {
     for (const tp of r.testProfiles) {
       if (Array.isArray(tp.command)) {
@@ -119,6 +98,30 @@ for (const r of rawRepos) {
       }
     }
   }
+}
+
+if (rawRepos.length === 0) {
+  const demoTargetDir = path.join(os.homedir(), '.agent-hub-demo-repo');
+  rawRepos = [
+    {
+      id: '11111111-2222-3333-4444-555555555555',
+      label: 'demo-geometry-repo',
+      path: demoTargetDir,
+      defaultTestProfileId: 'geom-tests',
+      model: 'deepseek-chat',
+      models: {
+        planner: 'deepseek-reasoner',
+        developer: 'deepseek-chat',
+        reviewer: 'deepseek-chat'
+      },
+      effort: 'low',
+      testProfiles: [
+        { id: 'circle-tests', command: [process.execPath || 'node', 'test_circle.js'], timeoutMs: 15000 },
+        { id: 'rect-tests', command: [process.execPath || 'node', 'test_rect.js'], timeoutMs: 15000 },
+        { id: 'geom-tests', command: [process.execPath || 'node', 'test_geom.js'], timeoutMs: 15000 }
+      ]
+    }
+  ];
 }
 
 const repositories = await Promise.all(rawRepos.map(resolveRepository));
