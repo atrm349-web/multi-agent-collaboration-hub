@@ -43,6 +43,7 @@ export interface Subtask extends Entity, PlannedSubtask {
   workspaceId: string | null; branchName: string | null; progressPct: number;
   attempt: number; maxAttempts: number; timeoutMs: number; idleTimeoutMs?: number;
   outputArtifactIds: string[]; error: StructuredError | null;
+  model?: string;
 }
 export interface Agent extends Entity {
   label: string; roleTitle: string; adapterId: string; adapterVersion: string;
@@ -86,6 +87,7 @@ export interface Validation extends EvidenceEntity {
 export interface TaskDetail {
   task: Task; subtasks: Subtask[]; runs: Page<AgentRun>;
   validations: Page<Validation>; approvals: Page<Approval>; artifacts: Page<Artifact>;
+  policy?: any;
 }
 export interface DraftPlan { id: string; repositoryId: string; goal: string; subtasks: PlannedSubtask[]; executionMode: ExecutionMode }
 export interface CreateTaskRequest {

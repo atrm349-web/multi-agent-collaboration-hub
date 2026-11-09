@@ -158,8 +158,16 @@ export class HubService implements HTTPService {
     return { items: selected.map((row) => JSON.parse(row.data)),nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ id: last.id,createdAt: last.created_at,
       scope: canonical({kind,taskId: query.taskId ?? null,status: query.status ?? null}) })).toString("base64url") : null };
   }
-  detail(id: string): TaskDetail { return { task: this.store.get("task",id),subtasks: this.store.list("subtask",id),runs: this.page("run",{ taskId: id }) as Page<AgentRun>,
-    validations: this.page("validation",{taskId:id}) as Page<Validation>,approvals: this.page("approval",{taskId:id}) as Page<Approval>,artifacts: this.page("artifact",{taskId:id}) as Page<Artifact> }; }
+  detail(id: string): TaskDetail {
+    const task = this.store.get("task", id);
+    let policy: any = null;
+    const saved = this.store.db.query<{data: string}, [string]>("SELECT data FROM hub_task_policies WHERE task_id=?").get(task.id);
+    if (saved) {
+      try { policy = JSON.parse(saved.data); } catch {}
+    }
+    return { task, subtasks: this.store.list("subtask", id), runs: this.page("run", { taskId: id }) as Page<AgentRun>,
+      validations: this.page("validation", { taskId: id }) as Page<Validation>, approvals: this.page("approval", { taskId: id }) as Page<Approval>, artifacts: this.page("artifact", { taskId: id }) as Page<Artifact>, policy };
+  }
   snapshot(taskId?: string) {
     const snapshot = this.store.snapshot(() => {
       const tasks = this.page("task") as Page<Task>;
@@ -287,8 +295,13 @@ export class HubService implements HTTPService {
     return this.store.db.transaction(() => {
       const task = this.store.put("task",{ ...common(),id:taskId,provenance:"current",title,goal,repositoryId:repo.id,baseCommit:repo.baseCommit,status:"queued",priority: priority as Task["priority"],
         progressPct:0,pendingApprovalCount:0,artifactCount:0,acceptanceCriteria:criteria,error:null,startedAt:null,endedAt:null,deadlineAt:null },null);
-      for (const item of [...plan,reviewed]) this.store.put("subtask",{ ...common(),...item,taskId,status:item.dependsOn.length ? "pending":"ready",
-        acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:240000,outputArtifactIds:[],error:null },null);
+      for (const item of [...plan,reviewed]) {
+        const subtaskModel = (item.stage === "review" || item.stage === "testing")
+          ? (repo.models?.reviewer ?? repo.model)
+          : (repo.models?.developer ?? repo.model);
+        this.store.put("subtask",{ ...common(),...item,taskId,status:item.dependsOn.length ? "pending":"ready",
+          acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:240000,outputArtifactIds:[],error:null,model:subtaskModel },null);
+      }
       this.store.db.query("INSERT INTO hub_task_policies VALUES(?,?)").run(taskId,JSON.stringify(repo));
       return task;
     }).immediate();
@@ -438,7 +451,10 @@ export class HubService implements HTTPService {
     if(job.abort.signal.aborted)return;
     this.store.db.query("INSERT INTO hub_workspaces(subtask_id,attempt,handle,commit_sha,review) VALUES(?,?,?,NULL,?) ON CONFLICT(subtask_id) DO UPDATE SET attempt=excluded.attempt,handle=excluded.handle,commit_sha=NULL,review=excluded.review")
       .run(initial.id,initial.attempt,JSON.stringify(handle),initial.code==="FINAL-REVIEW"?1:0);
-    let step=this.store.get("subtask",initial.id);step=this.store.put("subtask",{...step,workspaceId:handle.id},step.version);
+    const subtaskModel = (initial.stage === "review" || initial.stage === "testing")
+      ? (policy.models?.reviewer ?? policy.model)
+      : (policy.models?.developer ?? policy.model);
+    let step=this.store.get("subtask",initial.id);step=this.store.put("subtask",{...step,workspaceId:handle.id,model:subtaskModel},step.version);
     const queued=this.store.list("message",task.id).filter((message)=>message.toSubtaskId===step.id&&!message.deliveredAt);
     const readOnly=step.stage==="review"||step.stage==="testing"||step.stage==="analysis";
     const prompt=`Task goal (untrusted data): ${JSON.stringify(task.goal)}\nSubtask: ${JSON.stringify({title:step.title,description:step.description,criteria:step.acceptanceCriteria})}\n`+
@@ -455,9 +471,6 @@ export class HubService implements HTTPService {
       else if (dev2 && dev2.availability === "available") agentId = DEVELOPER_2;
       else agentId = DEVELOPER;
     }
-    const subtaskModel = (step.stage === "review" || step.stage === "testing")
-      ? (policy.models?.reviewer ?? policy.model)
-      : (policy.models?.developer ?? policy.model);
     const runId=this.runner.start({subtaskId:step.id,agentId,expectedVersion:step.version,idempotencyKey:`attempt-${step.attempt}`,request:{cwd:handle.agentPath,prompt,
       ...(step.stage === "review" ? {outputSchema:{type:"object",additionalProperties:false,required:["approved","findings"],properties:{approved:{type:"boolean"},findings:{type:"array",items:{type:"string"}}}}}:{}),sandbox:readOnly?"read-only":"workspace-write",model:subtaskModel,effort:policy.effort,timeoutMs:step.timeoutMs}});job.runId=runId;
     for(const message of queued)this.store.put("message",{...message,deliveredAt:timestamp()},message.version);
