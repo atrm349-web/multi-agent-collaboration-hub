@@ -42,9 +42,62 @@ const uiState = {
   directiveSubtaskId: '',
   reviewComments: {},
   routerMode: 'live', // 'live' (formal production mode) | 'demo'
-  routerSelectedMember: 'all'
+  routerSelectedMember: 'all',
+  selectedTextDeliverableId: null
 };
 globalThis.uiState = uiState;
+
+function getTaskTextDeliverables(detail) {
+  const allArts = Array.isArray(detail?.artifacts)
+    ? detail.artifacts
+    : detail?.artifacts?.items || [];
+  const docArts = allArts.filter((a) => {
+    const label = String(a.relativePath || a.name || '').toLowerCase();
+    return a.category === 'documentation' || label.endsWith('.md') || label.endsWith('.txt');
+  });
+  const priorityScore = (art) => {
+    const name = String(art.relativePath || art.name || '');
+    if (/报告|直答|穿衣|天气|DELIVERY_REPORT|成果文字说明/i.test(name)) return 0;
+    if (/README/i.test(name)) return 1;
+    return 2;
+  };
+  return [...docArts].sort((a, b) => priorityScore(a) - priorityScore(b));
+}
+
+function renderReadableTextReport(rawText) {
+  const lines = String(rawText ?? '').split('\n');
+  return lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return '<div style="height:8px;"></div>';
+      const formatInline = (s) =>
+        escapeHtml(s)
+          .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#fff;font-weight:700;">$1</strong>')
+          .replace(/`([^`]+)`/g, '<code style="background:rgba(56,189,248,0.14);color:#7dd3fc;padding:1px 5px;border-radius:4px;font-family:var(--font-mono);font-size:12px;">$1</code>');
+      if (trimmed.startsWith('# ')) {
+        return `<div style="font-size:18px;font-weight:800;color:#f8fafc;margin:12px 0 6px;padding-bottom:6px;border-bottom:1px solid rgba(56,189,248,0.25);">${formatInline(trimmed.slice(2))}</div>`;
+      }
+      if (trimmed.startsWith('## ')) {
+        return `<div style="font-size:15px;font-weight:700;color:#38bdf8;margin:10px 0 4px;">${formatInline(trimmed.slice(3))}</div>`;
+      }
+      if (trimmed.startsWith('### ')) {
+        return `<div style="font-size:13.5px;font-weight:700;color:#a5b4fc;margin:8px 0 3px;">${formatInline(trimmed.slice(4))}</div>`;
+      }
+      if (trimmed.startsWith('> ')) {
+        return `<div style="border-left:3px solid #10b981;padding:4px 10px;margin:4px 0;background:rgba(16,185,129,0.08);color:#d1fae5;border-radius:0 6px 6px 0;font-size:13px;">${formatInline(trimmed.slice(2))}</div>`;
+      }
+      if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+        return `<div style="padding-left:14px;margin:3px 0;color:#e2e8f0;font-size:13px;line-height:1.65;">• ${formatInline(trimmed.slice(2))}</div>`;
+      }
+      if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+        if (/^\|[\s\-:|]+\|$/.test(trimmed)) return '';
+        const cells = trimmed.slice(1, -1).split('|').map((c) => formatInline(c.trim()));
+        return `<div style="display:grid;grid-template-columns:repeat(${cells.length},minmax(80px,1fr));gap:8px;padding:6px 10px;background:rgba(15,23,42,0.65);border-bottom:1px solid rgba(255,255,255,0.07);font-size:12.5px;color:#e2e8f0;">${cells.map((c) => `<div>${c}</div>`).join('')}</div>`;
+      }
+      return `<div style="color:#e2e8f0;font-size:13.5px;line-height:1.7;margin:2px 0;">${formatInline(line)}</div>`;
+    })
+    .join('');
+}
 
 function escapeHtml(str) {
   return String(str ?? '')
@@ -1540,13 +1593,78 @@ function renderReviewCenterView() {
 
 function renderArtifactCenterView() {
   const detail = uiState.selectedTaskDetail;
+  const task = detail?.task || getSelectedTask();
   const allArts = detail?.artifacts?.items || [];
   const filtered =
     uiState.selectedArtifactCategory === 'all'
       ? allArts
       : allArts.filter((a) => a.category === uiState.selectedArtifactCategory);
 
+  const textDocs = getTaskTextDeliverables(detail);
+  const activeDoc =
+    textDocs.find((d) => d.id === uiState.selectedTextDeliverableId) || textDocs[0] || null;
+  const activeDocText = activeDoc
+    ? uiState.artifactContentCache[activeDoc.id] ?? '正在加载成果文字说明...'
+    : '';
+
   return `
+    <!-- 成果文字直答与说明展示面板 -->
+    <div class="section-card" style="border:1px solid rgba(16,185,129,0.45);background:linear-gradient(180deg,rgba(16,185,129,0.08) 0%,rgba(15,23,42,0.92) 100%);margin-bottom:16px;">
+      <div class="section-header" style="border-bottom:1px solid rgba(16,185,129,0.2);padding-bottom:10px;margin-bottom:12px;">
+        <div>
+          <div class="section-title" style="display:flex;align-items:center;gap:8px;color:#34d399;font-size:15px;">
+            <span>📝 成果文字说明展示 · AI 任务回复报告</span>
+            <span class="chip" style="background:rgba(16,185,129,0.2);color:#6ee7b7;border-color:rgba(16,185,129,0.4);">可读文字直览</span>
+          </div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;">
+            针对任务目标「<strong style="color:#f8fafc;">${escapeHtml(task?.goal || task?.title || '当前任务')}</strong>」生成的自然语言解答、分析报告与使用说明（无需翻阅底层代码即可直接阅读成果）
+          </div>
+        </div>
+        ${
+          activeDoc
+            ? `
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="btn btn-sm btn-primary" data-copy-text-deliverable="${escapeHtml(activeDoc.id)}">📋 一键复制文字成果</button>
+            <button class="btn btn-sm" data-download-artifact="${escapeHtml(activeDoc.id)}" data-filename="${escapeHtml((activeDoc.relativePath || activeDoc.name || 'report.md').split('/').pop())}">⬇ 下载文字报告 (.md)</button>
+          </div>
+        `
+            : ''
+        }
+      </div>
+
+      ${
+        textDocs.length > 1
+          ? `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          ${textDocs
+            .map(
+              (doc) => `
+            <button class="btn btn-sm ${activeDoc?.id === doc.id ? 'btn-primary' : ''}" data-select-text-doc="${escapeHtml(doc.id)}">
+              📄 ${escapeHtml(doc.relativePath || doc.name)}
+            </button>
+          `
+            )
+            .join('')}
+        </div>
+      `
+          : ''
+      }
+
+      ${
+        activeDoc
+          ? `
+        <div style="background:rgba(9,13,22,0.85);border:1px solid rgba(56,189,248,0.25);border-radius:10px;padding:18px 20px;max-height:540px;overflow-y:auto;box-shadow:inset 0 2px 12px rgba(0,0,0,0.4);">
+          ${renderReadableTextReport(activeDocText)}
+        </div>
+      `
+          : `
+        <div style="padding:18px;background:rgba(15,23,42,0.6);border:1px dashed rgba(148,163,184,0.3);border-radius:8px;color:#94a3b8;font-size:13px;">
+          当前任务正在执行或尚未产出文档类文字说明。任务子步骤完成后，AI 回复的文字总结与报告将自动在此直接展示。
+        </div>
+      `
+      }
+    </div>
+
     <div class="section-card">
       <div class="section-header">
         <div>
@@ -1578,13 +1696,13 @@ function renderArtifactCenterView() {
               <span class="mock-tag ${art.provenance === 'historical' ? 'provenance-live' : ''}">${art.provenance === 'historical' ? '🔒 HISTORICAL LIVE EVIDENCE' : 'MOCK ARTIFACT'}</span>
               <span class="chip">${escapeHtml(art.category.toUpperCase())}</span>
               <span class="status-badge status-${escapeHtml(art.validationStatus)}">${escapeHtml(art.validationStatus)}</span>
-              <strong style="color:#fff;margin-left:6px;font-family:var(--font-mono);">${escapeHtml(art.relativePath)}</strong>
+              <strong style="color:#fff;margin-left:6px;font-family:var(--font-mono);">${escapeHtml(art.relativePath || art.name || art.path)}</strong>
             </div>
             <div style="display:flex;align-items:center;gap:10px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);">
               <span>ID: ${escapeHtml(art.id)}</span>
               <span>SHA-256: ${(art.sha256 || '').slice(0, 14)}...</span>
               <span>${art.sizeBytes} B</span>
-              <button class="btn btn-sm" data-download-artifact="${escapeHtml(art.id)}" data-filename="${escapeHtml((art.relativePath || 'artifact.txt').split('/').pop())}" title="下载受控产物 (GET /api/v1/artifacts/:id/content)">⬇ 下载产物</button>
+              <button class="btn btn-sm" data-download-artifact="${escapeHtml(art.id)}" data-filename="${escapeHtml((art.relativePath || art.name || art.path || 'artifact.txt').split('/').pop())}" title="下载受控产物 (GET /api/v1/artifacts/:id/content)">⬇ 下载产物</button>
             </div>
           </div>
           ${
@@ -2031,6 +2149,38 @@ function renderAgentRouterView() {
                   <span>真实交付成果</span>
                 </div>
 
+                <!-- Direct Text Report Preview Card -->
+                ${(() => {
+                  const textDocs = getTaskTextDeliverables(detail);
+                  const primaryDoc = textDocs[0] || null;
+                  const rawPreview = primaryDoc ? (uiState.artifactContentCache[primaryDoc.id] || '正在加载文字成果...') : '';
+                  const cleanPreview = rawPreview
+                    .replace(/^[#>*\-\s]+/gm, '')
+                    .trim()
+                    .slice(0, 180);
+                  return `
+                    <div class="ar-output-card" style="border-color:rgba(16,185,129,0.4);background:linear-gradient(180deg,rgba(16,185,129,0.1) 0%,rgba(15,23,42,0.85) 100%);">
+                      <div class="ar-output-header">
+                        <div style="display:flex;align-items:center;gap:6px;">
+                          <span style="font-size:14px;">📝</span>
+                          <div>
+                            <span style="font-weight:700;color:#34d399;">成果文字说明直览</span>
+                          </div>
+                        </div>
+                        <button class="ar-btn-link" data-goto-view="artifact-center" style="font-size:10.5px;padding:2px 7px;background:rgba(16,185,129,0.2);color:#6ee7b7;border-color:rgba(16,185,129,0.4);">全文阅读 ↗</button>
+                      </div>
+                      <div style="padding:8px 10px;font-size:11.5px;color:#e2e8f0;line-height:1.55;max-height:110px;overflow-y:auto;background:rgba(9,13,22,0.6);border-radius:6px;margin-top:4px;">
+                        ${primaryDoc ? `
+                          <div style="font-weight:700;color:#38bdf8;margin-bottom:3px;font-size:11px;">📄 ${escapeHtml(primaryDoc.relativePath || primaryDoc.name)}</div>
+                          <div>${escapeHtml(cleanPreview)}${rawPreview.length > 180 ? '...' : ''}</div>
+                        ` : `
+                          <div style="color:#64748b;text-align:center;padding:8px 0;">任务完成后在此直接展示文字回复</div>
+                        `}
+                      </div>
+                    </div>
+                  `;
+                })()}
+
                 <!-- Artifacts Card -->
                 <div class="ar-output-card">
                   <div class="ar-output-header">
@@ -2044,7 +2194,7 @@ function renderAgentRouterView() {
                   </div>
                   <div>
                     ${artifacts.length > 0 ? artifacts.slice(0, 6).map((art) => `
-                      <div class="ar-file-item">
+                      <div class="ar-file-item" data-goto-view="artifact-center" style="cursor:pointer;" title="点击前往成果库查看详情">
                         <span class="ar-task-code-chip" style="background:rgba(56,189,248,0.12);color:#38bdf8;font-size:9px;">${art.category || 'code'}</span>
                         <span style="font-family:var(--font-mono);font-size:11px;">${escapeHtml(art.name || art.path)}</span>
                       </div>
@@ -2245,8 +2395,25 @@ function renderAll() {
 }
 
 document.addEventListener('click', async (e) => {
-  const target = e.target.closest('button, [data-select-task], [data-ar-toggle-mode], [data-ar-member]');
+  const target = e.target.closest('button, [data-select-task], [data-ar-toggle-mode], [data-ar-member], [data-goto-view]');
   if (!target) return;
+
+  if (target.dataset.selectTextDoc) {
+    uiState.selectedTextDeliverableId = target.dataset.selectTextDoc;
+    await ensureArtifactContent(target.dataset.selectTextDoc);
+    renderAll();
+    return;
+  }
+
+  if (target.dataset.copyTextDeliverable) {
+    const docId = target.dataset.copyTextDeliverable;
+    const text = uiState.artifactContentCache[docId] || '';
+    if (navigator.clipboard && text) {
+      await navigator.clipboard.writeText(text);
+      showToast('✔ 已复制成果文字说明到剪贴板！');
+    }
+    return;
+  }
 
   if (target.dataset.arToggleMode) {
     uiState.routerMode = target.dataset.arToggleMode;

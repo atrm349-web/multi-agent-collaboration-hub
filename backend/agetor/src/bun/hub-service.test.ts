@@ -7,7 +7,19 @@ import {execFileSync,spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {HubStore} from '../../packages/core/state/store.ts';
 import {HubService,resolveRepository} from '../../packages/core/hub.ts';
+import {extractReviewJson} from '../../packages/core/quality.ts';
 import {createHubHandler} from '../../packages/core/http.ts';
+
+test('extractReviewJson parses pure JSON, fenced JSON, and JSON preceded by reviewer analysis text', () => {
+  expect(extractReviewJson('{"approved":true,"findings":[]}')).toEqual({ approved: true, findings: [] });
+  expect(extractReviewJson('```json\n{"approved":false,"findings":["fix bug"]}\n```')).toEqual({ approved: false, findings: ['fix bug'] });
+  expect(extractReviewJson('我来审查所有文件。\n现在所有测试结果都清楚了。\n{"approved":false,"findings":["1. fix test_formatter.js","2. pass startDate"]}')).toEqual({
+    approved: false,
+    findings: ['1. fix test_formatter.js', '2. pass startDate']
+  });
+  expect(() => extractReviewJson('not json at all')).toThrow('ACCEPTANCE_FAILED: reviewer returned invalid JSON');
+  expect(() => extractReviewJson('{"approved":"yes"}')).toThrow('ACCEPTANCE_FAILED: malformed review');
+});
 
 for (const scenario of ['approve','tamper','reject','expiry','cancel','rework','test-mutates'] as const) test('HTTP durable pipeline and final gate: '+scenario,async()=>{
  const root=await mkdtemp(path.join(tmpdir(),'hub-service-'));const old=process.env.AGETOR_DATA_DIR;

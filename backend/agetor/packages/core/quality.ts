@@ -12,6 +12,46 @@ function rows<T>(store: HubStore, kind: string, taskId: string): T[] {
   return store.db.query<{ data: string }, [string, string]>("SELECT data FROM hub_entities WHERE kind=? AND task_id=? ORDER BY created_at,id")
     .all(kind, taskId).map((row) => JSON.parse(row.data));
 }
+
+export function extractReviewJson(rawText: string): { approved: boolean; findings: string[] } {
+  const isValidReview = (obj: unknown): obj is { approved: boolean; findings: string[] } => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+    const rec = obj as Record<string, unknown>;
+    return typeof rec.approved === "boolean" && Array.isArray(rec.findings) && rec.findings.every((item) => typeof item === "string");
+  };
+
+  const trimmed = rawText.trim();
+  let parsedAnyJson = false;
+
+  const tryCandidate = (str: string): { approved: boolean; findings: string[] } | null => {
+    try {
+      const parsed = JSON.parse(str);
+      parsedAnyJson = true;
+      if (isValidReview(parsed)) return { approved: parsed.approved, findings: parsed.findings };
+    } catch {}
+    return null;
+  };
+
+  const direct = tryCandidate(trimmed);
+  if (direct) return direct;
+
+  const fenceMatches = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)];
+  for (let i = fenceMatches.length - 1; i >= 0; i--) {
+    const fenced = tryCandidate(fenceMatches[i]![1]!.trim());
+    if (fenced) return fenced;
+  }
+
+  for (let end = trimmed.lastIndexOf("}"); end !== -1; end = trimmed.lastIndexOf("}", end - 1)) {
+    for (let start = trimmed.lastIndexOf("{", end); start !== -1; start = trimmed.lastIndexOf("{", start - 1)) {
+      const candidate = trimmed.slice(start, end + 1);
+      const res = tryCandidate(candidate);
+      if (res) return res;
+    }
+  }
+
+  if (parsedAnyJson) throw new Error("ACCEPTANCE_FAILED: malformed review");
+  throw new Error("ACCEPTANCE_FAILED: reviewer returned invalid JSON");
+}
 export interface FinalDelivery {
   task: Task; review: Subtask; reviewRun: AgentRun;
   subtasks: Subtask[]; runs: AgentRun[]; artifacts: Artifact[]; validations: Validation[]; digest: string;
@@ -43,9 +83,12 @@ export function captureFinalDelivery(store: HubStore, taskId: string, reviewSubt
     const event = JSON.parse(log.data).raw?.event;
     if (event?.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") verdictText = event.item.text;
   }
-  let verdict: unknown;
-  try { verdict = verdictText === null ? null : JSON.parse(verdictText); } catch { fail("ACCEPTANCE_FAILED", "Review verdict is not structured JSON"); }
-  if (!verdict || typeof verdict !== "object" || Array.isArray(verdict) || (verdict as { approved?: unknown }).approved !== true) fail("ACCEPTANCE_FAILED", "Independent reviewer did not approve the current work");
+  let verdict: { approved: boolean; findings: string[] };
+  try {
+    if (verdictText === null) throw new Error("missing verdict");
+    verdict = extractReviewJson(verdictText);
+  } catch { fail("ACCEPTANCE_FAILED", "Review verdict is not structured JSON"); }
+  if (verdict.approved !== true) fail("ACCEPTANCE_FAILED", "Independent reviewer did not approve the current work");
   const allValidations = rows<Validation>(store, "validation", taskId);
   const required = new Map<string, { step: Subtask; criterion: AcceptanceCriterion }>();
   const requireCriterion = (step: Subtask, criterion: AcceptanceCriterion) => {
