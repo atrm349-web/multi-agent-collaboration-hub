@@ -703,7 +703,7 @@ function renderTopbarAndSidebar() {
         <div class="sidebar-task-title">${escapeHtml(t.title)}</div>
         <div class="sidebar-task-meta">
           <span class="status-badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>
-          <span>v${t.version} · ${t.status === 'waiting_approval' ? '<strong style="color:#fbbf24;">待批准 (95%)</strong>' : `${t.progressPct}%`}<span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
+          <span>v${t.version} · ${t.status === 'waiting_approval' ? '<strong style="color:#fbbf24;">待批准</strong>' : `${t.progressPct}%`}<span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
         </div>
       </div>
     `;
@@ -1813,9 +1813,12 @@ const AGENT_LOGOS = {
 };
 
 function resolveSubtaskModel(s, task, detail) {
+  const isReview = (s && (s.stage === 'review' || s.stage === 'testing' || s.code === 'FINAL-REVIEW'));
+
   // 1. Explicit model field on subtask entity
   const explicit = (s && s.model) ? String(s.model).toLowerCase() : '';
   if (explicit) {
+    if (explicit === 'auto' || explicit === 'default') return isReview ? 'claude' : 'auto';
     if (explicit.includes('workbuddy') || explicit.includes('codebuddy') || explicit.includes('wb')) return 'workbuddy';
     if (explicit.includes('deepseek')) return 'deepseek';
     if (explicit.includes('claude') || explicit.includes('sonnet') || explicit.includes('opus')) return 'claude';
@@ -1826,27 +1829,29 @@ function resolveSubtaskModel(s, task, detail) {
   // 2. Policy models from detail.policy or task.policy or task.models
   const policy = detail?.policy || task?.policy || null;
   const models = policy?.models || task?.models || null;
-  const isReview = (s && (s.stage === 'review' || s.stage === 'testing' || s.code === 'FINAL-REVIEW'));
   const candidate = isReview
     ? (models?.reviewer || policy?.model || task?.model || '')
     : (models?.developer || policy?.model || task?.model || '');
 
   const candStr = String(candidate).toLowerCase();
+  if (candStr === 'auto' || candStr === 'default') return isReview ? 'claude' : 'auto';
   if (candStr.includes('workbuddy') || candStr.includes('codebuddy') || candStr.includes('wb')) return 'workbuddy';
   if (candStr.includes('deepseek')) return 'deepseek';
   if (candStr.includes('claude') || candStr.includes('sonnet') || candStr.includes('opus')) return 'claude';
   if (candStr.includes('gemini') || candStr.includes('antigravity')) return 'gemini';
   if (candStr.includes('codex') || candStr.includes('openai') || candStr.includes('gpt')) return 'codex';
 
-  // 3. Fallbacks for historical tasks without policy data
+  // 3. Default division of labor when not specified:
+  // Working agents = Gemini + DeepSeek + WorkBuddy ('auto'); Acceptance agent = Claude ('claude')
+  if (isReview) return 'claude';
   if (s?.assignedAgentId?.includes('3333')) return 'workbuddy';
   if (s?.assignedAgentId?.includes('1111')) return 'deepseek';
-  if (isReview) return 'claude';
-  return 'deepseek';
+  return 'auto';
 }
 
 function getSubtaskModelDisplayName(modelKey) {
   switch (modelKey) {
+    case 'auto': return 'Gemini / DeepSeek / WorkBuddy';
     case 'workbuddy': return 'WorkBuddy';
     case 'deepseek': return 'DeepSeek';
     case 'claude': return 'Claude';
@@ -1891,17 +1896,38 @@ function renderAgentRouterView() {
     return { label: '排队中', color: '#94a3b8' };
   };
 
-  // 5 Real Executive Member cards reflecting genuinely connected models
+  // Helper to check if a member card is assigned to a subtask
+  const matchesMember = (s, memberId) => {
+    const resolved = resolveSubtaskModel(s, task, detail);
+    if (resolved === 'auto') {
+      return memberId === 'gemini' || memberId === 'deepseek' || memberId === 'workbuddy';
+    }
+    return resolved === memberId;
+  };
+
+  // Resolve Master Coordinator (defaults to Codex unless explicitly overridden)
+  const rawPlanner = String(detail?.policy?.models?.planner || task?.policy?.models?.planner || 'codex').toLowerCase();
+  const masterName = rawPlanner.includes('deepseek')
+    ? 'DeepSeek (主代理)'
+    : rawPlanner.includes('claude')
+      ? 'Claude (主代理)'
+      : rawPlanner.includes('gemini')
+        ? 'Gemini (主代理)'
+        : (rawPlanner.includes('workbuddy') && rawPlanner !== 'auto')
+          ? 'Codex · 主代理 (WorkBuddy 协同)'
+          : 'Codex · 主代理';
+
+  // 5 Real Executive Member cards reflecting default roles (Workers: Gemini/DeepSeek/WorkBuddy, Reviewer: Claude, Master: Codex)
   const memberCards = [
     {
       id: "deepseek",
       name: "DeepSeek",
-      model: "deepseek-reasoner / chat",
+      model: "deepseek-reasoner · 主力工作",
       icon: AGENT_LOGOS.deepseek(15),
       avatarCls: "ar-avatar-dsh",
-      status: "就绪",
+      status: "主力工作",
       statusCls: "ar-status-success",
-      tasks: subtasks.filter((s) => resolveSubtaskModel(s, task, detail) === "deepseek").map((s, i) => {
+      tasks: subtasks.filter((s) => matchesMember(s, "deepseek")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
           code: s.displayIndex || s.code || `T${i + 1}`,
@@ -1914,12 +1940,12 @@ function renderAgentRouterView() {
     {
       id: "claude",
       name: "Claude",
-      model: "claude-3-5-sonnet",
+      model: "claude-3-5-sonnet · 验收门禁",
       icon: AGENT_LOGOS.claude(15),
       avatarCls: "ar-avatar-z",
-      status: "就绪",
+      status: "独立验收",
       statusCls: "ar-status-success",
-      tasks: subtasks.filter((s) => resolveSubtaskModel(s, task, detail) === "claude").map((s, i) => {
+      tasks: subtasks.filter((s) => matchesMember(s, "claude")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
           code: s.displayIndex || s.code || `T${i + 1}`,
@@ -1932,12 +1958,12 @@ function renderAgentRouterView() {
     {
       id: "gemini",
       name: "Gemini",
-      model: "gemini-3.5-flash",
+      model: "gemini-3.5-flash · 主力工作",
       icon: AGENT_LOGOS.gemini(15),
       avatarCls: "ar-avatar-o",
-      status: "就绪",
+      status: "主力工作",
       statusCls: "ar-status-success",
-      tasks: subtasks.filter((s) => resolveSubtaskModel(s, task, detail) === "gemini").map((s, i) => {
+      tasks: subtasks.filter((s) => matchesMember(s, "gemini")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
           code: s.displayIndex || s.code || `T${i + 1}`,
@@ -1950,12 +1976,12 @@ function renderAgentRouterView() {
     {
       id: "workbuddy",
       name: "WorkBuddy",
-      model: "本地网关 (18492)",
+      model: "本地网关 (18492) · 主力工作",
       icon: AGENT_LOGOS.workbuddy(15),
       avatarCls: "ar-avatar-d",
-      status: "本地在线",
+      status: "主力工作",
       statusCls: "ar-status-success",
-      tasks: subtasks.filter((s) => resolveSubtaskModel(s, task, detail) === "workbuddy").map((s, i) => {
+      tasks: subtasks.filter((s) => matchesMember(s, "workbuddy")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
           code: s.displayIndex || s.code || `T${i + 1}`,
@@ -1968,12 +1994,12 @@ function renderAgentRouterView() {
     {
       id: "codex",
       name: "Codex",
-      model: "OpenAI Codex CLI",
+      model: "OpenAI Codex · 默认主 Agent",
       icon: AGENT_LOGOS.codex(15),
       avatarCls: "ar-avatar-x",
-      status: "备用",
-      statusCls: "ar-status-queued",
-      tasks: subtasks.filter((s) => resolveSubtaskModel(s, task, detail) === "codex").map((s, i) => {
+      status: "主控分配",
+      statusCls: "ar-status-running",
+      tasks: subtasks.filter((s) => matchesMember(s, "codex")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
           code: s.displayIndex || s.code || `T${i + 1}`,
@@ -2147,14 +2173,14 @@ function renderAgentRouterView() {
 
                 <div class="ar-center-box">
                   <div class="ar-center-header">
-                    <div class="ar-center-avatar">${AGENT_LOGOS.hub(26)}</div>
+                    <div class="ar-center-avatar">${AGENT_LOGOS.codex(22)}</div>
                     <div class="ar-center-meta">
-                      <div class="ar-center-title">Claude Code</div>
-                      <div class="ar-center-sub">主代理 · 拆解 · 派发 · 汇总</div>
+                      <div class="ar-center-title">${masterName}</div>
+                      <div class="ar-center-sub">默认主 Agent · 统筹分配任务 · 工作: Gemini/DeepSeek/WorkBuddy · 验收: Claude</div>
                     </div>
                     <div class="ar-center-status">
                       <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>
-                      在线 · 回合 8 · 0 read_inbox
+                      在线 · 主控调度中
                     </div>
                   </div>
 
@@ -2229,12 +2255,12 @@ function renderAgentRouterView() {
                         </div>
                         <button class="ar-btn-link" data-goto-view="artifact-center" style="font-size:10.5px;padding:2px 7px;background:rgba(16,185,129,0.2);color:#6ee7b7;border-color:rgba(16,185,129,0.4);">全文阅读 ↗</button>
                       </div>
-                      <div style="padding:8px 10px;font-size:11.5px;color:#e2e8f0;line-height:1.55;max-height:110px;overflow-y:auto;background:rgba(9,13,22,0.6);border-radius:6px;margin-top:4px;">
+                      <div style="padding:6px 9px;font-size:11px;color:#e2e8f0;line-height:1.45;max-height:66px;overflow-y:auto;background:rgba(9,13,22,0.6);border-radius:6px;margin-top:2px;">
                         ${primaryDoc ? `
-                          <div style="font-weight:700;color:#38bdf8;margin-bottom:3px;font-size:11px;">📄 ${escapeHtml(primaryDoc.relativePath || primaryDoc.name)}</div>
+                          <div style="font-weight:700;color:#38bdf8;margin-bottom:2px;font-size:10.5px;">📄 ${escapeHtml(primaryDoc.relativePath || primaryDoc.name)}</div>
                           <div>${escapeHtml(cleanPreview)}${rawPreview.length > 180 ? '...' : ''}</div>
                         ` : `
-                          <div style="color:#64748b;text-align:center;padding:8px 0;">任务完成后在此直接展示文字回复</div>
+                          <div style="color:#64748b;text-align:center;padding:6px 0;">任务完成后在此直接展示文字回复</div>
                         `}
                       </div>
                     </div>
@@ -2245,21 +2271,21 @@ function renderAgentRouterView() {
                 <div class="ar-output-card">
                   <div class="ar-output-header">
                     <div style="display:flex;align-items:center;gap:6px;">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                       <div>
                         <span style="font-weight:700;color:#f8fafc;">不可变产物库</span>
                       </div>
                     </div>
-                    <span style="font-size:11px;background:rgba(56,189,248,0.15);color:#38bdf8;padding:1px 6px;border-radius:4px;font-weight:700;">${artifacts.length}</span>
+                    <span style="font-size:10.5px;background:rgba(56,189,248,0.15);color:#38bdf8;padding:1px 6px;border-radius:4px;font-weight:700;">${artifacts.length}</span>
                   </div>
-                  <div>
+                  <div style="max-height:92px;overflow-y:auto;">
                     ${artifacts.length > 0 ? artifacts.slice(0, 6).map((art) => `
                       <div class="ar-file-item" data-goto-view="artifact-center" style="cursor:pointer;" title="点击前往成果库查看详情">
                         <span class="ar-task-code-chip" style="background:rgba(56,189,248,0.12);color:#38bdf8;font-size:9px;">${art.category || 'code'}</span>
-                        <span style="font-family:var(--font-mono);font-size:11px;">${escapeHtml(art.name || art.path)}</span>
+                        <span style="font-family:var(--font-mono);font-size:10.5px;">${escapeHtml(art.name || art.path)}</span>
                       </div>
                     `).join('') : `
-                      <div style="padding: 16px; font-size: 11px; color: #64748b; text-align: center;">暂无代码产物，任务执行后自动提取</div>
+                      <div style="padding: 10px; font-size: 11px; color: #64748b; text-align: center;">暂无代码产物，任务执行后自动提取</div>
                     `}
                   </div>
                 </div>
@@ -2268,17 +2294,17 @@ function renderAgentRouterView() {
                 <div class="ar-output-card">
                   <div class="ar-output-header">
                     <div style="display:flex;align-items:center;gap:6px;">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
                       <div>
                         <span style="font-weight:700;color:#f8fafc;">自动化测试门禁</span>
-                        <span style="font-size:10.5px;color:#64748b;margin-left:6px;">exitCode=0 验证放行</span>
+                        <span style="font-size:10px;color:#64748b;margin-left:6px;">exitCode=0 验证放行</span>
                       </div>
                     </div>
                   </div>
-                  <div>
+                  <div style="max-height:74px;overflow-y:auto;">
                     ${subtasks.length > 0 ? subtasks.map((s) => `
                       <div class="ar-report-item">
-                        <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
+                        <div style="font-size:10.5px;color:#cbd5e1;line-height:1.35;">
                           <span class="ar-task-code-chip" style="color:#38bdf8;">${s.code || 'SUB'}</span>
                           ${escapeHtml(s.title)}
                           <span style="color:${s.status === 'succeeded' ? '#10b981' : (s.status === 'failed' ? '#ef4444' : '#94a3b8')};font-size:10px;float:right;">
@@ -2287,7 +2313,7 @@ function renderAgentRouterView() {
                         </div>
                       </div>
                     `).join('') : `
-                      <div style="padding: 16px; font-size: 11px; color: #64748b; text-align: center;">任务启动后将实时展示门禁测试报告</div>
+                      <div style="padding: 10px; font-size: 11px; color: #64748b; text-align: center;">任务启动后将实时展示门禁测试报告</div>
                     `}
                   </div>
                 </div>
@@ -2392,22 +2418,23 @@ function renderAgentRouterView() {
 
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                 <div>
-                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">规划模型 (Planner)</label>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">主代理 · 任务分配 (Master Planner)</label>
                   <select id="newTaskPlannerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="workbuddy">🛠️ WorkBuddy (本地网关 · 优先推荐)</option>
+                    <option value="codex" selected>⚙️ 默认主 Agent: Codex (分配任务与统筹)</option>
+                    <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
                     <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
                     <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
                     <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
-                    <option value="codex">⚙️ Codex (CLI)</option>
                   </select>
                 </div>
                 <div>
-                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">开发与审查模型 (Developer & Reviewer)</label>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">工作与验收模型 (Workers & Reviewer)</label>
                   <select id="newTaskDevSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="workbuddy">🛠️ WorkBuddy (本地网关 · 优先推荐)</option>
-                    <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
-                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
-                    <option value="deepseek-chat">🧠 DeepSeek Chat (V3)</option>
+                    <option value="auto" selected>🤖 默认协同 (工作: Gemini/DeepSeek/WorkBuddy · 验收: Claude)</option>
+                    <option value="workbuddy">🛠️ 指定单模型: WorkBuddy (本地网关)</option>
+                    <option value="gemini-3.5-flash-lite">🌐 指定单模型: Gemini 3.5 Flash</option>
+                    <option value="deepseek-chat">🧠 指定单模型: DeepSeek Chat (V3)</option>
+                    <option value="claude-3-5-sonnet-20241022">⚡ 指定单模型: Claude 3.5 Sonnet</option>
                   </select>
                 </div>
               </div>
@@ -2637,12 +2664,13 @@ document.addEventListener('click', async (e) => {
     }
 
     try {
-      const plannerModel = plannerSelect?.value || 'workbuddy';
-      const devModel = devSelect?.value || 'workbuddy';
+      const plannerModel = plannerSelect?.value || 'codex';
+      const devModel = devSelect?.value || 'auto';
+      const reviewerModel = devModel === 'auto' ? 'claude-3-5-sonnet-20241022' : devModel;
       const fastSubtaskId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
         ? globalThis.crypto.randomUUID()
         : '10000000-1000-4000-8000-' + String(Date.now()).padStart(12, '0').slice(-12);
-      showToast(`🚀 正在向 Hub 主调度器下发真实目标 (模型: ${devModel}, 模式: ${execMode === 'fast' ? '⚡极速直达' : '🕸️DAG拆解'})...`);
+      showToast(`🚀 正在向主代理 (${plannerModel.toUpperCase()}) 下发真实目标 (工作模型: ${devModel === 'auto' ? 'Gemini/DeepSeek/WorkBuddy · 验收: Claude' : devModel})...`);
       const created = await apiRequest('/api/v1/tasks', {
         method: 'POST',
         body: JSON.stringify({
@@ -2653,7 +2681,7 @@ document.addEventListener('click', async (e) => {
           models: {
             planner: plannerModel,
             developer: devModel,
-            reviewer: devModel
+            reviewer: reviewerModel
           },
           acceptanceCriteria: [
             { id: 'ac-core', description: 'All generated modules pass automated tests and review gate' }

@@ -108,11 +108,11 @@ if (rawRepos.length === 0) {
       label: 'demo-geometry-repo',
       path: demoTargetDir,
       defaultTestProfileId: 'geom-tests',
-      model: 'workbuddy',
+      model: 'auto',
       models: {
-        planner: 'workbuddy',
-        developer: 'workbuddy',
-        reviewer: 'workbuddy'
+        planner: 'codex',
+        developer: 'auto',
+        reviewer: 'claude-3-5-sonnet-20241022'
       },
       effort: 'low',
       testProfiles: [

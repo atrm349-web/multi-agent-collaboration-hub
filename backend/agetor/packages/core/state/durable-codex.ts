@@ -52,15 +52,20 @@ export class DurableCodexRunner {
         catch (error) { stopForFailure(error,runtimeId); }
       },
     };
-    job.runtime = input.request.model?.startsWith("deepseek")
-      ? new DeepSeekRuntime(runtimeOptions)
-      : input.request.model?.startsWith("claude")
-        ? new ClaudeRuntime(runtimeOptions)
-        : (input.request.model?.startsWith("gemini") || input.request.model?.startsWith("antigravity"))
-          ? new GeminiRuntime(runtimeOptions)
-          : (input.request.model?.startsWith("workbuddy") || input.request.model?.startsWith("wb") || input.request.model?.startsWith("codebuddy"))
-            ? new WorkBuddyRuntime(runtimeOptions)
-            : new CodexRuntime(runtimeOptions);
+    const isTestSpawn = Boolean(this.options.spawn);
+    const reqModel = input.request.model ?? "";
+    const hasClaudeKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_API_KEY?.trim());
+    job.runtime = (!isTestSpawn && (reqModel === "auto" || reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy") || (reqModel.startsWith("claude") && !hasClaudeKey) || reqModel.startsWith("deepseek") || reqModel.startsWith("codex")))
+      ? new WorkBuddyRuntime(runtimeOptions)
+      : reqModel.startsWith("deepseek")
+        ? new DeepSeekRuntime(runtimeOptions)
+        : reqModel.startsWith("claude")
+          ? new ClaudeRuntime(runtimeOptions)
+          : (reqModel.startsWith("gemini") || reqModel.startsWith("antigravity"))
+            ? new GeminiRuntime(runtimeOptions)
+            : (reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy"))
+              ? new WorkBuddyRuntime(runtimeOptions)
+              : new CodexRuntime(runtimeOptions);
     this.jobs.set(id,job);
     const heartbeat = setInterval(() => {
       try {

@@ -390,7 +390,7 @@ code {
 
 /* Sidebar */
 .sidebar {
-  width: 232px;
+  width: 252px;
   background: #090d16;
   border-right: 1px solid rgba(255, 255, 255, 0.07);
   display: flex;
@@ -488,6 +488,7 @@ code {
   border: 1px solid rgba(255, 255, 255, 0.06);
   cursor: pointer;
   transition: all 0.15s ease;
+  overflow: hidden;
 }
 
 .sidebar-task-card:hover {
@@ -526,10 +527,26 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 8px;
   font-size: 10.5px;
-  color: #64748b;
+  color: #94a3b8;
   white-space: nowrap;
+}
+
+.sidebar-task-meta .status-badge {
+  font-size: 9.5px;
+  padding: 2px 7px;
+  gap: 5px;
+  letter-spacing: 0;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-task-meta > span:last-child {
+  flex-shrink: 0;
+  padding-right: 2px;
 }
 
 .sidebar-task-meta .mock-tag {
@@ -2240,29 +2257,30 @@ code {
 
 /* Agent Router Left Rail Sidebar */
 .ar-sidebar {
-  width: 120px;
+  width: 112px;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
-  padding: 14px 10px;
+  padding: 10px 8px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 10px;
   background: #080c14;
   flex-shrink: 0;
   z-index: 10;
+  overflow-y: auto;
 }
 
 .ar-section-label {
-  font-size: 10.5px;
+  font-size: 10px;
   color: #64748b;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  margin-bottom: 6px;
+  margin-bottom: 5px;
   padding-left: 2px;
 }
 
 .ar-run-pill {
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-radius: 6px;
   background: rgba(30, 41, 59, 0.5);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -2270,24 +2288,24 @@ code {
 
 .ar-run-pill-title {
   color: #f1f5f9;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-bottom: 3px;
+  gap: 5px;
+  margin-bottom: 2px;
 }
 
 .ar-run-pill-sub {
   color: #64748b;
-  font-size: 9.5px;
-  line-height: 1.3;
+  font-size: 9px;
+  line-height: 1.25;
 }
 
 .ar-members-list {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 9px;
   align-items: center;
 }
 
@@ -2295,20 +2313,20 @@ code {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
+  gap: 3px;
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .ar-avatar {
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
-  font-size: 14px;
+  font-size: 13px;
   color: #ffffff;
   transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s;
 }
@@ -2344,10 +2362,10 @@ code {
 /* Agent Router Canvas */
 .ar-canvas {
   flex: 1;
-  padding: 12px 20px;
+  padding: 8px 18px 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
   overflow-y: auto;
   position: relative;
   background: radial-gradient(circle at 50% 20%, #111827 0%, #070a10 85%);
@@ -2357,17 +2375,18 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 16px;
+  padding: 6px 14px;
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.85);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
 }
 
 .ar-mission-tag {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 13.5px;
+  font-size: 13px;
 }
 
 .ar-mission-badge {
@@ -2388,13 +2407,11 @@ code {
   gap: 6px;
 }
 
-/* Topology Diagram Layout — 3 Columns Stretched to Exact Equal Bottom Edge */
+/* Topology Diagram Layout — 3 Columns Stretched to Exact Equal Bottom Edge & Compact Viewport Fit */
 .ar-flow-container {
   position: relative;
-  min-height: 480px;
   display: flex;
   flex-direction: column;
-  flex: 1;
 }
 
 .ar-flow-svg {
@@ -2412,8 +2429,7 @@ code {
   z-index: 2;
   display: grid;
   grid-template-columns: 295px 1fr 345px;
-  gap: 20px;
-  flex: 1;
+  gap: 18px;
   align-items: stretch;
 }
 
@@ -2423,10 +2439,10 @@ code {
 }
 
 .ar-col-title {
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
   color: #94a3b8;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2438,8 +2454,8 @@ code {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: 10px 14px;
-  margin-bottom: 10px;
+  padding: 6px 12px;
+  margin-bottom: 6px;
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.85);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -2454,7 +2470,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 6px;
+  margin-bottom: 3px;
 }
 
 .ar-node-identity {
@@ -2485,6 +2501,9 @@ code {
   font-size: 10px;
   color: #64748b;
   font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ar-status-badge {
@@ -2492,6 +2511,8 @@ code {
   padding: 2px 6px;
   border-radius: 4px;
   font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .ar-status-success {
@@ -2546,7 +2567,7 @@ code {
   background: rgba(13, 17, 23, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 12px;
-  padding: 18px 20px;
+  padding: 12px 16px;
   margin-bottom: 0;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
@@ -2555,22 +2576,23 @@ code {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
   flex-shrink: 0;
 }
 
 .ar-center-avatar {
-  width: 44px;
-  height: 44px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
-  background: #ea580c;
+  background: linear-gradient(135deg, #0f172a, #334155);
+  border: 1.5px solid rgba(56, 189, 248, 0.45);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 800;
-  font-size: 18px;
+  font-size: 16px;
   color: #fff;
-  box-shadow: 0 0 16px rgba(234, 88, 12, 0.5);
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.35);
 }
 
 .ar-center-meta {
@@ -2578,19 +2600,22 @@ code {
 }
 
 .ar-center-title {
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 700;
   color: #ffffff;
 }
 
 .ar-center-sub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: #94a3b8;
   margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ar-center-status {
-  font-size: 11px;
+  font-size: 10.5px;
   color: #34d399;
   display: flex;
   align-items: center;
@@ -2599,6 +2624,8 @@ code {
   padding: 3px 8px;
   border-radius: 999px;
   border: 1px solid rgba(16, 185, 129, 0.25);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .ar-goal-inner-card {
@@ -2608,15 +2635,15 @@ code {
   background: rgba(15, 23, 42, 0.85);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 14px;
+  padding: 11px 14px;
+  margin-bottom: 10px;
 }
 
 .ar-goal-title-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12px;
+  font-size: 11.5px;
   flex-shrink: 0;
 }
 
@@ -2625,8 +2652,8 @@ code {
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
-  gap: 8px;
-  margin-top: 10px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .ar-center-task-item {
@@ -2634,7 +2661,7 @@ code {
   align-items: center;
   justify-content: space-between;
   background: rgba(255, 255, 255, 0.03);
-  padding: 8px 12px;
+  padding: 6px 10px;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.04);
 }
@@ -2643,9 +2670,9 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-around;
-  font-size: 11.5px;
+  font-size: 11px;
   color: #94a3b8;
-  padding-top: 12px;
+  padding-top: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
 }
@@ -2657,8 +2684,8 @@ code {
   background: rgba(15, 23, 42, 0.85);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
-  padding: 10px 12px;
-  margin-bottom: 10px;
+  padding: 8px 11px;
+  margin-bottom: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
 }
 
@@ -2671,8 +2698,8 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
-  font-size: 12px;
+  margin-bottom: 5px;
+  font-size: 11.5px;
   font-weight: 600;
   color: #f1f5f9;
 }
@@ -2681,19 +2708,19 @@ code {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-size: 10.5px;
   color: #cbd5e1;
-  padding: 4px 6px;
+  padding: 3px 6px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.02);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
 }
 
 .ar-report-item {
   background: rgba(255, 255, 255, 0.03);
   border-radius: 6px;
-  padding: 7px 9px;
-  margin-bottom: 6px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
@@ -2701,27 +2728,28 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 3px;
+  margin-bottom: 2px;
 }
 
 /* Timeline */
 .ar-timeline-block {
-  padding: 10px 16px;
+  padding: 8px 14px;
   background: rgba(13, 17, 23, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
-  margin-top: 6px;
+  margin-top: 2px;
+  flex-shrink: 0;
 }
 
 .ar-timeline-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 5px;
 }
 
 .ar-timeline-title {
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 700;
   color: #f1f5f9;
 }
@@ -2730,20 +2758,20 @@ code {
   display: flex;
   align-items: center;
   gap: 12px;
-  font-size: 11px;
+  font-size: 10.5px;
   color: #94a3b8;
 }
 
 .ar-timeline-tracks {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .ar-track-row {
   display: flex;
   align-items: center;
-  height: 24px;
+  height: 20px;
 }
 
 .ar-track-label {

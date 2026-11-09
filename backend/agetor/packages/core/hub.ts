@@ -260,7 +260,7 @@ export class HubService implements HTTPService {
           ? planWithClaude
           : (plannerModel.startsWith("gemini") || plannerModel.startsWith("antigravity"))
             ? planWithGemini
-            : (plannerModel.startsWith("workbuddy") || plannerModel.startsWith("wb") || plannerModel.startsWith("codebuddy"))
+            : (plannerModel.startsWith("workbuddy") || plannerModel.startsWith("wb") || plannerModel.startsWith("codebuddy") || plannerModel === "auto" || plannerModel === "codex")
               ? planWithWorkBuddy
               : planWithCodex;
       const plan = await (this.options.planner ?? defaultPlanner)({ goal: `${goal}\nProduce only implementation, testing, review or documentation stages. Planning is already complete; do not add an analysis stage. IMPORTANT FOR SPEED: Prefer 1 consolidated 'implementation' subtask (or at most 2 parallel subtasks) rather than splitting simple queries, scripts, or reports into many serial steps. Ensure the implementation subtask also produces a clear, human-readable Chinese summary report (DELIVERY_REPORT.md) directly answering the user's goal in plain text alongside the code. Available capabilities: stream, resume, cancel, structured-output. Registered test profile IDs: ${repo.testProfiles.map((p) => p.id).join(", ")}.`,
@@ -295,10 +295,15 @@ export class HubService implements HTTPService {
     return this.store.db.transaction(() => {
       const task = this.store.put("task",{ ...common(),id:taskId,provenance:"current",title,goal,repositoryId:repo.id,baseCommit:repo.baseCommit,status:"queued",priority: priority as Task["priority"],
         progressPct:0,pendingApprovalCount:0,artifactCount:0,acceptanceCriteria:criteria,error:null,startedAt:null,endedAt:null,deadlineAt:null },null);
+      const defaultWorkers = ["workbuddy", "gemini-3.5-flash-lite", "deepseek-chat"];
+      let workIdx = 0;
       for (const item of [...plan,reviewed]) {
-        const subtaskModel = (item.stage === "review" || item.stage === "testing")
-          ? (repo.models?.reviewer ?? repo.model)
-          : (repo.models?.developer ?? repo.model);
+        const isRev = item.stage === "review" || item.stage === "testing" || item.code === "FINAL-REVIEW";
+        const rawDev = repo.models?.developer ?? repo.model;
+        const rawRev = repo.models?.reviewer ?? (rawDev && rawDev !== "auto" ? rawDev : "claude-3-5-sonnet-20241022");
+        const subtaskModel = isRev
+          ? (rawRev === "auto" ? "claude-3-5-sonnet-20241022" : rawRev)
+          : (!rawDev || rawDev === "auto" ? (plan.length === 1 ? "auto" : defaultWorkers[workIdx++ % defaultWorkers.length]!) : rawDev);
         this.store.put("subtask",{ ...common(),...item,taskId,status:item.dependsOn.length ? "pending":"ready",
           acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:240000,outputArtifactIds:[],error:null,model:subtaskModel },null);
       }
@@ -451,9 +456,12 @@ export class HubService implements HTTPService {
     if(job.abort.signal.aborted)return;
     this.store.db.query("INSERT INTO hub_workspaces(subtask_id,attempt,handle,commit_sha,review) VALUES(?,?,?,NULL,?) ON CONFLICT(subtask_id) DO UPDATE SET attempt=excluded.attempt,handle=excluded.handle,commit_sha=NULL,review=excluded.review")
       .run(initial.id,initial.attempt,JSON.stringify(handle),initial.code==="FINAL-REVIEW"?1:0);
-    const subtaskModel = (initial.stage === "review" || initial.stage === "testing")
-      ? (policy.models?.reviewer ?? policy.model)
-      : (policy.models?.developer ?? policy.model);
+    const isRevStep = initial.stage === "review" || initial.stage === "testing" || initial.code === "FINAL-REVIEW";
+    const rawDevModel = policy.models?.developer ?? policy.model;
+    const rawRevModel = policy.models?.reviewer ?? (rawDevModel && rawDevModel !== "auto" ? rawDevModel : "claude-3-5-sonnet-20241022");
+    const subtaskModel = initial.model
+      ? initial.model
+      : (isRevStep ? rawRevModel : rawDevModel);
     let step=this.store.get("subtask",initial.id);step=this.store.put("subtask",{...step,workspaceId:handle.id,model:subtaskModel},step.version);
     const queued=this.store.list("message",task.id).filter((message)=>message.toSubtaskId===step.id&&!message.deliveredAt);
     const readOnly=step.stage==="review"||step.stage==="testing"||step.stage==="analysis";
