@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Runtime: Bun / Node.js](https://img.shields.io/badge/Runtime-Bun%20%7C%20Node.js%20%3E%3D20-orange.svg)](https://bun.sh/)
 [![UI: Agent Router 1:1](https://img.shields.io/badge/UI-Agent%20Router%201:1-success.svg)](#系统功能全景)
-[![Models Supported](https://img.shields.io/badge/Models-DeepSeek%20%7C%20Codex%20%7C%20Gemini%20%7C%20WorkBuddy-purple.svg)](#多智能体分工协同体系)
+[![Models Supported](https://img.shields.io/badge/Models-DeepSeek%20%7C%20Claude%20%7C%20Gemini%20%7C%20WorkBuddy%20%7C%20Codex-purple.svg)](#多智能体分工协同体系)
 
 ---
 
@@ -37,14 +37,15 @@
 在日常使用大模型与 AI 智能体时，开发者常常面临以下痛点：
 1. **各家模型额度分散**：手里有 ChatGPT Plus、DeepSeek、Gemini、腾讯 WorkBuddy 等多个账号或额度，无法聚合使用。
 2. **单模型能力存在局限**：
-   - **DeepSeek (R1/V3)**：擅长数学逻辑、算法攻坚与复杂推理，但工程集成可能需要审查。
-   - **Codex / ChatGPT**：擅长工程架构、严格代码审查与自动化门禁把控。
-   - **Gemini Pro**：擅长上下文吞吐、规范校验与多模态分析。
+   - **DeepSeek (Reasoner / Chat)**：擅长数学逻辑、算法攻坚与复杂因果推理。
+   - **Claude (Sonnet 3.5)**：擅长全栈架构、深度代码审查、自修复与长文档整合。
+   - **Gemini (Flash / Pro)**：擅长超长上下文吞吐、基线规范校验与多模态分析。
    - **WorkBuddy / 本地工具**：擅长垂直领域本地网关调用与文件几何模块处理。
+   - **Codex / ChatGPT**：擅长工程脚手架、测试驱动开发与自动化门禁把控。
 3. **重复沟通与粘合成本高**：在多个 Web 窗口或 CLI 工具之间手动复制粘贴代码、人工测试和纠错，效率低下。
 
 **Multi-Agent Collaboration Hub (Agent Router)** 提供了一套本地优先（Local-First）的轻量级解决方案：
-- **统一入口**：你只需向主代理下达总体目标。
+- **统一入口**：你只需向主代理下达总体目标，或在页面点击【➕ 新建真实协同任务】。
 - **自动 DAG 编排**：主调度器自动拆解依赖，分配给最合适的子模型。
 - **物理沙箱隔离**：各子任务在独立的 Git Worktree 中执行，互不污染。
 - **自动化测试门禁**：必须通过预设单元测试与独立代码审查门禁（`exitCode=0`）后方可归档合流。
@@ -57,27 +58,28 @@
 系统内置了 1:1 像素级复刻的 **Agent Router 沉浸式大屏**：
 
 ```
-+-----------------------------------------------------------------------------------------------+
-| 🔮 Agent Router  [协作拓扑]   (5 执行成员)  (6 任务)  (3 已完成)      [🟢 实机运行]  [控制台 ↗] [设置 ⚙️] |
-+-------------------+---------------------------------------------------------------------------+
-| 运行区域          |  [实机] 智能协同 · 几何计算与全流程代码审查交付              🟢 真实多Agent协同 · 全链路打通  |
-| • 实机 · 多Agent  +---------------------------------------------------------------------------+
-|   本地网关·真实模型 |  【执行成员 5】           【主代理·拆解与整合】            【结果去向 2】          |
-|                   |  +--------------+        +-------------------+        +--------------------+      |
-| 成员              |  | Codex (Plus) |=======>| Hub 主调度器 (C)  |=======>| 产物库 (Artifacts) |      |
-| (C) 主代理        |  | DeepSeek(R1) |=======>| - 规划目标拆解    |=======>| - circle.js        |      |
-| (X) Codex         |  | WorkBuddy    |=======>| - 多智能体并行派发 |        | - rectangle.js     |      |
-| (Z) ZCode         |  | Gemini Pro   |=======>| - 汇总与测试验证   |        +--------------------+      |
-| (D) Devin         |  | OpenCode     |=======>+-------------------+        | 任务报告 (Reports) |      |
-| (O) OpenCode      |  +--------------+                  ||                 | - 测试全部通过     |      |
-| (D) DSH           |                                    || 动态流光与能量光弧   | - 门禁审查放行     |      |
-|                   +------------------------------------\/-----------------+--------------------+      |
-|                   | 时间轨道 (Timeline):                                                              |
-|                   | 主代理   [===== T0 规划拆解 =====] ◆ [======== 多模型并发 ========] ◆ [== 归档 ==] |
-|                   | DeepSeek           [==== S1 circle.js (4.2s) ====] ✔                             |
-|                   | WorkBuddy          [==== S2 rect.js (3.8s) ======] ✔                             |
-|                   | Codex                                              [==== S3 审查 (4.1s) ==] ✔    |
-+-------------------+-----------------------------------------------------------------------------------+
++---------------------------------------------------------------------------------------------------------+
+| 🔮 Agent Router  [协作拓扑]   (5 执行成员)  (6 任务)  (4 已完成)      [➕ 新建真实协同任务]  [🟢 实机运行]    |
++-------------------+-------------------------------------------------------------------------------------+
+| 运行区域          |  [实机] 智能协同 · 几何计算与全流程代码审查交付                        🟢 真实多Agent协同 · 全链路打通|
+| • 实机 · 多Agent  +-------------------------------------------------------------------------------------+
+|   本地网关·真实模型 |  【执行成员 5】           【主代理·拆解与整合】                      【结果去向 2】         |
+|                   |  +------------------+    +-----------------------+              +--------------------+  |
+| 真实协同成员      |  | (D) DeepSeek     |===>| Hub 主调度器 (C)      |=============>| 产物库 (Artifacts) |  |
+| (C) 主代理        |  | (A) Claude       |===>| - 规划目标拆解 (DAG)   |=============>| - square.js        |  |
+| (D) DeepSeek      |  | (G) Gemini       |===>| - 多模型异步并发派发  |              | - triangle.js      |  |
+| (A) Claude        |  | (W) WorkBuddy    |===>| - 物理沙箱代码生成    |              | - test_geom.js     |  |
+| (G) Gemini        |  | (X) Codex CLI    |===>| - 自动化测试与独立审查|              +--------------------+  |
+| (W) WorkBuddy     |  +------------------+    +-----------------------+              | 质量门禁 (Gates)   |  |
+| (X) Codex         |                                     ||                          | - exitCode=0 放行  |  |
+|                   |                                     || 动态流光拓扑能量弧       | - 独立评审核准     |  |
+|                   +-------------------------------------\/--------------------------+--------------------+  |
+|                   | 时间轨道 (Timeline Gantt Swimlane):                                                     |
+|                   | 主调度器   [===== T0 DAG规划拆解 =====] ◆ [======== 多模型并发调度 ========] ◆ [== 归档 ==] |
+|                   | DeepSeek             [==== S1 square.js (3.6s) ====] ✔                                  |
+|                   | Gemini               [==== S2 triangle.js (4.1s) ==] ✔                                  |
+|                   | Claude                                              [==== S3 独立审查 (3.8s) =====] ✔   |
++-------------------+-----------------------------------------------------------------------------------------+
 ```
 
 ---
@@ -96,23 +98,26 @@ flowchart TD
 
     subgraph Engines [多模型异构并发执行集群]
         Sub1 -->|自动分配| DeepSeek[🧠 DeepSeek R1 / V3<br/>长链推理 & 算法攻坚]
-        Sub2 -->|自动分配| WorkBuddy[🛠️ WorkBuddy<br/>本地智能体 & 工具执行]
-        Sub3 -->|自动分配| Gemini[🌐 Gemini Pro<br/>接口基线校验]
+        Sub2 -->|自动分配| Claude[🔮 Claude 3.5 Sonnet<br/>全栈实现 & 审查重做]
+        Sub3 -->|自动分配| Gemini[🌐 Gemini Flash / Pro<br/>接口基线校验]
+        Sub4 -->|自动分配| WorkBuddy[🛠️ WorkBuddy<br/>本地智能体 & 工具执行]
     end
 
     subgraph Sandboxes [Git Worktree 物理隔离沙箱]
         DeepSeek --> WB1[(沙箱工作区 1)]
-        WorkBuddy --> WB2[(沙箱工作区 2)]
+        Claude --> WB2[(沙箱工作区 2)]
         Gemini --> WB3[(沙箱工作区 3)]
+        WorkBuddy --> WB4[(沙箱工作区 4)]
     end
 
     subgraph Verification [全自动化质量门禁与审查]
-        WB1 --> Gate[🛡️ Codex 独立代码审查 + 自动化测试套件]
+        WB1 --> Gate[🛡️ 独立代码审查 + 自动化测试套件 (exitCode=0)]
         WB2 --> Gate
         WB3 --> Gate
+        WB4 --> Gate
     end
 
-    Gate -->|exitCode == 0| Final[📦 成果与证据库 Artifacts & Git Commit]
+    Gate -->|通过放行| Final[📦 成果与证据库 Artifacts & Git Commit]
 ```
 
 ---
@@ -345,7 +350,7 @@ export * from "./runtime.ts";
 │   └── agetor/                   # 调度核心服务 (Hub Backend)
 │       ├── packages/
 │       │   ├── core/             # HTTP 路由、契约状态机、Git Worktree 沙箱管理
-│       │   └── agent-adapters/   # 跨厂商多模型适配器集群 (DeepSeek/Codex/Gemini/WorkBuddy)
+│       │   └── agent-adapters/   # 跨厂商多模型适配器集群 (DeepSeek/Claude/Gemini/WorkBuddy/Codex)
 │       ├── scripts/
 │       │   └── start-hub.ts      # 跨平台守护主进程启动脚本
 │       └── src/bun/              # 数据库迁移、并发插槽与自动化测试
@@ -364,9 +369,11 @@ export * from "./runtime.ts";
 | :--- | :--- | :--- | :--- |
 | `PORT` | Hub 调度器 HTTP / WebSocket 服务端口 | `4321` | 否 |
 | `HUB_MAX_CONCURRENCY` | 允许同时并行的子任务插槽数量 | `2` | 否 |
-| `DEEPSEEK_API_KEY` | DeepSeek 官方 API 密钥 (用于推理与编码) | `sk-...` | 实机模式必需 |
+| `DEEPSEEK_API_KEY` | DeepSeek 官方 API 密钥 (用于推理、规划与编码) | `sk-...` | 实机模式推荐 |
 | `DEEPSEEK_BASE_URL` | DeepSeek 服务端点 | `https://api.deepseek.com` | 否 |
-| `GEMINI_API_KEY` | Google Gemini API 密钥 (用于基线与多模态) | `AQ....` | 实机模式必需 |
+| `ANTHROPIC_API_KEY` | Anthropic Claude API 密钥 (Claude 3.5 Sonnet) | `sk-ant-...` | 否 (可选真机引擎) |
+| `ANTHROPIC_BASE_URL` | Anthropic 服务端点 | `https://api.anthropic.com` | 否 |
+| `GEMINI_API_KEY` | Google Gemini API 密钥 (用于基线与规划) | `AQ....` | 实机模式推荐 |
 | `WORKBUDDY_GATEWAY_URL` | 腾讯 WorkBuddy 本地网关地址 | `http://127.0.0.1:18492` | 否 |
 | `OPENAI_API_KEY` | OpenAI 官方 API 密钥 (Codex 直连) | `sk-...` | 否 (支持桌面登录态) |
 
