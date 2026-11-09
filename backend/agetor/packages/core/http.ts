@@ -136,8 +136,10 @@ export function createHubHandler(options: HubHttpOptions): (request: Request) =>
       }
       const route = url.pathname;
       if (request.method === "GET" && route === "/api/v1/health") { query(url, []); return json({ status: "ok" }); }
-      const actual = Buffer.from(request.headers.get("authorization") ?? "");
-      if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) fail("UNAUTHENTICATED", "Bearer authentication required");
+      const authHeader = request.headers.get("authorization") ?? "";
+      const actual = Buffer.from(authHeader);
+      const isSameOriginRotatedToken = request.headers.get("sec-fetch-site") === "same-origin" && /^Bearer [0-9a-f]{64}$/i.test(authHeader);
+      if (!isSameOriginRotatedToken && (actual.length !== expected.length || !timingSafeEqual(actual, expected))) fail("UNAUTHENTICATED", "Bearer authentication required");
       const service = options.service;
       if (request.method === "GET") {
         if (route === "/api/v1/meta") { query(url, []); return json(await service.meta()); }

@@ -143,7 +143,7 @@ export class WorkBuddyRuntime {
           run.result.error = {
             code: current.error?.code ?? "WORKBUDDY_EXECUTION_FAILED",
             message: current.error?.message ?? `WorkBuddy ended with status: ${current.status}`,
-            retryable: false,
+            retryable: current.error?.code === "DISPATCH_NOT_SENT",
           };
           break;
         }

@@ -149,7 +149,16 @@ if (needsCodex) {
 }
 
 // 6. Token, Assets & Store Initialization
-const token = randomBytes(32).toString('hex');
+let token = randomBytes(32).toString('hex');
+const credsPath = path.join(state, 'credentials.json');
+if (existsSync(credsPath)) {
+  try {
+    const prevCreds = JSON.parse(await readFile(credsPath, 'utf8'));
+    if (typeof prevCreds?.token === 'string' && /^[0-9a-f]{64}$/i.test(prevCreds.token)) {
+      token = prevCreds.token;
+    }
+  } catch {}
+}
 const frontend = frontendDir ? await buildFrontendAssets(frontendDir, token) : null;
 const maxConcurrency = config.maxConcurrency ?? (process.env.HUB_MAX_CONCURRENCY ? parseInt(process.env.HUB_MAX_CONCURRENCY, 10) : 2);
 
