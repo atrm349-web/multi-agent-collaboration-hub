@@ -1788,6 +1788,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 5px 6px;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.03);
@@ -1803,6 +1804,8 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .ar-task-code-chip {
@@ -2535,6 +2538,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   font-size: 11px;
   color: #cbd5e1;
   padding: 3px 0;
@@ -2548,6 +2552,8 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .ar-task-code-chip {

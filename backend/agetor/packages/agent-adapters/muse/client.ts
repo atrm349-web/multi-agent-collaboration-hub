@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { existsSync } from "node:fs";
+
 export interface MuseRunInput {
   task: string;
   workspace?: string;
@@ -32,187 +36,158 @@ export interface MuseRunResponse {
 }
 
 export class MuseClient {
-  private readonly baseUrl: string;
-  private token: string | null = null;
-  private localRuns = new Map<string, MuseRunResponse["run"]>();
+  private activeRuns = new Map<string, {
+    run: MuseRunResponse["run"];
+    promise: Promise<MuseRunResponse["run"]>;
+  }>();
 
-  constructor(options: { baseUrl?: string; token?: string } = {}) {
-    this.baseUrl = (options.baseUrl ?? process.env.MUSE_GATEWAY_URL ?? "http://127.0.0.1:18492").replace(/\/+$/, "");
-    if (options.token) this.token = options.token;
-  }
-
-  private async ensureToken(): Promise<string> {
-    if (this.token) return this.token;
-
-    try {
-      const res = await fetch(`${this.baseUrl}/`, { method: "GET" });
-      const cookie = res.headers.get("set-cookie");
-      const match = cookie?.match(/agent_hub=([^;]+)/);
-      if (match && match[1]) {
-        this.token = match[1];
-        return this.token;
-      }
-    } catch {
-      // Fallback to internal token for autonomous execution
-    }
-
-    this.token = "muse_local_quota_token";
-    return this.token;
-  }
+  constructor(_options: { baseUrl?: string; token?: string } = {}) {}
 
   async health(): Promise<{ status: string; version: string; quotaMode: string }> {
-    try {
-      const token = await this.ensureToken();
-      const res = await fetch(`${this.baseUrl}/v1/health`, {
-        headers: { authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json() as any;
-        return { status: "ok", version: data.version || "1.2.0-muse", quotaMode: "self_subscription" };
-      }
-    } catch {
-      // Local autonomous mode
-    }
-    return { status: "ok", version: "1.2.0-muse-autonomous", quotaMode: "self_subscription" };
+    const appExists = existsSync("/Applications/Muse.app");
+    return {
+      status: appExists ? "ok" : "degraded",
+      version: "1.3.0-muse-spark-native",
+      quotaMode: "self_subscription"
+    };
   }
 
   async providers(): Promise<{ providers: any[] }> {
-    try {
-      const token = await this.ensureToken();
-      const res = await fetch(`${this.baseUrl}/v1/providers`, {
-        headers: { authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json() as any;
-        const list = Array.isArray(data.providers) ? [...data.providers] : [];
-        if (!list.some((p: any) => p.id === "muse")) {
-          list.push({
-            id: "muse",
-            label: "Meta Muse (自带专属周额度)",
-            state: "available",
-            capabilities: ["stream", "tools", "structured-output", "self_quota"],
-            quotaType: "self_quota",
-            message: "Muse 自带独立周额度执行引擎在线，不消耗外部 API 额度"
-          });
-        }
-        return { providers: list };
-      }
-    } catch {
-      // Return default provider
-    }
     return {
       providers: [
         {
           id: "muse",
-          label: "Meta Muse (自带专属周额度)",
+          label: "Meta Muse (Spark 1.3 桌面端真实执行 · 自带专属额度)",
           state: "available",
-          capabilities: ["stream", "tools", "structured-output", "self_quota"],
+          capabilities: ["stream", "tools", "structured-output", "self_quota", "desktop-native"],
           quotaType: "self_quota",
-          message: "Muse 自带独立周额度执行引擎在线，不消耗外部 API 额度"
+          message: "Muse 桌面端（Spark 1.3）已接入，通过原生桥接调度，使用其自身独立周额度执行"
         }
       ]
     };
+  }
+
+  private runBridgeProcess(spec: Record<string, unknown>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const scriptPath = path.resolve(__dirname, "muse-desktop-bridge.py");
+      const child = spawn("python3", [scriptPath, JSON.stringify(spec)], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk.toString("utf8");
+      });
+
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      child.on("close", (code) => {
+        if (code === 0) {
+          try {
+            const data = JSON.parse(stdout.trim());
+            resolve(data);
+          } catch (e) {
+            reject(new Error(`Failed to parse bridge output: ${stdout || stderr}`));
+          }
+        } else {
+          reject(new Error(`Muse bridge exited with code ${code}: ${stderr || stdout}`));
+        }
+      });
+
+      child.on("error", (err) => {
+        reject(err);
+      });
+    });
   }
 
   async submitRun(input: MuseRunInput): Promise<MuseRunResponse> {
     const runId = "muse-" + Math.random().toString(36).slice(2, 10);
     const now = new Date().toISOString();
 
-    // Try gateway first
-    try {
-      const token = await this.ensureToken();
-      const res = await fetch(`${this.baseUrl}/v1/runs`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          provider: "workbuddy", // Use shared local agent gateway backend
-          task: `[Meta Muse 自带额度执行]\n${input.task}`,
-          workspace: input.workspace,
-          output: input.output ?? "text",
-          idempotencyKey: input.idempotencyKey,
-          constraints: input.constraints ?? [],
-          timeoutSeconds: input.timeoutSeconds ?? 1800,
-        })
-      });
-
-      if (res.ok) {
-        const gwRes = await res.json() as any;
-        return {
-          run: {
-            ...gwRes.run,
-            quotaType: "self_quota",
-          },
-          created: true
-        };
-      }
-    } catch {
-      // Gateway not answering, use autonomous execution
-    }
-
-    // Local autonomous run entry
-    const localRun: MuseRunResponse["run"] = {
+    const runObj: MuseRunResponse["run"] = {
       id: runId,
       input,
       workspace: input.workspace ?? process.cwd(),
-      status: "completed",
-      review: "accepted",
+      status: "running",
+      review: "pending",
       round: 1,
       quotaType: "self_quota",
-      result: {
-        text: `Muse 智能体（使用自身专属额度）已成功完成任务目标：\n${input.task.slice(0, 160)}...`,
-        artifacts: []
-      },
       createdAt: now,
       updatedAt: now,
     };
 
-    this.localRuns.set(runId, localRun);
-    return { run: localRun, created: true };
+    const promise = (async () => {
+      try {
+        const res = await this.runBridgeProcess({
+          task: input.task,
+          workspace: input.workspace ?? process.cwd(),
+          output: input.output ?? "text",
+          timeoutSeconds: input.timeoutSeconds ?? 120,
+        });
+
+        if (res.status === "completed") {
+          runObj.status = "completed";
+          runObj.review = "accepted";
+          runObj.result = {
+            text: res.reply || "",
+            json: res.json ?? undefined,
+            artifacts: res.artifacts || [],
+          };
+        } else {
+          runObj.status = "failed";
+          runObj.error = {
+            code: "MUSE_EXECUTION_FAILED",
+            message: res.error || "Unknown execution failure",
+          };
+        }
+      } catch (err: any) {
+        runObj.status = "failed";
+        runObj.error = {
+          code: "MUSE_BRIDGE_ERROR",
+          message: err.message || String(err),
+        };
+      }
+      runObj.updatedAt = new Date().toISOString();
+      return runObj;
+    })();
+
+    this.activeRuns.set(runId, { run: runObj, promise });
+    return { run: runObj, created: true };
   }
 
   async getRun(id: string): Promise<MuseRunResponse["run"]> {
-    if (this.localRuns.has(id)) {
-      return this.localRuns.get(id)!;
-    }
-    const token = await this.ensureToken();
-    const res = await fetch(`${this.baseUrl}/v1/runs/${id}`, {
-      headers: { authorization: `Bearer ${token}` }
-    });
-    if (!res.ok) throw new Error(`Muse getRun failed (${res.status})`);
-    const data = await res.json() as any;
-    return { ...data, quotaType: "self_quota" };
+    const item = this.activeRuns.get(id);
+    if (item) return item.run;
+    throw new Error(`NOT_FOUND: Muse run ${id} not found`);
   }
 
-  async waitRun(id: string, timeoutSeconds = 45): Promise<MuseRunResponse["run"]> {
-    if (this.localRuns.has(id)) {
-      return this.localRuns.get(id)!;
-    }
-    const token = await this.ensureToken();
-    const res = await fetch(`${this.baseUrl}/v1/runs/${id}/wait?timeoutSeconds=${timeoutSeconds}`, {
-      headers: { authorization: `Bearer ${token}` }
+  async waitRun(id: string, timeoutSeconds = 60): Promise<MuseRunResponse["run"]> {
+    const item = this.activeRuns.get(id);
+    if (!item) throw new Error(`NOT_FOUND: Muse run ${id} not found`);
+
+    const timeoutPromise = new Promise<MuseRunResponse["run"]>((_, reject) => {
+      setTimeout(() => reject(new Error("TIMEOUT")), timeoutSeconds * 1000);
     });
-    if (!res.ok) throw new Error(`Muse waitRun failed (${res.status})`);
-    const data = await res.json() as any;
-    return { ...data, quotaType: "self_quota" };
+
+    try {
+      return await Promise.race([item.promise, timeoutPromise]);
+    } catch (e: any) {
+      if (e.message === "TIMEOUT") {
+        return item.run;
+      }
+      throw e;
+    }
   }
 
   async cancelRun(id: string): Promise<void> {
-    if (this.localRuns.has(id)) {
-      const r = this.localRuns.get(id)!;
-      r.status = "cancelled";
-      return;
+    const item = this.activeRuns.get(id);
+    if (item && item.run.status === "running") {
+      item.run.status = "cancelled";
+      item.run.updatedAt = new Date().toISOString();
     }
-    const token = await this.ensureToken();
-    await fetch(`${this.baseUrl}/v1/runs/${encodeURIComponent(id)}/cancel`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({})
-    }).catch(() => {});
   }
 }

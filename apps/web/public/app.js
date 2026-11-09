@@ -2195,9 +2195,9 @@ function renderAgentRouterView() {
                         <div class="ar-task-entry">
                           <div class="ar-task-entry-title">
                             <span class="ar-task-code-chip">${t.code}</span>
-                            <span>${escapeHtml(t.title)}</span>
+                            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(t.title)}</span>
                           </div>
-                          <span style="color:${t.color};font-size:10px;">${t.status}</span>
+                          <span style="color:${t.color};font-size:10px;white-space:nowrap;flex-shrink:0;">${t.status}</span>
                         </div>
                       `).join('')}
                     </div>

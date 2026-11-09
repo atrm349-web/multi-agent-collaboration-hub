@@ -1,6 +1,6 @@
 {
   "port": 4321,
-  "maxConcurrency": 1,
+  "maxConcurrency": 4,
   "frontendDir": "apps/web/public",
   "repositories": [
     {
