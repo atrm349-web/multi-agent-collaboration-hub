@@ -579,7 +579,7 @@ async function connectFetchSse(overrideCursor = null) {
 
     uiState.sseConnected = true;
     if (badge) {
-      badge.textContent = `SSE v0.2: Connected (snapshotSeq=${uiState.snapshotSeq}, seq=${uiState.lastAppliedSeq})`;
+      badge.textContent = `⚡ 实时流在线 (seq=${uiState.lastAppliedSeq})`;
     }
 
     const reader = response.body.getReader();
@@ -673,16 +673,16 @@ function renderTopbarAndSidebar() {
 
   const modeBadge = document.getElementById('executionModeBadge');
   if (modeBadge) {
-    const isLiveAvail = Boolean(uiState.meta.liveExecutionAvailable);
-    modeBadge.innerHTML = `<span class="dot"></span> SERVICE: ${uiState.meta.executionMode.toUpperCase()} · contractVersion=${uiState.meta.contractVersion} · liveExecutionAvailable=${isLiveAvail}`;
+    modeBadge.innerHTML = `<span class="dot"></span> 引擎: ${uiState.meta.executionMode.toUpperCase()} (v${uiState.meta.contractVersion})`;
   }
 
   const repoBadge = document.getElementById('activeRepoBadge');
   if (repoBadge && selectedTask) {
     const repo = uiState.repositories.find((r) => r.id === selectedTask.repositoryId);
+    const shortCommit = String(selectedTask.baseCommit || '').slice(0, 7);
     repoBadge.textContent = repo
-      ? `Repo: ${repo.label} (${repo.baseBranch} @ ${selectedTask.baseCommit})`
-      : `RepoId: ${selectedTask.repositoryId} (@ ${selectedTask.baseCommit})`;
+      ? `仓库: ${repo.label} (${repo.baseBranch} @ ${shortCommit})`
+      : `仓库: ${String(selectedTask.repositoryId || '').slice(0, 8)} (@ ${shortCommit})`;
   }
 
   document.getElementById('navTaskCount').textContent = tasks.length;
@@ -703,7 +703,7 @@ function renderTopbarAndSidebar() {
         <div class="sidebar-task-title">${escapeHtml(t.title)}</div>
         <div class="sidebar-task-meta">
           <span class="status-badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>
-          <span>v${t.version} · ${t.status === 'waiting_approval' ? '<strong style="color:#fbbf24;">待批准 (95%)</strong>' : `${t.progressPct}%`} · <span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
+          <span>v${t.version} · ${t.status === 'waiting_approval' ? '<strong style="color:#fbbf24;">待批准 (95%)</strong>' : `${t.progressPct}%`}<span class="mock-tag ${isHistorical ? 'provenance-live' : ''}">${isHistorical ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span></span>
         </div>
       </div>
     `;
@@ -760,9 +760,9 @@ function renderActiveTaskBar() {
           isHistorical
             ? `<span style="font-size:11.5px;color:#34d399;font-family:var(--font-mono);">🔒 历史真实 CLI 证据只读保护：禁止对其执行 Pause/Resume/Cancel 或 Mock 注入</span>`
             : `
-              <button class="btn btn-sm" data-v1-task-control="pause" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canPause ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/pause (CAS expectedVersion + Idempotency-Key)">⏸ 暂停任务 (Pause → pausing)</button>
-              <button class="btn btn-sm btn-success" data-v1-task-control="resume" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canResume ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/resume (仅允许从 paused 状态恢复)">▶ 恢复派发 (Resume → queued)</button>
-              <button class="btn btn-sm btn-danger" data-v1-task-control="cancel" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canCancel ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/cancel (进入 cancelling 过渡态)">⏹ 取消任务 (Cancel → cancelling)</button>
+              <button class="btn btn-sm" data-v1-task-control="pause" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canPause ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/pause (Pause → pausing · CAS expectedVersion + Idempotency-Key)">⏸ 暂停任务</button>
+              <button class="btn btn-sm btn-success" data-v1-task-control="resume" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canResume ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/resume (Resume → queued · 仅允许从 paused 状态恢复)">▶ 恢复派发</button>
+              <button class="btn btn-sm btn-danger" data-v1-task-control="cancel" data-task-id="${escapeHtml(task.id)}" data-version="${task.version}" ${!canCancel ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''} title="POST /api/v1/tasks/:id/cancel (Cancel → cancelling · 进入取消过渡态)">⏹ 取消任务</button>
             `
         }
       </div>
@@ -853,7 +853,7 @@ function renderDashboardView() {
                   ${escapeHtml(s.title)}
                 </div>
                 <div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-top:4px;">
-                  阶段: ${escapeHtml(s.stage)} · ${escapeHtml(s.assignedAgentId || 'agent-codex')}
+                  阶段: ${escapeHtml(s.stage)} · ${escapeHtml(getSubtaskModelDisplayName(resolveSubtaskModel(s, activeTask, detail)))}
                 </div>
               </div>
             `
@@ -976,22 +976,22 @@ function renderTaskCenterView() {
   const columns = [
     {
       key: 'queued_running',
-      title: '排队 / 拆解 / 执行中 (draft / queued / running)',
+      title: '⚡ 排队与执行中',
       filter: (t) => ['draft', 'decomposing', 'queued', 'running'].includes(t.status)
     },
     {
       key: 'waiting_approval',
-      title: '等待人工审批 (waiting_approval)',
+      title: '⏳ 等待人工审批',
       filter: (t) => t.status === 'waiting_approval'
     },
     {
       key: 'exception',
-      title: '过渡态 / 暂停 / 超时 / 失败 (pausing / paused / cancelling / timed_out / failed / cancelled)',
+      title: '⚠️ 异常与已暂停',
       filter: (t) => ['pausing', 'paused', 'cancelling', 'timed_out', 'failed', 'cancelled'].includes(t.status)
     },
     {
       key: 'succeeded',
-      title: '已验收成功 (succeeded)',
+      title: '✅ 已验收完成',
       filter: (t) => t.status === 'succeeded'
     }
   ];
@@ -1121,15 +1121,19 @@ function renderTaskCenterView() {
                   : colTasks
                       .map((t) => {
                         const isHist = t.provenance === 'historical';
+                        const repoObj = uiState.repositories.find((r) => r.id === t.repositoryId);
+                        const repoLabel = repoObj ? repoObj.label : 'demo-geometry-repo';
+                        const shortSha = String(t.baseCommit || '').slice(0, 7);
                         return `
                     <div class="kanban-card ${t.id === uiState.selectedTaskId ? 'active-card' : ''}" data-select-task="${escapeHtml(t.id)}">
-                      <div style="display:flex;justify-content:space-between;align-items:center;">
+                      <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
                         <span class="status-badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>
-                        <span class="mock-tag ${isHist ? 'provenance-live' : ''}">${isHist ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span>
+                        <span class="mock-tag ${isHist ? 'provenance-live' : ''}" style="font-size:9.5px;padding:1.5px 5px;white-space:nowrap;">${isHist ? '🔒 HISTORICAL LIVE' : 'MOCK CURRENT'}</span>
                       </div>
-                      <div style="font-weight:700;color:#fff;cursor:pointer;">${escapeHtml(t.title)}</div>
-                      <div style="font-size:11px;color:var(--text-secondary);font-family:var(--font-mono);">
-                        v${t.version} · repo=${escapeHtml(t.repositoryId)} @ ${escapeHtml(t.baseCommit)} · ${t.progressPct}%
+                      <div style="font-weight:700;color:#f8fafc;cursor:pointer;font-size:13px;line-height:1.4;">${escapeHtml(t.title)}</div>
+                      <div style="font-size:11px;color:var(--text-secondary);font-family:var(--font-mono);display:flex;justify-content:space-between;align-items:center;white-space:nowrap;gap:6px;">
+                        <span>${escapeHtml(repoLabel)} @ ${escapeHtml(shortSha)}</span>
+                        <span style="color:#38bdf8;font-weight:600;">v${t.version} · ${t.progressPct}%</span>
                       </div>
                       <div class="progress-track">
                         <div class="progress-fill" style="width:${t.progressPct}%"></div>
@@ -1220,12 +1224,10 @@ function renderWorkflowDagView() {
                           <div class="progress-track" style="height:5px;">
                             <div class="progress-fill" style="width:${s.progressPct}%"></div>
                           </div>
-                          <div style="font-size:11px;font-family:var(--font-mono);color:#93c5fd;background:rgba(59,130,246,0.08);padding:6px;border-radius:4px;">
-                            <div>Agent: ${escapeHtml(s.assignedAgentId || 'unassigned')}</div>
-                            <div>WorkspaceId: ${escapeHtml(s.workspaceId || 'N/A')}</div>
-                            <div>Branch: ${escapeHtml(s.branchName || 'N/A')}</div>
-                            <div>Attempt: ${s.attempt} / ${s.maxAttempts} · timeoutMs: ${s.timeoutMs}</div>
-                            <div>DependsOn: ${s.dependsOn.length ? escapeHtml(s.dependsOn.join(', ')) : 'None (Root)'}</div>
+                          <div style="font-size:11px;font-family:var(--font-mono);color:#93c5fd;background:rgba(59,130,246,0.08);padding:8px 10px;border-radius:6px;line-height:1.5;">
+                            <div>执行模型: ${escapeHtml(getSubtaskModelDisplayName(resolveSubtaskModel(s, task, detail)))}</div>
+                            <div>工作区: ${escapeHtml(String(s.workspaceId || 'N/A').slice(0, 8))} · 分支: ${escapeHtml(s.branchName || 'main')}</div>
+                            <div>重试轮次: ${s.attempt} / ${s.maxAttempts} · 依赖: ${s.dependsOn.length ? escapeHtml(s.dependsOn.join(', ')) : 'Root'}</div>
                           </div>
                           ${
                             s.error
@@ -1302,14 +1304,15 @@ function renderAgentWorkspaceView() {
         .map((run) => {
           const logPage = uiState.runLogsByRunId[run.id] || { items: [], nextSeq: 0, hasMore: false };
           return `
-        <div style="margin-bottom:16px;border:1px solid var(--border-subtle);border-radius:10px;padding:14px;background:var(--bg-surface);animation:${['failed','timed_out','interrupted'].includes(run.status) ? 'breatheCrimsonHalo 2.6s' : run.status === 'succeeded' ? 'breatheEmeraldHalo 3.8s' : 'breatheCyanBlueHalo 3s'} ease-in-out infinite;">
+        <div style="margin-bottom:16px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:16px;background:rgba(11,16,28,0.75);">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
-            <div>
+            <div style="display:flex;align-items:center;gap:8px;">
               <span class="mock-tag ${run.provenance === 'historical' ? 'provenance-live' : ''}">${run.provenance === 'historical' ? '🔒 HISTORICAL LIVE EVIDENCE' : 'MOCK RUN'}</span>
-              <strong style="margin-left:6px;color:#fff;">Run ${escapeHtml(run.id)} (attempt #${run.attempt}) · Subtask: ${escapeHtml(run.subtaskId)} · Agent: ${escapeHtml(run.agentId)}</strong>
+              <strong style="color:#f8fafc;">Run #${escapeHtml(String(run.id).slice(0, 8))} (第 ${run.attempt} 轮) · 子任务: ${escapeHtml(String(run.subtaskId).slice(0, 8))}</strong>
             </div>
-            <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);">
-              providerSessionId: ${escapeHtml(run.providerSessionId || 'N/A')} | workspaceId: ${escapeHtml(run.workspaceId)} | exitCode: ${escapeHtml(run.exitCode ?? 'N/A')} |
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);display:flex;align-items:center;gap:8px;">
+              <span>沙箱: ${escapeHtml(String(run.workspaceId || '').slice(0, 8))}</span>
+              <span>exitCode: ${escapeHtml(run.exitCode ?? 'N/A')}</span>
               <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>
             </div>
           </div>
