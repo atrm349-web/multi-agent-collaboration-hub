@@ -2802,3 +2802,17 @@ code {
   margin-top: 6px;
   padding-left: 90px;
 }
+
+/* Dynamic Topology Stream Pipeline */
+@keyframes arDashFlow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.ar-active-stream {
+  animation: arDashFlow 1.2s linear infinite;
+}

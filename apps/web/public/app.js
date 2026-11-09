@@ -1987,62 +1987,26 @@ function renderAgentRouterView() {
 
           <!-- Topology Diagram with Flow Connections -->
           <div class="ar-flow-container">
-            <!-- Dynamic SVG Connectors (Calibrated for 1440 grid) -->
-            <svg class="ar-flow-svg" viewBox="0 0 1440 480" preserveAspectRatio="none" style="z-index:10;pointer-events:none;">
+            <!-- Dynamic Adaptive SVG Connectors -->
+            <svg id="arTopologySvg" class="ar-flow-svg" style="z-index:1;pointer-events:none;overflow:visible;">
               <defs>
-                <linearGradient id="arGradCyan" x1="0%" y1="0%" x2="100%" y2="0%">
-                  <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.9"/>
-                  <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.9"/>
+                <linearGradient id="arGradActiveLeft" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.95"/>
+                  <stop offset="100%" stop-color="#818cf8" stop-opacity="0.95"/>
                 </linearGradient>
-                <linearGradient id="arGradGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+                <linearGradient id="arGradActiveRight" x1="0%" y1="0%" x2="100%" y2="0%">
                   <stop offset="0%" stop-color="#10b981" stop-opacity="0.95"/>
-                  <stop offset="100%" stop-color="#06b6d4" stop-opacity="0.95"/>
+                  <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.95"/>
                 </linearGradient>
-                <linearGradient id="arGradSwoop" x1="0%" y1="100%" x2="100%" y2="0%">
-                  <stop offset="0%" stop-color="#059669" stop-opacity="0.2"/>
-                  <stop offset="40%" stop-color="#10b981" stop-opacity="0.95"/>
-                  <stop offset="100%" stop-color="#38bdf8" stop-opacity="1"/>
-                </linearGradient>
-                <filter id="arGlowGreen" x="-20%" y="-20%" width="140%" height="140%">
-                  <feGaussianBlur stdDeviation="4" result="blur" />
+                <filter id="arGlowLine" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="2.5" result="blur" />
                   <feMerge>
                     <feMergeNode in="blur" />
                     <feMergeNode in="SourceGraphic" />
                   </feMerge>
                 </filter>
-                <filter id="arGlowHeavy" x="-50%" y="-50%" width="200%" height="200%">
-                  <feGaussianBlur stdDeviation="7" result="blur1" />
-                  <feGaussianBlur stdDeviation="3" result="blur2" />
-                  <feMerge>
-                    <feMergeNode in="blur1" />
-                    <feMergeNode in="blur2" />
-                    <feMergeNode in="SourceGraphic" />
-                  </feMerge>
-                </filter>
               </defs>
-
-              <!-- Cables from Executive Members (Col 1 right edge = 290) to Claude Master (Col 2 left = 310) -->
-              <path d="M 290 52 C 300 52, 300 160, 310 160" fill="none" stroke="#64748b" stroke-width="2" opacity="0.9"/>
-              <circle cx="290" cy="52" r="3" fill="#64748b"/>
-              <path d="M 290 138 C 300 138, 300 180, 310 180" fill="none" stroke="#2563eb" stroke-width="2.5" opacity="0.9"/>
-              <circle cx="290" cy="138" r="3" fill="#2563eb"/>
-              <path d="M 290 224 C 300 224, 300 200, 310 200" fill="none" stroke="#0284c7" stroke-width="2.5" opacity="0.9"/>
-              <circle cx="290" cy="224" r="3" fill="#0284c7"/>
-              <path d="M 290 310 C 300 310, 300 220, 310 220" fill="none" stroke="#d97706" stroke-width="2.5" opacity="0.9"/>
-              <circle cx="290" cy="310" r="3" fill="#d97706"/>
-              <path d="M 290 396 C 300 396, 300 240, 310 240" fill="none" stroke="#7c3aed" stroke-width="2" opacity="0.9"/>
-              <circle cx="290" cy="396" r="3" fill="#7c3aed"/>
-
-              <!-- Cables from Master (Col 2 right edge = 1080) to Outputs (Col 3 left = 1100) -->
-              <path d="M 1080 150 C 1090 150, 1090 100, 1100 100" fill="none" stroke="url(#arGradGreen)" stroke-width="2.5" opacity="0.9"/>
-              <circle cx="1080" cy="150" r="3" fill="#10b981"/>
-              <path d="M 1080 250 C 1090 250, 1090 270, 1100 270" fill="none" stroke="url(#arGradGreen)" stroke-width="3" filter="url(#arGlowGreen)" opacity="0.95"/>
-              <circle cx="1080" cy="250" r="3.5" fill="#10b981" filter="url(#arGlowGreen)"/>
-
-              <!-- Luminous Emerald Swoop Ribbon arching from bottom timeline into the Report card -->
-              <path d="M 520 440 C 720 540, 1060 480, 1260 360" fill="none" stroke="url(#arGradSwoop)" stroke-width="6" filter="url(#arGlowHeavy)" stroke-linecap="round"/>
-              <circle cx="1260" cy="360" r="6" fill="#38bdf8" filter="url(#arGlowHeavy)"/>
-              <circle cx="520" cy="440" r="4.5" fill="#10b981"/>
+              <g id="arTopologyLinks"></g>
             </svg>
 
             <!-- 3 Column Cards Layout -->
@@ -2401,7 +2365,90 @@ function renderAll() {
     default:
       viewport.innerHTML = renderDashboardView();
   }
+
+  if (uiState.activeView === 'agent-router') {
+    requestAnimationFrame(() => updateTopologyConnectors());
+  }
 }
+
+function updateTopologyConnectors() {
+  if (uiState.activeView !== 'agent-router') return;
+  const container = document.querySelector('.ar-flow-container');
+  const svg = document.getElementById('arTopologySvg');
+  const g = document.getElementById('arTopologyLinks');
+  if (!container || !svg || !g) return;
+
+  const containerRect = container.getBoundingClientRect();
+  if (containerRect.width === 0 || containerRect.height === 0) return;
+
+  const centerBox = container.querySelector('.ar-center-box');
+  if (!centerBox) return;
+  const centerRect = centerBox.getBoundingClientRect();
+
+  const nodeCards = Array.from(container.querySelectorAll('.ar-node-card'));
+  const outputCards = Array.from(container.querySelectorAll('.ar-output-card'));
+
+  let pathsHtml = '';
+
+  // 1. Connect each Left Node Card to Center Master
+  nodeCards.forEach((card, idx) => {
+    const cardRect = card.getBoundingClientRect();
+    const x1 = Math.round(cardRect.right - containerRect.left);
+    const y1 = Math.round(cardRect.top + cardRect.height / 2 - containerRect.top);
+
+    const x2 = Math.round(centerRect.left - containerRect.left);
+    const totalNodes = nodeCards.length || 5;
+    const step = (centerRect.height - 40) / Math.max(1, totalNodes - 1);
+    const y2 = Math.round((centerRect.top + 20 + idx * step) - containerRect.top);
+
+    const deltaX = Math.max(20, Math.round((x2 - x1) * 0.45));
+    const d = `M ${x1} ${y1} C ${x1 + deltaX} ${y1}, ${x2 - deltaX} ${y2}, ${x2} ${y2}`;
+
+    const hasActiveTask = card.querySelector('.ar-task-entry') !== null;
+    const strokeColor = hasActiveTask ? 'url(#arGradActiveLeft)' : 'rgba(148, 163, 184, 0.22)';
+    const strokeWidth = hasActiveTask ? 2 : 1.2;
+    const dotColor = hasActiveTask ? '#38bdf8' : 'rgba(148, 163, 184, 0.4)';
+
+    pathsHtml += `
+      <path d="${d}" fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}" ${hasActiveTask ? 'filter="url(#arGlowLine)" stroke-dasharray="6,3" class="ar-active-stream"' : ''} />
+      <circle cx="${x1}" cy="${y1}" r="${hasActiveTask ? 3.5 : 2}" fill="${dotColor}" />
+      <circle cx="${x2}" cy="${y2}" r="${hasActiveTask ? 3 : 2}" fill="${dotColor}" />
+    `;
+  });
+
+  // 2. Connect Center Master to Right Output Cards
+  outputCards.forEach((outCard, idx) => {
+    const outRect = outCard.getBoundingClientRect();
+    const totalOut = outputCards.length || 3;
+    const step = (centerRect.height - 40) / Math.max(1, totalOut - 1);
+
+    const x1 = Math.round(centerRect.right - containerRect.left);
+    const y1 = Math.round((centerRect.top + 20 + idx * step) - containerRect.top);
+
+    const x2 = Math.round(outRect.left - containerRect.left);
+    const y2 = Math.round(outRect.top + Math.min(32, outRect.height / 2) - containerRect.top);
+
+    const deltaX = Math.max(20, Math.round((x2 - x1) * 0.45));
+    const d = `M ${x1} ${y1} C ${x1 + deltaX} ${y1}, ${x2 - deltaX} ${y2}, ${x2} ${y2}`;
+
+    const strokeColor = 'url(#arGradActiveRight)';
+    const strokeWidth = 1.8;
+
+    pathsHtml += `
+      <path d="${d}" fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}" filter="url(#arGlowLine)" stroke-dasharray="6,3" class="ar-active-stream" />
+      <circle cx="${x1}" cy="${y1}" r="3" fill="#10b981" />
+      <circle cx="${x2}" cy="${y2}" r="3.5" fill="#38bdf8" />
+    `;
+  });
+
+  g.innerHTML = pathsHtml;
+}
+
+window.addEventListener('resize', () => {
+  if (uiState.activeView === 'agent-router') {
+    updateTopologyConnectors();
+  }
+});
 
 document.addEventListener('click', async (e) => {
   const target = e.target.closest('button, [data-select-task], [data-ar-toggle-mode], [data-ar-member], [data-goto-view]');
