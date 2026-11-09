@@ -7,7 +7,7 @@ import { migrate } from "../../src/bun/migrate.ts";
 import schema from "../../src/bun/migrations/083_hub_service.sql" with { type: "text" };
 import { HubStore } from "./state/store.ts";
 import { DurableCodexRunner } from "./state/durable-codex.ts";
-import { planWithCodex, planWithDeepSeek, planWithGemini, validatePlan, type PlannerOptions } from "./planner.ts";
+import { planWithCodex, planWithDeepSeek, planWithGemini, planWithClaude, validatePlan, type PlannerOptions } from "./planner.ts";
 import { WorkspaceManager, writeArtifact, freezeArtifact, readFrozenArtifact, runTestProfile, workspaceFingerprint,
   type WorkspaceHandle, type FrozenArtifact, type TestProfile, type TestResult } from "./workspace.ts";
 import { QualityGate } from "./quality.ts";
@@ -243,9 +243,11 @@ export class HubService implements HTTPService {
       const plannerModel = repo.models?.planner ?? repo.model;
       const defaultPlanner = plannerModel.startsWith("deepseek")
         ? planWithDeepSeek
-        : (plannerModel.startsWith("gemini") || plannerModel.startsWith("antigravity"))
-          ? planWithGemini
-          : planWithCodex;
+        : plannerModel.startsWith("claude")
+          ? planWithClaude
+          : (plannerModel.startsWith("gemini") || plannerModel.startsWith("antigravity"))
+            ? planWithGemini
+            : planWithCodex;
       const plan = await (this.options.planner ?? defaultPlanner)({ goal: `${goal}\nProduce only implementation, testing, review or documentation stages. Planning is already complete; do not add an analysis stage. Available capabilities: stream, resume, cancel, structured-output. Registered test profile IDs: ${repo.testProfiles.map((p) => p.id).join(", ")}.`,
         cwd: handle.agentPath,workspaceRoot: this.options.root,repositoryId: repo.id,model: plannerModel,effort: repo.effort,timeoutMs: 90000,signal: abort.signal });
       return { ...plan,goal,subtasks: validatePlan(plan.subtasks).map((step) => ({ ...step,acceptanceCriteria: this.criteria(step.acceptanceCriteria,repo) })) };

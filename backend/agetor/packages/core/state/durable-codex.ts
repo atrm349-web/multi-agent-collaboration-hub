@@ -3,6 +3,7 @@ import { CodexRuntime, type CodexResult, type CodexLog } from "../../agent-adapt
 import { DeepSeekRuntime } from "../../agent-adapters/deepseek/runtime.ts";
 import { GeminiRuntime } from "../../agent-adapters/gemini/runtime.ts";
 import { WorkBuddyRuntime } from "../../agent-adapters/workbuddy/runtime.ts";
+import { ClaudeRuntime } from "../../agent-adapters/claude/runtime.ts";
 import type { AgentRun } from "../../shared/src/types.ts";
 import { HubStore, type ClaimRequest } from "./store.ts";
 
@@ -53,11 +54,13 @@ export class DurableCodexRunner {
     };
     job.runtime = input.request.model?.startsWith("deepseek")
       ? new DeepSeekRuntime(runtimeOptions)
-      : (input.request.model?.startsWith("gemini") || input.request.model?.startsWith("antigravity"))
-        ? new GeminiRuntime(runtimeOptions)
-        : (input.request.model?.startsWith("workbuddy") || input.request.model?.startsWith("wb") || input.request.model?.startsWith("codebuddy"))
-          ? new WorkBuddyRuntime(runtimeOptions)
-          : new CodexRuntime(runtimeOptions);
+      : input.request.model?.startsWith("claude")
+        ? new ClaudeRuntime(runtimeOptions)
+        : (input.request.model?.startsWith("gemini") || input.request.model?.startsWith("antigravity"))
+          ? new GeminiRuntime(runtimeOptions)
+          : (input.request.model?.startsWith("workbuddy") || input.request.model?.startsWith("wb") || input.request.model?.startsWith("codebuddy"))
+            ? new WorkBuddyRuntime(runtimeOptions)
+            : new CodexRuntime(runtimeOptions);
     this.jobs.set(id,job);
     const heartbeat = setInterval(() => {
       try {

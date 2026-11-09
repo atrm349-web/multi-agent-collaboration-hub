@@ -1686,133 +1686,122 @@ function renderAgentRouterView() {
   const task = getSelectedTask();
   const detail = uiState.selectedTaskDetail;
 
-  const subtasks = (detail?.subtasks && Array.isArray(detail.subtasks) && detail.subtasks.length > 0)
-    ? detail.subtasks
-    : [
-        { id: "s1", title: "抓取国内电商评论与评分", status: "succeeded", displayIndex: "T1", agent: "Codex", agentModel: "gpt-5-codex" },
-        { id: "s2", title: "整理海外论坛与 Amazon 口碑", status: "succeeded", displayIndex: "T2", agent: "ZCode", agentModel: "glm-4.6" },
-        { id: "s3", title: "价格带与渠道分析", status: "succeeded", displayIndex: "T3", agent: "Devin", agentModel: "swe-1.5" },
-        { id: "s4", title: "专利与安全认证检索", status: "failed", displayIndex: "T4", agent: "OpenCode", agentModel: "space-bunny" },
-        { id: "s5", title: "功能矩阵对比表", status: "queued", displayIndex: "T5", agent: "Codex", agentModel: "gpt-5-codex" },
-        { id: "s6", title: "撰写竞品调研报告", status: "queued", displayIndex: "T6", agent: "DSH", agentModel: "deepseek-v3.2" }
-      ];
-
+  const subtasks = (detail?.subtasks && Array.isArray(detail.subtasks)) ? detail.subtasks : [];
   const artifacts = (Array.isArray(detail?.artifacts) && detail.artifacts.length > 0)
     ? detail.artifacts
     : (detail?.artifacts?.items && detail.artifacts.items.length > 0)
     ? detail.artifacts.items
-    : [
-        { name: "data/reviews_cn.json", path: "data/reviews_cn.json", category: "T1" },
-        { name: "data/ratings.csv", path: "data/ratings.csv", category: "T1" },
-        { name: "research/overseas_voice.md", path: "research/overseas_voice.md", category: "T2" },
-        { name: "analysis/pricing.csv", path: "analysis/pricing.csv", category: "T3" },
-        { name: "research/patents_partial.md", path: "research/patents_partial.md", category: "T4" }
-      ];
+    : [];
 
-  let missionTitle = "智能门锁·国内外竞品调研与报告交付";
-  let missionType = "演示";
-  let missionExtra = "模拟数据 · 不调用 Agent";
-  let isLive = false;
+  let missionTitle = "等待下发协同任务 (Ready for Tasks)";
+  let missionType = "就绪";
+  let missionExtra = "等待任务启动";
+  let isLive = true;
 
   if (task) {
-    if (task.executionMode === "live") {
-      isLive = true;
-      missionTitle = task.title || "智能协同 · 几何计算算法库交付";
-      missionType = "实机";
-      missionExtra = "🟢 真实多Agent协同 · 全链路打通";
-    } else {
-      missionTitle = task.title || missionTitle;
-    }
+    isLive = task.executionMode === "live";
+    missionTitle = task.title || task.goal || "多智能体协同研发任务";
+    missionType = "实机";
+    missionExtra = "🟢 真实多Agent协同 · 全链路打通";
   }
 
   const selectedMember = uiState.routerSelectedMember || "all";
 
-  // 5 Executive Member cards exactly matching screenshot
+  // 5 Real Executive Member cards reflecting genuinely connected models
   const memberCards = [
+    {
+      id: "deepseek",
+      name: "DeepSeek",
+      model: "deepseek-reasoner / chat",
+      letter: "D",
+      avatarCls: "ar-avatar-dsh",
+      status: "就绪",
+      statusCls: "ar-status-success",
+      tasks: subtasks.filter((s) => s.assignedAgentId?.includes("1111") || s.stage === "implementation" || s.stage === "analysis").map((s, i) => ({
+        code: s.displayIndex || s.code || `T${i + 1}`,
+        title: s.title,
+        status: s.status === "succeeded" ? "已完成" : s.status === "failed" ? "失败" : "执行中",
+        color: s.status === "succeeded" ? "#10b981" : s.status === "failed" ? "#ef4444" : "#38bdf8"
+      }))
+    },
+    {
+      id: "claude",
+      name: "Claude",
+      model: "claude-3-5-sonnet",
+      letter: "A",
+      avatarCls: "ar-avatar-z",
+      status: "就绪",
+      statusCls: "ar-status-success",
+      tasks: subtasks.filter((s) => s.stage === "review" || s.code === "FINAL-REVIEW").map((s, i) => ({
+        code: s.displayIndex || s.code || `T${i + 1}`,
+        title: s.title,
+        status: s.status === "succeeded" ? "已完成" : s.status === "failed" ? "失败" : "审查中",
+        color: s.status === "succeeded" ? "#10b981" : s.status === "failed" ? "#ef4444" : "#a855f7"
+      }))
+    },
+    {
+      id: "gemini",
+      name: "Gemini",
+      model: "gemini-3.5-flash",
+      letter: "G",
+      avatarCls: "ar-avatar-o",
+      status: "就绪",
+      statusCls: "ar-status-success",
+      tasks: subtasks.filter((s) => s.stage === "documentation" || s.stage === "testing").map((s, i) => ({
+        code: s.displayIndex || s.code || `T${i + 1}`,
+        title: s.title,
+        status: s.status === "succeeded" ? "已完成" : s.status === "failed" ? "失败" : "执行中",
+        color: s.status === "succeeded" ? "#10b981" : s.status === "failed" ? "#ef4444" : "#38bdf8"
+      }))
+    },
+    {
+      id: "workbuddy",
+      name: "WorkBuddy",
+      model: "本地网关 (18492)",
+      letter: "W",
+      avatarCls: "ar-avatar-d",
+      status: "本地在线",
+      statusCls: "ar-status-success",
+      tasks: subtasks.filter((s) => s.assignedAgentId?.includes("3333")).map((s, i) => ({
+        code: s.displayIndex || s.code || `T${i + 1}`,
+        title: s.title,
+        status: s.status === "succeeded" ? "已完成" : s.status === "failed" ? "失败" : "执行中",
+        color: s.status === "succeeded" ? "#10b981" : s.status === "failed" ? "#ef4444" : "#38bdf8"
+      }))
+    },
     {
       id: "codex",
       name: "Codex",
-      model: "gpt-5-codex",
+      model: "OpenAI Codex CLI",
       letter: "X",
       avatarCls: "ar-avatar-x",
-      status: "排队中",
+      status: "备用",
       statusCls: "ar-status-queued",
-      tasks: [
-        { code: "T1", title: "抓取国内电商评论与评分", status: "已完成", color: "#10b981" },
-        { code: "T5", title: "功能矩阵对比表", status: "待执行", color: "#94a3b8" }
-      ]
-    },
-    {
-      id: "zcode",
-      name: "ZCode",
-      model: "glm-4.6",
-      letter: "Z",
-      avatarCls: "ar-avatar-z",
-      status: "已完成",
-      statusCls: "ar-status-success",
-      tasks: [
-        { code: "T2", title: "整理海外论坛与 Amazon 口碑", status: "已完成", color: "#10b981" }
-      ]
-    },
-    {
-      id: "devin",
-      name: "Devin",
-      model: "swe-1.5",
-      letter: "D",
-      avatarCls: "ar-avatar-d",
-      status: "已完成",
-      statusCls: "ar-status-success",
-      tasks: [
-        { code: "T3", title: "价格带与渠道分析", status: "已完成", color: "#10b981" }
-      ]
-    },
-    {
-      id: "opencode",
-      name: "OpenCode",
-      model: "space-bunny",
-      letter: "O",
-      avatarCls: "ar-avatar-o",
-      status: "5天前",
-      statusCls: "ar-status-queued",
-      tasks: [
-        { code: "T4", title: "专利与安全认证检索", status: "失败", color: "#ef4444" }
-      ]
-    },
-    {
-      id: "dsh",
-      name: "DSH",
-      model: "deepseek-v3.2",
-      letter: "D",
-      avatarCls: "ar-avatar-dsh",
-      status: "排队中",
-      statusCls: "ar-status-queued",
-      tasks: [
-        { code: "T6", title: "撰写竞品调研报告", status: "待执行", color: "#94a3b8" }
-      ]
+      tasks: []
     }
   ];
 
   return `
     <div class="agent-router-view">
-      <!-- Topbar inside Router Canvas (Matches screenshot 1:1) -->
+      <!-- Topbar inside Router Canvas -->
       <div class="ar-topbar">
         <div class="ar-brand-group">
           <div class="ar-brand-logo">🔮</div>
           <div class="ar-brand-title">Agent Router</div>
           <div class="ar-nav-tab">协作拓扑</div>
           <div class="ar-pills">
-            <span class="ar-pill">5 执行成员</span>
-            <span class="ar-pill">6 任务</span>
-            <span class="ar-pill" style="color:#10b981;border-color:rgba(16,185,129,0.3);">3 已完成</span>
+            <span class="ar-pill">5 执行成员 (DeepSeek / Claude / Gemini / WorkBuddy / Codex)</span>
+            <span class="ar-pill">${subtasks.length} 任务</span>
+            <span class="ar-pill" style="color:#10b981;border-color:rgba(16,185,129,0.3);">${subtasks.filter((s) => s.status === 'succeeded').length} 已完成</span>
           </div>
         </div>
 
         <div class="ar-actions">
+          <button class="ar-btn-link" id="createRealTaskBtn" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:5px 14px;border-radius:6px;font-weight:700;cursor:pointer;box-shadow:0 0 12px rgba(99,102,241,0.5);">➕ 新建真实协同任务</button>
           <span class="ar-pill-mode" style="${isLive ? '' : 'background:rgba(139,92,246,0.18);border-color:rgba(139,92,246,0.4);color:#c084fc;'}">
             <span class="ar-green-dot" style="${isLive ? '' : 'background:#a855f7;box-shadow:0 0 8px #a855f7;'}"></span>
-            ${isLive ? '🟢 实机运行' : '* 演示'}
+            ${isLive ? '🟢 实机真模型运行' : '* 演示'}
           </span>
-          <button class="ar-btn-link" data-goto-view="communication">聊天 ↗</button>
           <button class="ar-btn-link" data-goto-view="agent-workspace">控制台 ↗</button>
           <button class="ar-btn-link" data-goto-view="task-center">任务中心 ↗</button>
           <button class="ar-btn-link" data-goto-view="artifact-center">成果库 ↗</button>
@@ -1821,45 +1810,45 @@ function renderAgentRouterView() {
       </div>
 
       <div class="ar-body">
-        <!-- Left Sidebar Rail: 运行区域 & 成员 -->
+        <!-- Left Sidebar Rail: 运行区域 & 真实模型成员 -->
         <aside class="ar-sidebar">
           <div class="ar-run-section">
             <div class="ar-section-label">运行区域</div>
             <div class="ar-run-pill">
               <div class="ar-run-pill-title">
-                <span class="ar-green-dot" style="${isLive ? '' : 'background:#a855f7;box-shadow:0 0 6px #a855f7;'}"></span>
-                ${isLive ? '实机 · 多Agent' : '• 演示 · 模拟运行'}
+                <span class="ar-green-dot"></span>
+                实机 · 多Agent
               </div>
-              <div class="ar-run-pill-sub">${isLive ? '本地网关 · 真实模型' : '本地进程，不调用 Agent'}</div>
+              <div class="ar-run-pill-sub">真实模型 · 物理沙箱</div>
             </div>
           </div>
 
           <div class="ar-members-section">
-            <div class="ar-section-label">成员</div>
+            <div class="ar-section-label">真实协同成员</div>
             <div class="ar-members-list">
-              <div class="ar-member-item" data-ar-member="hub" title="Hub 主调度器 (Claude Code)">
+              <div class="ar-member-item" data-ar-member="hub" title="Hub 主调度器 (Coordinator)">
                 <div class="ar-avatar ar-avatar-c" style="${selectedMember === 'hub' ? 'outline: 2px solid #fff;' : ''}">C</div>
                 <div class="ar-avatar-label">主代理</div>
               </div>
-              <div class="ar-member-item" data-ar-member="codex" title="Codex">
+              <div class="ar-member-item" data-ar-member="deepseek" title="DeepSeek (R1/V3 · 规划与算法)">
+                <div class="ar-avatar ar-avatar-dsh" style="${selectedMember === 'deepseek' ? 'outline: 2px solid #fff;' : ''}">D</div>
+                <div class="ar-avatar-label">DeepSeek</div>
+              </div>
+              <div class="ar-member-item" data-ar-member="claude" title="Anthropic Claude (3.5 Sonnet / Opus)">
+                <div class="ar-avatar ar-avatar-z" style="${selectedMember === 'claude' ? 'outline: 2px solid #fff;' : ''}">A</div>
+                <div class="ar-avatar-label">Claude</div>
+              </div>
+              <div class="ar-member-item" data-ar-member="gemini" title="Google Gemini (3.5 Flash / Pro)">
+                <div class="ar-avatar ar-avatar-o" style="${selectedMember === 'gemini' ? 'outline: 2px solid #fff;' : ''}">G</div>
+                <div class="ar-avatar-label">Gemini</div>
+              </div>
+              <div class="ar-member-item" data-ar-member="workbuddy" title="腾讯 WorkBuddy (本地智能体网关)">
+                <div class="ar-avatar ar-avatar-d" style="${selectedMember === 'workbuddy' ? 'outline: 2px solid #fff;' : ''}">W</div>
+                <div class="ar-avatar-label">WorkBuddy</div>
+              </div>
+              <div class="ar-member-item" data-ar-member="codex" title="OpenAI Codex (CLI 门禁)">
                 <div class="ar-avatar ar-avatar-x" style="${selectedMember === 'codex' ? 'outline: 2px solid #fff;' : ''}">X</div>
                 <div class="ar-avatar-label">Codex</div>
-              </div>
-              <div class="ar-member-item" data-ar-member="zcode" title="ZCode">
-                <div class="ar-avatar ar-avatar-z" style="${selectedMember === 'zcode' ? 'outline: 2px solid #fff;' : ''}">Z</div>
-                <div class="ar-avatar-label">ZCode</div>
-              </div>
-              <div class="ar-member-item" data-ar-member="devin" title="Devin">
-                <div class="ar-avatar ar-avatar-d" style="${selectedMember === 'devin' ? 'outline: 2px solid #fff;' : ''}">D</div>
-                <div class="ar-avatar-label">Devin</div>
-              </div>
-              <div class="ar-member-item" data-ar-member="opencode" title="OpenCode">
-                <div class="ar-avatar ar-avatar-o" style="${selectedMember === 'opencode' ? 'outline: 2px solid #fff;' : ''}">O</div>
-                <div class="ar-avatar-label">OpenCode</div>
-              </div>
-              <div class="ar-member-item" data-ar-member="dsh" title="DSH">
-                <div class="ar-avatar ar-avatar-dsh" style="${selectedMember === 'dsh' ? 'outline: 2px solid #fff;' : ''}">D</div>
-                <div class="ar-avatar-label">DSH</div>
               </div>
             </div>
           </div>
@@ -2000,13 +1989,13 @@ function renderAgentRouterView() {
                     <div style="font-size:12.5px;font-weight:700;color:#f8fafc;margin:4px 0 10px;">${escapeHtml(missionTitle)}</div>
 
                     <div class="ar-center-tasks">
-                      ${subtasks.map((s, idx) => {
+                      ${subtasks.length > 0 ? subtasks.map((s, idx) => {
                         const isSucc = s.status === 'succeeded';
                         const isFail = s.status === 'failed';
-                        const color = isSucc ? '#10b981' : (isFail ? '#ef4444' : '#94a3b8');
-                        const label = isSucc ? '已完成' : (isFail ? '失败' : '待执行');
-                        const code = s.displayIndex || `T${idx + 1}`;
-                        const agentName = s.agent || (idx === 0 || idx === 4 ? 'Codex' : idx === 1 ? 'ZCode' : idx === 2 ? 'Devin' : idx === 3 ? 'OpenCode' : 'DSH');
+                        const color = isSucc ? '#10b981' : (isFail ? '#ef4444' : '#38bdf8');
+                        const label = isSucc ? '已完成' : (isFail ? '失败' : (s.status === 'running' ? '执行中' : '排队中'));
+                        const code = s.displayIndex || s.code || `T${idx + 1}`;
+                        const agentName = s.assignedAgentId?.includes('1111') ? 'DeepSeek' : (s.assignedAgentId?.includes('3333') ? 'WorkBuddy' : (s.stage === 'review' ? 'Claude' : 'Agent'));
 
                         return `
                           <div class="ar-center-task-item">
@@ -2018,24 +2007,28 @@ function renderAgentRouterView() {
                             <span style="color:${color};font-size:10.5px;flex-shrink:0;">[${label}]</span>
                           </div>
                         `;
-                      }).join('')}
+                      }).join('') : `
+                        <div style="padding: 16px 8px; text-align: center; color: #64748b; font-size: 11.5px;">
+                          当前无执行中的子任务。点击右上角 <strong>【➕ 新建真实协同任务】</strong> 即可下发新需求。
+                        </div>
+                      `}
                     </div>
                   </div>
 
                   <div class="ar-center-summary-bar">
-                    <span>产物汇总 <strong style="color:#fff;">5</strong></span>
-                    <span>任务报告 <strong style="color:#fff;">4</strong></span>
+                    <span>产物汇总 <strong style="color:#fff;">${artifacts.length}</strong></span>
+                    <span>已完成子任务 <strong style="color:#fff;">${subtasks.filter((s) => s.status === 'succeeded').length}</strong></span>
                   </div>
                   <div style="text-align:center;font-size:10.5px;color:#64748b;margin-top:8px;">
-                    — 子代理结果汇入，主代理整合分发
+                    — 子代理独立沙箱执行，测试门禁通过后自动合流
                   </div>
                 </div>
               </div>
 
-              <!-- Column 3: 结果去向 2 -->
+              <!-- Column 3: 真实结果去向 -->
               <div>
                 <div class="ar-col-title">
-                  <span>结果去向 2</span>
+                  <span>真实交付成果</span>
                 </div>
 
                 <!-- Artifacts Card -->
@@ -2044,19 +2037,20 @@ function renderAgentRouterView() {
                     <div style="display:flex;align-items:center;gap:6px;">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                       <div>
-                        <span style="font-weight:700;color:#f8fafc;">产物</span>
-                        <span style="font-size:10.5px;color:#64748b;margin-left:6px;font-family:var(--font-mono);">D:\demo\lock-research</span>
+                        <span style="font-weight:700;color:#f8fafc;">不可变产物库</span>
                       </div>
                     </div>
-                    <span style="font-size:11px;background:rgba(56,189,248,0.15);color:#38bdf8;padding:1px 6px;border-radius:4px;font-weight:700;">5</span>
+                    <span style="font-size:11px;background:rgba(56,189,248,0.15);color:#38bdf8;padding:1px 6px;border-radius:4px;font-weight:700;">${artifacts.length}</span>
                   </div>
                   <div>
-                    ${artifacts.slice(0, 5).map((art) => `
+                    ${artifacts.length > 0 ? artifacts.slice(0, 6).map((art) => `
                       <div class="ar-file-item">
-                        <span class="ar-task-code-chip" style="background:rgba(56,189,248,0.12);color:#38bdf8;font-size:9px;">${art.category || 'T1'}</span>
+                        <span class="ar-task-code-chip" style="background:rgba(56,189,248,0.12);color:#38bdf8;font-size:9px;">${art.category || 'code'}</span>
                         <span style="font-family:var(--font-mono);font-size:11px;">${escapeHtml(art.name || art.path)}</span>
                       </div>
-                    `).join('')}
+                    `).join('') : `
+                      <div style="padding: 16px; font-size: 11px; color: #64748b; text-align: center;">暂无代码产物，任务执行后自动提取</div>
+                    `}
                   </div>
                 </div>
 
@@ -2066,142 +2060,146 @@ function renderAgentRouterView() {
                     <div style="display:flex;align-items:center;gap:6px;">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
                       <div>
-                        <span style="font-weight:700;color:#f8fafc;">任务报告</span>
-                        <span style="font-size:10.5px;color:#64748b;margin-left:6px;">凭证回传主代理</span>
+                        <span style="font-weight:700;color:#f8fafc;">自动化测试门禁</span>
+                        <span style="font-size:10.5px;color:#64748b;margin-left:6px;">exitCode=0 验证放行</span>
                       </div>
                     </div>
                   </div>
                   <div>
-                    <div class="ar-report-item">
-                      <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
-                        <span class="ar-task-code-chip" style="color:#38bdf8;">T3</span> 价格集中在 999-1,999 元，线上渠道占比 71%，高阶市...
-                        <span style="color:#10b981;font-size:10px;float:right;">已完成</span>
+                    ${subtasks.length > 0 ? subtasks.map((s) => `
+                      <div class="ar-report-item">
+                        <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
+                          <span class="ar-task-code-chip" style="color:#38bdf8;">${s.code || 'SUB'}</span>
+                          ${escapeHtml(s.title)}
+                          <span style="color:${s.status === 'succeeded' ? '#10b981' : (s.status === 'failed' ? '#ef4444' : '#94a3b8')};font-size:10px;float:right;">
+                            ${s.status === 'succeeded' ? '测试通过' : (s.status === 'failed' ? '未达标' : '待测')}
+                          </span>
+                        </div>
                       </div>
-                    </div>
-                    <div class="ar-report-item">
-                      <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
-                        <span class="ar-task-code-chip" style="color:#38bdf8;">T2</span> 海外口碑: 电池续航与 App 稳定性是最大槽点，高动用户更...
-                        <span style="color:#10b981;font-size:10px;float:right;">已完成</span>
-                      </div>
-                    </div>
-                    <div class="ar-report-item">
-                      <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
-                        <span class="ar-task-code-chip" style="color:#ef4444;">T4</span> 检索接口返回 429 限流，已包裹已检索到的 18 条专利，待...
-                        <span style="color:#ef4444;font-size:10px;float:right;">失败</span>
-                      </div>
-                    </div>
-                    <div class="ar-report-item">
-                      <div style="font-size:11px;color:#cbd5e1;line-height:1.4;">
-                        <span class="ar-task-code-chip" style="color:#38bdf8;">T1</span> 国内主流平台评分 2,431 条已清洗入库，差评集中在指纹识别...
-                        <span style="color:#10b981;font-size:10px;float:right;">已完成</span>
-                      </div>
-                    </div>
+                    `).join('') : `
+                      <div style="padding: 16px; font-size: 11px; color: #64748b; text-align: center;">任务启动后将实时展示门禁测试报告</div>
+                    `}
                   </div>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- Bottom: 时间轨道 (Matches screenshot 1:1) -->
+          <!-- Bottom: 真实时间轨道 -->
           <div class="ar-timeline-block">
             <div class="ar-timeline-header">
-              <div class="ar-timeline-title">时间轨道</div>
+              <div class="ar-timeline-title">时间轨道 (Gantt Swimlane)</div>
               <div class="ar-timeline-legend">
                 <span>-- 派发</span>
                 <span style="color:#38bdf8;">—— 执行</span>
-                <span style="color:#10b981;">·· 汇报</span>
-                <span style="color:#f59e0b;">◆ 归档</span>
+                <span style="color:#10b981;">·· 门禁通过</span>
+                <span style="color:#f59e0b;">◆ 审查合流</span>
               </div>
             </div>
 
             <div class="ar-timeline-tracks">
-              <!-- Track 1: 主代理 -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#ea580c;"></span>
-                  主代理
+              ${subtasks.length > 0 ? `
+                <div class="ar-track-row">
+                  <div class="ar-track-label">
+                    <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#ea580c;"></span>
+                    主调度器
+                  </div>
+                  <div class="ar-track-lane">
+                    <div class="ar-gantt-bar" style="left:2%;width:20%;background:linear-gradient(90deg,#ea580c,#f97316);">DAG 拆解完成</div>
+                    <span style="position:absolute;left:23%;top:4px;color:#f59e0b;font-size:9px;">◆</span>
+                    <div class="ar-gantt-bar" style="left:25%;width:50%;background:rgba(234,88,12,0.3);border:1px dashed #f97316;">多模型并发调度中</div>
+                    <span style="position:absolute;left:76%;top:4px;color:#f59e0b;font-size:9px;">◆</span>
+                    <div class="ar-gantt-bar" style="left:78%;width:20%;background:linear-gradient(90deg,#f97316,#10b981);">产物汇总归档</div>
+                  </div>
                 </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:5%;width:18%;background:linear-gradient(90deg,#ea580c,#f97316);">拆解与目标下发</div>
-                  <span style="position:absolute;left:24%;top:4px;color:#f59e0b;font-size:9px;">◆</span>
-                  <div class="ar-gantt-bar" style="left:26%;width:42%;background:rgba(234,88,12,0.3);border:1px dashed #f97316;">多智能体并行调度中</div>
-                  <span style="position:absolute;left:69%;top:4px;color:#f59e0b;font-size:9px;">◆</span>
-                  <div class="ar-gantt-bar" style="left:71%;width:22%;background:linear-gradient(90deg,#f97316,#10b981);">报告汇总集成</div>
+                ${subtasks.map((s, idx) => {
+                  const agentName = s.assignedAgentId?.includes('1111') ? 'DeepSeek' : (s.assignedAgentId?.includes('3333') ? 'WorkBuddy' : (s.stage === 'review' ? 'Claude' : 'Agent'));
+                  const color = s.status === 'succeeded' ? '#10b981' : (s.status === 'failed' ? '#ef4444' : '#3b82f6');
+                  const leftPos = Math.min(20 + idx * 18, 75);
+                  return `
+                    <div class="ar-track-row">
+                      <div class="ar-track-label">
+                        <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${color};"></span>
+                        ${agentName}
+                      </div>
+                      <div class="ar-track-lane">
+                        <div class="ar-gantt-bar" style="left:${leftPos}%;width:24%;background:${color};">${s.code || `T${idx+1}`} ${escapeHtml(s.title.slice(0, 16))}</div>
+                        ${s.status === 'succeeded' ? `<span style="position:absolute;left:${leftPos + 25}%;top:4px;color:#10b981;font-size:9px;">✔ 通过</span>` : ''}
+                      </div>
+                    </div>
+                  `;
+                }).join('')}
+              ` : `
+                <div style="padding: 24px; text-align: center; color: #64748b; font-size: 12.5px;">
+                  当前暂无活跃时间轨道数据。请点击右上角 <strong>【➕ 新建真实协同任务】</strong> 立即下发真实需求。
                 </div>
-              </div>
-
-              <!-- Track 2: Codex -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#475569;"></span>
-                  Codex
-                </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:24%;width:35%;background:linear-gradient(90deg,#334155,#64748b);">T1 抓取国内电商评论</div>
-                  <span style="position:absolute;left:60%;top:4px;color:#10b981;font-size:9px;">✔ 3.2s</span>
-                </div>
-              </div>
-
-              <!-- Track 3: ZCode -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#2563eb;"></span>
-                  ZCode
-                </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:26%;width:30%;background:linear-gradient(90deg,#1d4ed8,#3b82f6);">T2 整理海外论坛口碑</div>
-                  <span style="position:absolute;left:57%;top:4px;color:#10b981;font-size:9px;">✔ 2.8s</span>
-                </div>
-              </div>
-
-              <!-- Track 4: Devin -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#0284c7;"></span>
-                  Devin
-                </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:25%;width:28%;background:linear-gradient(90deg,#0369a1,#0284c7);">T3 价格带与渠道分析</div>
-                  <span style="position:absolute;left:54%;top:4px;color:#10b981;font-size:9px;">✔ 3.1s</span>
-                </div>
-              </div>
-
-              <!-- Track 5: OpenCode -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#d97706;"></span>
-                  OpenCode
-                </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:28%;width:20%;background:linear-gradient(90deg,#b45309,#ef4444);">T4 专利检索 (429)</div>
-                  <span style="position:absolute;left:49%;top:4px;color:#ef4444;font-size:9px;">✖ 429</span>
-                </div>
-              </div>
-
-              <!-- Track 6: DSH -->
-              <div class="ar-track-row">
-                <div class="ar-track-label">
-                  <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#7c3aed;"></span>
-                  DSH
-                </div>
-                <div class="ar-track-lane">
-                  <div class="ar-gantt-bar" style="left:55%;width:38%;background:linear-gradient(90deg,#6d28d9,#8b5cf6);">T6 撰写竞品调研报告</div>
-                  <span style="position:absolute;left:94%;top:4px;color:#10b981;font-size:9px;">✔</span>
-                </div>
-              </div>
-            </div>
-
-            <!-- Time Axis Ticks (Matches screenshot exactly) -->
-            <div class="ar-time-axis">
-              <span>21:10:30</span>
-              <span>21:10:40</span>
-              <span>21:10:50</span>
-              <span>21:11:00</span>
-              <span>21:11:10</span>
+              `}
             </div>
           </div>
         </main>
       </div>
+
+      <!-- New Task Modal Dialog -->
+      ${uiState.showNewTaskModal ? `
+        <div class="ar-modal-backdrop" id="newTaskModalBackdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);z-index:9999;display:flex;align-items:center;justify-content:center;">
+          <div class="ar-modal-card" style="background:#0f172a;border:1px solid rgba(255,255,255,0.15);border-radius:12px;width:580px;max-width:92vw;box-shadow:0 20px 40px rgba(0,0,0,0.6);padding:24px;color:#f8fafc;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+              <div style="font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px;">
+                <span style="font-size:20px;">🔮</span>
+                <span>发起多智能体真实协同任务</span>
+              </div>
+              <button id="closeNewTaskModalBtn" style="background:none;border:none;color:#94a3b8;font-size:20px;cursor:pointer;">&times;</button>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:14px;">
+              <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">任务标题 (Title)</label>
+                <input type="text" id="newTaskTitleInput" value="几何算法与自动化门禁验证任务" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:13px;" />
+              </div>
+
+              <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">协同任务目标与提示词 (Goal Prompt)</label>
+                <textarea id="newTaskGoalInput" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:13px;resize:vertical;" placeholder="请输入你希望多个模型协同完成的开发目标...">编写并实现一个具备高精度圆和矩形计算的图形算法库，通过独立测试门禁并生成最终代码与文档。</textarea>
+              </div>
+
+              <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">执行代码仓库 (Repository)</label>
+                <select id="newTaskRepoSelect" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:13px;">
+                  ${(uiState.repositories || []).map((r) => `
+                    <option value="${r.id}">${escapeHtml(r.label)} (${escapeHtml(r.path)})</option>
+                  `).join('')}
+                </select>
+              </div>
+
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                <div>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">规划模型 (Planner)</label>
+                  <select id="newTaskPlannerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
+                    <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
+                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
+                    <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
+                    <option value="codex">⚙️ Codex (CLI)</option>
+                  </select>
+                </div>
+                <div>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">开发执行模型 (Developer)</label>
+                  <select id="newTaskDevSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
+                    <option value="deepseek-chat">🧠 DeepSeek Chat (V3)</option>
+                    <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
+                    <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
+                    <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;">
+              <button id="cancelNewTaskModalBtn" style="padding:8px 16px;background:#334155;border:none;border-radius:6px;color:#cbd5e1;cursor:pointer;font-size:13px;">取消</button>
+              <button id="submitNewTaskModalBtn" style="padding:8px 20px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 0 12px rgba(99,102,241,0.5);">🚀 立即启动真实协同</button>
+            </div>
+          </div>
+        </div>
+      ` : ''}
     </div>
   `;
 }
@@ -2278,6 +2276,59 @@ document.addEventListener('click', async (e) => {
     uiState.activeView = 'task-center';
     renderAll();
     document.getElementById('composerGoalInput')?.focus();
+    return;
+  }
+
+  if (target.id === 'createRealTaskBtn') {
+    uiState.showNewTaskModal = true;
+    renderAll();
+    return;
+  }
+
+  if (target.id === 'closeNewTaskModalBtn' || target.id === 'cancelNewTaskModalBtn' || target.id === 'newTaskModalBackdrop') {
+    uiState.showNewTaskModal = false;
+    renderAll();
+    return;
+  }
+
+  if (target.id === 'submitNewTaskModalBtn') {
+    const titleInput = document.getElementById('newTaskTitleInput');
+    const goalInput = document.getElementById('newTaskGoalInput');
+    const repoSelect = document.getElementById('newTaskRepoSelect');
+    const plannerSelect = document.getElementById('newTaskPlannerSelect');
+    const devSelect = document.getElementById('newTaskDevSelect');
+
+    const title = titleInput?.value.trim() || '多智能体真实协同研发任务';
+    const goal = goalInput?.value.trim();
+    const repositoryId = repoSelect?.value || uiState.repositories?.[0]?.id;
+
+    if (!goal) {
+      showToast('请输入具体的任务目标与 Prompt！', true);
+      return;
+    }
+
+    try {
+      showToast('🚀 正在向 Hub 主调度器下发真实目标并启动多模型协同...');
+      const created = await apiRequest('/api/v1/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          title,
+          goal,
+          repositoryId,
+          priority: 'high',
+          acceptanceCriteria: [
+            { id: 'ac-core', description: 'All generated modules pass automated tests and review gate' }
+          ]
+        })
+      });
+
+      uiState.showNewTaskModal = false;
+      uiState.selectedTaskId = created.id;
+      showToast(`✔ 真实任务下发成功 (ID: ${created.id.slice(0, 8)}...)，模型正在并行执行！`);
+      await loadConsistentSnapshot(created.id);
+    } catch (err) {
+      showToast(`下发任务失败: ${err.message}`, true);
+    }
     return;
   }
 
