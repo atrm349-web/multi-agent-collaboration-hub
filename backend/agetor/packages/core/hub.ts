@@ -99,6 +99,10 @@ export class HubService implements HTTPService {
       store.db.query("UPDATE hub_api_requests SET status='error',error=? WHERE status='pending'")
         .run(JSON.stringify({ code: "PROCESS_CRASHED",message: "Operation owner was lost; inspect state before issuing a new request",retryable: false }));
     }).immediate();
+    // Startup-only: a crash during the validation phase leaves subtasks in
+    // "validating" with no active run, which reconcileExpired cannot see.
+    try { store.reconcileInterruptedValidations(); }
+    catch (error) { console.error("[hub] interrupted-validation sweep failed", String(error).slice(0,200)); }
     this.manager = new WorkspaceManager(options.root);
     this.runner = new DurableCodexRunner(store,{ workspaceRoot: options.root,...(options.spawn ? { spawn: options.spawn } : {}) });
     this.quality = new QualityGate(store,{ verifyArtifact: async (artifact) => { await readFrozenArtifact(options.root,artifact); } });
