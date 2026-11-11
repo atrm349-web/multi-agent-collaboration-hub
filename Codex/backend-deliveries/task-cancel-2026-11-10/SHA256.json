@@ -1,0 +1,19 @@
+{
+  "README.md": "8ca12fbb8990208ef7587a15839bcf55a92970008ca8a361e9ab156571402bc1",
+  "app.live-native.js": "249ec2cef1b85bb7573f55704a23ad537972d5b43a7405a221dd46607b282e7d",
+  "before-hashes.json": "d6716914921ff83fe69fd98fb47589408dc032f40a47fafdec628b7374834f78",
+  "build-release.ts": "44cd427f9516f3529da40ace5732d1e0b4062e3dadf45c471c8db7aae4a0c27d",
+  "deployment.json": "071461d983c10c34b28c13613dc2e470202d6000ed8ebc87dec246b68e053b57",
+  "frontend-source-lock.json": "e6d678ecb492142c48e8dfc866c534d97b076e9b8c23e295783756dece3fb89b",
+  "index.live-native.html": "9a3fb5452832bf80aed19f8278d8b8907346aa326e21d66f8b2e37f3a1869e6b",
+  "manifest.json": "120f044c6b08eafee1a40ee016e0dbd1e952f0506e7ee65cbacf6a5db44c0d53",
+  "publish.py": "00646051238306d854bc2e927cb85d44670eeb83995edf92c5b7fbe478e43b34",
+  "source/apps/web/public/app.js": "eb95825866e6a3c2b9e66076996c47f8fb6e96b8c00ee4f9997a571882b4fc27",
+  "source/backend/agetor/docs/hub/frontend-source-lock.json": "e6d678ecb492142c48e8dfc866c534d97b076e9b8c23e295783756dece3fb89b",
+  "source/backend/agetor/src/bun/hub-frontend.test.ts": "990b2601e97baab6c5f19d654a575b6e34c1a682875d3439a88315dae44de640",
+  "source-before/apps/web/public/app.js": "0b0fc77b6338bf8e03cd3f0d5c3da250c36f2efd562f419597803734feb5f8db",
+  "source-before/backend/agetor/docs/hub/frontend-source-lock.json": "8a1fcf8d3f5c74fe02b3a972d619d093a35b3971eb3fb231d5f23ee1cd35a9c8",
+  "source-before/backend/agetor/src/bun/hub-frontend.test.ts": "81d988a734936bc2086b6ad795f014f20be398ac8213eee8e5515c7564f310f8",
+  "tests.log": "d79e0d2f6842ee955eacdcc7d0b683b85ee961f1abf2e771b32ad5af0f6a9769",
+  "typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

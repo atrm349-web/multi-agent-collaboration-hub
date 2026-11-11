@@ -222,3 +222,51 @@ test("interruption acknowledgement never releases a still-present process group"
     await new Promise<void>((resolve) => child.once("close",() => resolve()));
   }
 });
+
+test('validation crash recovery fails orphaned state and quarantines unknown test ownership', () => {
+  const run = store.claim(input()).run;
+  store.complete(run.id,'worker-1',result(run.id));
+  store.beginValidation(subtask.id,run.id,'old-controller');
+  store.recoverValidationProcesses('new-controller');
+  store.reconcileInterruptedValidations();
+  expect(store.get('subtask',subtask.id).status).toBe('failed');
+  expect(store.get('task',task.id).error?.code).toBe('PROCESS_CRASHED');
+  expect(store.validationRecovery()).toHaveLength(1);
+  const step = store.get('subtask',subtask.id);
+  store.acknowledgeValidation(step.id,step.version,'Operator verified no test was spawned');
+  expect(store.validationRecovery()).toHaveLength(0);
+});
+
+test('API request completion does not treat controller pid as a child process group', () => {
+  const run = store.claim(input()).run;
+  store.spawned(run.id,'worker-1',process.pid,'in-process');
+  expect(store.complete(run.id,'worker-1',result(run.id)).status).toBe('succeeded');
+});
+
+test('recovery reaps only the recorded test process incarnation', async () => {
+  const run = store.claim(input()).run;
+  store.complete(run.id,'worker-1',result(run.id));
+  store.beginValidation(subtask.id,run.id,'old-controller');
+  const child = spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+  const done = new Promise(resolve => child.once('close',resolve));
+  try {
+    store.spawnedValidation(subtask.id,'old-controller',child.pid!);
+    store.recoverValidationProcesses('new-controller');
+    await done;
+    store.recoverValidationProcesses('new-controller');
+    expect(store.validationRecovery()).toHaveLength(0);
+  } finally { try { process.kill(-child.pid!,'SIGKILL'); } catch {} }
+});
+
+import validationMigration from './migrations/085_hub_validation_claims.sql' with { type: 'text' };
+test('legacy native Muse claims migrate as in-process without controller group ownership', () => {
+  const legacy = new Database(':memory:');
+  try {
+    legacy.exec('CREATE TABLE hub_entities(id TEXT PRIMARY KEY); CREATE TABLE hub_run_claims(request_json TEXT);');
+    legacy.query('INSERT INTO hub_run_claims VALUES(?)').run(JSON.stringify({model:'muse'}));
+    legacy.query('INSERT INTO hub_run_claims VALUES(?)').run(JSON.stringify({model:'gpt-6.1-sol'}));
+    legacy.exec(validationMigration);
+    expect(legacy.query<{execution_kind:string},[]>("SELECT execution_kind FROM hub_run_claims WHERE json_extract(request_json,'$.model')='muse'").get()!.execution_kind).toBe('in-process');
+    expect(legacy.query<{execution_kind:string},[]>("SELECT execution_kind FROM hub_run_claims WHERE json_extract(request_json,'$.model')='gpt-6.1-sol'").get()!.execution_kind).toBe('process-group');
+  } finally { legacy.close(); }
+});

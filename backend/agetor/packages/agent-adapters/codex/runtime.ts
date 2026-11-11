@@ -60,7 +60,7 @@ export class CodexRuntime {
     workspaceRoot: string;
     spawn?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
     onEvent?: (runId: string, log: CodexLog) => void;
-    onSpawn?: (runId: string, processGroupId: number) => void;
+    onSpawn?: (runId: string, processGroupId: number, kind?: "process-group" | "in-process") => void;
     killGraceMs?: number;
   }) {
     if (process.platform === "win32") throw new Error("UNSUPPORTED_PLATFORM: process-tree cancellation is not verified on Windows");

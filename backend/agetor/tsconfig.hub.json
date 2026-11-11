@@ -18,6 +18,9 @@
     "src/bun/hub-frontend.test.ts",
     "src/bun/hub-service.test.ts",
     "scripts/start-hub.ts",
-    "scripts/verify-hub-platform.ts"
+    "scripts/verify-hub-platform.ts",
+    "packages/agent-adapters/**/*.ts",
+    "src/bun/hub-adapter-contract.test.ts",
+    "src/bun/hub-validation-recovery.test.ts"
   ]
 }

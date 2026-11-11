@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "executionMode": "live",
+    "liveExecutionAvailable": true,
+    "needsAttention": 0
+  },
+  "taskStatusCounts": {
+    "failed": 5,
+    "succeeded": 2,
+    "waiting_approval": 3
+  },
+  "oldInterruptedTask": {
+    "id": "8e2acae6-57a9-43c0-8d70-c1376d3fed99",
+    "status": "failed",
+    "error": {
+      "code": "PROCESS_CRASHED",
+      "message": "Error: PROCESS_CRASHED: Execution owner lost; reconcile side effects before retry",
+      "retryable": false
+    }
+  },
+  "databaseBackupIntegrity": {
+    "agetor.sqlite": "ok",
+    "hub.db": "ok"
+  },
+  "verifiedDeliveryFiles": 135,
+  "browserDeployedUiLoaded": true,
+  "deployedScreenshot": "browser/screenshots/deployed.png"
+}

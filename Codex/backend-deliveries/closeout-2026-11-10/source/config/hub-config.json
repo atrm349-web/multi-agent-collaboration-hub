@@ -1,0 +1,73 @@
+{
+  "port": 4321,
+  "maxConcurrency": 4,
+  "frontendDir": "apps/web/public",
+  "repositories": [
+    {
+      "id": "11111111-2222-3333-4444-555555555555",
+      "label": "demo-geometry-repo",
+      "path": "examples/demo-geometry-repo",
+      "defaultTestProfileId": "geom-tests",
+      "model": "auto",
+      "models": {
+        "planner": "codex",
+        "developer": "auto",
+        "reviewer": "claude-3-5-sonnet-20241022"
+      },
+      "effort": "low",
+      "testProfiles": [
+        {
+          "id": "circle-tests",
+          "command": [
+            "node",
+            "config/acceptance/test_circle.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Verify circle.js area and circumference only",
+          "stages": [
+            "implementation",
+            "testing",
+            "review"
+          ]
+        },
+        {
+          "id": "rect-tests",
+          "command": [
+            "node",
+            "config/acceptance/test_rect.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Verify rectangle.js area and perimeter only",
+          "stages": [
+            "implementation",
+            "testing",
+            "review"
+          ]
+        },
+        {
+          "id": "geom-tests",
+          "command": [
+            "node",
+            "config/acceptance/test_geom.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Final integrated circle.js + rectangle.js checks",
+          "stages": [
+            "implementation",
+            "testing",
+            "review"
+          ]
+        }
+      ]
+    }
+  ]
+}

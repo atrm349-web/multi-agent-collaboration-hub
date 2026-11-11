@@ -1,0 +1,54 @@
+{
+  "mode": "real codex planner/developer/reviewer; official OS test sandbox; disposable repository",
+  "status": "succeeded",
+  "subtasks": [
+    {
+      "code": "SUB-01",
+      "status": "succeeded",
+      "attempt": 1
+    },
+    {
+      "code": "FINAL-REVIEW",
+      "status": "succeeded",
+      "attempt": 1
+    }
+  ],
+  "runs": [
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "status": "succeeded",
+      "executionKind": "process-group"
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "status": "succeeded",
+      "executionKind": "process-group"
+    }
+  ],
+  "validations": [
+    {
+      "criterionId": "AC-01",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "criterionId": "AC-03",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "criterionId": "AC-02",
+      "status": "passed",
+      "exitCode": 0
+    },
+    {
+      "criterionId": "final-double",
+      "status": "passed",
+      "exitCode": 0
+    }
+  ],
+  "verifiedArtifacts": 7,
+  "originalRepositoryUnchanged": true
+}

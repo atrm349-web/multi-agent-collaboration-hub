@@ -1,5 +1,6 @@
+import { readWorkspaceFile, writeWorkspaceFile, listWorkspaceFiles } from '../workspace-files.ts';
 import { randomUUID } from "node:crypto";
-import { realpath, stat, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { GeminiClient, type GeminiContent } from "./client.ts";
 import type { CodexRequest, CodexResult, CodexLog, CodexRunStatus } from "../codex/runtime.ts";
@@ -22,7 +23,7 @@ export class GeminiRuntime {
   constructor(private readonly options: {
     workspaceRoot: string;
     onEvent?: (runId: string, log: CodexLog) => void;
-    onSpawn?: (runId: string, processGroupId: number) => void;
+    onSpawn?: (runId: string, processGroupId: number, kind?: "process-group" | "in-process") => void;
     killGraceMs?: number;
   }) {
     this.client = new GeminiClient();
@@ -63,7 +64,7 @@ export class GeminiRuntime {
       };
 
       this.runs.set(runId, run);
-      this.options.onSpawn?.(runId, process.pid);
+      this.options.onSpawn?.(runId, process.pid, "in-process");
       run.result.status = "running";
       this.record(run, {
         seq: run.logs.length + 1,
@@ -86,19 +87,10 @@ export class GeminiRuntime {
     }
   }
 
-  private resolveSafePath(cwd: string, relativePath: string): string {
-    const target = path.resolve(cwd, relativePath);
-    const rel = path.relative(cwd, target);
-    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-      throw new Error(`PERMISSION_DENIED: path escapes workspace: ${relativePath}`);
-    }
-    return target;
-  }
-
   private cleanJson(raw: string): string {
     const trimmed = raw.trim();
     const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    return match ? match[1].trim() : trimmed;
+    return match ? match[1]!.trim() : trimmed;
   }
 
   private async executeLoop(run: Run, request: CodexRequest, cwd: string): Promise<void> {
@@ -121,11 +113,11 @@ No markdown formatting or extra text.`
           : `You are an expert software engineer in read-only analysis mode. Inspect files and provide clear analysis.`;
 
       // Read current workspace files for context
-      const fileList = await readdir(cwd).catch(() => []);
+      const fileList = (await listWorkspaceFiles(cwd)).filter((entry) => entry.isFile()).map((entry) => entry.name);
       const fileContexts: string[] = [];
       for (const f of fileList.slice(0, 10)) {
         try {
-          const content = await readFile(path.join(cwd, f), "utf8");
+          const content = await readWorkspaceFile(cwd, f);
           if (content.length < 5000) fileContexts.push(`--- File: ${f} ---\n${content}`);
         } catch {}
       }
@@ -148,6 +140,7 @@ No markdown formatting or extra text.`
         signal: run.abortController.signal,
       });
 
+      if (run.abortController.signal.aborted) throw new Error("CANCELLED: request stopped before file delivery");
       const text = res.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       this.record(run, {
         seq: run.logs.length + 1,
@@ -161,11 +154,9 @@ No markdown formatting or extra text.`
         let match;
         let filesWritten = 0;
         while ((match = fileRegex.exec(text)) !== null) {
-          const filePath = match[1].trim();
-          const fileContent = match[2];
-          const safePath = this.resolveSafePath(cwd, filePath);
-          await mkdir(path.dirname(safePath), { recursive: true });
-          await writeFile(safePath, fileContent, "utf8");
+          const filePath = match[1]!.trim();
+          const fileContent = match[2]!;
+          await writeWorkspaceFile(cwd, filePath, fileContent, isWrite);
           filesWritten++;
           this.record(run, {
             seq: run.logs.length + 1,

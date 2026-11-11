@@ -110,3 +110,24 @@ test("assets remain a frozen read snapshot after the source changes", async () =
   expect(built.assets.get("/app.js")!.body).toBe(original);
   await expect(buildFrontendAssets(folder,token)).rejects.toThrow("INVALID_INPUT");
 });
+
+
+test('task controls disable terminal and cancelling tasks and suppress duplicate pending requests', async () => {
+  const source = await readFile(new URL('../../../../apps/web/public/app.js',import.meta.url),'utf8');
+  const controlSource = source.slice(source.indexOf('const pendingTaskControls ='),source.indexOf('function renderDashboardView()'));
+  const bar = {innerHTML:''};
+  const task = {id:'fixture',provenance:'current',status:'failed',version:3,title:'Fixture',progressPct:0,pendingApprovalCount:0,artifactCount:0,error:null};
+  const context = {document:{getElementById:()=>bar},getSelectedTask:()=>task,escapeHtml:(value:unknown)=>String(value ?? '')};
+  for (const status of ['failed','timed_out','succeeded','cancelled','cancelling']) {
+    task.status=status;
+    runInNewContext(controlSource+'\nrenderActiveTaskBar();',context);
+    expect(bar.innerHTML).toMatch(/data-v1-task-control="cancel"[^>]*disabled/);
+  }
+  for (const status of ['queued','running','paused','waiting_approval']) {
+    task.status=status;
+    expect(runInNewContext(controlSource+"\ncanControlTask(getSelectedTask(),'cancel');",context)).toBe(true);
+  }
+  expect(runInNewContext(controlSource+"\npendingTaskControls.add('fixture');canControlTask(getSelectedTask(),'cancel');",context)).toBe(false);
+  task.provenance='historical';
+  expect(runInNewContext(controlSource+"\ncanControlTask(getSelectedTask(),'cancel');",context)).toBe(false);
+});

@@ -5,7 +5,7 @@ import path from "node:path";
 import { GeminiClient, resolveGeminiApiKey } from "../../packages/agent-adapters/gemini/client.ts";
 import { GeminiRuntime } from "../../packages/agent-adapters/gemini/runtime.ts";
 
-describe("Gemini & Antigravity Integration Suite", () => {
+describe.skipIf(process.env.HUB_LIVE_TESTS !== "1")("Gemini & Antigravity Integration Suite", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -39,7 +39,7 @@ describe("Gemini & Antigravity Integration Suite", () => {
 
       expect(res.candidates).toBeArray();
       expect(res.candidates!.length).toBeGreaterThan(0);
-      const text = res.candidates![0].content.parts[0].text;
+      const text = res.candidates![0]!.content.parts[0]!.text;
       expect(text).toBeString();
       expect(text!.toUpperCase()).toContain("PONG");
     }, 35000);

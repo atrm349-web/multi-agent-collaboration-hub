@@ -22,7 +22,7 @@ export class WorkBuddyRuntime {
   constructor(private readonly options: {
     workspaceRoot: string;
     onEvent?: (runId: string, log: CodexLog) => void;
-    onSpawn?: (runId: string, processGroupId: number) => void;
+    onSpawn?: (runId: string, processGroupId: number, kind?: "process-group" | "in-process") => void;
     killGraceMs?: number;
   }) {
     this.client = new WorkBuddyClient();
@@ -61,7 +61,7 @@ export class WorkBuddyRuntime {
       };
 
       this.runs.set(runId, run);
-      this.options.onSpawn?.(runId, process.pid);
+      this.options.onSpawn?.(runId, process.pid, "in-process");
       run.result.status = "running";
       this.record(run, {
         seq: run.logs.length + 1,
@@ -88,12 +88,13 @@ export class WorkBuddyRuntime {
   private async execute(run: Run, request: CodexRequest, cwd: string): Promise<void> {
     try {
       const wantsJson = Boolean(request.outputSchema);
+      const readOnlyInstruction = request.sandbox === "read-only" ? "\nRead-only role: inspect and report only. Do not modify source files or run implementation. Only the platform result/report files may be written." : "";
       const taskPrompt = wantsJson
         ? `${request.prompt}\n\n[WorkBuddy 网关说明]：请正常写入平台指定的本轮结果文件 output.json 并调用 report（这属于平台正常交付机制，不违反只读/不修改代码目录的约束）。请将上述要求的纯 JSON 结构同时放入 output.json 的 "json" 字段与 "text" 字段中，"artifacts" 設为空数组 []。`
         : `${request.prompt}\n\n[WorkBuddy 网关说明]：请在当前工作目录 (${cwd}) 完成任务要求的文件修改或编写，并正常写入平台指定的本轮结果文件 output.json（将中文成果说明填入 "text" 字段）及调用 report。`;
 
       const submitRes = await this.client.submitRun({
-        task: taskPrompt,
+        task: taskPrompt + readOnlyInstruction,
         workspace: cwd,
         output: wantsJson ? "json" : "text",
         timeoutSeconds: Math.floor((request.timeoutMs ?? 180_000) / 1000),

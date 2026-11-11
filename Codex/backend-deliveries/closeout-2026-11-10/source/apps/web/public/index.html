@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Agent Collaboration Hub — 多 AI Agent 自主协同平台 (Contract v0.2)</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Global Bar -->
+    <header class="topbar">
+      <div class="topbar-brand">
+        <div class="brand-logo">MA</div>
+        <div>
+          <div class="brand-title">Multi-Agent Collaboration Hub</div>
+          <div class="brand-subtitle">Local-First Cross-Vendor Autonomous Agent Orchestrator · Contract v0.2</div>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <span class="neural-wave-pill" title="多 Agent 协同神经核心处于活跃呼吸态">
+          <span class="neural-bars"><span></span><span></span><span></span><span></span><span></span></span>
+          NEURAL PULSE: ALIVE
+        </span>
+        <span class="repo-pill" id="activeRepoBadge">Repo: smartcar-vision (main @ a4f92c1)</span>
+        <span class="mode-pill mode-mock" id="executionModeBadge" title="当前服务端为 Mock 状态机 (liveExecutionAvailable=false)，与历史只读实测证据分区展示">
+          <span class="dot"></span>
+          SERVICE: MOCK · contractVersion=0.2 · liveExecutionAvailable=false
+        </span>
+        <span class="sse-pill" id="sseStatusBadge">SSE v0.2: Connecting...</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="btn btn-secondary agent-router-switch-btn" id="openAgentRouterTopBtn" data-view="agent-router" title="切换到 Agent Router 协作拓扑大屏">
+          <span class="router-pulse-dot"></span>
+          🌐 协作拓扑大屏 (Agent Router)
+        </button>
+        <button class="btn btn-primary" id="quickNewTaskBtn">+ 发布新协同任务</button>
+      </div>
+    </header>
+
+    <div class="main-body">
+      <!-- Left Navigation Rail -->
+      <aside class="sidebar">
+        <div class="nav-section-label">核心工作台</div>
+        <nav class="nav-list" id="navList">
+          <button class="nav-item nav-item-special active" data-view="agent-router" id="navAgentRouterBtn" title="协作拓扑大屏">
+            <span class="nav-key">1</span>
+            <span class="nav-icon">🌐</span>
+            <span class="nav-text">协作拓扑大屏</span>
+            <span class="nav-badge badge-glow">LIVE</span>
+          </button>
+          <button class="nav-item" data-view="task-center" title="任务派发中心">
+            <span class="nav-key">2</span>
+            <span class="nav-icon">📋</span>
+            <span class="nav-text">任务派发中心</span>
+            <span class="nav-badge" id="navTaskCount">0</span>
+          </button>
+          <button class="nav-item" data-view="agent-workspace" title="AI 执行终端">
+            <span class="nav-key">3</span>
+            <span class="nav-icon">💻</span>
+            <span class="nav-text">AI 执行终端</span>
+          </button>
+          <button class="nav-item" data-view="artifact-center" title="成果与验证库">
+            <span class="nav-key">4</span>
+            <span class="nav-icon">📦</span>
+            <span class="nav-text">成果与验证库</span>
+            <span class="nav-badge" id="navArtifactCount">0</span>
+          </button>
+
+          <div class="nav-divider" style="margin:8px 0;border-top:1px solid rgba(255,255,255,0.08);"></div>
+          <div class="nav-section-label">管理与监控</div>
+
+          <button class="nav-item" data-view="dashboard" title="仪表盘总览">
+            <span class="nav-key">5</span>
+            <span class="nav-icon">📊</span>
+            <span class="nav-text">仪表盘总览</span>
+          </button>
+          <button class="nav-item" data-view="workflow-dag" title="流程图 (DAG)">
+            <span class="nav-key">6</span>
+            <span class="nav-icon">🔄</span>
+            <span class="nav-text">流程图 (DAG)</span>
+          </button>
+          <button class="nav-item" data-view="review-center" title="人工审核门禁">
+            <span class="nav-key">7</span>
+            <span class="nav-icon">🛡️</span>
+            <span class="nav-text">人工审核门禁</span>
+            <span class="nav-badge badge-warn" id="navApprovalCount">0</span>
+          </button>
+          <button class="nav-item" data-view="communication" title="消息与总线">
+            <span class="nav-key">8</span>
+            <span class="nav-icon">💬</span>
+            <span class="nav-text">消息与总线</span>
+            <span class="nav-badge" id="navMsgCount">0</span>
+          </button>
+          <button class="nav-item" data-view="settings" title="适配器策略">
+            <span class="nav-key">9</span>
+            <span class="nav-icon">⚙️</span>
+            <span class="nav-text">适配器策略</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-task-switcher">
+          <div class="nav-section-label">当前聚焦任务</div>
+          <div id="sidebarTaskList" class="sidebar-task-list"></div>
+        </div>
+
+        <div class="sidebar-footer">
+          <div style="font-size:11px;color:#10b981;display:flex;align-items:center;gap:6px;">
+            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>
+            <span>连接与能力以实际运行记录为准</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center Workspace -->
+      <main class="workspace-area">
+        <!-- Sticky Active Task Control Bar (Never loses context when switching tabs) -->
+        <section class="active-task-bar" id="activeTaskBar"></section>
+
+        <!-- Dynamic Module Viewport -->
+        <div class="viewport-content" id="viewportContent"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

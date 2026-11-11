@@ -5,7 +5,7 @@ import path from "node:path";
 import { WorkBuddyClient } from "../../packages/agent-adapters/workbuddy/client.ts";
 import { WorkBuddyRuntime } from "../../packages/agent-adapters/workbuddy/runtime.ts";
 
-describe("WorkBuddy Integration Suite", () => {
+describe.skipIf(process.env.HUB_LIVE_TESTS !== "1")("WorkBuddy Integration Suite", () => {
   let tempDir: string;
 
   beforeEach(async () => {

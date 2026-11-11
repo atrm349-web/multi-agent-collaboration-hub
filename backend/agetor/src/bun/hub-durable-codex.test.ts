@@ -116,3 +116,19 @@ test("process identity persistence failure stops before delivering a prompt", as
   expect(delivered).toBe(false);
   expect(store.get("run",id).error?.code).toBe("PROCESS_CRASHED");
 });
+
+import { spyOn } from 'bun:test';
+import { ClaudeRuntime } from '../../packages/agent-adapters/claude/runtime.ts';
+import { DeepSeekRuntime } from '../../packages/agent-adapters/deepseek/runtime.ts';
+test('Claude dispatch failure stays Claude and never silently falls back to DeepSeek', async () => {
+  const claude = spyOn(ClaudeRuntime.prototype,'start').mockImplementation(async () => { throw new Error('AUTH_REQUIRED: fixture'); });
+  const deepseek = spyOn(DeepSeekRuntime.prototype,'start').mockImplementation(async () => { throw new Error('UNEXPECTED_FALLBACK'); });
+  try {
+    const r = runner();
+    const id = start(r,{...input(),request:{...input().request,model:'claude-fixture'}});
+    const run = await r.wait(id);
+    expect(run.status).toBe('failed'); expect(run.provider).toBe('claude');
+    expect(run.error?.code).toBe('AUTH_REQUIRED');
+    expect(claude).toHaveBeenCalledTimes(1); expect(deepseek).not.toHaveBeenCalled();
+  } finally { claude.mockRestore(); deepseek.mockRestore(); }
+});

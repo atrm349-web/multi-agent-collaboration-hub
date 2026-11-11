@@ -52,6 +52,7 @@ export interface Agent extends Entity {
   supportedStages: Stage[]; permissionProfile: string; maxConcurrency: number;
 }
 export interface AgentRun extends EvidenceEntity {
+  capabilities?: Capability[]; provider?: string; model?: string; executionKind?: "process-group" | "in-process";
   taskId: string; subtaskId: string; agentId: string; status: RunStatus;
   attempt: number; providerSessionId: string | null; workspaceId: string;
   startedAt: string | null; endedAt: string | null; exitCode: number | null;
@@ -98,6 +99,7 @@ export interface CreateTaskRequest {
 export interface Meta {
   contractVersion: '0.2'; executionMode: ExecutionMode;
   liveExecutionAvailable: boolean; enabledFeatures: string[];
+  needsAttention?: number; validationRecovery?: {subtaskId: string; processGroupId: number | null}[];
 }
 export interface Snapshot {
   schemaVersion: '0.2'; snapshotSeq: number;

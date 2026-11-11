@@ -21,7 +21,13 @@ test('extractReviewJson parses pure JSON, fenced JSON, and JSON preceded by revi
   expect(() => extractReviewJson('{"approved":"yes"}')).toThrow('ACCEPTANCE_FAILED: malformed review');
 });
 
-for (const scenario of ['approve','tamper','reject','expiry','cancel','rework','test-mutates'] as const) test('HTTP durable pipeline and final gate: '+scenario,async()=>{
+test('review extraction rejects ambiguous verdicts and nested approval in a malformed envelope', () => {
+  expect(() => extractReviewJson('Analysis {"approved":true,"findings":[]} then {"approved":false,"findings":["bug"]}')).toThrow('ambiguous review');
+  expect(() => extractReviewJson('{"example":{"approved":true,"findings":[]}}')).toThrow('malformed review');
+  expect(extractReviewJson('审查结论\n```json\n{"approved":false,"findings":["brace } inside string"]}\n```')).toEqual({approved:false,findings:['brace } inside string']});
+});
+
+for (const scenario of ['approve','tamper','reject','expiry','cancel','rework','test-mutates','orphaned'] as const) test('HTTP durable pipeline and final gate: '+scenario,async()=>{
  const root=await mkdtemp(path.join(tmpdir(),'hub-service-'));const old=process.env.AGETOR_DATA_DIR;
  const repository=path.join(root,'source');await mkdir(repository);await mkdir(path.join(root,'state'));process.env.AGETOR_DATA_DIR=path.join(root,'state');
  execFileSync('/usr/bin/git',['init','-q',repository]);execFileSync('/usr/bin/git',['-C',repository,'config','user.name','Fixture']);execFileSync('/usr/bin/git',['-C',repository,'config','user.email','fixture@example.invalid']);
@@ -35,6 +41,12 @@ for (const scenario of ['approve','tamper','reject','expiry','cancel','rework','
  const id=randomUUID();const payload={title:'Fixture',goal:'Keep the fixture intact',repositoryId:repo.id,acceptanceCriteria:[{id:'task-check',description:'Registered acceptance'}],plannedSubtasks:[{id,code:'IMPLEMENT',title:'Implement',description:'Inspect fixture',stage:'implementation',dependsOn:[],requiredCapabilities:['stream'],acceptanceCriteria:[{id:'step-check',description:'Registered acceptance'}]}]};
  const key=randomUUID();const response=await post('tasks',payload,key);expect(response.status).toBe(201);const created=(await response.json()).data;
  expect((await (await post('tasks',payload,key)).json()).data.id).toBe(created.id);
+
+ if(scenario==='orphaned'){
+   const step=store.get('subtask',id);store.put('subtask',{...step,status:'blocked',error:{code:'PROCESS_CRASHED',message:'Lost old controller',retryable:false}},step.version);
+   const task=store.get('task',created.id);store.put('task',{...task,status:'running'},task.version);
+   await service.tick();expect(store.get('task',created.id).status).toBe('failed');expect(store.get('task',created.id).error?.code).toBe('PROCESS_CRASHED');expect(executions).toBe(0);return;
+ }
  const deadline=Date.now()+15000;while(Date.now()<deadline&& !['waiting_approval','failed'].includes(store.get('task',created.id).status))await Bun.sleep(30);
  if(scenario==='test-mutates'){expect(store.get('task',created.id).status).toBe('failed');expect(store.get('task',created.id).error?.message).toContain('modified the frozen source');return;}
  expect(store.get('task',created.id).error).toBeNull();expect(store.get('task',created.id).status).toBe('waiting_approval');expect(executions).toBe(scenario==='rework'?3:2);expect(service.snapshot().selectedTask?.subtasks.length).toBe(2);

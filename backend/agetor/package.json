@@ -24,7 +24,7 @@
     "release:upload-only": "bun scripts/upload-release.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:hub": "bun test src/bun/hub-codex-runtime.test.ts src/bun/hub-durable-codex.test.ts src/bun/hub-frontend.test.ts src/bun/hub-http.test.ts src/bun/hub-planner.test.ts src/bun/hub-service.test.ts src/bun/hub-state-store.test.ts src/bun/hub-workspace.test.ts",
+    "test:hub": "bun test src/bun/hub-adapter-contract.test.ts src/bun/hub-claude.test.ts src/bun/hub-codex-runtime.test.ts src/bun/hub-deepseek.test.ts src/bun/hub-durable-codex.test.ts src/bun/hub-frontend.test.ts src/bun/hub-gemini.test.ts src/bun/hub-http.test.ts src/bun/hub-multimodel.test.ts src/bun/hub-muse.test.ts src/bun/hub-parallel-service.test.ts src/bun/hub-plan-execution.test.ts src/bun/hub-planner.test.ts src/bun/hub-service.test.ts src/bun/hub-state-store.test.ts src/bun/hub-workbuddy.test.ts src/bun/hub-workspace.test.ts",
     "typecheck:hub": "tsc --noEmit -p tsconfig.hub.json",
     "verify:hub:live": "bun scripts/verify-hub-codex.ts",
     "test:hub:state": "bun test src/bun/hub-state-store.test.ts",

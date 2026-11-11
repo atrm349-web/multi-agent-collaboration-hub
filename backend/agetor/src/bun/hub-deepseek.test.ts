@@ -7,7 +7,7 @@ import { DeepSeekClient, resolveDeepSeekApiKey } from "../../packages/agent-adap
 import { DeepSeekRuntime } from "../../packages/agent-adapters/deepseek/runtime.ts";
 import { planWithDeepSeek, validatePlan } from "../../packages/core/planner.ts";
 
-describe("DeepSeek Integration Suite", () => {
+describe.skipIf(process.env.HUB_LIVE_TESTS !== "1")("DeepSeek Integration Suite", () => {
   let tempDir: string;
 
   beforeEach(async () => {
@@ -44,8 +44,8 @@ describe("DeepSeek Integration Suite", () => {
 
       expect(res.choices).toBeArray();
       expect(res.choices.length).toBeGreaterThan(0);
-      expect(res.choices[0].message.content).toBeString();
-      expect(res.choices[0].message.content!.toUpperCase()).toContain("PONG");
+      expect(res.choices[0]!.message.content).toBeString();
+      expect(res.choices[0]!.message.content!.toUpperCase()).toContain("PONG");
     }, 20000);
   });
 

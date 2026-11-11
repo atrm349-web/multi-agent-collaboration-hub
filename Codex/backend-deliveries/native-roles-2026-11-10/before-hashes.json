@@ -1,0 +1,8 @@
+{
+  "apps/web/public/app.js": "c29d84aa6f843f28ba2693d7992c2d58bae311cdb1479ebceec4f42c3322079a",
+  "backend/agetor/packages/core/planner.ts": "34ac34f14231a02d050890bc775f024eec747fbf2c5596089cfbf81bd33e59eb",
+  "backend/agetor/packages/agent-adapters/muse/runtime.ts": "099c7f4b1feed209f218f0a2a4f452bb09f10d44826a3619697f270a56be0abe",
+  "backend/agetor/packages/agent-adapters/workbuddy/runtime.ts": "bbc0e5de5bf5d16e9c47047ac0ec2da2af5e72a1f178bdb8d32a8d79cd315e20",
+  "backend/agetor/src/bun/hub-adapter-contract.test.ts": "618e440d8043d6089627cf48d123b3745b9d80faf507ddd5aac2851e6651ddf8",
+  "backend/agetor/docs/hub/frontend-source-lock.json": "76472e737d49cc5bbf1ecba04bb8d697695de49e9541a52342e35ccbf41ced56"
+}

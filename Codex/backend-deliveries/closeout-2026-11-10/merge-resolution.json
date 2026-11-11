@@ -1,0 +1,21 @@
+{
+  "baseCommit": "03de4b3",
+  "resolved": [
+    "backend/agetor/packages/core/hub.ts",
+    "backend/agetor/packages/core/planner.ts",
+    "apps/web/public/app.js"
+  ],
+  "markersRemaining": 0,
+  "preserved": [
+    "Muse and WorkBuddy developer integration",
+    "latest styles and layout",
+    "working task model overrides and speed modes"
+  ],
+  "corrected": [
+    "Codex planner routing",
+    "explicit auto worker assignment",
+    "no silent Claude to DeepSeek fallback",
+    "actual run provider and model attribution",
+    "native read-only and planning rejection until verified"
+  ]
+}

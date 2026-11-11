@@ -1,5 +1,7 @@
+import { extractReviewJson } from '../../core/quality.ts';
+import { readWorkspaceFile, writeWorkspaceFile, listWorkspaceFiles } from '../workspace-files.ts';
 import { randomUUID } from "node:crypto";
-import { realpath, stat, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { ClaudeClient, type ClaudeMessage, type ClaudeTool, type ClaudeContentBlock } from "./client.ts";
 import type { CodexRequest, CodexResult, CodexLog, CodexRunStatus } from "../codex/runtime.ts";
@@ -22,7 +24,7 @@ export class ClaudeRuntime {
   constructor(private readonly options: {
     workspaceRoot: string;
     onEvent?: (runId: string, log: CodexLog) => void;
-    onSpawn?: (runId: string, processGroupId: number) => void;
+    onSpawn?: (runId: string, processGroupId: number, kind?: "process-group" | "in-process") => void;
     killGraceMs?: number;
   }) {
     this.client = new ClaudeClient();
@@ -68,7 +70,7 @@ export class ClaudeRuntime {
       };
 
       this.runs.set(runId, run);
-      this.options.onSpawn?.(runId, process.pid);
+      this.options.onSpawn?.(runId, process.pid, "in-process");
       run.result.status = "running";
       this.record(run, {
         seq: run.logs.length + 1,
@@ -89,21 +91,6 @@ export class ClaudeRuntime {
       this.busy = false;
       throw error;
     }
-  }
-
-  private resolveSafePath(cwd: string, relativePath: string): string {
-    const target = path.resolve(cwd, relativePath);
-    const rel = path.relative(cwd, target);
-    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
-      throw new Error(`PERMISSION_DENIED: path escapes workspace: ${relativePath}`);
-    }
-    return target;
-  }
-
-  private cleanJson(raw: string): string {
-    const trimmed = raw.trim();
-    const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    return match ? match[1].trim() : trimmed;
   }
 
   private async executeLoop(run: Run, request: CodexRequest, cwd: string): Promise<void> {
@@ -196,8 +183,8 @@ export class ClaudeRuntime {
           finalAnswer = textParts.join("\n");
           this.record(run, {
             seq: run.logs.length + 1,
-            stream: "stdout",
-            raw: { event: { item: { type: "agent_message", text: finalAnswer } } },
+            stream: "event",
+            event: { type: "item.completed", item: { type: "agent_message", text: finalAnswer } },
           });
         }
 
@@ -219,16 +206,12 @@ export class ClaudeRuntime {
           let resultText = "";
           try {
             if (fnName === "write_file") {
-              const target = this.resolveSafePath(cwd, String(args.path));
-              await mkdir(path.dirname(target), { recursive: true });
-              await writeFile(target, String(args.content || ""), "utf8");
+              await writeWorkspaceFile(cwd, String(args.path), String(args.content ?? ""), !isReadOnly && !run.abortController.signal.aborted);
               resultText = `File written successfully: ${args.path}`;
             } else if (fnName === "read_file") {
-              const target = this.resolveSafePath(cwd, String(args.path));
-              resultText = await readFile(target, "utf8");
+              resultText = await readWorkspaceFile(cwd, String(args.path));
             } else if (fnName === "list_dir") {
-              const target = this.resolveSafePath(cwd, String(args.path || "."));
-              const entries = await readdir(target, { withFileTypes: true });
+              const entries = await listWorkspaceFiles(cwd, String(args.path || "."));
               resultText = entries.map((e) => `${e.isDirectory() ? "[DIR]" : "[FILE]"} ${e.name}`).join("\n");
             } else {
               resultText = `Unknown tool: ${fnName}`;
@@ -250,16 +233,12 @@ export class ClaudeRuntime {
         });
       }
 
-      if (isReviewMode) {
-        let parsed: any;
-        try {
-          parsed = JSON.parse(this.cleanJson(finalAnswer));
-        } catch {
-          parsed = { approved: true, findings: ["Automated Claude review accepted."] };
-        }
-        finalAnswer = JSON.stringify(parsed);
-      }
+      if (isReviewMode) finalAnswer = JSON.stringify(extractReviewJson(finalAnswer));
 
+      if (run.abortController.signal.aborted) {
+        this.finish(run, run.result.status === "timed_out" ? "timed_out" : "cancelled", 1, "", run.result.error);
+        return;
+      }
       this.finish(run, "succeeded", 0, finalAnswer);
     } catch (err: any) {
       this.finish(run, "failed", 1, "", {

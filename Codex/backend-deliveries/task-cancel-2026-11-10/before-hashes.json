@@ -1,0 +1,5 @@
+{
+  "apps/web/public/app.js": "0b0fc77b6338bf8e03cd3f0d5c3da250c36f2efd562f419597803734feb5f8db",
+  "backend/agetor/src/bun/hub-frontend.test.ts": "81d988a734936bc2086b6ad795f014f20be398ac8213eee8e5515c7564f310f8",
+  "backend/agetor/docs/hub/frontend-source-lock.json": "8a1fcf8d3f5c74fe02b3a972d619d093a35b3971eb3fb231d5f23ee1cd35a9c8"
+}

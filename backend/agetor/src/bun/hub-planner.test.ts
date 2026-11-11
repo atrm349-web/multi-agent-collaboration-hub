@@ -96,3 +96,8 @@ test("rejects invalid goal or repository before starting an Agent", async () => 
   await expect(planWithCodex({ ...options(),repositoryId: "arbitrary-path" },runtime)).rejects.toThrow("INVALID_INPUT");
   expect(started).toBe(false);
 });
+
+test('Codex planner alias resolves to the explicit supported model', async () => {
+  const runtime = fixture({result:JSON.stringify({subtasks:[step()]})},request => expect(request.model).toBe('gpt-6.1-sol'));
+  await planWithCodex({...options(),model:'codex'},runtime);
+});

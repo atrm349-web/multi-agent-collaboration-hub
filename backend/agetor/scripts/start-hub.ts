@@ -91,6 +91,10 @@ for (const r of rawRepos) {
 
   if (Array.isArray(r.testProfiles)) {
     for (const tp of r.testProfiles) {
+      tp.readPaths = (tp.readPaths ?? []).map((file: string) => path.isAbsolute(file) ? file : path.resolve(projectRoot,file));
+      if (Array.isArray(tp.command) && typeof tp.command[1] === 'string' && tp.command[1].startsWith('config/acceptance/')) {
+        tp.command[1] = path.resolve(projectRoot,tp.command[1]);
+      }
       if (Array.isArray(tp.command)) {
         if (tp.command[0] === 'node' || tp.command[0]?.includes('node')) {
           tp.command[0] = process.execPath || 'node';
@@ -116,9 +120,9 @@ if (rawRepos.length === 0) {
       },
       effort: 'low',
       testProfiles: [
-        { id: 'circle-tests', command: [process.execPath || 'node', 'test_circle.js'], timeoutMs: 15000 },
-        { id: 'rect-tests', command: [process.execPath || 'node', 'test_rect.js'], timeoutMs: 15000 },
-        { id: 'geom-tests', command: [process.execPath || 'node', 'test_geom.js'], timeoutMs: 15000 }
+        { id: 'circle-tests', command: [process.execPath, path.join(projectRoot,'config/acceptance/test_circle.cjs')], readPaths:[path.join(projectRoot,'config/acceptance')], timeoutMs: 15000 },
+        { id: 'rect-tests', command: [process.execPath, path.join(projectRoot,'config/acceptance/test_rect.cjs')], readPaths:[path.join(projectRoot,'config/acceptance')], timeoutMs: 15000 },
+        { id: 'geom-tests', command: [process.execPath, path.join(projectRoot,'config/acceptance/test_geom.cjs')], readPaths:[path.join(projectRoot,'config/acceptance')], timeoutMs: 15000 }
       ]
     }
   ];

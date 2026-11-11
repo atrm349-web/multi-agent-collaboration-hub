@@ -1,0 +1,18 @@
+{
+  "delivery": "Codex task-cancel-2026-11-10",
+  "baseCommit": "03de4b3bacfa28bd1d58171f1b49c3962b028b71",
+  "files": {
+    "apps/web/public/app.js": {
+      "sha256": "eb95825866e6a3c2b9e66076996c47f8fb6e96b8c00ee4f9997a571882b4fc27",
+      "beforeSha256": "0b0fc77b6338bf8e03cd3f0d5c3da250c36f2efd562f419597803734feb5f8db"
+    },
+    "backend/agetor/docs/hub/frontend-source-lock.json": {
+      "sha256": "e6d678ecb492142c48e8dfc866c534d97b076e9b8c23e295783756dece3fb89b",
+      "beforeSha256": "8a1fcf8d3f5c74fe02b3a972d619d093a35b3971eb3fb231d5f23ee1cd35a9c8"
+    },
+    "backend/agetor/src/bun/hub-frontend.test.ts": {
+      "sha256": "990b2601e97baab6c5f19d654a575b6e34c1a682875d3439a88315dae44de640",
+      "beforeSha256": "81d988a734936bc2086b6ad795f014f20be398ac8213eee8e5515c7564f310f8"
+    }
+  }
+}

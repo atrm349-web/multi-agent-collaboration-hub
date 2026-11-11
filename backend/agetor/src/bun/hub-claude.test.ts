@@ -40,6 +40,7 @@ describe("Anthropic Claude Integration Suite", () => {
         cwd: path.join(tempDir, "../../../escape-dir"),
         prompt: "test",
         sandbox: "workspace-write",
+        model: "claude-fixture", effort: "low",
       })).rejects.toThrow("PERMISSION_DENIED");
     });
   });

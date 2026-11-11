@@ -18,18 +18,57 @@
       "testProfiles": [
         {
           "id": "circle-tests",
-          "command": ["node", "test_circle.js"],
-          "timeoutMs": 15000
+          "command": [
+            "node",
+            "config/acceptance/test_circle.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Verify circle.js area and circumference only",
+          "stages": [
+            "implementation",
+            "testing",
+            "review",
+            "documentation"
+          ]
         },
         {
           "id": "rect-tests",
-          "command": ["node", "test_rect.js"],
-          "timeoutMs": 15000
+          "command": [
+            "node",
+            "config/acceptance/test_rect.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Verify rectangle.js area and perimeter only",
+          "stages": [
+            "implementation",
+            "testing",
+            "review",
+            "documentation"
+          ]
         },
         {
           "id": "geom-tests",
-          "command": ["node", "test_geom.js"],
-          "timeoutMs": 15000
+          "command": [
+            "node",
+            "config/acceptance/test_geom.cjs"
+          ],
+          "timeoutMs": 15000,
+          "readPaths": [
+            "config/acceptance"
+          ],
+          "description": "Final integrated circle.js + rectangle.js checks",
+          "stages": [
+            "implementation",
+            "testing",
+            "review",
+            "documentation"
+          ]
         }
       ]
     }

@@ -1,7 +1,10 @@
+import { providerForModel, capabilitiesForModel } from '../../agent-adapters/provider.ts';
+import { processIdentity, processGroupExists } from '../process-identity.ts';
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { migrate } from "../../../src/bun/migrate.ts";
 import schema from "../../../src/bun/migrations/082_hub_execution.sql" with { type: "text" };
+import schema085 from "../../../src/bun/migrations/085_hub_validation_claims.sql" with { type: "text" };
 import schema084 from "../../../src/bun/migrations/084_hub_parallel_slots.sql" with { type: "text" };
 import type { Agent, AgentRun, Approval, Artifact, EventEnvelope, LogLine, Message,
   Subtask, Task, Validation } from "../../shared/src/types.ts";
@@ -12,7 +15,7 @@ type Entities = { task: Task; subtask: Subtask; agent: Agent; run: AgentRun;
   message: Message; artifact: Artifact; approval: Approval; validation: Validation };
 type Kind = keyof Entities;
 type Claim = { run_id: string; owner_id: string; lease_until_ms: number;
-  process_group_id: number | null; request_hash: string; request_json: string; subtask_id: string };
+  process_group_id: number | null; execution_kind: string; process_started_at: string | null; request_hash: string; request_json: string; subtask_id: string };
 const ACTIVE = new Set(["starting", "running", "cancelling"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const allowed: Record<Kind, readonly string[]> = {
@@ -36,7 +39,7 @@ export class HubStore {
     if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1) throw new Error("INVALID_INPUT: invalid max concurrency");
     db.run("PRAGMA foreign_keys=ON"); db.run("PRAGMA busy_timeout=3000");
     db.run("PRAGMA journal_mode=WAL"); db.run("PRAGMA synchronous=FULL");
-    migrate(db, [{ id: "082_hub_execution", sql: schema }, { id: "084_hub_parallel_slots", sql: schema084 }]);
+    migrate(db, [{ id: "082_hub_execution", sql: schema }, { id: "084_hub_parallel_slots", sql: schema084 }, { id: "085_hub_validation_claims", sql: schema085 }]);
   }
   get<K extends Kind>(kind: K, id: string): Entities[K] {
     const row = this.db.query<{ data: string }, [string,string]>(
@@ -145,8 +148,9 @@ export class HubStore {
       if (subtask.version !== input.expectedVersion) throw new Error("CONFLICT: stale subtask version");
       if (!["ready","retry_wait"].includes(subtask.status) || !["queued","running"].includes(task.status)
           || task.provenance !== "current" || !["available","busy"].includes(agent.availability)
-          || agent.adapterId !== "codex-cli" || agent.executionMode !== "live" || task.executionMode !== "live"
+          || !["codex-cli","hub-router"].includes(agent.adapterId) || agent.executionMode !== "live" || task.executionMode !== "live"
           || subtask.executionMode !== "live") throw new Error("UNSUPPORTED_TRANSITION: subtask/agent is not executable");
+      if (subtask.requiredCapabilities.some((capability) => !capabilitiesForModel(input.request.model).includes(capability))) throw new Error("UNSUPPORTED_CAPABILITY: model lacks a required capability");
       if (subtask.requiredCapabilities.some((capability) => !agent.capabilities.includes(capability)) || !agent.supportedStages.includes(subtask.stage)) {
         throw new Error("UNSUPPORTED_CAPABILITY: agent cannot execute this subtask");
       }
@@ -163,7 +167,7 @@ export class HubStore {
       const now = new Date(this.clock()).toISOString();
       const run = this.save("run",{ id: randomUUID(), version: 1, createdAt: now, updatedAt: now,
         executionMode: "live", provenance: "current", taskId: task.id, subtaskId: subtask.id, agentId: agent.id,
-        status: "starting", attempt: subtask.attempt, providerSessionId: input.request.sessionId ?? null,
+        status: "starting", capabilities: capabilitiesForModel(input.request.model), model: input.request.model, provider: providerForModel(input.request.model), executionKind: providerForModel(input.request.model) === "codex" ? "process-group" : "in-process", attempt: subtask.attempt, providerSessionId: input.request.sessionId ?? null,
         workspaceId: subtask.workspaceId ?? subtask.id, startedAt: null, endedAt: null, exitCode: null, error: null },null);
       this.db.query("INSERT INTO hub_run_claims(run_id,subtask_id,attempt,idempotency_key,request_hash,request_json,owner_id,lease_until_ms) VALUES(?,?,?,?,?,?,?,?)")
         .run(run.id,subtask.id,subtask.attempt,input.idempotencyKey,hash,JSON.stringify(input.request),input.ownerId,this.clock()+this.leaseMs);
@@ -187,10 +191,10 @@ export class HubStore {
       this.db.query("UPDATE hub_run_claims SET lease_until_ms=? WHERE run_id=?").run(this.clock()+this.leaseMs,runId);
     }).immediate();
   }
-  spawned(runId: string, owner: string, pid: number): void {
+  spawned(runId: string, owner: string, pid: number, kind = "process-group"): void {
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("INVALID_INPUT: process group");
     this.db.transaction(() => { const { run } = this.owned(runId,owner);
-      this.db.query("UPDATE hub_run_claims SET process_group_id=? WHERE run_id=?").run(pid,runId);
+      this.db.query("UPDATE hub_run_claims SET process_group_id=?,execution_kind=?,process_started_at=? WHERE run_id=?").run(pid,kind,processIdentity(pid),runId);
       this.save("run",{ ...run,status: run.status === "cancelling" ? "cancelling" : "running",startedAt: new Date(this.clock()).toISOString() },run.version);
     }).immediate();
   }
@@ -229,7 +233,7 @@ export class HubStore {
   complete(runId: string, owner: string, result: CodexResult): AgentRun {
     return this.db.transaction(() => {
       const { run,claim } = this.owned(runId,owner);
-      if (claim.process_group_id && claim.process_group_id !== process.pid) {
+      if (claim.process_group_id && claim.execution_kind !== "in-process") {
         try { process.kill(-claim.process_group_id,0); throw new Error("AGENT_UNAVAILABLE: process group has not stopped"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }
@@ -264,6 +268,48 @@ export class HubStore {
       }
       // Keep the occupied slot: old children may still be executing. Never kill a reused PID.
       return rows.map((row) => row.run_id);
+    }).immediate();
+  }
+  beginValidation(subtaskId: string, runId: string, owner: string): void {
+    this.db.query("INSERT INTO hub_validation_claims VALUES(?,?,?,NULL,NULL,'starting')").run(subtaskId,runId,owner);
+  }
+  spawnedValidation(subtaskId: string, owner: string, pid: number): void {
+    const updated = this.db.query("UPDATE hub_validation_claims SET process_group_id=?,process_started_at=?,status='running' WHERE subtask_id=? AND owner_id=?")
+      .run(pid,processIdentity(pid),subtaskId,owner);
+    if (updated.changes !== 1) throw new Error("CONFLICT: validation ownership lost");
+  }
+  finishValidation(subtaskId: string, owner: string): void {
+    this.db.query("DELETE FROM hub_validation_claims WHERE subtask_id=? AND owner_id=?").run(subtaskId,owner);
+  }
+  validationRecovery() {
+    return this.db.query<{subtask_id:string;process_group_id:number|null},[]>("SELECT subtask_id,process_group_id FROM hub_validation_claims WHERE status='interrupted'").all();
+  }
+  recoverValidationProcesses(owner: string): void {
+    const claims = this.db.query<{subtask_id:string;process_group_id:number|null;process_started_at:string|null;status:string},[string]>(
+      "SELECT * FROM hub_validation_claims WHERE owner_id<>?").all(owner);
+    for (const claim of claims) {
+      const pid = claim.process_group_id;
+      if (pid && !processGroupExists(pid)) {
+        this.db.query("DELETE FROM hub_validation_claims WHERE subtask_id=?").run(claim.subtask_id);
+        continue;
+      }
+      // Only the recorded process incarnation authorizes signalling its owned group.
+      if (pid && claim.status !== "interrupted" && claim.process_started_at && processIdentity(pid) === claim.process_started_at) {
+        try { process.kill(-pid,"SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+      this.db.query("UPDATE hub_validation_claims SET status='interrupted' WHERE subtask_id=?").run(claim.subtask_id);
+    }
+  }
+  acknowledgeValidation(subtaskId: string, expectedVersion: number, reason: string): void {
+    this.db.transaction(() => {
+      const step = this.get("subtask",subtaskId);
+      if (step.version !== expectedVersion || !reason.trim()) throw new Error("CONFLICT: stale validation review");
+      const claim = this.validationRecovery().find((item) => item.subtask_id === subtaskId);
+      if (!claim) throw new Error("NOT_FOUND: no quarantined validation");
+      if (claim.process_group_id && processGroupExists(claim.process_group_id)) throw new Error("AGENT_UNAVAILABLE: test process group is still present");
+      this.db.query("DELETE FROM hub_validation_claims WHERE subtask_id=?").run(subtaskId);
+      this.put("message",{id:randomUUID(),version:1,createdAt:new Date(this.clock()).toISOString(),updatedAt:new Date(this.clock()).toISOString(),executionMode:"live",provenance:"current",taskId:step.taskId,fromRunId:null,toSubtaskId:step.id,fromLabel:"user",toLabel:step.title,summary:"Validation recovery reviewed",content:reason,kind:"human_directive",correlationId:randomUUID(),causationId:null,artifactRefs:[],deliveredAt:null},null);
     }).immediate();
   }
   /**
@@ -307,7 +353,12 @@ export class HubStore {
       }
       if (!this.db.query("SELECT 1 FROM hub_execution_slot WHERE run_id=?").get(runId)) return;
       const claim = this.db.query<Claim,[string]>("SELECT * FROM hub_run_claims WHERE run_id=?").get(runId)!;
-      if (claim.process_group_id && claim.process_group_id !== process.pid) {
+      if (claim.process_group_id && claim.execution_kind === "in-process") {
+        if (!claim.process_started_at || processIdentity(claim.process_group_id) === claim.process_started_at) {
+          try { process.kill(claim.process_group_id, 0); throw new Error("AGENT_UNAVAILABLE: previous API request owner is still present"); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        }
+      } else if (claim.process_group_id) {
         try { process.kill(-claim.process_group_id,0); throw new Error("AGENT_UNAVAILABLE: process group is still present"); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }

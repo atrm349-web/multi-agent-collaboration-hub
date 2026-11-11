@@ -1,0 +1,15 @@
+{
+  "frontend-source-lock.json": "b0d99753b2702764e1f650ae026c46cfc0a198f70e11270a0747a1be9f93477f",
+  "get_composer_info.applescript": "1fba232e685797f089fe06ba492cee755a54575a20d42fd3fd35f07748e6312d",
+  "before-hashes.json": "f64ca5792b0f9af5322a7fd88f39d5355a86b981cda603cea79fcda6e259e9fd",
+  "README.md": "319bd4006f87449348474b33ebfe31b188a855dffa2b3904ba0b423cc1278c36",
+  "manifest.json": "6a2718f000c86a2cce801f78c53af842e671131ff6cb21141f3edb6a93467935",
+  "tests.log": "62cfbeb2911bb226088bfb0918eb4b05008ea70b20bce854ee2ca8a564bd37a5",
+  "test_bridge.py": "44ac9ed3b13b7ed772ff81cbe0e58f68fe2365855bcc937961e55199942fb953",
+  "read_chat_snapshot.applescript": "5f9eb547e04f091c35569a2d1f87ebbea9633da54dcf00f9583faaa5e6701c60",
+  "publish.py": "585d7627086ba9f50eaece65da37c5d3852c12ccde26fb76772bac14fbb8c549",
+  "source/backend/agetor/docs/hub/frontend-source-lock.json": "b0d99753b2702764e1f650ae026c46cfc0a198f70e11270a0747a1be9f93477f",
+  "source/backend/agetor/packages/agent-adapters/muse/muse-desktop-bridge.py": "eb6b9826b7418d068e547382d647ab86cca5b28dcf635d598258399ef1220dd7",
+  "source-before/backend/agetor/docs/hub/frontend-source-lock.json": "e6d678ecb492142c48e8dfc866c534d97b076e9b8c23e295783756dece3fb89b",
+  "source-before/backend/agetor/packages/agent-adapters/muse/muse-desktop-bridge.py": "1a60149a089ca58967501e4b4e2762fe57493a4088e9a9dd82868456bf1daaa3"
+}

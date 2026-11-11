@@ -14,41 +14,46 @@ function rows<T>(store: HubStore, kind: string, taskId: string): T[] {
 }
 
 export function extractReviewJson(rawText: string): { approved: boolean; findings: string[] } {
-  const isValidReview = (obj: unknown): obj is { approved: boolean; findings: string[] } => {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
-    const rec = obj as Record<string, unknown>;
-    return typeof rec.approved === "boolean" && Array.isArray(rec.findings) && rec.findings.every((item) => typeof item === "string");
-  };
-
-  const trimmed = rawText.trim();
+  if (Buffer.byteLength(rawText) > 64000) throw new Error("ACCEPTANCE_FAILED: review exceeds limit");
+  type Review = {approved: boolean; findings: string[]};
+  const reviews: Review[] = [];
   let parsedAnyJson = false;
-
-  const tryCandidate = (str: string): { approved: boolean; findings: string[] } | null => {
-    try {
-      const parsed = JSON.parse(str);
-      parsedAnyJson = true;
-      if (isValidReview(parsed)) return { approved: parsed.approved, findings: parsed.findings };
-    } catch {}
-    return null;
+  const accept = (source: string) => {
+    let parsed: unknown;
+    try { parsed = JSON.parse(source); } catch { return; }
+    parsedAnyJson = true;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const value = parsed as Record<string,unknown>;
+    if (typeof value.approved === "boolean" && Array.isArray(value.findings) && value.findings.every((item) => typeof item === "string")) {
+      reviews.push({approved:value.approved,findings:value.findings});
+    }
   };
-
-  const direct = tryCandidate(trimmed);
-  if (direct) return direct;
-
-  const fenceMatches = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)];
-  for (let i = fenceMatches.length - 1; i >= 0; i--) {
-    const fenced = tryCandidate(fenceMatches[i]![1]!.trim());
-    if (fenced) return fenced;
+  const trimmed = rawText.trim();
+  accept(trimmed);
+  if (parsedAnyJson) {
+    if (reviews.length === 1) return reviews[0]!;
+    throw new Error("ACCEPTANCE_FAILED: malformed review");
   }
-
-  for (let end = trimmed.lastIndexOf("}"); end !== -1; end = trimmed.lastIndexOf("}", end - 1)) {
-    for (let start = trimmed.lastIndexOf("{", end); start !== -1; start = trimmed.lastIndexOf("{", start - 1)) {
-      const candidate = trimmed.slice(start, end + 1);
-      const res = tryCandidate(candidate);
-      if (res) return res;
+  // Scan complete top-level objects once, ignoring braces inside JSON strings.
+  let depth = 0;
+  let start = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < trimmed.length; index++) {
+    const char = trimmed[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+    } else if (depth > 0 && char === '"') quoted = true;
+    else if (char === "{") { if (depth === 0) start = index; depth++; }
+    else if (char === "}" && depth > 0) {
+      depth--;
+      if (depth === 0) accept(trimmed.slice(start,index+1));
     }
   }
-
+  if (reviews.length > 1) throw new Error("ACCEPTANCE_FAILED: ambiguous review contains multiple verdicts");
+  if (reviews.length === 1) return reviews[0]!;
   if (parsedAnyJson) throw new Error("ACCEPTANCE_FAILED: malformed review");
   throw new Error("ACCEPTANCE_FAILED: reviewer returned invalid JSON");
 }

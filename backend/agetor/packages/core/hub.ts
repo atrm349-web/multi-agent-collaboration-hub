@@ -7,13 +7,14 @@ import { migrate } from "../../src/bun/migrate.ts";
 import schema from "../../src/bun/migrations/083_hub_service.sql" with { type: "text" };
 import { HubStore } from "./state/store.ts";
 import { DurableCodexRunner } from "./state/durable-codex.ts";
+import { resolveClaudeApiKey } from "../agent-adapters/claude/client.ts";
 import { planWithCodex, planWithDeepSeek, planWithGemini, planWithClaude, planWithWorkBuddy, planWithMuse, validatePlan, type PlannerOptions } from "./planner.ts";
 import { WorkspaceManager, writeArtifact, freezeArtifact, readFrozenArtifact, runTestProfile, workspaceFingerprint,
   type WorkspaceHandle, type FrozenArtifact, type TestProfile, type TestResult } from "./workspace.ts";
 import { QualityGate, extractReviewJson } from "./quality.ts";
 import type { HTTPService, PageQuery } from "./http.ts";
 import type { AcceptanceCriterion, Agent, AgentRun, Approval, Artifact, DraftPlan, EventEnvelope,
-  Message, Page, PlannedSubtask, RepositoryRef, Subtask, Task, TaskDetail, Validation } from "../shared/src/types.ts";
+  Message, Page, PlannedSubtask, RepositoryRef, Stage, Subtask, Task, TaskDetail, Validation } from "../shared/src/types.ts";
 
 const exec = promisify(execFile);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -101,8 +102,8 @@ export class HubService implements HTTPService {
     }).immediate();
     // Startup-only: a crash during the validation phase leaves subtasks in
     // "validating" with no active run, which reconcileExpired cannot see.
-    try { store.reconcileInterruptedValidations(); }
-    catch (error) { console.error("[hub] interrupted-validation sweep failed", String(error).slice(0,200)); }
+    store.recoverValidationProcesses(this.owner);
+    store.reconcileInterruptedValidations();
     this.manager = new WorkspaceManager(options.root);
     this.runner = new DurableCodexRunner(store,{ workspaceRoot: options.root,...(options.spawn ? { spawn: options.spawn } : {}) });
     this.quality = new QualityGate(store,{ verifyArtifact: async (artifact) => { await readFrozenArtifact(options.root,artifact); } });
@@ -119,7 +120,7 @@ export class HubService implements HTTPService {
   }
   private seedAgent(id: string,label: string,stages: Agent["supportedStages"],permissionProfile: string) {
     if (this.store.db.query("SELECT 1 FROM hub_entities WHERE id=?").get(id)) return;
-    this.store.put("agent",{ ...common(),id,label,roleTitle: label,adapterId: "codex-cli",adapterVersion: "official-cli",
+    this.store.put("agent",{ ...common(),id,label,roleTitle: label,adapterId: "hub-router",adapterVersion: "0.2",
       availability: "available",capabilities: CAPABILITIES,unsupportedReasons: { "live-context": "Context is queued for the next turn" },
       supportedStages: stages,permissionProfile,maxConcurrency: 1 },null);
   }
@@ -129,7 +130,9 @@ export class HubService implements HTTPService {
     return {
       contractVersion: "0.2" as const,
       executionMode: "live" as const,
-      liveExecutionAvailable: !this.closing && !this.planning && this.activeJobs.size < this.maxConcurrency && slotAvailable,
+      needsAttention: this.store.validationRecovery().length,
+      validationRecovery: this.store.validationRecovery().map((claim) => ({subtaskId:claim.subtask_id,processGroupId:claim.process_group_id})),
+      liveExecutionAvailable: this.store.validationRecovery().length === 0 && !this.closing && !this.planning && this.activeJobs.size < this.maxConcurrency && slotAvailable,
       enabledFeatures: ["durable-tasks","dag","codex-cli","independent-tests","review","approvals","worktrees","artifacts","sse","interrupted-recovery","parallel-execution"]
     };
   }
@@ -220,15 +223,23 @@ export class HubService implements HTTPService {
     const found = this.registered.get(text(id,"repositoryId",36));
     if (!found) throw new Error("NOT_FOUND: repository is not registered"); return found;
   }
-  private criteria(value: unknown,repo: RegisteredRepository): AcceptanceCriterion[] {
+  private criteria(value: unknown,repo: RegisteredRepository,stage?: Stage): AcceptanceCriterion[] {
     if (!Array.isArray(value) || !value.length || value.length > 20) throw new Error("INVALID_INPUT: acceptance criteria required");
     const ids = new Set<string>();
     return value.map((item) => {
       const c = object(item,["id","description","testProfileId"]); const id = text(c.id,"criterion id",128);
       const testProfileId = c.testProfileId === undefined ? repo.defaultTestProfileId : text(c.testProfileId,"testProfileId",128);
       if (ids.has(id) || !repo.testProfiles.some((profile) => profile.id === testProfileId)) throw new Error("INVALID_INPUT: criterion/profile");
+      const profile = repo.testProfiles.find((item) => item.id === testProfileId)!;
+      if (stage && profile.stages && !profile.stages.includes(stage)) throw new Error("INVALID_INPUT: acceptance profile does not support this stage");
       ids.add(id); return {id,description:text(c.description,"criterion description",2000),testProfileId};
     });
+  }
+  async acknowledgeValidation(subtaskId: string, body: unknown) {
+    const value = object(body,["expectedVersion","processGroupVerifiedStopped","reason"]);
+    if (value.processGroupVerifiedStopped !== true) throw new Error("INVALID_INPUT: explicit process review is required");
+    this.store.acknowledgeValidation(subtaskId,version(value.expectedVersion),text(value.reason,"reason",4000));
+    return {subtaskId,status:"acknowledged"};
   }
   async acknowledgeInterruption(runId: string, body: unknown) {
     const b = object(body, ["expectedVersion", "processGroupVerifiedStopped", "reason"]);
@@ -252,7 +263,7 @@ export class HubService implements HTTPService {
     let finish!: () => void; this.planningDone = new Promise<void>((resolve) => { finish = resolve; });
     try {
       const handle = await this.manager.prepare({ repositoryPath: repo.path,baseCommit: repo.baseCommit,taskId: randomUUID(),subtaskId: randomUUID() });
-      const customModels = b.models && typeof b.models === "object" && !Array.isArray(b.models) ? (b.models as StageModelConfig) : undefined;
+      const customModels = b.models === undefined ? undefined : Object.fromEntries(Object.entries(object(b.models,["planner","developer","reviewer"])).map(([key,value]) => [key,text(value,`${key} model`,128)])) as StageModelConfig;
       const plannerModel = customModels?.planner ?? repo.models?.planner ?? repo.model;
       const defaultPlanner = plannerModel.startsWith("deepseek")
         ? planWithDeepSeek
@@ -260,20 +271,18 @@ export class HubService implements HTTPService {
           ? planWithClaude
           : (plannerModel.startsWith("gemini") || plannerModel.startsWith("antigravity"))
             ? planWithGemini
-            : plannerModel.startsWith("muse")
-              ? planWithMuse
-              : (plannerModel.startsWith("workbuddy") || plannerModel.startsWith("wb") || plannerModel.startsWith("codebuddy") || plannerModel === "auto" || plannerModel === "codex")
-                ? planWithWorkBuddy
+            : plannerModel.startsWith("muse") ? planWithMuse
+              : /^(workbuddy|wb|codebuddy)/.test(plannerModel) ? planWithWorkBuddy
                 : planWithCodex;
-      const plan = await (this.options.planner ?? defaultPlanner)({ goal: `${goal}\nProduce only implementation, testing, review or documentation stages. Planning is already complete; do not add an analysis stage. IMPORTANT FOR SPEED: Prefer 1 consolidated 'implementation' subtask (or at most 2 parallel subtasks) rather than splitting simple queries, scripts, or reports into many serial steps. Ensure the implementation subtask also produces a clear, human-readable Chinese summary report (DELIVERY_REPORT.md) directly answering the user's goal in plain text alongside the code. Available capabilities: stream, resume, cancel, structured-output. Registered test profile IDs: ${repo.testProfiles.map((p) => p.id).join(", ")}.`,
+      const plan = await (this.options.planner ?? defaultPlanner)({ goal: `${goal}\nPrefer one consolidated implementation step for simple tasks. Produce only implementation, testing, review or documentation stages. Planning is already complete; do not add an analysis stage. Ensure the final implementation also writes a human-readable Chinese DELIVERY_REPORT.md answering the user's goal. Available capabilities: stream, resume, cancel, structured-output. Registered test profiles: ${JSON.stringify(repo.testProfiles.map((p) => ({id:p.id,description:p.description ?? p.id,stages:p.stages ?? ["implementation","testing","review","documentation"]})))}. Choose the matching testProfileId for each criterion; avoid splitting a step that must pass the full suite before its dependencies implement the required files.`,
         cwd: handle.agentPath,workspaceRoot: this.options.root,repositoryId: repo.id,model: plannerModel,effort: repo.effort,timeoutMs: 120000,signal: abort.signal });
-      return { ...plan,goal,subtasks: validatePlan(plan.subtasks).map((step) => ({ ...step,acceptanceCriteria: this.criteria(step.acceptanceCriteria,repo) })) };
+      return { ...plan,goal,subtasks: validatePlan(plan.subtasks).map((step) => ({ ...step,acceptanceCriteria: this.criteria(step.acceptanceCriteria,repo,step.stage) })) };
     } finally { this.planning = false; this.planningAbort = null; finish(); }
   }
   async create(body: unknown): Promise<Task> {
     const b = object(body,["title","goal","repositoryId","acceptanceCriteria","priority","plannedSubtasks","models"]);
     const baseRepo = this.repo(b.repositoryId); const title = text(b.title,"title",200); const goal = text(b.goal,"goal");
-    const customModels = b.models && typeof b.models === "object" && !Array.isArray(b.models) ? (b.models as StageModelConfig) : undefined;
+    const customModels = b.models === undefined ? undefined : Object.fromEntries(Object.entries(object(b.models,["planner","developer","reviewer"])).map(([key,value]) => [key,text(value,`${key} model`,128)])) as StageModelConfig;
     const repo: RegisteredRepository = customModels ? {
       ...baseRepo,
       model: customModels.developer ? text(customModels.developer, "developer model", 128) : baseRepo.model,
@@ -297,17 +306,18 @@ export class HubService implements HTTPService {
     return this.store.db.transaction(() => {
       const task = this.store.put("task",{ ...common(),id:taskId,provenance:"current",title,goal,repositoryId:repo.id,baseCommit:repo.baseCommit,status:"queued",priority: priority as Task["priority"],
         progressPct:0,pendingApprovalCount:0,artifactCount:0,acceptanceCriteria:criteria,error:null,startedAt:null,endedAt:null,deadlineAt:null },null);
-      const defaultWorkers = ["workbuddy", "muse", "gemini-3.5-flash-lite", "deepseek-chat"];
+      const defaultWorkers = ["workbuddy", "muse", "gemini-3.5-flash-lite"];
+      const autoReviewer = resolveClaudeApiKey() ? "claude-3-5-sonnet-20241022" : "gpt-6.1-sol";
       let workIdx = 0;
       for (const item of [...plan,reviewed]) {
         const isRev = item.stage === "review" || item.stage === "testing" || item.code === "FINAL-REVIEW";
         const rawDev = repo.models?.developer ?? repo.model;
-        const rawRev = repo.models?.reviewer ?? (rawDev && rawDev !== "auto" ? rawDev : "claude-3-5-sonnet-20241022");
+        const rawRev = repo.models?.reviewer ?? (rawDev && rawDev !== "auto" ? rawDev : autoReviewer);
         const subtaskModel = isRev
-          ? (rawRev === "auto" ? "claude-3-5-sonnet-20241022" : rawRev)
-          : (!rawDev || rawDev === "auto" ? (plan.length === 1 ? "auto" : defaultWorkers[workIdx++ % defaultWorkers.length]!) : rawDev);
+          ? (rawRev === "auto" ? autoReviewer : rawRev)
+          : (!rawDev || rawDev === "auto" ? defaultWorkers[workIdx++ % defaultWorkers.length]! : rawDev);
         this.store.put("subtask",{ ...common(),...item,taskId,status:item.dependsOn.length ? "pending":"ready",
-          acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:240000,outputArtifactIds:[],error:null,model:subtaskModel },null);
+          acceptanceCriteria:this.criteria(item.acceptanceCriteria,repo,item.stage),assignedAgentId:null,workspaceId:null,branchName:null,progressPct:0,attempt:1,maxAttempts:3,timeoutMs:240000,outputArtifactIds:[],error:null,model:subtaskModel },null);
       }
       this.store.db.query("INSERT INTO hub_task_policies VALUES(?,?)").run(taskId,JSON.stringify(repo));
       return task;
@@ -408,7 +418,9 @@ export class HubService implements HTTPService {
     return {message,delivery:"queued_next_turn"};
   }
   async tick():Promise<void> {
-    if(this.polling||this.closing||this.activeJobs.size >= this.maxConcurrency||this.planning)return;this.polling=true;
+    if (this.closing) return;
+    this.store.recoverValidationProcesses(this.owner);
+    if(this.store.validationRecovery().length || this.polling||this.activeJobs.size >= this.maxConcurrency||this.planning)return;this.polling=true;
     try {
       this.store.reconcileExpired();
       const rows=this.store.db.query<{data:string},[]>("SELECT data FROM hub_entities WHERE kind='task' AND status IN ('queued','running','pausing','cancelling') ORDER BY created_at,id LIMIT 100").all();
@@ -416,6 +428,8 @@ export class HubService implements HTTPService {
         const task=JSON.parse(row.data) as Task;
         if(task.status==="pausing"||task.status==="cancelling") { this.finishControl(task);continue; }
         const steps=this.store.list("subtask",task.id);
+        const interrupted = steps.find((step) => step.status === "blocked" && step.error?.code === "PROCESS_CRASHED");
+        if (interrupted) { this.failTask(task.id,new Error(`PROCESS_CRASHED: ${interrupted.error!.message}`)); continue; }
         for(const step of steps.filter((s)=>s.status==="pending"&&s.dependsOn.every((id)=>steps.some((p)=>p.id===id&&p.status==="succeeded")))) this.store.put("subtask",{...step,status:"ready"},step.version);
         const final = steps.find((step) => step.code === "FINAL-REVIEW" && step.status === "waiting_approval");
         if (final) { await this.quality.openFinalApproval(task.id, final.id); continue; }
@@ -459,11 +473,11 @@ export class HubService implements HTTPService {
     this.store.db.query("INSERT INTO hub_workspaces(subtask_id,attempt,handle,commit_sha,review) VALUES(?,?,?,NULL,?) ON CONFLICT(subtask_id) DO UPDATE SET attempt=excluded.attempt,handle=excluded.handle,commit_sha=NULL,review=excluded.review")
       .run(initial.id,initial.attempt,JSON.stringify(handle),initial.code==="FINAL-REVIEW"?1:0);
     const isRevStep = initial.stage === "review" || initial.stage === "testing" || initial.code === "FINAL-REVIEW";
+    const autoReviewer = resolveClaudeApiKey() ? "claude-3-5-sonnet-20241022" : "gpt-6.1-sol";
     const rawDevModel = policy.models?.developer ?? policy.model;
-    const rawRevModel = policy.models?.reviewer ?? (rawDevModel && rawDevModel !== "auto" ? rawDevModel : "claude-3-5-sonnet-20241022");
-    const subtaskModel = initial.model
-      ? initial.model
-      : (isRevStep ? rawRevModel : rawDevModel);
+    const rawRevModel = policy.models?.reviewer ?? (rawDevModel && rawDevModel !== "auto" ? rawDevModel : autoReviewer);
+    const selectedModel = initial.model ?? (isRevStep ? rawRevModel : rawDevModel);
+    const subtaskModel = selectedModel === "auto" ? (isRevStep ? autoReviewer : "workbuddy") : selectedModel === "codex" ? "gpt-6.1-sol" : selectedModel;
     let step=this.store.get("subtask",initial.id);step=this.store.put("subtask",{...step,workspaceId:handle.id,model:subtaskModel},step.version);
     const queued=this.store.list("message",task.id).filter((message)=>message.toSubtaskId===step.id&&!message.deliveredAt);
     const readOnly=step.stage==="review"||step.stage==="testing"||step.stage==="analysis";
@@ -476,7 +490,7 @@ export class HubService implements HTTPService {
       agentId = REVIEWER;
     } else {
       const dev1 = this.store.get("agent", DEVELOPER);
-      const dev2 = this.store.db.query("SELECT 1 FROM hub_entities WHERE id=?", [DEVELOPER_2]).get() ? this.store.get("agent", DEVELOPER_2) : null;
+      const dev2 = this.store.db.query("SELECT 1 FROM hub_entities WHERE id=?").get(DEVELOPER_2) ? this.store.get("agent", DEVELOPER_2) : null;
       if (dev1.availability === "available") agentId = DEVELOPER;
       else if (dev2 && dev2.availability === "available") agentId = DEVELOPER_2;
       else agentId = DEVELOPER;
@@ -508,7 +522,13 @@ export class HubService implements HTTPService {
     const criteria=step.acceptanceCriteria;const profiles=[...new Set(criteria.map((c)=>c.testProfileId!))];const reports=new Map<string,{result:TestResult;artifact:Artifact}>();
     for(const id of profiles) {
       const profile=policy.testProfiles.find((p)=>p.id===id)!;
-      const checked=await (this.options.testRunner??runTestProfile)(this.options.root,handle.agentPath,profile,job.abort.signal);
+      if (profile.stages && !profile.stages.includes(step.stage)) throw new Error("INVALID_INPUT: acceptance profile does not support this stage");
+      this.store.beginValidation(step.id,runId,this.owner);
+      let checked: TestResult;
+      try {
+        checked=await (this.options.testRunner??runTestProfile)(this.options.root,handle.agentPath,profile,job.abort.signal,
+          (pid) => this.store.spawnedValidation(step.id,this.owner,pid));
+      } finally { this.store.finishValidation(step.id,this.owner); }
       if(job.abort.signal.aborted||checked.cancelled)return;
       const report=await this.saveArtifact(await writeArtifact(this.options.root,JSON.stringify(checked,null,2),`${step.code}-${id}.json`),task.id,step.id,runId,"test_report");
       artifacts.push(report);reports.set(id,{result:checked,artifact:report});

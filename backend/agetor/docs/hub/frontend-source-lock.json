@@ -1,40 +1,35 @@
 {
   "schemaVersion": 1,
-  "delivery": "Codex F02-r3",
-  "checkedAt": "2026-11-03T07:44:18.947Z",
-  "backendBaseCommit": "9f56aa45219df6544a7d2a62177a16ce78aa9a20",
-  "reviewStatus": "accepted-macos-mvp-scoped",
+  "delivery": "Codex muse-bridge-2026-11-10",
+  "checkedAt": "2026-11-10T00:52:22.859500+00:00",
+  "backendBaseCommit": "03de4b3",
+  "reviewStatus": "semantic-muse-bridge-regression-tested",
   "sourceHashes": {
-    "index.html": "66304e120a1fad26f5a79e740721a1140fa81f6c5b27d9ab6472f17ac595bde5",
-    "app.js": "d2d92a8bc1b3aff0df40c4d192864401a77493a78cd45171d89217e0e96b9081",
-    "styles.css": "3170eff9f508f913dbfc8b1fe2ed95a1faad7d9a4fb2001b7df2bd5faea9376e"
+    "index.html": "c5bed888152454e704220641cbc71af505cf3fa5e874885052b54eab4c21746b",
+    "app.js": "eb95825866e6a3c2b9e66076996c47f8fb6e96b8c00ee4f9997a571882b4fc27",
+    "styles.css": "7f56a8742a1a0b97c5f513754f73d4095b4e94fb1ada738fe1cae06e0a3acfe9"
   },
   "nativeBundleHashes": {
-    "app.live-native.js": "8642dd35b11ee2a796cda93f3f1cc81d7f2694e4f9acda2827fc6a1bb74a68e0",
-    "index.live-native.html": "794b7df7d07c3aa5fcb7ed1f9920df291a7bb650645207e77e4f5e5507f68523"
+    "app.live-native.js": "249ec2cef1b85bb7573f55704a23ad537972d5b43a7405a221dd46607b282e7d",
+    "index.live-native.html": "9a3fb5452832bf80aed19f8278d8b8907346aa326e21d66f8b2e37f3a1869e6b"
   },
   "backendHashes": {
     "packages/core/frontend.ts": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
-    "packages/core/http.ts": "336d38d2a5911716a813b1e0697d729c296b64973e4952d729c002ebf55db6bc",
-    "packages/core/hub.ts": "c78178d24cf188f902f843519e569154aa1e039edad097ce5c68a9f4cc61b097",
-    "packages/core/quality.ts": "469f5e9bb9b27e10b199b282436e55969cb1bec03d449618cf1f21ff040e6e87",
-    "packages/core/workspace.ts": "11f34351be19f10fb28660eac7526b4f84fe998c01f79a0a0f2e47c9b87b9836",
-    "scripts/start-hub.ts": "875fed6861b13fbd73c74e2700cbdbe1d5c14b6d92be629482005835ebef8211"
+    "packages/core/http.ts": "8f630a3214cb833b0e2a16173529886b7dfeadfed0decc4c170fbd490f63b2cd",
+    "packages/core/hub.ts": "2604f2d7166ae4cc5c3a6e740946feffc3be183a8cb95ab7d78474e57137de7b",
+    "packages/core/quality.ts": "f8834f0004f30b3afa4d8654497d7cdb688def51f3965389c9e3ad1ffc023e77",
+    "packages/core/workspace.ts": "767d638a24682588f8f0e21d82d741d408449b6abc09604693b14bf46e1961f1",
+    "scripts/start-hub.ts": "9b0ea184a50e2223fd416b004608c41f83d2fe5c6bb9596bcba44ff1b42736d0",
+    "packages/core/planner.ts": "bc2ca5253d74b50f8d1f4635048b5200eb77a00e626c475ffac137ce038aa835",
+    "packages/agent-adapters/muse/runtime.ts": "420840067e664a8c17353ed1e73bab7d93d3c7ad0cc48715ac4184558888063d",
+    "packages/agent-adapters/workbuddy/runtime.ts": "0840c2e2dbd21e01884ae4cdd723c5d39b91b3cee644fe363b93e655757ad00e",
+    "packages/agent-adapters/muse/muse-desktop-bridge.py": "eb6b9826b7418d068e547382d647ab86cca5b28dcf635d598258399ef1220dd7"
   },
   "runtimeEnforced": false,
-  "note": "F-02/I-01 accepted for verified macOS single-user MVP scope. R3 ambiguity rejected before mutation. Controlled browser evidence and prior real CLI success-path evidence remain separately classified.",
-  "reviewFindings": [],
-  "acceptedReworkItems": [
-    "R1 evidence boundary corrected",
-    "R2 raw byte download and hash verification",
-    "R4 JSON data preserved",
-    "R5 cancellation output drop documented"
-  ],
-  "manifestSha256": "e06fce34ba66b41e0009b64428135ac00dc0902ce660618ebc7cb28297b7793b",
-  "sourceSnapshotNote": "Merged latest Antigravity error handlers with Codex conservative compression guard; source hashes verified against desktop published files.",
+  "note": "Muse composer and chat discovery now use semantic AX labels across nesting changes. Six isolated Python regressions and AppleScript compilation passed. Current Muse native structure inspected through CUA. Full patched bridge Hub-to-Muse round trip remains to be exercised.",
   "remainingLimits": [
-    "Ambiguous or terminal analysis requires replanning",
-    "Real-model forced failure/rework not verified this round",
-    "Windows/cross-vendor/long-run and running-process crash recovery pending"
+    "Native live execution to be tested by user",
+    "Native cancellation/recovery and OS read-only enforcement remain unverified",
+    "Windows and long-duration testing remain unverified"
   ]
 }

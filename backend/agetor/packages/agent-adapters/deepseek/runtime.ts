@@ -1,5 +1,6 @@
+import { readWorkspaceFile, writeWorkspaceFile, listWorkspaceFiles } from '../workspace-files.ts';
 import { randomUUID } from "node:crypto";
-import { realpath, stat, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { DeepSeekClient, type DeepSeekMessage, type DeepSeekTool } from "./client.ts";
 import type { CodexRequest, CodexResult, CodexLog, CodexRunStatus } from "../codex/runtime.ts";
@@ -67,7 +68,7 @@ export class DeepSeekRuntime {
   constructor(private readonly options: {
     workspaceRoot: string;
     onEvent?: (runId: string, log: CodexLog) => void;
-    onSpawn?: (runId: string, processGroupId: number) => void;
+    onSpawn?: (runId: string, processGroupId: number, kind?: "process-group" | "in-process") => void;
     killGraceMs?: number;
     client?: DeepSeekClient;
   }) {
@@ -79,21 +80,15 @@ export class DeepSeekRuntime {
     this.options.onEvent?.(run.result.runId, log);
   }
 
-  private resolveSafePath(cwd: string, targetPath: string): string {
-    const resolved = path.resolve(cwd, targetPath);
-    const relative = path.relative(cwd, resolved);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new Error(`PERMISSION_DENIED: path escapes workspace sandbox: ${targetPath}`);
-    }
-    return resolved;
-  }
-
   async start(request: CodexRequest): Promise<string> {
     if (this.busy) throw new Error("AGENT_UNAVAILABLE: one run is already active");
     this.busy = true;
 
     try {
       const cwd = await realpath(request.cwd);
+      const root = await realpath(this.options.workspaceRoot);
+      const relative = path.relative(root, cwd);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("PERMISSION_DENIED: workspace escapes root");
       if (!(await stat(cwd)).isDirectory()) {
         throw new Error("INVALID_INPUT: workspace cwd is not a directory");
       }
@@ -124,7 +119,7 @@ export class DeepSeekRuntime {
       this.runs.set(runId, run);
 
       // Signal spawn callback with current process pid
-      this.options.onSpawn?.(runId, process.pid);
+      this.options.onSpawn?.(runId, process.pid, "in-process");
 
       run.result.status = "running";
       this.record(run, {
@@ -154,14 +149,14 @@ export class DeepSeekRuntime {
   private cleanJson(raw: string): string {
     const trimmed = raw.trim();
     const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    return match ? match[1].trim() : trimmed;
+    return match ? match[1]!.trim() : trimmed;
   }
 
   private async executeLoop(run: Run, request: CodexRequest, cwd: string): Promise<void> {
     try {
       const model = request.model.startsWith("deepseek") ? request.model : "deepseek-chat";
       const isWrite = request.sandbox === "workspace-write";
-      const availableTools = isWrite ? TOOLS : [TOOLS[1], TOOLS[2]]; // read_file and list_files in read-only
+      const availableTools = isWrite ? TOOLS : [TOOLS[1]!, TOOLS[2]!]; // read_file and list_files in read-only
 
       const systemPrompt = isWrite
         ? "You are an expert autonomous software engineer working in a local workspace repository.\n"
@@ -248,9 +243,7 @@ export class DeepSeekRuntime {
                 if (!isWrite) {
                   throw new Error("PERMISSION_DENIED: write operations are forbidden in read-only sandbox");
                 }
-                const safePath = this.resolveSafePath(cwd, String(args.path));
-                await mkdir(path.dirname(safePath), { recursive: true });
-                await writeFile(safePath, String(args.content), "utf8");
+                await writeWorkspaceFile(cwd, String(args.path), String(args.content), isWrite && !run.abortController.signal.aborted);
                 toolResult = `Successfully wrote ${Buffer.byteLength(String(args.content))} bytes to ${args.path}`;
                 this.record(run, {
                   seq: run.logs.length + 1,
@@ -258,11 +251,9 @@ export class DeepSeekRuntime {
                   event: { type: "tool.write_file", path: args.path, status: "ok" },
                 });
               } else if (name === "read_file") {
-                const safePath = this.resolveSafePath(cwd, String(args.path));
-                toolResult = await readFile(safePath, "utf8");
+                toolResult = await readWorkspaceFile(cwd, String(args.path));
               } else if (name === "list_files") {
-                const safePath = this.resolveSafePath(cwd, String(args.directory ?? ""));
-                const entries = await readdir(safePath, { withFileTypes: true });
+                const entries = await listWorkspaceFiles(cwd, String(args.directory ?? "."));
                 toolResult = JSON.stringify(entries.map((e) => ({
                   name: e.name,
                   isDirectory: e.isDirectory(),
@@ -278,7 +269,7 @@ export class DeepSeekRuntime {
               role: "tool",
               name,
               tool_call_id: toolCall.id,
-              content: toolResult,
+              content: toolResult ?? "",
             });
           }
         } else {
@@ -311,7 +302,7 @@ export class DeepSeekRuntime {
         run.result.status = "failed";
         run.result.exitCode = 1;
         run.result.error = {
-          code: match ? match[1] : "TURN_FAILED",
+          code: match ? match[1]! : "TURN_FAILED",
           message: msg,
           retryable: false,
         };

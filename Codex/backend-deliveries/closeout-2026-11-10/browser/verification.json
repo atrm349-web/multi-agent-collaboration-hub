@@ -1,0 +1,25 @@
+{
+  "mode": "real browser/controller/HTTP/SQLite/Git; controlled planner/provider/testRunner; no model calls",
+  "observedTask": "最终收尾验证（本地受控执行器）",
+  "taskStatus": "succeeded",
+  "actualRunLabels": [
+    "codex · gpt-6.1-sol"
+  ],
+  "textArtifactVisible": true,
+  "approvalStatus": "approved",
+  "sourceHashes": {
+    "index.html": "c5bed888152454e704220641cbc71af505cf3fa5e874885052b54eab4c21746b",
+    "app.js": "c29d84aa6f843f28ba2693d7992c2d58bae311cdb1479ebceec4f42c3322079a",
+    "styles.css": "7f56a8742a1a0b97c5f513754f73d4095b4e94fb1ada738fe1cae06e0a3acfe9"
+  },
+  "screenshot": "screenshots/approved.png",
+  "tasks": [
+    {
+      "id": "c1619db0-7fae-4465-b0e0-6cebd7e79391",
+      "title": "最终收尾验证（本地受控执行器）",
+      "status": "succeeded",
+      "artifactCount": 10,
+      "pendingApprovalCount": 0
+    }
+  ]
+}

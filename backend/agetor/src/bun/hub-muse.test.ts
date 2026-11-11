@@ -5,7 +5,7 @@ import path from "node:path";
 import { MuseClient } from "../../packages/agent-adapters/muse/client.ts";
 import { MuseRuntime } from "../../packages/agent-adapters/muse/runtime.ts";
 
-describe("Muse Integration Suite", () => {
+describe.skipIf(process.env.HUB_LIVE_TESTS !== "1")("Muse Integration Suite", () => {
   let tempDir: string;
 
   beforeEach(async () => {

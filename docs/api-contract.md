@@ -84,3 +84,21 @@ meta.executionMode说明当前服务，liveExecutionAvailable表示当前可派�
 ## 契约验收（尚待迁移执行）
 
 检查页形状、DTO状态/错误枚举、所有控制CAS/幂等、审批摘要和过期、路径越界、Auth/Origin、快照订阅竞态、游标过期、UTF-8分块与CRLF、取消后迟到输出、能力禁用、Mock与历史证据隔离。HTTP/API测试和真实浏览器测试分别记录；真实CLI取消/恢复需独立证据。
+
+
+## 2026-11-09 适配器与测试恢复增补
+
+AgentRun 新增可选 provider、model、executionKind、capabilities 字段，记录该次运行实际执行方式。历史记录缺失时界面显示模型未记录。角色注册不表示每个厂商均已连通。API 模型不声明 session resume，WorkBuddy 网关目前拒绝 read-only 请求。
+
+Meta 新增可选 needsAttention 与 validationRecovery。每项包含 subtaskId、processGroupId，表示崩溃后尚待确认的测试执行。存在待处理测试时 liveExecutionAvailable=false，并停止新任务派发。
+
+POST /api/v1/subtasks/{id}/validation-acknowledge 使用既有 Bearer 鉴权、Idempotency-Key 和 CAS。请求体为 expectedVersion、processGroupVerifiedStopped=true 与非空 reason。系统拒绝仍存在的已知测试进程组。未能登记进程身份的窗口要求本地所有者人工检查，并写入审计消息。解除隔离保留失败状态，后续重试须显式触发。
+
+TestProfile 新增可选 description 和 stages。规划依据登记目录选择 testProfileId，创建和执行时检查阶段匹配，最终终审使用任务级整合验收。注册的外部可信断言目录只读授权，Agent 修改项目内部测试不能替代外部验收。
+
+
+## 2026-11-10 模型选择与原生网关边界
+
+创建任务与拆解入口的可选 models 只接受 planner/developer/reviewer 字段，每项须为非空、有界字符串。未知字段或非对象输入返回 INVALID_INPUT。未配置密钥时按指定厂商返回认证错误，不自动更换厂商。Codex 角色别名在提交执行前解析为 gpt-6.1-sol。auto 工作模型按注册顺序分配到显式 model 字段，实际运行归因以 AgentRun 为准。
+
+Muse 与 WorkBuddy 的 read-only 请求和直接规划暂返回 UNSUPPORTED_CAPABILITY，直至网关提供经过验证的只读策略；开发执行仍保留。Muse 记录 provider=muse、executionKind=in-process，不把控制器 PID 误记为可终止的模型进程组。界面独立选择 reviewer，不将原生开发模型直接当作可只读审查模型。

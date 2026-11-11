@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { WorkspaceManager, freezeArtifact, readFrozenArtifact, runTestProfile, writeArtifact } from "../../packages/core/workspace.ts";
 
 let temp: string; let root: string; let repo: string; let base: string; let taskId: string; let manager: WorkspaceManager;
@@ -90,4 +91,19 @@ test("test timeout and explicit cancellation are distinct and reap their process
   const controller = new AbortController(); const pending = runTestProfile(root,workspace.agentPath,{ ...profile,timeoutMs: 15_000 },controller.signal);
   setTimeout(() => controller.abort(),100); const cancelled = await pending;
   expect(cancelled.cancelled).toBe(true); expect(cancelled.timedOut).toBe(false);
+});
+
+test('external trusted oracle still rejects code after project tests are weakened', async () => {
+  const workspace = await manager.prepare(input());
+  const oracle = fileURLToPath(new URL('../../../../config/acceptance/test_circle.cjs',import.meta.url));
+  const profile = {id:'external-circle',command:[process.execPath,oracle],readPaths:[path.dirname(oracle)],timeoutMs:15000};
+  await writeFile(path.join(workspace.agentPath,'circle.js'),'exports.area=()=>0;exports.circumference=()=>0;');
+  await writeFile(path.join(workspace.agentPath,'test_circle.js'),'console.log("all tests passed");');
+  const failed = await runTestProfile(root,workspace.agentPath,profile);
+  expect(failed.exitCode).not.toBe(0);
+  await writeFile(path.join(workspace.agentPath,'circle.js'),'exports.area=r=>Math.PI*r*r;exports.circumference=r=>2*Math.PI*r;');
+  const passed = await runTestProfile(root,workspace.agentPath,profile);
+  if (passed.exitCode !== 0) throw new Error(passed.stderr || passed.stdout);
+  expect(passed.exitCode).toBe(0);
+  expect(passed.stdout).toContain('CIRCLE_TESTS_PASSED');
 });

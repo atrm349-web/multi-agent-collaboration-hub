@@ -1,0 +1,12 @@
+{
+  "sourcePublished": true,
+  "changedFiles": 44,
+  "runtimeBackup": "/Users/anyunhong/.agent-hub-runtime/backups/pre-hardening-20261110-092437",
+  "serviceRestarted": false,
+  "serviceStarted": true,
+  "previousServiceRunning": false,
+  "origin": "http://127.0.0.1:4321",
+  "pid": 15885,
+  "needsAttention": 0,
+  "servedAppHashMatches": true
+}

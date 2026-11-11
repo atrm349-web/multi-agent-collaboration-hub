@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "delivery": "Codex closeout-2026-11-10",
+  "checkedAt": "2026-11-10T00:24:18.750Z",
+  "backendBaseCommit": "03de4b3",
+  "reviewStatus": "accepted-macos-hardening-tested",
+  "sourceHashes": {
+    "index.html": "c5bed888152454e704220641cbc71af505cf3fa5e874885052b54eab4c21746b",
+    "app.js": "c29d84aa6f843f28ba2693d7992c2d58bae311cdb1479ebceec4f42c3322079a",
+    "styles.css": "7f56a8742a1a0b97c5f513754f73d4095b4e94fb1ada738fe1cae06e0a3acfe9"
+  },
+  "nativeBundleHashes": {
+    "app.live-native.js": "f9dc298a8bb911372483f115c62c1876d6c8ac6a6de1f1d18d727fe6fde0d90a",
+    "index.live-native.html": "9a3fb5452832bf80aed19f8278d8b8907346aa326e21d66f8b2e37f3a1869e6b"
+  },
+  "backendHashes": {
+    "packages/core/frontend.ts": "5c954b121957df10608f3a65822f3d32df3842c36e10b96071b673e3d35b54ec",
+    "packages/core/http.ts": "8f630a3214cb833b0e2a16173529886b7dfeadfed0decc4c170fbd490f63b2cd",
+    "packages/core/hub.ts": "2604f2d7166ae4cc5c3a6e740946feffc3be183a8cb95ab7d78474e57137de7b",
+    "packages/core/quality.ts": "f8834f0004f30b3afa4d8654497d7cdb688def51f3965389c9e3ad1ffc023e77",
+    "packages/core/workspace.ts": "767d638a24682588f8f0e21d82d741d408449b6abc09604693b14bf46e1961f1",
+    "scripts/start-hub.ts": "9b0ea184a50e2223fd416b004608c41f83d2fe5c6bb9596bcba44ff1b42736d0"
+  },
+  "runtimeEnforced": false,
+  "note": "Working-tree release identified by manifest hashes. Final merged source: real Codex success, official test sandbox, controlled browser and process crash recovery verified. DeepSeek last live attempt on 2026-11-09 blocked by HTTP 402.",
+  "remainingLimits": [
+    "Other provider live-account tests require explicit HUB_LIVE_TESTS=1",
+    "Native gateway read-only planning/review unavailable; external native cancellation and recovery remain unverified",
+    "Unregistered test process ownership requires local operator review",
+    "Windows, long-duration load and complete host read isolation remain outside current validation"
+  ]
+}

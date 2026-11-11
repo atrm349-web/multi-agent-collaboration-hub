@@ -20,6 +20,7 @@ export interface HTTPService {
   subtaskAction(id: string, action: "retry" | "rework", body: unknown): Promise<unknown>;
   decideApproval(id: string, body: unknown): Promise<Approval>;
   message(taskId: string, body: unknown): Promise<unknown>;
+  acknowledgeValidation?(subtaskId: string, body: unknown): Promise<unknown>;
   acknowledgeInterruption(runId: string, body: unknown): Promise<unknown>;
   mutate(scope: string, key: string, body: unknown, operation: () => Promise<MutationResult>): Promise<MutationResult>;
   events(afterSeq: number, taskId?: string): EventEnvelope[];
@@ -234,11 +235,13 @@ export function createHubHandler(options: HubHttpOptions): (request: Request) =>
           const subtask = route.match(/^\/api\/v1\/subtasks\/([^/]+)\/(retry|rework)$/);
           const approval = route.match(/^\/api\/v1\/approvals\/([^/]+)\/decision$/);
           const message = route.match(/^\/api\/v1\/tasks\/([^/]+)\/messages$/);
+          const validationAck = route.match(/^\/api\/v1\/subtasks\/([^/]+)\/validation-acknowledge$/);
           const runAck = route.match(/^\/api\/v1\/runs\/([^/]+)\/(acknowledge|interruption-ack)$/);
           if (task) { const taskId = id(task[1]!); const action = task[2] as "pause" | "resume" | "cancel"; fields = action === "cancel" ? ["expectedVersion", "reason"] : ["expectedVersion"]; operation = async (data) => ({ status: 202, data: await service.taskAction(taskId, action, data) }); }
           else if (subtask) { const subtaskId = id(subtask[1]!); const action = subtask[2] as "retry" | "rework"; fields = action === "rework" ? ["expectedVersion", "reason", "artifactRefs"] : ["expectedVersion", "reason"]; operation = async (data) => ({ status: 202, data: await service.subtaskAction(subtaskId, action, data) }); }
           else if (approval) { const approvalId = id(approval[1]!); fields = ["expectedVersion", "decision", "actionDigest", "comment"]; operation = async (data) => ({ status: 200, data: await service.decideApproval(approvalId, data) }); }
           else if (message) { const taskId = id(message[1]!); fields = ["toSubtaskId", "content", "artifactRefs"]; operation = async (data) => ({ status: 201, data: await service.message(taskId, data) }); }
+          else if (validationAck) { const subtaskId = id(validationAck[1]!); fields = ["expectedVersion", "processGroupVerifiedStopped", "reason"]; operation = async (data) => { if (!service.acknowledgeValidation) throw new Error("UNSUPPORTED_CAPABILITY: validation recovery"); return {status:200,data:await service.acknowledgeValidation(subtaskId,data)}; }; }
           else if (runAck) { const runId = id(runAck[1]!); fields = ["expectedVersion", "processGroupVerifiedStopped", "reason"]; operation = async (data) => ({ status: 200, data: await service.acknowledgeInterruption(runId, data) }); }
         }
         if (operation) {

@@ -11,7 +11,7 @@ export interface WorkspaceHandle {
 }
 export interface WorkspaceFile { relativePath: string; sizeBytes: number; sha256: string }
 export interface FrozenArtifact { id: string; name: string; relativePath: string; sha256: string; sizeBytes: number; mimeType: string }
-export interface TestProfile { id: string; command: string[]; timeoutMs: number; readPaths?: string[] }
+export interface TestProfile { description?: string; stages?: string[]; id: string; command: string[]; timeoutMs: number; readPaths?: string[] }
 export interface TestResult { profileId: string; exitCode: number | null; stdout: string; stderr: string; timedOut: boolean; cancelled: boolean }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA = /^[a-f0-9]{40,64}$/i;
@@ -193,7 +193,7 @@ export async function readFrozenArtifact(root: string, expected: FrozenArtifact)
 }
 
 /** Runs only a server-registered fixed argv under a restricted-read OS sandbox. */
-export async function runTestProfile(root: string, workspace: string, profile: TestProfile, signal?: AbortSignal): Promise<TestResult> {
+export async function runTestProfile(root: string, workspace: string, profile: TestProfile, signal?: AbortSignal, onSpawn?: (pid: number) => void): Promise<TestResult> {
   if (process.platform !== "darwin") throw new Error("UNSUPPORTED_CAPABILITY: independent test sandbox is only verified on macOS");
   if (!profile.id || !Array.isArray(profile.command) || !profile.command.length || !path.isAbsolute(profile.command[0]!) || profile.command.some((arg) => typeof arg !== "string" || arg.includes("\0"))
     || !Number.isSafeInteger(profile.timeoutMs) || profile.timeoutMs < 1 || profile.timeoutMs > 300_000) throw new Error("INVALID_INPUT: invalid registered test profile");
@@ -213,6 +213,15 @@ export async function runTestProfile(root: string, workspace: string, profile: T
   if (!found) throw new Error("BINARY_NOT_FOUND: official Codex sandbox is not installed");
   const sandboxBinary = await realpath(found);
   const proc = spawn(sandboxBinary,["sandbox","-P","hub-test","-C",cwd,"--",...profile.command],{ cwd,env,detached: true,stdio: ["ignore","pipe","pipe"] });
+  const completion = new Promise<number|null>((resolve,reject) => { proc.once("error",reject); proc.once("close",resolve); });
+  try {
+    if (!proc.pid) throw new Error("PROCESS_CRASHED: test process failed to spawn");
+    onSpawn?.(proc.pid);
+  } catch (error) {
+    if (proc.pid) { try { process.kill(-proc.pid,"SIGKILL"); } catch {} }
+    await completion.catch(() => {});
+    throw error;
+  }
   let stdout = ""; let stderr = ""; let timedOut = false; let cancelled = false; let overLimit = false;
   const stdoutDecoder = new StringDecoder("utf8"); const stderrDecoder = new StringDecoder("utf8");
   const kill = (signal: NodeJS.Signals) => { if (!proc.pid) return; try { process.kill(-proc.pid,signal); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } };
@@ -227,7 +236,7 @@ export async function runTestProfile(root: string, workspace: string, profile: T
     if (Buffer.byteLength(stdout)+Buffer.byteLength(stderr) > 1024*1024) { overLimit = true; stop(); }
   };
   proc.stdout.on("data",(bytes: Buffer) => collect("stdout",bytes)); proc.stderr.on("data",(bytes: Buffer) => collect("stderr",bytes));
-  const exitCode = await new Promise<number|null>((resolve,reject) => { proc.once("error",reject); proc.once("close",resolve); }).finally(() => { clearTimeout(timer); clearTimeout(escalation); signal?.removeEventListener("abort",abort); });
+  const exitCode = await completion.finally(() => { clearTimeout(timer); clearTimeout(escalation); signal?.removeEventListener("abort",abort); });
   stdout += stdoutDecoder.end(); stderr += stderrDecoder.end();
   // A test may have forked a silent descendant; never leave its group behind.
   kill("SIGKILL");

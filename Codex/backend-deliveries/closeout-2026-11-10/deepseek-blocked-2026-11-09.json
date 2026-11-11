@@ -1,0 +1,7 @@
+{
+  "provider": "deepseek",
+  "status": "blocked",
+  "httpStatus": 402,
+  "reason": "Insufficient Balance",
+  "modelCompleted": false
+}

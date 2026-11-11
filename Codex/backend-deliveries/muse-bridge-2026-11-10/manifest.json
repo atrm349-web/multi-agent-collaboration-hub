@@ -1,0 +1,15 @@
+{
+  "delivery": "Codex muse-bridge-2026-11-10",
+  "activation": "hot update; next native Python invocation loads patched script",
+  "fullNativeRoundTripVerified": false,
+  "files": {
+    "backend/agetor/packages/agent-adapters/muse/muse-desktop-bridge.py": {
+      "beforeSha256": "1a60149a089ca58967501e4b4e2762fe57493a4088e9a9dd82868456bf1daaa3",
+      "sha256": "eb6b9826b7418d068e547382d647ab86cca5b28dcf635d598258399ef1220dd7"
+    },
+    "backend/agetor/docs/hub/frontend-source-lock.json": {
+      "beforeSha256": "e6d678ecb492142c48e8dfc866c534d97b076e9b8c23e295783756dece3fb89b",
+      "sha256": "b0d99753b2702764e1f650ae026c46cfc0a198f70e11270a0747a1be9f93477f"
+    }
+  }
+}

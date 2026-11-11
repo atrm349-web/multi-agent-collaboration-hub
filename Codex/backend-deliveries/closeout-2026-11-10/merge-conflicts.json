@@ -1,0 +1,5 @@
+[
+  "backend/agetor/packages/core/hub.ts",
+  "backend/agetor/packages/core/planner.ts",
+  "apps/web/public/app.js"
+]

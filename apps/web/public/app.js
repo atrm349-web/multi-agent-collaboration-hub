@@ -711,6 +711,15 @@ function renderTopbarAndSidebar() {
     .join('');
 }
 
+const pendingTaskControls = new Set();
+
+function canControlTask(task, action) {
+  if (!task || task.provenance === 'historical' || pendingTaskControls.has(task.id)) return false;
+  if (action === 'pause') return ['queued', 'running', 'waiting_approval'].includes(task.status);
+  if (action === 'resume') return task.status === 'paused';
+  return action === 'cancel' && !['succeeded', 'failed', 'cancelled', 'timed_out', 'cancelling'].includes(task.status);
+}
+
 function renderActiveTaskBar() {
   const bar = document.getElementById('activeTaskBar');
   const task = getSelectedTask();
@@ -720,9 +729,9 @@ function renderActiveTaskBar() {
   }
 
   const isHistorical = task.provenance === 'historical';
-  const canPause = !isHistorical && ['queued', 'running', 'waiting_approval'].includes(task.status);
-  const canResume = !isHistorical && task.status === 'paused';
-  const canCancel = !isHistorical && !['succeeded', 'cancelled'].includes(task.status);
+  const canPause = canControlTask(task, 'pause');
+  const canResume = canControlTask(task, 'resume');
+  const canCancel = canControlTask(task, 'cancel');
 
   const errorBannerHtml = task.error
     ? `
@@ -1726,12 +1735,90 @@ function renderArtifactCenterView() {
   `;
 }
 
+function runForSubtask(subtask) {
+  return (uiState.selectedTaskDetail?.runs?.items || [])
+    .filter((run) => run.subtaskId === subtask.id)
+    .sort((left, right) => right.attempt - left.attempt)[0];
+}
+
+function resolveSubtaskModel(s, task, detail) {
+  const isReview = (s && (s.stage === 'review' || s.stage === 'testing' || s.code === 'FINAL-REVIEW'));
+
+  // 0. Actual persisted run attribution (provider / model) if available
+  const run = s ? runForSubtask(s) : null;
+  const runSource = `${run?.provider || ''} ${run?.model || ''}`.trim().toLowerCase();
+  if (runSource) {
+    if (runSource.includes('workbuddy') || runSource.includes('codebuddy') || runSource.includes('wb')) return 'workbuddy';
+    if (runSource.includes('muse')) return 'muse';
+    if (runSource.includes('deepseek')) return 'deepseek';
+    if (runSource.includes('claude') || runSource.includes('sonnet') || runSource.includes('opus')) return 'claude';
+    if (runSource.includes('gemini') || runSource.includes('antigravity')) return 'gemini';
+    if (runSource.includes('codex') || runSource.includes('openai') || runSource.includes('gpt')) return 'codex';
+  }
+
+  // 1. Explicit model field on subtask entity
+  const explicit = (s && s.model) ? String(s.model).toLowerCase() : '';
+  if (explicit) {
+    if (explicit === 'auto' || explicit === 'default') return isReview ? 'codex' : 'auto';
+    if (explicit.includes('workbuddy') || explicit.includes('codebuddy') || explicit.includes('wb')) return 'workbuddy';
+    if (explicit.includes('muse')) return 'muse';
+    if (explicit.includes('deepseek')) return 'deepseek';
+    if (explicit.includes('claude') || explicit.includes('sonnet') || explicit.includes('opus')) return 'claude';
+    if (explicit.includes('gemini') || explicit.includes('antigravity')) return 'gemini';
+    if (explicit.includes('codex') || explicit.includes('openai') || explicit.includes('gpt')) return 'codex';
+  }
+
+  // 2. Policy models from detail.policy or task.policy or task.models
+  const policy = detail?.policy || task?.policy || null;
+  const models = policy?.models || task?.models || null;
+  const candidate = isReview
+    ? (models?.reviewer || policy?.model || task?.model || '')
+    : (models?.developer || policy?.model || task?.model || '');
+
+  const candStr = String(candidate).toLowerCase();
+  if (candStr === 'auto' || candStr === 'default') return isReview ? 'codex' : 'auto';
+  if (candStr.includes('workbuddy') || candStr.includes('codebuddy') || candStr.includes('wb')) return 'workbuddy';
+  if (candStr.includes('muse')) return 'muse';
+  if (candStr.includes('deepseek')) return 'deepseek';
+  if (candStr.includes('claude') || candStr.includes('sonnet') || candStr.includes('opus')) return 'claude';
+  if (candStr.includes('gemini') || candStr.includes('antigravity')) return 'gemini';
+  if (candStr.includes('codex') || candStr.includes('openai') || candStr.includes('gpt')) return 'codex';
+
+  // 3. Default division of labor when not specified:
+  if (isReview) return 'codex';
+  if (s?.assignedAgentId?.includes('3333')) return 'workbuddy';
+  if (s?.assignedAgentId?.includes('1111')) return 'deepseek';
+  return 'auto';
+}
+
+function getSubtaskModelDisplayName(modelKey) {
+  switch (modelKey) {
+    case 'auto': return 'Gemini / DeepSeek / WorkBuddy / Muse';
+    case 'workbuddy': return 'WorkBuddy';
+    case 'muse': return 'Muse';
+    case 'deepseek': return 'DeepSeek';
+    case 'claude': return 'Claude';
+    case 'gemini': return 'Gemini';
+    case 'codex': return 'Codex';
+    default: return 'Agent';
+  }
+}
+
+function executionLabel(subtask) {
+  const run = runForSubtask(subtask);
+  if (run?.model) {
+    return escapeHtml(getSubtaskModelDisplayName(resolveSubtaskModel(subtask, getSelectedTask(), uiState.selectedTaskDetail)));
+  }
+  return escapeHtml(getSubtaskModelDisplayName(resolveSubtaskModel(subtask, getSelectedTask(), uiState.selectedTaskDetail)));
+}
+
 function renderSettingsView() {
+  const agents = uiState.agentsPage.items || [];
   return `
     <div class="section-card">
       <div class="section-header">
-        <div class="section-title">4 大实机 AI 引擎适配器与运行环境</div>
-        <span class="mock-tag" style="background:rgba(16,185,129,0.1);color:#10b981;border-color:rgba(16,185,129,0.3);">🟢 4 核心引擎在线</span>
+        <div class="section-title">5 大实机 AI 引擎适配器与运行环境</div>
+        <span class="mock-tag" style="background:rgba(16,185,129,0.1);color:#10b981;border-color:rgba(16,185,129,0.3);">🟢 5 核心引擎在线</span>
       </div>
       <div class="agent-grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));gap:12px;">
         <div class="agent-card">
@@ -1805,6 +1892,23 @@ function renderSettingsView() {
         </div>
       </div>
 
+      ${agents.length > 0 ? `
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-subtle);">
+          <div style="font-size:13px;font-weight:700;color:#93c5fd;margin-bottom:8px;">已登记的执行槽位角色 (${agents.length})</div>
+          <div class="agent-grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));gap:10px;">
+            ${agents.map((agent) => `
+              <div class="agent-card" style="padding:10px 12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  <strong>${escapeHtml(agent.label)}</strong>
+                  <span class="status-badge status-${escapeHtml(agent.availability)}">${escapeHtml(agent.availability)}</span>
+                </div>
+                <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${escapeHtml(agent.adapterId)} · 能力: ${escapeHtml((agent.capabilities || []).join(', '))}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      ` : ''}
+
       <details style="margin-top:14px;font-size:11.5px;color:var(--text-secondary);background:rgba(255,255,255,0.02);border:1px solid var(--border-subtle);border-radius:6px;padding:8px 12px;cursor:pointer;">
         <summary style="color:#94a3b8;font-weight:600;outline:none;">底层平台规格与契约协议 (contractVersion=${escapeHtml(uiState.meta.contractVersion)})</summary>
         <div style="margin-top:8px;line-height:1.6;font-family:var(--font-mono);font-size:11px;">
@@ -1827,58 +1931,6 @@ const AGENT_LOGOS = {
   codex: (size = 20) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="#ffffff"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813v6.7227zm1.145-1.708l2.5484-1.4687 2.5484 1.4687v2.9374l-2.5484 1.4687-2.5484-1.4687z"/></svg>`
 };
 
-function resolveSubtaskModel(s, task, detail) {
-  const isReview = (s && (s.stage === 'review' || s.stage === 'testing' || s.code === 'FINAL-REVIEW'));
-
-  // 1. Explicit model field on subtask entity
-  const explicit = (s && s.model) ? String(s.model).toLowerCase() : '';
-  if (explicit) {
-    if (explicit === 'auto' || explicit === 'default') return isReview ? 'claude' : 'auto';
-    if (explicit.includes('workbuddy') || explicit.includes('codebuddy') || explicit.includes('wb')) return 'workbuddy';
-    if (explicit.includes('muse')) return 'muse';
-    if (explicit.includes('deepseek')) return 'deepseek';
-    if (explicit.includes('claude') || explicit.includes('sonnet') || explicit.includes('opus')) return 'claude';
-    if (explicit.includes('gemini') || explicit.includes('antigravity')) return 'gemini';
-    if (explicit.includes('codex') || explicit.includes('openai') || explicit.includes('gpt')) return 'codex';
-  }
-
-  // 2. Policy models from detail.policy or task.policy or task.models
-  const policy = detail?.policy || task?.policy || null;
-  const models = policy?.models || task?.models || null;
-  const candidate = isReview
-    ? (models?.reviewer || policy?.model || task?.model || '')
-    : (models?.developer || policy?.model || task?.model || '');
-
-  const candStr = String(candidate).toLowerCase();
-  if (candStr === 'auto' || candStr === 'default') return isReview ? 'claude' : 'auto';
-  if (candStr.includes('workbuddy') || candStr.includes('codebuddy') || candStr.includes('wb')) return 'workbuddy';
-  if (candStr.includes('muse')) return 'muse';
-  if (candStr.includes('deepseek')) return 'deepseek';
-  if (candStr.includes('claude') || candStr.includes('sonnet') || candStr.includes('opus')) return 'claude';
-  if (candStr.includes('gemini') || candStr.includes('antigravity')) return 'gemini';
-  if (candStr.includes('codex') || candStr.includes('openai') || candStr.includes('gpt')) return 'codex';
-
-  // 3. Default division of labor when not specified:
-  // Working agents = Gemini + DeepSeek + WorkBuddy + Muse ('auto'); Acceptance agent = Claude ('claude')
-  if (isReview) return 'claude';
-  if (s?.assignedAgentId?.includes('3333')) return 'workbuddy';
-  if (s?.assignedAgentId?.includes('1111')) return 'deepseek';
-  return 'auto';
-}
-
-function getSubtaskModelDisplayName(modelKey) {
-  switch (modelKey) {
-    case 'auto': return 'Gemini / DeepSeek / WorkBuddy / Muse';
-    case 'workbuddy': return 'WorkBuddy';
-    case 'muse': return 'Muse';
-    case 'deepseek': return 'DeepSeek';
-    case 'claude': return 'Claude';
-    case 'gemini': return 'Gemini';
-    case 'codex': return 'Codex';
-    default: return 'Agent';
-  }
-}
-
 function renderAgentRouterView() {
   const task = getSelectedTask();
   const detail = uiState.selectedTaskDetail;
@@ -1900,7 +1952,7 @@ function renderAgentRouterView() {
     isLive = task.executionMode === "live";
     missionTitle = task.title || task.goal || "多智能体协同研发任务";
     missionType = "实机";
-    missionExtra = "🟢 真实多Agent协同 · 全链路打通";
+    missionExtra = "按当前任务与运行记录展示";
   }
 
   const selectedMember = uiState.routerSelectedMember || "all";
@@ -1914,8 +1966,12 @@ function renderAgentRouterView() {
     return { label: '排队中', color: '#94a3b8' };
   };
 
-  // Helper to check if a member card is assigned to a subtask
   const matchesMember = (s, memberId) => {
+    const run = runForSubtask(s);
+    if (run?.model) {
+      const runSource = `${run.provider || ''} ${run.model || ''}`.toLowerCase();
+      if (runSource.includes(memberId)) return true;
+    }
     const resolved = resolveSubtaskModel(s, task, detail);
     if (resolved === 'auto') {
       return memberId === 'gemini' || memberId === 'deepseek' || memberId === 'workbuddy' || memberId === 'muse';
@@ -1923,7 +1979,6 @@ function renderAgentRouterView() {
     return resolved === memberId;
   };
 
-  // Resolve Master Coordinator (defaults to Codex unless explicitly overridden)
   const rawPlanner = String(detail?.policy?.models?.planner || task?.policy?.models?.planner || 'codex').toLowerCase();
   const masterName = rawPlanner.includes('deepseek')
     ? 'DeepSeek (主代理)'
@@ -1935,7 +1990,6 @@ function renderAgentRouterView() {
           ? 'Codex · 主代理 (WorkBuddy 协同)'
           : 'Codex · 主代理';
 
-  // 6 Real Executive Member cards reflecting default roles (Workers: Gemini/DeepSeek/WorkBuddy/Muse, Reviewer: Claude, Master: Codex)
   const memberCards = [
     {
       id: "deepseek",
@@ -1943,8 +1997,8 @@ function renderAgentRouterView() {
       model: "deepseek-reasoner · 主力工作",
       icon: AGENT_LOGOS.deepseek(15),
       avatarCls: "ar-avatar-dsh",
-      status: "主力工作",
-      statusCls: "ar-status-success",
+      status: subtasks.some((s) => matchesMember(s, "deepseek") && ['running', 'validating'].includes(s.status)) ? "执行中" : "主力工作",
+      statusCls: subtasks.some((s) => matchesMember(s, "deepseek") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-queued",
       tasks: subtasks.filter((s) => matchesMember(s, "deepseek")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -1961,8 +2015,8 @@ function renderAgentRouterView() {
       model: "claude-3-5-sonnet · 验收门禁",
       icon: AGENT_LOGOS.claude(15),
       avatarCls: "ar-avatar-z",
-      status: "独立验收",
-      statusCls: "ar-status-success",
+      status: subtasks.some((s) => matchesMember(s, "claude") && ['running', 'validating'].includes(s.status)) ? "执行中" : "独立验收",
+      statusCls: subtasks.some((s) => matchesMember(s, "claude") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-queued",
       tasks: subtasks.filter((s) => matchesMember(s, "claude")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -1979,8 +2033,8 @@ function renderAgentRouterView() {
       model: "gemini-3.5-flash · 主力工作",
       icon: AGENT_LOGOS.gemini(15),
       avatarCls: "ar-avatar-o",
-      status: "主力工作",
-      statusCls: "ar-status-success",
+      status: subtasks.some((s) => matchesMember(s, "gemini") && ['running', 'validating'].includes(s.status)) ? "执行中" : "主力工作",
+      statusCls: subtasks.some((s) => matchesMember(s, "gemini") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-queued",
       tasks: subtasks.filter((s) => matchesMember(s, "gemini")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -1997,8 +2051,8 @@ function renderAgentRouterView() {
       model: "本地网关 (18492) · 主力工作",
       icon: AGENT_LOGOS.workbuddy(15),
       avatarCls: "ar-avatar-d",
-      status: "主力工作",
-      statusCls: "ar-status-success",
+      status: subtasks.some((s) => matchesMember(s, "workbuddy") && ['running', 'validating'].includes(s.status)) ? "执行中" : "主力工作",
+      statusCls: subtasks.some((s) => matchesMember(s, "workbuddy") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-queued",
       tasks: subtasks.filter((s) => matchesMember(s, "workbuddy")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -2015,8 +2069,8 @@ function renderAgentRouterView() {
       model: "Meta Muse · 专属周额度",
       icon: AGENT_LOGOS.muse(15),
       avatarCls: "ar-avatar-m",
-      status: "主力工作",
-      statusCls: "ar-status-success",
+      status: subtasks.some((s) => matchesMember(s, "muse") && ['running', 'validating'].includes(s.status)) ? "执行中" : "主力工作",
+      statusCls: subtasks.some((s) => matchesMember(s, "muse") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-queued",
       tasks: subtasks.filter((s) => matchesMember(s, "muse")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -2033,8 +2087,8 @@ function renderAgentRouterView() {
       model: "OpenAI Codex · 默认主 Agent",
       icon: AGENT_LOGOS.codex(15),
       avatarCls: "ar-avatar-x",
-      status: "主控分配",
-      statusCls: "ar-status-running",
+      status: subtasks.some((s) => matchesMember(s, "codex") && ['running', 'validating'].includes(s.status)) ? "执行中" : "主控分配",
+      statusCls: subtasks.some((s) => matchesMember(s, "codex") && ['running', 'validating'].includes(s.status)) ? "ar-status-success" : "ar-status-running",
       tasks: subtasks.filter((s) => matchesMember(s, "codex")).map((s, i) => {
         const st = resolveSubtaskStatus(s);
         return {
@@ -2049,6 +2103,8 @@ function renderAgentRouterView() {
 
   return `
     <div class="agent-router-view">
+      ${uiState.meta.needsAttention ? `<div class="section-card" role="alert">有 ${Number(uiState.meta.needsAttention)} 项测试恢复需要处理。确认旧测试停止并检查工作区后再解除隔离。
+        ${(uiState.meta.validationRecovery || []).map((entry) => `<button class="btn" data-validation-acknowledge="${escapeHtml(entry.subtaskId)}">检查后解除 ${escapeHtml(entry.subtaskId)}</button>`).join('')}</div>` : ''}
       <!-- Topbar inside Router Canvas -->
       <div class="ar-topbar">
         <div class="ar-brand-group">
@@ -2066,7 +2122,7 @@ function renderAgentRouterView() {
           <button class="ar-btn-link" id="createRealTaskBtn" style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;border:none;padding:5px 14px;border-radius:6px;font-weight:700;cursor:pointer;box-shadow:0 0 12px rgba(99,102,241,0.5);">➕ 新建真实协同任务</button>
           <span class="ar-pill-mode" style="${isLive ? '' : 'background:rgba(139,92,246,0.18);border-color:rgba(139,92,246,0.4);color:#c084fc;'}">
             <span class="ar-green-dot" style="${isLive ? '' : 'background:#a855f7;box-shadow:0 0 8px #a855f7;'}"></span>
-            ${isLive ? '🟢 实机真模型运行' : '* 演示'}
+            ${isLive ? '🟢 本地 LIVE 服务' : '* 演示'}
           </span>
           <button class="ar-btn-link" data-goto-view="agent-workspace">控制台 ↗</button>
           <button class="ar-btn-link" data-goto-view="task-center">任务中心 ↗</button>
@@ -2085,12 +2141,12 @@ function renderAgentRouterView() {
                 <span class="ar-green-dot"></span>
                 实机 · 多Agent
               </div>
-              <div class="ar-run-pill-sub">真实模型 · 物理沙箱</div>
+              <div class="ar-run-pill-sub">独立工作区 · 受控测试</div>
             </div>
           </div>
 
           <div class="ar-members-section">
-            <div class="ar-section-label">真实协同成员</div>
+            <div class="ar-section-label">厂商筛选目录</div>
             <div class="ar-members-list">
               <div class="ar-member-item" data-ar-member="hub" title="Hub 主调度器 (Coordinator)">
                 <div class="ar-avatar ar-avatar-c" style="${selectedMember === 'hub' ? 'outline: 2px solid #fff;' : ''}">${AGENT_LOGOS.hub(21)}</div>
@@ -2220,7 +2276,7 @@ function renderAgentRouterView() {
                     </div>
                     <div class="ar-center-status">
                       <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;"></span>
-                      在线 · 主控调度中
+                      ${escapeHtml(task?.status || "等待任务")}
                     </div>
                   </div>
 
@@ -2238,8 +2294,7 @@ function renderAgentRouterView() {
                         const color = isSucc ? '#10b981' : (isFail ? '#ef4444' : (isWait ? '#f59e0b' : '#38bdf8'));
                         const label = isSucc ? '已完成' : (isFail ? '失败' : (isWait ? (s.code === 'FINAL-REVIEW' ? '审查中' : '待批准') : (s.status === 'running' ? '执行中' : '排队中')));
                         const code = s.displayIndex || s.code || `T${idx + 1}`;
-                        const modelKey = resolveSubtaskModel(s, task, detail);
-                        const agentName = getSubtaskModelDisplayName(modelKey);
+                        const agentName = executionLabel(s);
 
                         return `
                           <div class="ar-center-task-item">
@@ -2264,7 +2319,7 @@ function renderAgentRouterView() {
                     <span>已完成子任务 <strong style="color:#fff;">${subtasks.filter((s) => s.status === 'succeeded').length}</strong></span>
                   </div>
                   <div style="text-align:center;font-size:10.5px;color:#64748b;margin-top:8px;">
-                    — 子代理独立沙箱执行，测试门禁通过后自动合流
+                    — 子任务在独立工作区执行，通过测试与审查后交付
                   </div>
                 </div>
               </div>
@@ -2389,9 +2444,8 @@ function renderAgentRouterView() {
                   </div>
                 </div>
                 ${subtasks.map((s, idx) => {
-                  const modelKey = resolveSubtaskModel(s, task, detail);
-                  const agentName = getSubtaskModelDisplayName(modelKey);
-                  const color = s.status === 'succeeded' ? '#10b981' : (s.status === 'failed' ? '#ef4444' : (s.status === 'waiting_approval' ? '#f59e0b' : '#3b82f6'));
+                  const agentName = executionLabel(s);
+                  const color = s.status === 'succeeded' ? '#10b981' : (s.status === 'failed' ? '#ef4444' : '#3b82f6');
                   const leftPos = Math.min(20 + idx * 18, 75);
                   return `
                     <div class="ar-track-row">
@@ -2451,7 +2505,7 @@ function renderAgentRouterView() {
               <div>
                 <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">执行速度与拆解模式 (Execution Speed Mode)</label>
                 <select id="newTaskExecModeSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #10b981;border-radius:6px;color:#6ee7b7;font-size:12px;font-weight:600;">
-                  <option value="fast">⚡ 极速协同模式 (推荐 · 跳过冗长拆解，单步综合实现 + 终审，提速 70%)</option>
+                  <option value="fast">⚡ 极速协同模式 (推荐 · 跳过冗长拆解，单步综合实现 + 终审，减少拆解步骤)</option>
                   <option value="dag">🕸️ 完整多节点 DAG 拆解模式 (适合复杂大型工程，耗时较长)</option>
                 </select>
               </div>
@@ -2461,17 +2515,18 @@ function renderAgentRouterView() {
                   <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">主代理 · 任务分配 (Master Planner)</label>
                   <select id="newTaskPlannerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
                     <option value="codex" selected>⚙️ 默认主 Agent: Codex (分配任务与统筹)</option>
-                    <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
-                    <option value="muse">🎨 Meta Muse (自带专属周额度)</option>
+                    <option value="workbuddy">WorkBuddy（本地网关）</option>
+                    <option value="muse">Meta Muse</option>
                     <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
                     <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet</option>
                     <option value="deepseek-reasoner">🧠 DeepSeek Reasoner (R1)</option>
                   </select>
                 </div>
                 <div>
-                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">工作与验收模型 (Workers & Reviewer)</label>
+                  <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">工作模型 (Workers)</label>
                   <select id="newTaskDevSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
-                    <option value="auto" selected>🤖 默认协同 (工作: Gemini/DeepSeek/WorkBuddy/Muse · 验收: Claude)</option>
+                    <option value="auto" selected>🤖 自动分配: Gemini/DeepSeek/WorkBuddy/Muse</option>
+                    <option value="gpt-6.1-sol">Codex · gpt-6.1-sol</option>
                     <option value="workbuddy">🛠️ 指定单模型: WorkBuddy (本地网关)</option>
                     <option value="muse">🎨 指定单模型: Meta Muse (自带专属周额度)</option>
                     <option value="gemini-3.5-flash-lite">🌐 指定单模型: Gemini 3.5 Flash</option>
@@ -2482,6 +2537,18 @@ function renderAgentRouterView() {
               </div>
             </div>
 
+              <div>
+                <label for="newTaskReviewerSelect" style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">独立审查与门禁模型 (Independent Reviewer)</label>
+                <select id="newTaskReviewerSelect" style="width:100%;box-sizing:border-box;padding:7px 9px;background:#1e293b;border:1px solid #334155;border-radius:6px;color:#fff;font-size:12px;">
+                  <option value="auto" selected>🤖 自动智能选择 (优先 Claude，缺失则 fallback 到本地 Codex)</option>
+                  <option value="gpt-6.1-sol">⚙️ Codex · gpt-6.1-sol (本地登录态 · 稳定免 API)</option>
+                  <option value="workbuddy">🛠️ WorkBuddy (本地网关)</option>
+                  <option value="muse">🎨 Meta Muse (自带专属周额度)</option>
+                  <option value="claude-3-5-sonnet-20241022">⚡ Claude 3.5 Sonnet (需配置 ANTHROPIC_API_KEY)</option>
+                  <option value="gemini-3.5-flash-lite">🌐 Gemini 3.5 Flash</option>
+                  <option value="deepseek-chat">🧠 DeepSeek Chat (V3)</option>
+                </select>
+              </div>
             <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px;">
               <button id="cancelNewTaskModalBtn" style="padding:8px 16px;background:#334155;border:none;border-radius:6px;color:#cbd5e1;cursor:pointer;font-size:13px;">取消</button>
               <button id="submitNewTaskModalBtn" style="padding:8px 20px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer;font-size:13px;box-shadow:0 0 12px rgba(99,102,241,0.5);">🚀 立即启动真实协同</button>
@@ -2708,11 +2775,11 @@ document.addEventListener('click', async (e) => {
     try {
       const plannerModel = plannerSelect?.value || 'codex';
       const devModel = devSelect?.value || 'auto';
-      const reviewerModel = devModel === 'auto' ? 'claude-3-5-sonnet-20241022' : devModel;
+      const reviewerModel = document.getElementById('newTaskReviewerSelect')?.value || 'auto';
       const fastSubtaskId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
         ? globalThis.crypto.randomUUID()
         : '10000000-1000-4000-8000-' + String(Date.now()).padStart(12, '0').slice(-12);
-      showToast(`🚀 正在向主代理 (${plannerModel.toUpperCase()}) 下发真实目标 (工作模型: ${devModel === 'auto' ? 'Gemini/DeepSeek/WorkBuddy/Muse · 验收: Claude' : devModel})...`);
+      showToast(`🚀 正在向主代理 (${plannerModel.toUpperCase()}) 下发真实目标 (工作模型: ${devModel === 'auto' ? 'Gemini/DeepSeek/WorkBuddy/Muse' : devModel} · 审查: ${reviewerModel})...`);
       const created = await apiRequest('/api/v1/tasks', {
         method: 'POST',
         body: JSON.stringify({
@@ -2749,7 +2816,7 @@ document.addEventListener('click', async (e) => {
 
       uiState.showNewTaskModal = false;
       uiState.selectedTaskId = created.id;
-      showToast(`✔ 真实任务下发成功 (ID: ${created.id.slice(0, 8)}...)，模型正在并行执行！`);
+      showToast(`✔ 真实任务下发成功 (ID: ${created.id.slice(0, 8)}...)，任务已进入调度队列。`);
       await loadConsistentSnapshot(created.id);
     } catch (err) {
       showToast(`下发任务失败: ${err.message}`, true);
@@ -2860,14 +2927,25 @@ document.addEventListener('click', async (e) => {
   if (target.dataset.v1TaskControl) {
     const action = target.dataset.v1TaskControl;
     const taskId = target.dataset.taskId || uiState.selectedTaskId;
-    const expectedVersion = Number(target.dataset.version);
+    const task = getSelectedTask();
+    if (target.disabled || task?.id !== taskId || !canControlTask(task, action)) return;
+    const expectedVersion = task.version;
     const body = action === 'cancel' ? { expectedVersion, reason: 'Operator requested cancellation from UI' } : { expectedVersion };
-    const res = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}/${action}`, {
-      method: 'POST',
-      body: JSON.stringify(body)
-    });
-    showToast(`任务控制指令已提交 [202]: status=${res.status} (operationId=${res.operationId})`);
-    await loadConsistentSnapshot(taskId);
+    pendingTaskControls.add(taskId);
+    renderActiveTaskBar();
+    try {
+      const res = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}/${action}`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      showToast(`任务控制指令已提交 [202]: status=${res.status} (operationId=${res.operationId})`);
+      await loadConsistentSnapshot(taskId);
+    } catch (err) {
+      // apiRequest already displays errors and refreshes conflicting task state.
+    } finally {
+      pendingTaskControls.delete(taskId);
+      renderActiveTaskBar();
+    }
     return;
   }
 
@@ -2986,6 +3064,22 @@ document.addEventListener('click', async (e) => {
   }
 
   // Explicit compression of non-executable DraftPlan nodes preserving transitive dependencies
+  if (target.dataset.validationAcknowledge) {
+    const subtaskId = target.dataset.validationAcknowledge;
+    const detail = await apiRequest(`/api/v1/tasks/${uiState.selectedTaskId}`);
+    const step = detail.subtasks.find((item) => item.id === subtaskId);
+    if (!step) { showToast('请先选择对应任务并重新检查', true); return; }
+    const reason = window.prompt('请填写旧测试进程已停止及工作区检查结果');
+    if (!reason?.trim()) return;
+    try {
+      await apiRequest(`/api/v1/subtasks/${subtaskId}/validation-acknowledge`, {method:'POST',body:JSON.stringify({expectedVersion:step.version,processGroupVerifiedStopped:true,reason})});
+      uiState.meta = await apiRequest('/api/v1/meta');
+      await loadConsistentSnapshot(uiState.selectedTaskId);
+      renderAll();
+    } catch (error) { showToast(`解除失败 ${error.message}`, true); }
+    return;
+  }
+
   if (target.id === 'compressDraftPlanBtn') {
     captureCurrentInputsBeforeRender();
     const currentPlan = uiState.composerDraft.draftPlan;

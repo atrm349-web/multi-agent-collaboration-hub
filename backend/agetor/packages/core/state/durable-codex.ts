@@ -41,9 +41,9 @@ export class DurableCodexRunner {
       queueMicrotask(() => { void job.runtime.cancel(runtimeId).catch((failure) => { job.failure ??= failure; }); });
     };
     const runtimeOptions = { ...this.options,
-      onSpawn: (runtimeId: string, pid: number) => {
+      onSpawn: (runtimeId: string, pid: number, kind?: "process-group" | "in-process") => {
         job.runtimeId = runtimeId;
-        try { this.store.spawned(id,this.ownerId,pid); }
+        try { this.store.spawned(id,this.ownerId,pid,kind); }
         catch (error) { persistenceFailure ??= error; throw error; }
         if (this.store.get("run",id).status === "cancelling") throw new Error("CANCELLED: task was cancelled before prompt delivery");
       },
@@ -53,9 +53,7 @@ export class DurableCodexRunner {
         catch (error) { stopForFailure(error,runtimeId); }
       },
     };
-    const isTestSpawn = Boolean(this.options.spawn);
     const reqModel = input.request.model ?? "";
-    const hasClaudeKey = Boolean(process.env.ANTHROPIC_API_KEY?.trim() || process.env.CLAUDE_API_KEY?.trim());
     job.runtime = reqModel.startsWith("muse")
       ? new MuseRuntime(runtimeOptions)
       : reqModel.startsWith("deepseek")
@@ -63,7 +61,7 @@ export class DurableCodexRunner {
         : (reqModel.startsWith("gemini") || reqModel.startsWith("antigravity"))
           ? new GeminiRuntime(runtimeOptions)
           : reqModel.startsWith("claude")
-            ? (hasClaudeKey ? new ClaudeRuntime(runtimeOptions) : new DeepSeekRuntime(runtimeOptions))
+            ? new ClaudeRuntime(runtimeOptions)
             : (reqModel.startsWith("workbuddy") || reqModel.startsWith("wb") || reqModel.startsWith("codebuddy"))
               ? new WorkBuddyRuntime(runtimeOptions)
               : new CodexRuntime(runtimeOptions);
